@@ -11,7 +11,8 @@ gate from implementation and static validation.
 
 Before changing tracked files, establish the intended branch, local HEAD,
 remote baseline when relevant, and tracked-worktree cleanliness. Confirm that
-`core.hooksPath` is `.githooks` and that `.githooks/pre-commit` exists.
+`core.hooksPath` is `.githooks`, that `.githooks/pre-commit` exists, and that
+the ESP-IDF project exists at `firmware/CMakeLists.txt`.
 
 Run the repository privacy lint before a commit:
 
@@ -45,8 +46,9 @@ ESP-IDF v5.5.4 environment before invoking its tools. Installation and
 activation details are local-environment concerns and must not be hardcoded
 into tracked files.
 
-The repository's ESP-IDF project layout is not yet established. Do not assume
-an `firmware/` directory or a wrapper script that does not exist.
+`firmware/` is the ESP-IDF project root. Run `idf.py` from that directory (or
+pass it with `-C firmware`); do not treat the repository root as the project
+root. A repository wrapper script has not been established.
 
 ## Machine-local configuration
 

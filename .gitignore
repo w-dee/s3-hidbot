@@ -1,2 +1,4 @@
 *.pyc
 .*
+/firmware/build/
+/firmware/sdkconfig

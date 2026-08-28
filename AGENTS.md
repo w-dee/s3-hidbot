@@ -34,8 +34,8 @@
 
 - Do not hardcode developer-specific ESP-IDF installation paths or activation
   script absolute paths in tracked files.
-- The ESP-IDF project layout is not yet established; do not assume a project
-  directory or wrapper script.
+- `firmware/` is the ESP-IDF project root. Do not run `idf.py` from the
+  repository root as though it were the project root.
 
 ## Review gates
 
