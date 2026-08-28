@@ -28,3 +28,11 @@ configuration. Do not add their absolute paths to tracked documentation.
 
 Expand this document only after a hardware-validation procedure has been
 established and reviewed.
+
+## BOOT-button diagnostic
+
+GPIO0 is the active-low BOOT button and a boot strapping pin. Do not hold it
+low during reset, power-on, flashing, or bootloader entry unless download boot
+is explicitly intended. The controlled Mouse-report bring-up diagnostic is
+build-time opt-in; the default firmware does not configure GPIO0 or send HID
+reports in response to a BOOT-button press.

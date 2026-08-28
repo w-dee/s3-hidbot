@@ -50,6 +50,9 @@ into tracked files.
 pass it with `-C firmware`); do not treat the repository root as the project
 root. A repository wrapper script has not been established.
 
+The UART Control Plane v1 transport invariants and deferred protocol decisions
+are documented in [`uart-control-plane.md`](uart-control-plane.md).
+
 ## Machine-local configuration
 
 Keep workstation-specific configuration outside the repository, for example in

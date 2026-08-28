@@ -1,0 +1,12 @@
+menu "s3-hidbot diagnostic options"
+
+config S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
+    bool "Enable GPIO0 BOOT-button mouse diagnostic"
+    default n
+    help
+        Enables the controlled single Mouse HID report bring-up diagnostic.
+        GPIO0 is an active-low boot strapping pin; holding it low during reset
+        or power-on can select download boot. Keep this disabled for normal
+        control-plane firmware.
+
+endmenu

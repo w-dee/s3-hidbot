@@ -5,15 +5,18 @@
 #include "freertos/task.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
+#include "uart_control_transport/uart_control_transport.hpp"
 #include "class/hid/hid_device.h"
 
 namespace {
 
 constexpr gpio_num_t kOnboardLed = GPIO_NUM_2;
+constexpr TickType_t kMainLoopInterval = pdMS_TO_TICKS(10);
+#if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
 constexpr gpio_num_t kBootButton = GPIO_NUM_0;
-constexpr TickType_t kBlinkInterval = pdMS_TO_TICKS(1000);
-constexpr TickType_t kButtonPollInterval = pdMS_TO_TICKS(10);
 constexpr uint8_t kButtonDebounceSamples = 3;
+#endif
+constexpr TickType_t kBlinkInterval = pdMS_TO_TICKS(1000);
 constexpr char kLogTag[] = "s3_hidbot";
 
 constexpr uint8_t kKeyboardInterface = 0;
@@ -29,8 +32,8 @@ constexpr uint8_t kMouseStringIndex = 5;
 static_assert(kHidInterfaceCount == 2);
 static_assert(kKeyboardInterface != kMouseInterface);
 static_assert(kKeyboardEndpoint != kMouseEndpoint);
+#if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
 static_assert(kButtonDebounceSamples >= 2);
-
 enum class ButtonState : uint8_t {
     kReleased,
     kDebouncingPress,
@@ -105,6 +108,7 @@ constexpr bool button_debouncer_self_test() {
 }
 
 static_assert(button_debouncer_self_test());
+#endif
 
 const uint8_t kKeyboardReportDescriptor[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(),
@@ -209,6 +213,8 @@ extern "C" void app_main() {
         .intr_type = GPIO_INTR_DISABLE,
     };
 
+    ESP_ERROR_CHECK(gpio_config(&configuration));
+#if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
     const gpio_config_t button_configuration = {
         .pin_bit_mask = 1ULL << kBootButton,
         .mode = GPIO_MODE_INPUT,
@@ -216,11 +222,12 @@ extern "C" void app_main() {
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-
-    ESP_ERROR_CHECK(gpio_config(&configuration));
     ESP_ERROR_CHECK(gpio_config(&button_configuration));
-    ESP_LOGI(kLogTag, "S3-HIDBOT BLINK READY");
     ESP_LOGI(kLogTag, "BOOT button GPIO0 is active-low; hold during reset selects download boot");
+#endif
+    ESP_LOGI(kLogTag, "S3-HIDBOT BLINK READY");
+
+    ESP_ERROR_CHECK(uart_control_transport::start());
 
     tinyusb_config_t tinyusb_configuration = TINYUSB_DEFAULT_CONFIG(usb_event_handler);
     tinyusb_configuration.descriptor.device = nullptr;
@@ -230,13 +237,16 @@ extern "C" void app_main() {
         sizeof(kHidStringDescriptors) / sizeof(kHidStringDescriptors[0]);
     ESP_ERROR_CHECK(tinyusb_driver_install(&tinyusb_configuration));
     ESP_LOGI(kLogTag, "S3-HIDBOT USB HID READY");
+#if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
     ESP_LOGI(kLogTag, "S3-HIDBOT MOUSE TEST READY");
 
     ButtonDebouncer button;
+#endif
     TickType_t last_led_toggle = xTaskGetTickCount();
     bool led_on = true;
     ESP_ERROR_CHECK(gpio_set_level(kOnboardLed, 1));
     while (true) {
+#if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
         const bool button_pressed = gpio_get_level(kBootButton) == 0;
         if (button.update(button_pressed)) {
             if (tud_hid_n_ready(kMouseInterface)) {
@@ -250,6 +260,7 @@ extern "C" void app_main() {
                 ESP_LOGI(kLogTag, "MOUSE TEST REPORT DROPPED NOT READY");
             }
         }
+#endif
 
         const TickType_t now = xTaskGetTickCount();
         if (now - last_led_toggle >= kBlinkInterval) {
@@ -257,6 +268,6 @@ extern "C" void app_main() {
             ESP_ERROR_CHECK(gpio_set_level(kOnboardLed, led_on ? 1 : 0));
             last_led_toggle = now;
         }
-        vTaskDelay(kButtonPollInterval);
+        vTaskDelay(kMainLoopInterval);
     }
 }
