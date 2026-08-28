@@ -10,7 +10,10 @@
 namespace {
 
 constexpr gpio_num_t kOnboardLed = GPIO_NUM_2;
+constexpr gpio_num_t kBootButton = GPIO_NUM_0;
 constexpr TickType_t kBlinkInterval = pdMS_TO_TICKS(1000);
+constexpr TickType_t kButtonPollInterval = pdMS_TO_TICKS(10);
+constexpr uint8_t kButtonDebounceSamples = 3;
 constexpr char kLogTag[] = "s3_hidbot";
 
 constexpr uint8_t kKeyboardInterface = 0;
@@ -26,6 +29,82 @@ constexpr uint8_t kMouseStringIndex = 5;
 static_assert(kHidInterfaceCount == 2);
 static_assert(kKeyboardInterface != kMouseInterface);
 static_assert(kKeyboardEndpoint != kMouseEndpoint);
+static_assert(kButtonDebounceSamples >= 2);
+
+enum class ButtonState : uint8_t {
+    kReleased,
+    kDebouncingPress,
+    kPressed,
+    kDebouncingRelease,
+};
+
+class ButtonDebouncer {
+  public:
+    constexpr bool update(bool pressed) {
+        switch (state_) {
+            case ButtonState::kReleased:
+                if (pressed) {
+                    state_ = ButtonState::kDebouncingPress;
+                    consecutive_samples_ = 1;
+                }
+                break;
+            case ButtonState::kDebouncingPress:
+                if (!pressed) {
+                    state_ = ButtonState::kReleased;
+                    consecutive_samples_ = 0;
+                } else if (++consecutive_samples_ >= kButtonDebounceSamples) {
+                    state_ = ButtonState::kPressed;
+                    consecutive_samples_ = 0;
+                    return true;
+                }
+                break;
+            case ButtonState::kPressed:
+                if (!pressed) {
+                    state_ = ButtonState::kDebouncingRelease;
+                    consecutive_samples_ = 1;
+                }
+                break;
+            case ButtonState::kDebouncingRelease:
+                if (pressed) {
+                    state_ = ButtonState::kPressed;
+                    consecutive_samples_ = 0;
+                } else if (++consecutive_samples_ >= kButtonDebounceSamples) {
+                    state_ = ButtonState::kReleased;
+                    consecutive_samples_ = 0;
+                }
+                break;
+        }
+        return false;
+    }
+
+  private:
+    ButtonState state_ = ButtonState::kReleased;
+    uint8_t consecutive_samples_ = 0;
+};
+
+constexpr bool button_debouncer_self_test() {
+    ButtonDebouncer button;
+
+    // Initial bounce does not create an edge; three stable pressed samples do.
+    if (button.update(true) || button.update(false) || button.update(true) ||
+        button.update(true) || !button.update(true)) {
+        return false;
+    }
+    // A held button cannot create another edge.
+    if (button.update(true) || button.update(true)) {
+        return false;
+    }
+    // Release bounce does not re-arm until three stable released samples.
+    if (button.update(false) || button.update(true) || button.update(false) ||
+        button.update(false) || button.update(false)) {
+        return false;
+    }
+    // A new debounced press creates exactly one new edge.
+    return !button.update(true) && !button.update(true) && button.update(true) &&
+           !button.update(true);
+}
+
+static_assert(button_debouncer_self_test());
 
 const uint8_t kKeyboardReportDescriptor[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(),
@@ -130,8 +209,18 @@ extern "C" void app_main() {
         .intr_type = GPIO_INTR_DISABLE,
     };
 
+    const gpio_config_t button_configuration = {
+        .pin_bit_mask = 1ULL << kBootButton,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
     ESP_ERROR_CHECK(gpio_config(&configuration));
+    ESP_ERROR_CHECK(gpio_config(&button_configuration));
     ESP_LOGI(kLogTag, "S3-HIDBOT BLINK READY");
+    ESP_LOGI(kLogTag, "BOOT button GPIO0 is active-low; hold during reset selects download boot");
 
     tinyusb_config_t tinyusb_configuration = TINYUSB_DEFAULT_CONFIG(usb_event_handler);
     tinyusb_configuration.descriptor.device = nullptr;
@@ -141,11 +230,33 @@ extern "C" void app_main() {
         sizeof(kHidStringDescriptors) / sizeof(kHidStringDescriptors[0]);
     ESP_ERROR_CHECK(tinyusb_driver_install(&tinyusb_configuration));
     ESP_LOGI(kLogTag, "S3-HIDBOT USB HID READY");
+    ESP_LOGI(kLogTag, "S3-HIDBOT MOUSE TEST READY");
 
+    ButtonDebouncer button;
+    TickType_t last_led_toggle = xTaskGetTickCount();
+    bool led_on = true;
+    ESP_ERROR_CHECK(gpio_set_level(kOnboardLed, 1));
     while (true) {
-        ESP_ERROR_CHECK(gpio_set_level(kOnboardLed, 1));
-        vTaskDelay(kBlinkInterval);
-        ESP_ERROR_CHECK(gpio_set_level(kOnboardLed, 0));
-        vTaskDelay(kBlinkInterval);
+        const bool button_pressed = gpio_get_level(kBootButton) == 0;
+        if (button.update(button_pressed)) {
+            if (tud_hid_n_ready(kMouseInterface)) {
+                const bool sent = tud_hid_n_mouse_report(kMouseInterface, 0, 0, 10, 0, 0, 0);
+                if (sent) {
+                    ESP_LOGI(kLogTag, "MOUSE TEST REPORT SENT");
+                } else {
+                    ESP_LOGI(kLogTag, "MOUSE TEST REPORT DROPPED SEND FAILURE");
+                }
+            } else {
+                ESP_LOGI(kLogTag, "MOUSE TEST REPORT DROPPED NOT READY");
+            }
+        }
+
+        const TickType_t now = xTaskGetTickCount();
+        if (now - last_led_toggle >= kBlinkInterval) {
+            led_on = !led_on;
+            ESP_ERROR_CHECK(gpio_set_level(kOnboardLed, led_on ? 1 : 0));
+            last_led_toggle = now;
+        }
+        vTaskDelay(kButtonPollInterval);
     }
 }
