@@ -18,6 +18,10 @@ def main() -> int:
     main_source = MAIN.read_text(encoding="utf-8")
 
     assert "config_.output(config_.output_context" in protocol
+    assert "struct ResponseSession" in protocol
+    assert "kUncorrelatableSession" in protocol
+    assert "\\\"session\\\":%s" in protocol
+    assert "\\\"client_nonce\\\":\\\"%s\\\"" in protocol
     for source in (protocol, session):
         assert "uart_write_bytes" not in source
         assert "ESP_LOG" not in source

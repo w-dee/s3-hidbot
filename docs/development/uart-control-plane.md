@@ -76,17 +76,19 @@ unknown fields fail closed.
 Success and error frames use these envelopes:
 
 ```json
-{"type":"response","v":1,"id":12,"ok":true,"result":{}}
-{"type":"response","v":1,"id":12,"ok":false,"error":{"code":"INVALID_PARAMS","message":"..."}}
+{"type":"response","v":1,"id":12,"session":"0123456789abcdef0123456789abcdef","ok":true,"result":{}}
+{"type":"response","v":1,"id":null,"session":null,"ok":false,"error":{"code":"MALFORMED_JSON","message":"..."}}
 ```
 
-If an `id` cannot be extracted as valid, the response uses `"id":null`.
-Error messages are bounded human diagnostics; host behavior must rely on
-`error.code`.
+Every response has exactly `type`, `v`, `id`, `session`, `ok`, and exactly one
+of `result` or `error`. If an `id` cannot be extracted as valid, the response
+uses `"id":null`. The `session` field is never omitted: it is either a valid
+current/new session token or JSON `null`. Error messages are bounded human
+diagnostics; host behavior must rely on `error.code`.
 
 ## Machine-readable output and logs
 
-Future protocol responses and events must use the common machine writer. It
+Protocol responses and future events must use the common machine writer. It
 has a fixed maximum of 1024 bytes including prefix, JSON, and LF. The writer
 holds the stdout FILE lock, flushes stdout, then writes the frame through the
 configured console UART driver before unlocking. This prevents byte-level
@@ -96,9 +98,10 @@ discipline.
 The protocol response buffer is fixed at 1024 bytes. All U2 formatters use
 bounded `vsnprintf` serialization and fail closed to a bounded
 `INTERNAL_ERROR` when a formatter cannot serialize. The hello format has a
-compile-time maximum calculation based on bounded metadata, two tokens, fixed
-capabilities, maximum ID, prefix, and LF; host-native tests assert every U2
-success and error response is within the bound.
+compile-time maximum calculation based on bounded metadata, four 32-hex values
+(top-level/result session, boot ID, and client nonce), fixed capabilities,
+maximum ID, prefix, and LF; host-native tests assert every U2 success and
+error response is within the bound.
 
 Machine frames must not use ESP_LOG or printf, and project code must not add a
 separate direct UART writer. ESP-IDF ROM boot output, panic output, and any
@@ -114,17 +117,45 @@ an authentication credential, and is returned from every successful hello.
 
 A valid hello with a new `client_nonce` generates a new session, revokes the
 previous session, clears normal-request retry state, activates the new session,
-caches the hello response, and returns project, protocol version, boot ID,
-session, and the explicit initial capability list:
+caches the hello response, and returns a response whose top-level `session` is
+the new token. The result retains the same `session` and includes an exact
+`client_nonce` echo, project, protocol version, boot ID, and the explicit
+initial capability list:
 
 ```text
 protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1
 ```
 
+For a successful hello, top-level `session` equals `result.session`. Both are
+the generated control-session token. The echoed nonce identifies this hello
+attempt; `boot_id` identifies the MCU boot epoch.
+
+The complete successful-hello shape is:
+
+```json
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1"]}}
+```
+
+The angle-bracket values above are documentation placeholders only; wire
+values are fixed-length lowercase hexadecimal tokens.
+
 Adding a future capability does not itself require changing protocol version
 `v`; hosts must use the advertised capability list. U2 does not advertise HID,
 release-all, event, or lease capabilities. All normal requests require the
 exact current session; USB mount does not automatically create one.
+
+The response `session` field is a correlation/epoch identity, not an
+authentication credential. A `session:null` response cannot be trusted as
+belonging to an authenticated/current control session. Only a response
+produced after exact current-session validation may contain the current token.
+Before that boundary, `session:null` is used. This includes framing/JSON/
+envelope/version errors, malformed or missing session, `SESSION_MISMATCH`,
+hello validation failures, `CLIENT_NONCE_CONFLICT`, and params-type errors
+found before session comparison.
+After the boundary, normal successes, exact retries, ID conflict/stale errors,
+unknown-command errors, and command-level parameter/execution errors contain
+the current token. A successful hello and exact hello retry contain the new
+session token.
 
 Hello and normal-request retry state are separate one-entry fixed-capacity
 caches. The hello cache holds the client nonce, exact normalized JSON bytes,
@@ -176,6 +207,25 @@ activate the new session. U2 does not yet implement that release behavior.
   never submits a HID report.
 
 Lifecycle transitions do not produce asynchronous U2 machine events.
+
+## Future U3 host correlation contract
+
+For a normal request, a future host accepts a response only when its type,
+protocol version, expected ID, expected current session, and response schema
+all match. A wrong-session or malformed frame cannot satisfy the request; the
+host should discard it within bounded limits and continue waiting.
+
+For hello, the host additionally requires the expected ID, `ok:true`, exact
+`result.client_nonce`, valid top-level and result session tokens that are equal,
+valid `boot_id`, expected project/protocol version, and a valid capabilities
+list. A wrong-nonce/stale frame must never establish a session. U3 will define
+the concrete discard limit and timeout recovery (`TRANSPORT_SYNC` followed by a
+fresh hello).
+
+U2.1 is a pre-freeze v1 wire hardening. Protocol `v` remains `1` and the
+capability list is unchanged; no new capability is advertised. The nonce
+identifies a hello attempt, the boot ID identifies an MCU boot epoch, and the
+request ID identifies a request within the current control session.
 
 ## Deferred control safety
 

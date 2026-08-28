@@ -22,14 +22,22 @@ constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kCapabilityJson[] =
     "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\"]";
+struct ResponseSession {
+    bool present;
+    std::string_view token;
+};
+
+constexpr ResponseSession kUncorrelatableSession{false, {}};
+constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
+
 // Every formatter below writes to ResponseFrame::bytes. This conservative
 // bound covers the largest U2 response: protocol.hello with bounded project
-// metadata, two 32-hex tokens, capability list, maximum int32 id, framing,
-// and LF. vsnprintf still fail-closes if a future format exceeds the buffer.
+// metadata, four 32-hex values (top-level session, result session, boot ID,
+// and client nonce), capability list, maximum int32 id, framing, and LF.
+// vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
-    kPrefixLength + 112 + kMaxMetadataBytes +
-    control_session::kTokenHexLength * 2 + (sizeof(kCapabilityJson) - 1) +
-    10 + 1;
+    kPrefixLength + 180 + kMaxMetadataBytes +
+    control_session::kTokenHexLength * 4 + (sizeof(kCapabilityJson) - 1) + 10 + 1;
 static_assert(kMaximumHelloResponseBytes <= control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
@@ -164,41 +172,89 @@ bool format_frame(control_session::ResponseFrame *frame, const char *format, ...
     return true;
 }
 
+bool format_session_field(char output[kSessionFieldBytes], ResponseSession session) {
+    if (!session.present) {
+        std::memcpy(output, "null", sizeof("null"));
+        return true;
+    }
+    if (!control_session::is_lower_hex_token(session.token)) {
+        return false;
+    }
+    const int length = std::snprintf(output,
+                                     kSessionFieldBytes,
+                                     "\"%.*s\"",
+                                     static_cast<int>(session.token.size()),
+                                     session.token.data());
+    return length == static_cast<int>(control_session::kTokenHexLength + 2);
+}
+
+bool is_lower_hex_token_cstr(const char *value) {
+    return value != nullptr &&
+           control_session::is_lower_hex_token(std::string_view(value));
+}
+
 bool make_error(control_session::ResponseFrame *frame,
+                ResponseSession session,
                 bool has_id,
                 std::int32_t id,
                 const char *code,
                 const char *message) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
     if (has_id) {
         return format_frame(frame,
-                            "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":false,"
+                            "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                            "\"session\":%s,\"ok\":false,"
                             "\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}\n",
                             static_cast<long>(id),
+                            session_field,
                             code,
                             message);
     }
     return format_frame(frame,
-                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":null,\"ok\":false,"
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":null,"
+                        "\"session\":%s,\"ok\":false,"
                         "\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}\n",
+                        session_field,
                         code,
                         message);
 }
 
-bool make_ping(control_session::ResponseFrame *frame, std::int32_t id) {
+bool make_ping(control_session::ResponseFrame *frame,
+               ResponseSession session,
+               std::int32_t id) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
     return format_frame(frame,
-                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":true,"
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,"
                         "\"result\":{\"pong\":true}}\n",
-                        static_cast<long>(id));
+                        static_cast<long>(id),
+                        session_field);
 }
 
 bool make_info(control_session::ResponseFrame *frame,
+               ResponseSession session,
                std::int32_t id,
                const Metadata &metadata) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
     return format_frame(frame,
-                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":true,\"result\":{"
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
                         "\"project\":\"%s\",\"target\":\"%s\",\"idf_version\":\"%s\","
                         "\"protocol_version\":1}}\n",
                         static_cast<long>(id),
+                        session_field,
                         metadata.project,
                         metadata.target,
                         metadata.idf_version);
@@ -209,12 +265,20 @@ const char *json_bool(bool value) {
 }
 
 bool make_usb_status(control_session::ResponseFrame *frame,
+                     ResponseSession session,
                      std::int32_t id,
                      UsbStatus status) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
     return format_frame(frame,
-                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":true,\"result\":{"
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
                         "\"mounted\":%s,\"suspended\":%s,\"keyboard_ready\":%s,\"mouse_ready\":%s}}\n",
                         static_cast<long>(id),
+                        session_field,
                         json_bool(status.mounted),
                         json_bool(status.suspended),
                         json_bool(status.keyboard_ready),
@@ -222,18 +286,32 @@ bool make_usb_status(control_session::ResponseFrame *frame,
 }
 
 bool make_hello(control_session::ResponseFrame *frame,
+                ResponseSession session,
                 std::int32_t id,
                 const Metadata &metadata,
+                const char *client_nonce,
                 const char *boot_id,
-                const char *session) {
+                const char *result_session) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session) ||
+        !is_lower_hex_token_cstr(client_nonce) ||
+        !is_lower_hex_token_cstr(boot_id) ||
+        !is_lower_hex_token_cstr(result_session)) {
+        frame->length = 0;
+        return false;
+    }
     return format_frame(frame,
-                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":true,\"result\":{"
-                        "\"project\":\"%s\",\"protocol_version\":1,\"boot_id\":\"%s\","
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"project\":\"%s\",\"protocol_version\":1,"
+                        "\"client_nonce\":\"%s\",\"boot_id\":\"%s\","
                         "\"session\":\"%s\",\"capabilities\":%s}}\n",
                         static_cast<long>(id),
+                        session_field,
                         metadata.project,
+                        client_nonce,
                         boot_id,
-                        session,
+                        result_session,
                         kCapabilityJson);
 }
 
@@ -288,7 +366,7 @@ void Protocol::handle_framing_event(const control_framing::Event &event) {
     }
     if (event.kind == control_framing::EventKind::kOverlongProtocolFrame) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, false, 0, "LINE_TOO_LONG", "request line exceeds 512 bytes")) {
+        if (make_error(&response, kUncorrelatableSession, false, 0, "LINE_TOO_LONG", "request line exceeds 512 bytes")) {
             write_frame(response);
         }
         return;
@@ -301,7 +379,7 @@ void Protocol::handle_framing_event(const control_framing::Event &event) {
 void Protocol::handle_frame(std::string_view payload) {
     if (payload.size() > control_session::kMaxRequestBytes) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, false, 0, "LINE_TOO_LONG", "request line exceeds 512 bytes")) {
+        if (make_error(&response, kUncorrelatableSession, false, 0, "LINE_TOO_LONG", "request line exceeds 512 bytes")) {
             write_frame(response);
         }
         return;
@@ -313,7 +391,7 @@ void Protocol::handle_frame(std::string_view payload) {
     cJSON *root = cJSON_ParseWithLengthOpts(json, payload.size() + 1, &parse_end, true);
     if (root == nullptr) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, false, 0, "MALFORMED_JSON", "request is not valid JSON")) {
+        if (make_error(&response, kUncorrelatableSession, false, 0, "MALFORMED_JSON", "request is not valid JSON")) {
             write_frame(response);
         }
         return;
@@ -323,7 +401,7 @@ void Protocol::handle_frame(std::string_view payload) {
     if (!cJSON_IsObject(root) || !is_json_tree_bounded(root, 0) ||
         !object_has_no_duplicate_keys(root)) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, false, 0, "INVALID_REQUEST", "request must be a bounded object")) {
+        if (make_error(&response, kUncorrelatableSession, false, 0, "INVALID_REQUEST", "request must be a bounded object")) {
             write_frame(response);
         }
         finish();
@@ -333,7 +411,7 @@ void Protocol::handle_frame(std::string_view payload) {
     std::int32_t id = 0;
     if (!parse_id(root, &id)) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, false, 0, "INVALID_REQUEST", "id must be a non-negative int32")) {
+        if (make_error(&response, kUncorrelatableSession, false, 0, "INVALID_REQUEST", "id must be a non-negative int32")) {
             write_frame(response);
         }
         finish();
@@ -343,7 +421,7 @@ void Protocol::handle_frame(std::string_view payload) {
     const cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "v");
     if (!is_integer_number(version)) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, true, id, "INVALID_REQUEST", "v must be an integer")) {
+        if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "v must be an integer")) {
             write_frame(response);
         }
         finish();
@@ -351,7 +429,7 @@ void Protocol::handle_frame(std::string_view payload) {
     }
     if (version->valuedouble != kProtocolVersion) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, true, id, "UNSUPPORTED_PROTOCOL_VERSION", "only protocol version 1 is supported")) {
+        if (make_error(&response, kUncorrelatableSession, true, id, "UNSUPPORTED_PROTOCOL_VERSION", "only protocol version 1 is supported")) {
             write_frame(response);
         }
         finish();
@@ -361,7 +439,7 @@ void Protocol::handle_frame(std::string_view payload) {
     std::string_view command;
     if (!get_bounded_nonempty_string(root, "cmd", kMaxCommandBytes, &command)) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, true, id, "INVALID_REQUEST", "cmd must be a bounded non-empty string")) {
+        if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "cmd must be a bounded non-empty string")) {
             write_frame(response);
         }
         finish();
@@ -372,7 +450,7 @@ void Protocol::handle_frame(std::string_view payload) {
         static constexpr const char *kHelloFields[] = {"v", "id", "cmd", "params"};
         if (!object_has_only_fields(root, kHelloFields, 4)) {
             control_session::ResponseFrame response{};
-            if (make_error(&response, true, id, "INVALID_REQUEST", "hello envelope has unknown fields")) {
+            if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "hello envelope has unknown fields")) {
                 write_frame(response);
             }
             finish();
@@ -383,7 +461,7 @@ void Protocol::handle_frame(std::string_view payload) {
         const cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
         if (!validate_hello_params(params, &client_nonce)) {
             control_session::ResponseFrame response{};
-            if (make_error(&response, true, id, "INVALID_PARAMS", "client_nonce must be 32 lowercase hex characters")) {
+            if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_PARAMS", "client_nonce must be 32 lowercase hex characters")) {
                 write_frame(response);
             }
             finish();
@@ -400,7 +478,7 @@ void Protocol::handle_frame(std::string_view payload) {
         }
         if (cache_result == control_session::HelloCacheResult::kNonceConflict) {
             control_session::ResponseFrame response{};
-            if (make_error(&response, true, id, "CLIENT_NONCE_CONFLICT", "client_nonce was previously used with different request bytes")) {
+            if (make_error(&response, kUncorrelatableSession, true, id, "CLIENT_NONCE_CONFLICT", "client_nonce was previously used with different request bytes")) {
                 write_frame(response);
             }
             finish();
@@ -410,8 +488,14 @@ void Protocol::handle_frame(std::string_view payload) {
         char new_session[control_session::kTokenStorageBytes]{};
         session_.generate_token(new_session);
         control_session::ResponseFrame response{};
-        if (!make_hello(&response, id, config_.metadata, session_.boot_id(), new_session)) {
-            make_error(&response, true, id, "INTERNAL_ERROR", "response serialization failed");
+        if (!make_hello(&response,
+                        ResponseSession{true, std::string_view(new_session, control_session::kTokenHexLength)},
+                        id,
+                        config_.metadata,
+                        client_nonce.data(),
+                        session_.boot_id(),
+                        new_session)) {
+            make_error(&response, kUncorrelatableSession, true, id, "INTERNAL_ERROR", "response serialization failed");
             write_frame(response);
             finish();
             return;
@@ -425,7 +509,7 @@ void Protocol::handle_frame(std::string_view payload) {
     static constexpr const char *kNormalFields[] = {"v", "id", "session", "cmd", "params"};
     if (!object_has_only_fields(root, kNormalFields, 5)) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, true, id, "INVALID_REQUEST", "request envelope has unknown fields")) {
+        if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "request envelope has unknown fields")) {
             write_frame(response);
         }
         finish();
@@ -436,7 +520,7 @@ void Protocol::handle_frame(std::string_view payload) {
     if (!get_bounded_nonempty_string(root, "session", control_session::kTokenHexLength, &session) ||
         !control_session::is_lower_hex_token(session)) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, true, id, "INVALID_REQUEST", "session must be 32 lowercase hex characters")) {
+        if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "session must be 32 lowercase hex characters")) {
             write_frame(response);
         }
         finish();
@@ -445,7 +529,7 @@ void Protocol::handle_frame(std::string_view payload) {
     const cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
     if (params != nullptr && !cJSON_IsObject(params)) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, true, id, "INVALID_PARAMS", "params must be an object")) {
+        if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_PARAMS", "params must be an object")) {
             write_frame(response);
         }
         finish();
@@ -457,12 +541,16 @@ void Protocol::handle_frame(std::string_view payload) {
         session_.inspect_request(session, id, payload, &cached_response);
     if (cache_result == control_session::RequestCacheResult::kSessionMismatch) {
         control_session::ResponseFrame response{};
-        if (make_error(&response, true, id, "SESSION_MISMATCH", "request session is not active")) {
+        if (make_error(&response, kUncorrelatableSession, true, id, "SESSION_MISMATCH", "request session is not active")) {
             write_frame(response);
         }
         finish();
         return;
     }
+    const ResponseSession current_session{
+        true,
+        std::string_view(session_.current_session(), control_session::kTokenHexLength),
+    };
     if (cache_result == control_session::RequestCacheResult::kExactRetry) {
         write_frame(*cached_response);
         finish();
@@ -476,7 +564,7 @@ void Protocol::handle_frame(std::string_view payload) {
         const char *message = cache_result == control_session::RequestCacheResult::kIdConflict ?
             "request id was previously used with different request bytes" :
             "request id is older than the last completed request";
-        if (make_error(&response, true, id, code, message)) {
+        if (make_error(&response, current_session, true, id, code, message)) {
             write_frame(response);
         }
         finish();
@@ -487,34 +575,34 @@ void Protocol::handle_frame(std::string_view payload) {
     bool completed = false;
     if (command == "system.ping") {
         if (!validate_no_params(params)) {
-            make_error(&response, true, id, "INVALID_PARAMS", "system.ping accepts no params");
+            make_error(&response, current_session, true, id, "INVALID_PARAMS", "system.ping accepts no params");
         } else {
-            completed = make_ping(&response, id);
+            completed = make_ping(&response, current_session, id);
         }
     } else if (command == "system.info") {
         if (!validate_no_params(params)) {
-            make_error(&response, true, id, "INVALID_PARAMS", "system.info accepts no params");
+            make_error(&response, current_session, true, id, "INVALID_PARAMS", "system.info accepts no params");
         } else {
-            completed = make_info(&response, id, config_.metadata);
+            completed = make_info(&response, current_session, id, config_.metadata);
         }
     } else if (command == "usb.status") {
         if (!validate_no_params(params)) {
-            make_error(&response, true, id, "INVALID_PARAMS", "usb.status accepts no params");
+            make_error(&response, current_session, true, id, "INVALID_PARAMS", "usb.status accepts no params");
         } else {
-            completed = make_usb_status(&response, id,
+            completed = make_usb_status(&response, current_session, id,
                                         config_.usb_status_provider(config_.usb_status_context));
         }
     } else {
         if (!validate_no_params(params)) {
-            make_error(&response, true, id, "INVALID_PARAMS", "unknown command accepts no params");
+            make_error(&response, current_session, true, id, "INVALID_PARAMS", "unknown command accepts no params");
         } else {
-            completed = make_error(&response, true, id, "UNKNOWN_COMMAND", "command is not registered");
+            completed = make_error(&response, current_session, true, id, "UNKNOWN_COMMAND", "command is not registered");
         }
     }
 
     if (!completed) {
         if (response.length == 0) {
-            make_error(&response, true, id, "INTERNAL_ERROR", "response serialization failed");
+            make_error(&response, current_session, true, id, "INTERNAL_ERROR", "response serialization failed");
         }
         write_frame(response);
         finish();
