@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "control_protocol/control_protocol.hpp"
 #include "esp_err.h"
 
 namespace uart_control_transport {
@@ -10,9 +11,14 @@ namespace uart_control_transport {
 inline constexpr std::size_t kMaxMachineFrameBytes = 1024;
 
 // Starts the sole UART RX consumer for the configured ESP-IDF console UART.
-// U1 consumes only transport/framing bytes; it intentionally has no JSON or
-// HID command dispatcher.
-esp_err_t start();
+// It owns byte transport and the sole machine-response writer; the U2 protocol
+// core handles bounded JSON/session commands and has no HID command dispatch.
+esp_err_t start(const control_protocol::Config *protocol_config);
+
+// Requests revocation of the active control session and retry caches. The USB
+// lifecycle owner calls this only for native USB HID detach; it performs no
+// HID action or blocking work in the callback.
+void on_usb_unmount();
 
 // Writes a bounded machine-readable frame without routing it through ESP_LOG
 // or printf. Future protocol responses and events must use this sole path.

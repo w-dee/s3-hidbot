@@ -15,7 +15,7 @@ def main() -> int:
     assert "kMaxMachineFrameBytes = 1024" in header
 
     writer_start = source.index("bool write_machine")
-    writer_end = source.index("esp_err_t start()", writer_start)
+    writer_end = source.index("esp_err_t start(", writer_start)
     writer = source[writer_start:writer_end]
     assert "length > kMaxMachineFrameBytes" in writer
     assert "ESP_LOG" not in writer

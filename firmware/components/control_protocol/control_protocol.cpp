@@ -1,0 +1,529 @@
+#include "control_protocol/control_protocol.hpp"
+
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <string_view>
+
+#include "cJSON.h"
+
+namespace control_protocol {
+namespace {
+
+constexpr std::size_t kPrefixLength = sizeof(control_framing::kFramePrefix) - 1;
+constexpr std::size_t kMaxCommandBytes = 48;
+constexpr std::size_t kMaxJsonStringBytes = 64;
+constexpr std::size_t kMaxJsonObjectMembers = 8;
+constexpr std::size_t kMaxJsonArrayMembers = 8;
+constexpr std::size_t kMaxJsonDepth = 4;
+constexpr std::size_t kMaxMetadataBytes = 32;
+
+constexpr char kCapabilityJson[] =
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\"]";
+// Every formatter below writes to ResponseFrame::bytes. This conservative
+// bound covers the largest U2 response: protocol.hello with bounded project
+// metadata, two 32-hex tokens, capability list, maximum int32 id, framing,
+// and LF. vsnprintf still fail-closes if a future format exceeds the buffer.
+constexpr std::size_t kMaximumHelloResponseBytes =
+    kPrefixLength + 112 + kMaxMetadataBytes +
+    control_session::kTokenHexLength * 2 + (sizeof(kCapabilityJson) - 1) +
+    10 + 1;
+static_assert(kMaximumHelloResponseBytes <= control_session::kMaxResponseBytes);
+
+bool is_bounded_string(const char *value, std::size_t maximum_length) {
+    return value != nullptr && std::strlen(value) <= maximum_length;
+}
+
+bool is_safe_metadata_string(const char *value) {
+    if (!is_bounded_string(value, kMaxMetadataBytes)) {
+        return false;
+    }
+    for (const char *character = value; *character != '\0'; ++character) {
+        if (*character < 0x20 || *character == '"' || *character == '\\') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_integer_number(const cJSON *item) {
+    return cJSON_IsNumber(item) && std::isfinite(item->valuedouble) &&
+           std::floor(item->valuedouble) == item->valuedouble;
+}
+
+bool parse_id(const cJSON *root, std::int32_t *id) {
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "id");
+    if (!is_integer_number(item) || item->valuedouble < 0 ||
+        item->valuedouble > std::numeric_limits<std::int32_t>::max()) {
+        return false;
+    }
+    *id = static_cast<std::int32_t>(item->valuedouble);
+    return true;
+}
+
+bool is_json_tree_bounded(const cJSON *item, std::size_t depth) {
+    if (item == nullptr || depth > kMaxJsonDepth) {
+        return false;
+    }
+    if (cJSON_IsString(item) &&
+        (item->valuestring == nullptr || std::strlen(item->valuestring) > kMaxJsonStringBytes)) {
+        return false;
+    }
+
+    if (cJSON_IsObject(item) || cJSON_IsArray(item)) {
+        std::size_t count = 0;
+        const std::size_t maximum = cJSON_IsObject(item) ? kMaxJsonObjectMembers : kMaxJsonArrayMembers;
+        for (const cJSON *child = item->child; child != nullptr; child = child->next) {
+            if (++count > maximum ||
+                (cJSON_IsObject(item) &&
+                 (child->string == nullptr || std::strlen(child->string) > kMaxJsonStringBytes)) ||
+                !is_json_tree_bounded(child, depth + 1)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool object_has_no_duplicate_keys(const cJSON *item) {
+    if (item == nullptr) {
+        return false;
+    }
+    if (cJSON_IsObject(item)) {
+        for (const cJSON *left = item->child; left != nullptr; left = left->next) {
+            if (left->string == nullptr) {
+                return false;
+            }
+            for (const cJSON *right = left->next; right != nullptr; right = right->next) {
+                if (right->string == nullptr || std::strcmp(left->string, right->string) == 0) {
+                    return false;
+                }
+            }
+        }
+    }
+    for (const cJSON *child = item->child; child != nullptr; child = child->next) {
+        if (!object_has_no_duplicate_keys(child)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool object_has_only_fields(const cJSON *object,
+                            const char *const *allowed,
+                            std::size_t allowed_count) {
+    if (!cJSON_IsObject(object)) {
+        return false;
+    }
+    for (const cJSON *child = object->child; child != nullptr; child = child->next) {
+        bool found = false;
+        for (std::size_t index = 0; index < allowed_count; ++index) {
+            if (std::strcmp(child->string, allowed[index]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool get_bounded_nonempty_string(const cJSON *object,
+                                 const char *name,
+                                 std::size_t maximum_length,
+                                 std::string_view *value) {
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(object, name);
+    if (!cJSON_IsString(item) || item->valuestring == nullptr) {
+        return false;
+    }
+    const std::size_t length = std::strlen(item->valuestring);
+    if (length == 0 || length > maximum_length) {
+        return false;
+    }
+    *value = std::string_view(item->valuestring, length);
+    return true;
+}
+
+bool format_frame(control_session::ResponseFrame *frame, const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    const int length = std::vsnprintf(reinterpret_cast<char *>(frame->bytes),
+                                      sizeof(frame->bytes),
+                                      format,
+                                      arguments);
+    va_end(arguments);
+    if (length < 0 || static_cast<std::size_t>(length) >= sizeof(frame->bytes)) {
+        frame->length = 0;
+        return false;
+    }
+    frame->length = static_cast<std::size_t>(length);
+    return true;
+}
+
+bool make_error(control_session::ResponseFrame *frame,
+                bool has_id,
+                std::int32_t id,
+                const char *code,
+                const char *message) {
+    if (has_id) {
+        return format_frame(frame,
+                            "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":false,"
+                            "\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}\n",
+                            static_cast<long>(id),
+                            code,
+                            message);
+    }
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":null,\"ok\":false,"
+                        "\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}\n",
+                        code,
+                        message);
+}
+
+bool make_ping(control_session::ResponseFrame *frame, std::int32_t id) {
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":true,"
+                        "\"result\":{\"pong\":true}}\n",
+                        static_cast<long>(id));
+}
+
+bool make_info(control_session::ResponseFrame *frame,
+               std::int32_t id,
+               const Metadata &metadata) {
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":true,\"result\":{"
+                        "\"project\":\"%s\",\"target\":\"%s\",\"idf_version\":\"%s\","
+                        "\"protocol_version\":1}}\n",
+                        static_cast<long>(id),
+                        metadata.project,
+                        metadata.target,
+                        metadata.idf_version);
+}
+
+const char *json_bool(bool value) {
+    return value ? "true" : "false";
+}
+
+bool make_usb_status(control_session::ResponseFrame *frame,
+                     std::int32_t id,
+                     UsbStatus status) {
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":true,\"result\":{"
+                        "\"mounted\":%s,\"suspended\":%s,\"keyboard_ready\":%s,\"mouse_ready\":%s}}\n",
+                        static_cast<long>(id),
+                        json_bool(status.mounted),
+                        json_bool(status.suspended),
+                        json_bool(status.keyboard_ready),
+                        json_bool(status.mouse_ready));
+}
+
+bool make_hello(control_session::ResponseFrame *frame,
+                std::int32_t id,
+                const Metadata &metadata,
+                const char *boot_id,
+                const char *session) {
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,\"ok\":true,\"result\":{"
+                        "\"project\":\"%s\",\"protocol_version\":1,\"boot_id\":\"%s\","
+                        "\"session\":\"%s\",\"capabilities\":%s}}\n",
+                        static_cast<long>(id),
+                        metadata.project,
+                        boot_id,
+                        session,
+                        kCapabilityJson);
+}
+
+bool validate_no_params(const cJSON *params) {
+    if (params == nullptr) {
+        return true;
+    }
+    return cJSON_IsObject(params) && params->child == nullptr;
+}
+
+bool validate_hello_params(const cJSON *params, std::string_view *client_nonce) {
+    static constexpr const char *kFields[] = {"client_nonce"};
+    if (!cJSON_IsObject(params) || !object_has_only_fields(params, kFields, 1) ||
+        !get_bounded_nonempty_string(params, "client_nonce", control_session::kTokenHexLength,
+                                     client_nonce)) {
+        return false;
+    }
+    return control_session::is_lower_hex_token(*client_nonce);
+}
+
+}  // namespace
+
+bool Protocol::initialize(const Config &config,
+                          control_session::RandomFill random_fill,
+                          void *random_context) {
+    if (config.output == nullptr || config.usb_status_provider == nullptr || random_fill == nullptr ||
+        !is_safe_metadata_string(config.metadata.project) ||
+        !is_safe_metadata_string(config.metadata.target) ||
+        !is_safe_metadata_string(config.metadata.idf_version)) {
+        return false;
+    }
+    config_ = config;
+    session_.initialize(random_fill, random_context);
+    initialized_ = true;
+    return true;
+}
+
+bool Protocol::write_frame(const control_session::ResponseFrame &frame) const {
+    return frame.length > 0 && frame.length <= control_session::kMaxResponseBytes &&
+           config_.output(config_.output_context, frame.bytes, frame.length);
+}
+
+void Protocol::on_usb_unmount() {
+    if (initialized_) {
+        session_.revoke_for_unmount();
+    }
+}
+
+void Protocol::handle_framing_event(const control_framing::Event &event) {
+    if (!initialized_) {
+        return;
+    }
+    if (event.kind == control_framing::EventKind::kOverlongProtocolFrame) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, false, 0, "LINE_TOO_LONG", "request line exceeds 512 bytes")) {
+            write_frame(response);
+        }
+        return;
+    }
+    if (event.kind == control_framing::EventKind::kFrame) {
+        handle_frame(event.payload);
+    }
+}
+
+void Protocol::handle_frame(std::string_view payload) {
+    if (payload.size() > control_session::kMaxRequestBytes) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, false, 0, "LINE_TOO_LONG", "request line exceeds 512 bytes")) {
+            write_frame(response);
+        }
+        return;
+    }
+
+    char json[control_session::kMaxRequestBytes + 1]{};
+    std::memcpy(json, payload.data(), payload.size());
+    const char *parse_end = nullptr;
+    cJSON *root = cJSON_ParseWithLengthOpts(json, payload.size() + 1, &parse_end, true);
+    if (root == nullptr) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, false, 0, "MALFORMED_JSON", "request is not valid JSON")) {
+            write_frame(response);
+        }
+        return;
+    }
+
+    auto finish = [&root]() { cJSON_Delete(root); };
+    if (!cJSON_IsObject(root) || !is_json_tree_bounded(root, 0) ||
+        !object_has_no_duplicate_keys(root)) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, false, 0, "INVALID_REQUEST", "request must be a bounded object")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+
+    std::int32_t id = 0;
+    if (!parse_id(root, &id)) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, false, 0, "INVALID_REQUEST", "id must be a non-negative int32")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "v");
+    if (!is_integer_number(version)) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, true, id, "INVALID_REQUEST", "v must be an integer")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+    if (version->valuedouble != kProtocolVersion) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, true, id, "UNSUPPORTED_PROTOCOL_VERSION", "only protocol version 1 is supported")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+
+    std::string_view command;
+    if (!get_bounded_nonempty_string(root, "cmd", kMaxCommandBytes, &command)) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, true, id, "INVALID_REQUEST", "cmd must be a bounded non-empty string")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+
+    if (command == "protocol.hello") {
+        static constexpr const char *kHelloFields[] = {"v", "id", "cmd", "params"};
+        if (!object_has_only_fields(root, kHelloFields, 4)) {
+            control_session::ResponseFrame response{};
+            if (make_error(&response, true, id, "INVALID_REQUEST", "hello envelope has unknown fields")) {
+                write_frame(response);
+            }
+            finish();
+            return;
+        }
+
+        std::string_view client_nonce;
+        const cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
+        if (!validate_hello_params(params, &client_nonce)) {
+            control_session::ResponseFrame response{};
+            if (make_error(&response, true, id, "INVALID_PARAMS", "client_nonce must be 32 lowercase hex characters")) {
+                write_frame(response);
+            }
+            finish();
+            return;
+        }
+
+        const control_session::ResponseFrame *cached_response = nullptr;
+        const control_session::HelloCacheResult cache_result =
+            session_.inspect_hello(client_nonce, payload, &cached_response);
+        if (cache_result == control_session::HelloCacheResult::kExactRetry) {
+            write_frame(*cached_response);
+            finish();
+            return;
+        }
+        if (cache_result == control_session::HelloCacheResult::kNonceConflict) {
+            control_session::ResponseFrame response{};
+            if (make_error(&response, true, id, "CLIENT_NONCE_CONFLICT", "client_nonce was previously used with different request bytes")) {
+                write_frame(response);
+            }
+            finish();
+            return;
+        }
+
+        char new_session[control_session::kTokenStorageBytes]{};
+        session_.generate_token(new_session);
+        control_session::ResponseFrame response{};
+        if (!make_hello(&response, id, config_.metadata, session_.boot_id(), new_session)) {
+            make_error(&response, true, id, "INTERNAL_ERROR", "response serialization failed");
+            write_frame(response);
+            finish();
+            return;
+        }
+        session_.activate_hello(client_nonce, payload, new_session, response);
+        write_frame(response);
+        finish();
+        return;
+    }
+
+    static constexpr const char *kNormalFields[] = {"v", "id", "session", "cmd", "params"};
+    if (!object_has_only_fields(root, kNormalFields, 5)) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, true, id, "INVALID_REQUEST", "request envelope has unknown fields")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+
+    std::string_view session;
+    if (!get_bounded_nonempty_string(root, "session", control_session::kTokenHexLength, &session) ||
+        !control_session::is_lower_hex_token(session)) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, true, id, "INVALID_REQUEST", "session must be 32 lowercase hex characters")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+    const cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
+    if (params != nullptr && !cJSON_IsObject(params)) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, true, id, "INVALID_PARAMS", "params must be an object")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+
+    const control_session::ResponseFrame *cached_response = nullptr;
+    const control_session::RequestCacheResult cache_result =
+        session_.inspect_request(session, id, payload, &cached_response);
+    if (cache_result == control_session::RequestCacheResult::kSessionMismatch) {
+        control_session::ResponseFrame response{};
+        if (make_error(&response, true, id, "SESSION_MISMATCH", "request session is not active")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+    if (cache_result == control_session::RequestCacheResult::kExactRetry) {
+        write_frame(*cached_response);
+        finish();
+        return;
+    }
+    if (cache_result == control_session::RequestCacheResult::kIdConflict ||
+        cache_result == control_session::RequestCacheResult::kIdStale) {
+        control_session::ResponseFrame response{};
+        const char *code = cache_result == control_session::RequestCacheResult::kIdConflict ?
+            "REQUEST_ID_CONFLICT" : "REQUEST_ID_STALE";
+        const char *message = cache_result == control_session::RequestCacheResult::kIdConflict ?
+            "request id was previously used with different request bytes" :
+            "request id is older than the last completed request";
+        if (make_error(&response, true, id, code, message)) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+
+    control_session::ResponseFrame response{};
+    bool completed = false;
+    if (command == "system.ping") {
+        if (!validate_no_params(params)) {
+            make_error(&response, true, id, "INVALID_PARAMS", "system.ping accepts no params");
+        } else {
+            completed = make_ping(&response, id);
+        }
+    } else if (command == "system.info") {
+        if (!validate_no_params(params)) {
+            make_error(&response, true, id, "INVALID_PARAMS", "system.info accepts no params");
+        } else {
+            completed = make_info(&response, id, config_.metadata);
+        }
+    } else if (command == "usb.status") {
+        if (!validate_no_params(params)) {
+            make_error(&response, true, id, "INVALID_PARAMS", "usb.status accepts no params");
+        } else {
+            completed = make_usb_status(&response, id,
+                                        config_.usb_status_provider(config_.usb_status_context));
+        }
+    } else {
+        if (!validate_no_params(params)) {
+            make_error(&response, true, id, "INVALID_PARAMS", "unknown command accepts no params");
+        } else {
+            completed = make_error(&response, true, id, "UNKNOWN_COMMAND", "command is not registered");
+        }
+    }
+
+    if (!completed) {
+        if (response.length == 0) {
+            make_error(&response, true, id, "INTERNAL_ERROR", "response serialization failed");
+        }
+        write_frame(response);
+        finish();
+        return;
+    }
+
+    session_.cache_completed_request(id, payload, response);
+    write_frame(response);
+    finish();
+}
+
+}  // namespace control_protocol

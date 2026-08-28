@@ -7,6 +7,7 @@
 #include "tinyusb_default_config.h"
 #include "uart_control_transport/uart_control_transport.hpp"
 #include "class/hid/hid_device.h"
+#include "device/usbd.h"
 
 namespace {
 
@@ -28,6 +29,15 @@ constexpr uint8_t kHidEndpointSize = 16;
 constexpr uint8_t kHidPollingIntervalMs = 10;
 constexpr uint8_t kKeyboardStringIndex = 4;
 constexpr uint8_t kMouseStringIndex = 5;
+
+control_protocol::UsbStatus usb_status(void *) {
+    return control_protocol::UsbStatus{
+        .mounted = tud_mounted(),
+        .suspended = tud_suspended(),
+        .keyboard_ready = tud_hid_n_ready(kKeyboardInterface),
+        .mouse_ready = tud_hid_n_ready(kMouseInterface),
+    };
+}
 
 static_assert(kHidInterfaceCount == 2);
 static_assert(kKeyboardInterface != kMouseInterface);
@@ -157,6 +167,7 @@ void usb_event_handler(tinyusb_event_t *event, void *argument) {
             break;
         case TINYUSB_EVENT_DETACHED:
             ESP_LOGI(kLogTag, "USB HID unmounted");
+            uart_control_transport::on_usb_unmount();
             break;
         case TINYUSB_EVENT_SUSPENDED:
             ESP_LOGI(kLogTag, "USB HID suspended (remote wakeup: %s)",
@@ -227,8 +238,6 @@ extern "C" void app_main() {
 #endif
     ESP_LOGI(kLogTag, "S3-HIDBOT BLINK READY");
 
-    ESP_ERROR_CHECK(uart_control_transport::start());
-
     tinyusb_config_t tinyusb_configuration = TINYUSB_DEFAULT_CONFIG(usb_event_handler);
     tinyusb_configuration.descriptor.device = nullptr;
     tinyusb_configuration.descriptor.full_speed_config = kHidConfigurationDescriptor;
@@ -237,6 +246,18 @@ extern "C" void app_main() {
         sizeof(kHidStringDescriptors) / sizeof(kHidStringDescriptors[0]);
     ESP_ERROR_CHECK(tinyusb_driver_install(&tinyusb_configuration));
     ESP_LOGI(kLogTag, "S3-HIDBOT USB HID READY");
+    const control_protocol::Config protocol_config = {
+        .metadata = {
+            .project = "s3-hidbot",
+            .target = CONFIG_IDF_TARGET,
+            .idf_version = IDF_VER,
+        },
+        .usb_status_provider = usb_status,
+        .usb_status_context = nullptr,
+        .output = nullptr,
+        .output_context = nullptr,
+    };
+    ESP_ERROR_CHECK(uart_control_transport::start(&protocol_config));
 #if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
     ESP_LOGI(kLogTag, "S3-HIDBOT MOUSE TEST READY");
 
