@@ -227,6 +227,52 @@ capability list is unchanged; no new capability is advertised. The nonce
 identifies a hello attempt, the boot ID identifies an MCU boot epoch, and the
 request ID identifies a request within the current control session.
 
+## U3.1/U3.2 pure host core
+
+The first host slices are deliberately independent of serial hardware. The
+stdlib-only package lives under `host/src/hidbot`; `host/tests` uses a fake byte
+transport. PySerial, a CLI, DTR/RTS handling, exclusive tty ownership, and all
+serial opening are deferred to U3.3 and must not be added to this slice.
+
+The receive framer is byte-oriented and bounded to the 1024-byte machine-frame
+limit. It accepts only an exact `@HIDBOT ` prefix at the beginning of a line,
+supports arbitrary chunks, multiple lines per chunk, LF or CRLF termination,
+and recovers from an overlong prefixed line at the next LF. Prefix-less lines
+are diagnostic logs and are discarded by default. A caller may provide a
+bounded log sink; no unbounded line or trace buffer is permitted.
+
+The host response model rejects duplicate JSON keys, non-finite numbers,
+missing envelope fields, invalid IDs/tokens, inconsistent `ok` versus
+`result`/`error`, unknown envelope fields, and structures beyond the host's
+bounded depth/member/string limits. Normal completion requires the expected
+ID and current session. Hello additionally requires the expected nonce,
+matching top-level/result sessions, a valid boot ID, `s3-hidbot` identity, the
+four baseline capabilities, and a unique bounded capability list. A stale hello
+with the wrong nonce never establishes a session. `session:null` errors are
+retained only as bounded untrusted diagnostics and cannot complete a request.
+
+The client is stop-and-wait with one outstanding logical request and a simple
+mutex for same-instance callers. The default deadline is 1.0 seconds per
+attempt, with three total attempts and a 50 ms transport polling interval.
+Only the same session, ID, and exact serialized frame bytes may be retried.
+Fresh hello creates a new 32-lowercase-hex nonce. Normal IDs start at zero for
+each fresh session and never wrap; hello IDs use a separate process-local
+monotonic space. When normal IDs are exhausted, a fresh hello is established
+before another normal request. A session loss, reset, or fresh hello never
+automatically replays an old logical command; its result is left to the caller
+as unknown/session-lost.
+
+U3.1/U3.2 expose only `ping()`, `info()`, and `usb_status()` after
+`connect()`/hello. No HID command, lease, event, release-all, or arbitrary raw
+command API exists. Closing the client only closes the injected transport and
+invalidates local session state; it sends no UART command.
+
+The current Freenove FNK0085 materials identify CH343 as the USB-UART bridge,
+but do not provide an authoritative DTR/RTS-to-EN/GPIO0 schematic or safe idle
+polarity. U3.3 must therefore characterize those lines before implementing a
+production serial transport. The host core must not assume that opening or
+closing a tty is reset-free.
+
 ## Deferred control safety
 
 U2 has no control lease. A later slice will make a bounded mandatory lease part

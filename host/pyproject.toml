@@ -1,0 +1,9 @@
+[project]
+name = "s3-hidbot-host"
+version = "0.1.0"
+description = "Pure host-side s3-hidbot UART control-plane core"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.s3-hidbot]
+scope = "U3.1/U3.2; PySerialTransport and pyserial are deferred to U3.3"
