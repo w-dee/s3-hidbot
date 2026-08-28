@@ -3,7 +3,17 @@ name = "s3-hidbot-host"
 version = "0.1.0"
 description = "Pure host-side s3-hidbot UART control-plane core"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pyserial>=3.5,<4"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+hidbotctl = "hidbot.cli:main"
 
 [tool.s3-hidbot]
-scope = "U3.1/U3.2; PySerialTransport and pyserial are deferred to U3.3"
+scope = "U3.3 host serial transport and diagnostic CLI; HID commands remain deferred"

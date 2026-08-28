@@ -218,9 +218,9 @@ host should discard it within bounded limits and continue waiting.
 For hello, the host additionally requires the expected ID, `ok:true`, exact
 `result.client_nonce`, valid top-level and result session tokens that are equal,
 valid `boot_id`, expected project/protocol version, and a valid capabilities
-list. A wrong-nonce/stale frame must never establish a session. U3 will define
-the concrete discard limit and timeout recovery (`TRANSPORT_SYNC` followed by a
-fresh hello).
+list. A wrong-nonce/stale frame must never establish a session. U3.1/U3.2 fix
+the bounded discard limit and timeout recovery (`TRANSPORT_SYNC` followed by a
+fresh hello) in the generic host client.
 
 U2.1 is a pre-freeze v1 wire hardening. Protocol `v` remains `1` and the
 capability list is unchanged; no new capability is advertised. The nonce
@@ -229,10 +229,10 @@ request ID identifies a request within the current control session.
 
 ## U3.1/U3.2 pure host core
 
-The first host slices are deliberately independent of serial hardware. The
-stdlib-only package lives under `host/src/hidbot`; `host/tests` uses a fake byte
-transport. PySerial, a CLI, DTR/RTS handling, exclusive tty ownership, and all
-serial opening are deferred to U3.3 and must not be added to this slice.
+The first host slices established a generic byte-transport core. U3.3 adds the
+board-specific serial adapter and thin CLI in `host/src/hidbot`; protocol logic
+continues to depend only on the generic transport interface. Host tests use
+fake transports and never open a real tty.
 
 The receive framer is byte-oriented and bounded to the 1024-byte machine-frame
 limit. It accepts only an exact `@HIDBOT ` prefix at the beginning of a line,
@@ -267,11 +267,45 @@ U3.1/U3.2 expose only `ping()`, `info()`, and `usb_status()` after
 command API exists. Closing the client only closes the injected transport and
 invalidates local session state; it sends no UART command.
 
-The current Freenove FNK0085 materials identify CH343 as the USB-UART bridge,
-but do not provide an authoritative DTR/RTS-to-EN/GPIO0 schematic or safe idle
-polarity. U3.3 must therefore characterize those lines before implementing a
-production serial transport. The host core must not assume that opening or
-closing a tty is reset-free.
+The current Freenove FNK0085 materials identify CH343 as the USB-UART bridge.
+The U3.3 hardware characterization observed safe idle as DTR=true and RTS=true
+on the tested board/host. DTR=false-to-true and a transition through both false
+could reset the application; an RTS-only transition had no observed effect.
+The exact circuit mapping was not inferred, and software cannot prove that an
+electrical glitch is impossible. Production transport code therefore sets both
+lines true before open, never changes them during normal use, restores both to
+true immediately before close, and does not expose line override options.
+
+## U3.3 serial transport and CLI
+
+`PySerialTransport` is a bounded implementation of the generic byte transport.
+It uses pyserial `>=3.5,<4` with explicit 8N1, no software or hardware flow
+control, a small read timeout (50 ms by default), a bounded write timeout, and
+Linux exclusive ownership. It is constructed with `port=None`, sets DTR=true
+and RTS=true, assigns the resolved port, and only then opens the tty. Opening
+performs no sync, hello, reset, input drain, or line pulse. Closing restores
+both lines to true before closing; repeated close and failed-open cleanup are
+safe. Partial writes complete through a bounded deadline and serial I/O
+failures become `TransportError`; request deadline expiry remains
+`RequestTimeoutError` in the generic client.
+
+The CLI entry point is `hidbotctl`. It exposes only `hello`, `ping`, `info`,
+and `usb-status`, all through `Client.connect()` and the diagnostic client
+methods. `--port` overrides `S3_HIDBOT_SERIAL`; there is no tracked default
+port. `--baud` overrides `S3_HIDBOT_BAUD`, then the current tested host default
+of 115200 is used. `--timeout`, `--attempts`, `--json`, and `--verbose` are
+available; DTR/RTS overrides and raw JSON/UART commands are intentionally not
+available. `--json` emits one compact result object on stdout; diagnostics and
+errors use stderr. Exit codes are 0 success, 2 configuration, 3 transport,
+4 protocol/compatibility/session, 5 remote command, and 6 timeout.
+
+The characterization and this transport policy were established for the
+Freenove ESP32-S3 WROOM Board / FNK0085 CH343 path during the U3.3 milestone.
+The measured true/true open/close sequence was repeated five times without
+reset, download boot, or native HID disconnect. It is a board/host policy, not
+an authentication mechanism; OS permissions and exclusive ownership are the
+local coordination boundary. A future hardware gate must perform real serial
+protocol round-trip validation; U3.3 itself does not open the real port.
 
 ## Deferred control safety
 

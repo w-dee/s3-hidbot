@@ -10,6 +10,7 @@ from .errors import (
     SessionLostError,
     TransportError,
 )
+from .serial_transport import PySerialTransport
 
 __all__ = [
     "Client",
@@ -21,4 +22,5 @@ __all__ = [
     "RequestTimeoutError",
     "SessionLostError",
     "TransportError",
+    "PySerialTransport",
 ]
