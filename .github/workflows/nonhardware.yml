@@ -33,4 +33,7 @@ jobs:
       - name: IDF-dependent native protocol tests
         run: ./tools/test-control-protocol.sh
       - name: ESP-IDF v5.5.4 esp32s3 firmware build
-        run: ./tools/test-firmware.sh
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          ./tools/test-firmware.sh
