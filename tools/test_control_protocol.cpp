@@ -12,13 +12,14 @@ namespace {
 
 constexpr char kNonceA[] = "0123456789abcdef0123456789abcdef";
 constexpr char kNonceB[] = "fedcba9876543210fedcba9876543210";
+constexpr std::size_t kMaxLogicalMachineFrameBytes = 1023;
 
 struct Sink {
     std::vector<std::string> frames;
 
     static bool write(void *context, const std::uint8_t *data, std::size_t length) {
         auto *sink = static_cast<Sink *>(context);
-        assert(length > 0 && length <= 1024);
+        assert(length > 0 && length <= kMaxLogicalMachineFrameBytes);
         const std::string frame(reinterpret_cast<const char *>(data), length);
         assert(frame.starts_with("@HIDBOT "));
         assert(frame.back() == '\n');
@@ -383,7 +384,7 @@ void test_request_cache_and_commands() {
     require_top_level_session(fixture.sink.last(), new_session);
 
     for (const std::string &frame : fixture.sink.frames) {
-        assert(frame.size() <= 1024);
+        assert(frame.size() <= kMaxLogicalMachineFrameBytes);
     }
 }
 

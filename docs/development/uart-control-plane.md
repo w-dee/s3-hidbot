@@ -88,20 +88,40 @@ diagnostics; host behavior must rely on `error.code`.
 
 ## Machine-readable output and logs
 
-Protocol responses and future events must use the common machine writer. It
-has a fixed maximum of 1024 bytes including prefix, JSON, and LF. The writer
-holds the stdout FILE lock, flushes stdout, then writes the frame through the
-configured console UART driver before unlocking. This prevents byte-level
-interleaving with normal stdout/VFS writers participating in the same locking
-discipline.
+Protocol responses and future events must use the common machine writer. The
+logical machine-frame maximum is 1023 bytes including prefix, JSON, and LF.
+With the current CRLF console configuration, the maximum UART wire form is
+1024 bytes (`...\r\n`) when `CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=y`. The
+writer holds the stdout FILE lock, flushes stdout,
+then performs one `write(fileno(stdout), frame, length)` through the configured
+console VFS before unlocking. This makes the complete frame share the UART VFS
+per-UART write lock with normal stdout, stderr, and ESP_LOG output.
+
+The configured console VFS may mirror the frame to the secondary USB
+Serial/JTAG console. That is accepted console behavior, not a second control
+endpoint; the supported control transport remains the configured USB-UART.
+
+The serialization guarantee covers normal VFS-backed stdout/stderr/ESP_LOG
+bytes: they cannot appear inside a machine frame. ROM boot output,
+panic/fatal-crash output, future direct UART writers, and physical UART
+corruption are outside the guarantee. The writer does not insert a leading LF
+and therefore cannot repair a pre-existing LF-less partial console line. The
+project's normal diagnostic output is LF-terminated ESP_LOG; future
+project-owned diagnostic output should preserve that invariant.
+
+The previous implementation called `uart_write_bytes()` directly after
+`fflush()`. Although the UART driver `tx_mux` serialized that call, it bypassed
+the UART VFS write lock held by normal console output and could split a
+diagnostic line around a machine frame. U3.4.2 removes that bypass.
 
 The protocol response buffer is fixed at 1024 bytes. All U2 formatters use
 bounded `vsnprintf` serialization and fail closed to a bounded
-`INTERNAL_ERROR` when a formatter cannot serialize. The hello format has a
-compile-time maximum calculation based on bounded metadata, four 32-hex values
-(top-level/result session, boot ID, and client nonce), fixed capabilities,
-maximum ID, prefix, and LF; host-native tests assert every U2 success and
-error response is within the bound.
+`INTERNAL_ERROR` when a formatter cannot serialize; because the NUL terminator
+occupies the last storage byte, generated logical responses are at most 1023
+bytes. The hello format has a compile-time maximum calculation based on
+bounded metadata, four 32-hex values (top-level/result session, boot ID, and
+client nonce), fixed capabilities, maximum ID, prefix, and LF; host-native
+tests assert every U2 success and error response is within the logical bound.
 
 Machine frames must not use ESP_LOG or printf, and project code must not add a
 separate direct UART writer. ESP-IDF ROM boot output, panic output, and any
@@ -111,10 +131,13 @@ must therefore accept only complete prefixed frames and ignore other lines.
 U3.4.1 stack hardening keeps the request JSON parse buffer and reusable
 response formatting scratch on the instance-owned `Protocol` object. The UART
 RX task remains the sole protocol consumer, so this reuse is non-reentrant and
-does not add a second synchronization mechanism. UART machine-writer
-serialization hardening through the UART VFS remains deferred; this milestone
-intentionally leaves the `flockfile`/`fflush`/direct-driver-writer path, UART
-TX-buffer setting, and sdkconfig unchanged for root-cause isolation.
+does not add a second synchronization mechanism. U3.4.2 uses the stdout
+console-VFS single-write path described above; it does not change the UART
+TX-buffer setting, sdkconfig, RX framing, or protocol/session semantics.
+
+The current implementation and validation do not include a synthetic concurrent
+writer stress task. That remains a separate, bounded, default-disabled hardware
+validation gate.
 
 ## Boot epoch and control session
 

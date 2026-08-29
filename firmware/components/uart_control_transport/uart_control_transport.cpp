@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <unistd.h>
 
 #include "control_framing/control_framing.hpp"
 #include "esp_random.h"
@@ -72,15 +73,18 @@ void control_rx_task(void *) {
 namespace uart_control_transport {
 
 bool write_machine(const std::uint8_t *data, std::size_t length) {
-    if (data == nullptr || length == 0 || length > kMaxMachineFrameBytes) {
+    if (data == nullptr || length == 0 || length > kMaxLogicalMachineFrameBytes) {
         return false;
     }
 
     ::flockfile(stdout);
     const bool flushed = std::fflush(stdout) == 0;
-    const int written = flushed ? uart_write_bytes(kConsoleUart, data, length) : -1;
+    const int stdout_fd = ::fileno(stdout);
+    const ssize_t written = flushed && stdout_fd >= 0
+                                ? ::write(stdout_fd, data, length)
+                                : -1;
     ::funlockfile(stdout);
-    return written == static_cast<int>(length);
+    return written == static_cast<ssize_t>(length);
 }
 
 esp_err_t start(const control_protocol::Config *protocol_config) {
