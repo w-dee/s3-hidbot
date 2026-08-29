@@ -9,9 +9,12 @@ contain a separate hidden test recipe.
 ## Prerequisites
 
 - Bash, Python 3.11 or newer, and a C/C++ toolchain providing `cc` and `c++`.
-- `test-static.sh`, `test-host.sh`, and `test-native.sh` do not require an
-  activated ESP-IDF environment. `test-host.sh` does require network access
-  to install the declared PyPI dependencies into its temporary venv.
+- `test-static.sh`, `test-host.sh`, `test-package.sh`, and `test-native.sh` do
+  not require an activated ESP-IDF environment. `test-host.sh` requires
+  network access to install the declared PyPI dependencies into its temporary
+  venv. `test-package.sh` additionally downloads the temporary `build` and
+  `twine` tools and resolves the package dependency while validating fresh
+  wheel/sdist environments.
 - `test-control-protocol.sh`, `test-firmware.sh`, and `test-nonhardware.sh`
   require an activated ESP-IDF v5.5.4 environment. Keep activation paths in
   local shell configuration; do not add them to this repository.
@@ -24,6 +27,12 @@ The host entrypoint creates a temporary virtual environment, stages the
 `PYTHONPATH` or site-packages and does not leave packaging metadata in the
 repository source tree.
 
+The package entrypoint builds wheel and sdist artifacts from temporary copies,
+checks their metadata with `twine`, verifies their allowlisted contents and
+privacy, installs each artifact into a fresh virtual environment, and runs the
+host tests from the extracted sdist. It is a validation-only command; it never
+uploads or publishes an artifact.
+
 ## Entrypoints
 
 Run these commands from the repository root:
@@ -31,16 +40,19 @@ Run these commands from the repository root:
 ```text
 ./tools/test-static.sh
 ./tools/test-host.sh
+./tools/test-package.sh
 ./tools/test-native.sh
 ./tools/test-control-protocol.sh
 ./tools/test-firmware.sh
 ./tools/test-nonhardware.sh
 ```
 
-`test-static.sh` runs the protocol, default-HID-safety, HID-runtime, and UART
-writer static guards. `test-native.sh` runs the three IDF-independent C++
-suites. `test-control-protocol.sh` additionally compiles against the active
-ESP-IDF cJSON source and therefore requires the v5.5.4 environment.
+`test-static.sh` runs the protocol, default-HID-safety, HID-runtime, UART
+writer, and documentation static guards. `test-package.sh` is the release
+artifact validation entrypoint; it requires network access but no ESP-IDF.
+`test-native.sh` runs the three IDF-independent C++ suites.
+`test-control-protocol.sh` additionally compiles against the active ESP-IDF
+cJSON source and therefore requires the v5.5.4 environment.
 
 `test-firmware.sh` verifies the active IDF version, the locked IDF/component
 metadata, and target `esp32s3`, then runs the canonical firmware command:
@@ -55,10 +67,10 @@ and dependency source of truth; no `set-target` step is required for a fresh
 checkout. Build output remains ignored and must never be tracked.
 
 `test-nonhardware.sh` is the complete A-D suite (static, privacy, host,
-IDF-independent native, and IDF-dependent protocol validation). It requires
-an active ESP-IDF environment because the protocol test is IDF-dependent, and
-also runs `git diff --check`. Firmware build is kept as the separate E
-entrypoint.
+package artifacts, IDF-independent native, and IDF-dependent protocol
+validation). It requires an active ESP-IDF environment because the protocol
+test is IDF-dependent, and also runs `git diff --check`. Firmware build is
+kept as the separate E entrypoint.
 
 All tracked shell scripts under `tools/` have executable mode and are invoked
 as `./tools/name.sh`. The wrappers call the existing focused scripts instead
@@ -67,8 +79,8 @@ of duplicating their test logic.
 ## CI tiers
 
 - Tier A (`privacy-lint.yml`): static guards and privacy unit/tracked scans.
-- Tier B (`nonhardware.yml`, host-native job): clean host install/tests and
-  IDF-independent native C++ tests.
+- Tier B (`nonhardware.yml`): clean host install/package validation on Python
+  3.11 and 3.12, plus one IDF-independent native C++ job.
 - Tier C (`nonhardware.yml`, firmware job): the IDF-dependent protocol test
   and ESP-IDF v5.5.4 firmware build in the official
   `espressif/idf:v5.5.4` container.

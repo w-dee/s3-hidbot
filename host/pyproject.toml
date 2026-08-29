@@ -2,8 +2,27 @@
 name = "s3-hidbot-host"
 version = "0.1.0"
 description = "Pure host-side s3-hidbot UART control-plane core"
+readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.11"
 dependencies = ["pyserial>=3.5,<4"]
+keywords = ["esp32", "hid", "uart", "usb"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Hardware",
+]
+
+[project.urls]
+Homepage = "https://github.com/w-dee/s3-hidbot"
+Repository = "https://github.com/w-dee/s3-hidbot"
+Issues = "https://github.com/w-dee/s3-hidbot/issues"
 
 [build-system]
 requires = ["setuptools>=68"]

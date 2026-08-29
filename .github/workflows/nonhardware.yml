@@ -12,14 +12,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  host-native:
-    name: Tier B - host and native
+  host-package:
+    name: Tier B - host and package (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Host clean install, import, CLI, and tests
+        run: ./tools/test-host.sh
+      - name: Host package wheel and sdist validation
+        run: ./tools/test-package.sh
+
+  native:
+    name: Tier B - IDF-independent native tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Host clean install, import, CLI, and tests
-        run: ./tools/test-host.sh
       - name: IDF-independent native C++ tests
         run: ./tools/test-native.sh
 

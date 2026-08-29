@@ -6,3 +6,6 @@
 /firmware/build/
 /firmware/sdkconfig
 /firmware/managed_components/
+/host/build/
+/host/dist/
+/host/src/*.egg-info/
