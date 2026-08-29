@@ -309,6 +309,89 @@ void test_unmount_clears_old_suspend_safety() {
     assert(sink.calls == 1);
 }
 
+void test_release_ticket_states_and_historical_submission() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+
+    state.begin_release_all();
+    auto snapshot = state.release_all_snapshot();
+    assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    state.finalize_release_all();
+
+    const std::array<std::uint8_t, 6> keys = {4, 0, 0, 0, 0, 0};
+    assert(state.queue_keyboard_report(0, keys));
+    state.execute(Sink::submit, &sink);
+    state.report_complete(0);
+    state.begin_release_all();
+    state.execute(Sink::submit, &sink);
+    snapshot = state.release_all_snapshot();
+    assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kSubmitted);
+    assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    // Completion is not allowed to rewrite this ticket's historical outcome.
+    state.report_complete(0);
+    snapshot = state.release_all_snapshot();
+    assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kSubmitted);
+    state.finalize_release_all();
+}
+
+void test_release_ticket_failure_and_lifecycle_cancellation() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    assert(state.queue_mouse_report(1, 1, 0, 0, 0));
+    state.execute(Sink::submit, &sink);
+    state.report_complete(1);
+
+    state.begin_release_all();
+    state.execute(Sink::submit, &sink);
+    assert(state.report_in_flight(hid_runtime::Interface::kMouse));
+    state.report_failed(1);
+    auto snapshot = state.release_all_snapshot();
+    assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kPending);
+    assert(snapshot.failed_before_finalization);
+    state.finalize_release_all();
+
+    state.begin_release_all();
+    const auto old_epoch = state.release_all_snapshot().authority_epoch;
+    state.on_suspend();
+    snapshot = state.release_all_snapshot();
+    assert(snapshot.canceled);
+    assert(snapshot.authority_epoch == old_epoch);
+    assert(!snapshot.active);
+}
+
+void test_release_ticket_partial_and_clean_unmounted() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    const std::array<std::uint8_t, 6> keys = {4, 0, 0, 0, 0, 0};
+    assert(state.queue_keyboard_report(0, keys));
+    state.execute(Sink::submit, &sink);
+    state.report_complete(0);
+    assert(state.queue_mouse_report(1, 0, 0, 0, 0));
+    state.execute(Sink::submit, &sink);
+    state.report_complete(1);
+    state.set_ready(hid_runtime::Interface::kMouse, false);
+    state.begin_release_all();
+    auto snapshot = state.release_all_snapshot();
+    assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kUnresolved);
+    assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kPending);
+    assert(state.safety_required(hid_runtime::Interface::kMouse));
+    state.execute(Sink::submit, &sink);
+    snapshot = state.release_all_snapshot();
+    assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kSubmitted);
+    assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kPending);
+    state.finalize_release_all();
+
+    state.on_unmount();
+    state.begin_release_all();
+    snapshot = state.release_all_snapshot();
+    assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+}
+
 }  // namespace
 
 int main() {
@@ -323,5 +406,8 @@ int main() {
     test_authority_epoch_suspend_resume_barrier();
     test_suspend_preserves_safety_and_ignores_late_completion();
     test_unmount_clears_old_suspend_safety();
+    test_release_ticket_states_and_historical_submission();
+    test_release_ticket_failure_and_lifecycle_cancellation();
+    test_release_ticket_partial_and_clean_unmounted();
     return 0;
 }

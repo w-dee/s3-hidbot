@@ -47,6 +47,21 @@ void request_hid_safety_release(void *) {
     s_hid_runtime.request_release_all();
 }
 
+control_protocol::ReleaseAllResult release_all(void *) {
+    const hid_runtime::ReleaseAllResult result = s_hid_runtime.release_all();
+    const auto convert = [](hid_runtime::ReleaseAllInterfaceState state) {
+        return state == hid_runtime::ReleaseAllInterfaceState::kSubmitted
+                   ? control_protocol::ReleaseAllInterfaceState::kSubmitted
+                   : control_protocol::ReleaseAllInterfaceState::kAlreadyUp;
+    };
+    return control_protocol::ReleaseAllResult{
+        .success = result.success,
+        .authority_lost = result.authority_lost,
+        .keyboard = convert(result.keyboard),
+        .mouse = convert(result.mouse),
+    };
+}
+
 static_assert(kHidInterfaceCount == 2);
 static_assert(kKeyboardInterface != kMouseInterface);
 static_assert(kKeyboardEndpoint != kMouseEndpoint);
@@ -301,6 +316,8 @@ extern "C" void app_main() {
         .session_takeover_context = nullptr,
         .hid_safety_failure = request_hid_safety_release,
         .hid_safety_failure_context = nullptr,
+        .release_all_provider = release_all,
+        .release_all_context = nullptr,
     };
     ESP_ERROR_CHECK(uart_control_transport::start(&protocol_config));
 #if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC

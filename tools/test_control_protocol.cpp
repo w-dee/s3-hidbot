@@ -77,6 +77,22 @@ struct AuthoritySource {
     }
 };
 
+struct ReleaseSource {
+    control_protocol::ReleaseAllResult result{
+        .success = true,
+        .authority_lost = false,
+        .keyboard = control_protocol::ReleaseAllInterfaceState::kAlreadyUp,
+        .mouse = control_protocol::ReleaseAllInterfaceState::kAlreadyUp,
+    };
+    int calls = 0;
+
+    static control_protocol::ReleaseAllResult get(void *context) {
+        auto *source = static_cast<ReleaseSource *>(context);
+        ++source->calls;
+        return source->result;
+    }
+};
+
 void increment_authority(void *context) {
     ++static_cast<AuthoritySource *>(context)->epoch;
 }
@@ -94,6 +110,7 @@ struct LeaseFixture {
     RandomSource random;
     LeaseClock clock;
     AuthoritySource authority;
+    ReleaseSource release;
     int expired_callbacks = 0;
     int takeover_callbacks = 0;
     int hid_failure_callbacks = 0;
@@ -128,6 +145,8 @@ struct LeaseFixture {
             .session_takeover_context = this,
             .hid_safety_failure = LeaseFixture::hid_failure,
             .hid_safety_failure_context = this,
+            .release_all_provider = ReleaseSource::get,
+            .release_all_context = &release,
         };
         assert(protocol.initialize(config, RandomSource::fill, &random));
     }
@@ -143,6 +162,7 @@ struct Fixture {
     RandomSource random;
     StatusSource status;
     AuthoritySource authority;
+    ReleaseSource release;
     control_protocol::Protocol protocol;
 
     explicit Fixture(std::uint8_t random_seed = 0) {
@@ -163,6 +183,8 @@ struct Fixture {
             .session_takeover_context = nullptr,
             .hid_safety_failure = nullptr,
             .hid_safety_failure_context = nullptr,
+            .release_all_provider = ReleaseSource::get,
+            .release_all_context = &release,
         };
         assert(protocol.initialize(config, RandomSource::fill, &random));
     }
@@ -622,6 +644,38 @@ void test_same_rx_batch_observes_published_epoch() {
     require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
 }
 
+void test_release_all_result_cache_and_pending_error() {
+    Fixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+
+    fixture.release.result = control_protocol::ReleaseAllResult{
+        .success = true,
+        .authority_lost = false,
+        .keyboard = control_protocol::ReleaseAllInterfaceState::kAlreadyUp,
+        .mouse = control_protocol::ReleaseAllInterfaceState::kSubmitted,
+    };
+    const std::string release = request(1, session, "hid.release_all");
+    fixture.payload(release);
+    const std::string success = fixture.sink.last();
+    require_contains(success, "\"keyboard\":\"already_up\"");
+    require_contains(success, "\"mouse\":\"submitted\"");
+    assert(fixture.release.calls == 1);
+    fixture.payload(release);
+    assert(fixture.sink.last() == success);
+    assert(fixture.release.calls == 1);
+
+    fixture.release.result.success = false;
+    fixture.payload(request(2, session, "hid.release_all"));
+    const std::string pending = fixture.sink.last();
+    require_contains(pending, "\"code\":\"HID_SAFETY_PENDING\"");
+    assert(pending.find("\"result\":") == std::string::npos);
+    assert(fixture.release.calls == 2);
+    fixture.payload(request(2, session, "hid.release_all"));
+    assert(fixture.sink.last() == pending);
+    assert(fixture.release.calls == 2);
+}
+
 }  // namespace
 
 int main() {
@@ -634,5 +688,6 @@ int main() {
     test_hid_failure_revokes_authority();
     test_authority_epoch_barrier_and_retry_scoping();
     test_same_rx_batch_observes_published_epoch();
+    test_release_all_result_cache_and_pending_error();
     return 0;
 }

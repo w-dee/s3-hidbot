@@ -15,8 +15,9 @@ inline constexpr std::size_t kMaxLogicalMachineFrameBytes = 1023;
 inline constexpr std::size_t kMaxWireMachineFrameBytes = 1024;
 
 // Starts the sole UART RX consumer for the configured ESP-IDF console UART.
-// It owns byte transport and the sole machine-response writer; the U2 protocol
-// core handles bounded JSON/session commands and has no HID command dispatch.
+// It owns byte transport and the sole machine-response writer; the protocol
+// core handles bounded JSON/session commands and the safety-only release_all
+// dispatch. Unsafe HID report commands remain outside this transport.
 esp_err_t start(const control_protocol::Config *protocol_config);
 
 // Publishes eventual protocol/session cleanup after a native HID lifecycle

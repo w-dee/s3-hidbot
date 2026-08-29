@@ -72,6 +72,7 @@ class FakeTransport:
                             "system.info-v1",
                             "usb.status-v1",
                             "hid.lease-v1",
+                            "hid.release-all-v1",
                         ],
                     },
                 )

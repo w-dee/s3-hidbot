@@ -29,6 +29,20 @@ using AuthorityEpochProvider = control_session::AuthorityEpoch (*)(void *context
 using OutputSink = bool (*)(void *context, const std::uint8_t *data, std::size_t length);
 using SafetyCallback = void (*)(void *context);
 
+enum class ReleaseAllInterfaceState : std::uint8_t {
+    kAlreadyUp,
+    kSubmitted,
+};
+
+struct ReleaseAllResult {
+    bool success = false;
+    bool authority_lost = false;
+    ReleaseAllInterfaceState keyboard = ReleaseAllInterfaceState::kAlreadyUp;
+    ReleaseAllInterfaceState mouse = ReleaseAllInterfaceState::kAlreadyUp;
+};
+
+using ReleaseAllProvider = ReleaseAllResult (*)(void *context);
+
 struct Config {
     Metadata metadata;
     UsbStatusProvider usb_status_provider;
@@ -45,6 +59,8 @@ struct Config {
     void *session_takeover_context;
     SafetyCallback hid_safety_failure;
     void *hid_safety_failure_context;
+    ReleaseAllProvider release_all_provider;
+    void *release_all_context;
 };
 
 class Protocol {

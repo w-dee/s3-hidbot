@@ -57,6 +57,11 @@ def main() -> int:
     assert "service_sof()" in main_source
     assert "on_hid_safety_failure" in protocol
     assert "hid_safety_failure" in protocol_header
+    assert 'command == "hid.release_all"' in protocol
+    assert "HID_SAFETY_PENDING" in protocol
+    assert "hid.release-all-v1" in protocol
+    assert "make_release_all" in protocol
+    assert "release_all_provider" in protocol_header
     assert "tud_hid_n_keyboard_report" not in main_source
     assert "tud_hid_n_report" not in main_source
     print("PASS: U2 protocol/HID/UART static boundaries")

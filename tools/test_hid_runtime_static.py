@@ -64,6 +64,13 @@ def main() -> int:
     assert "any_safety_required" in runtime
     assert "generation" in header and "slot_generation" in header
     assert "request_release_all" in header
+    assert "ReleaseAllTicket" in header
+    assert "begin_release_all" in runtime
+    assert "release_all_snapshot" in runtime
+    assert "finalize_release_all" in runtime
+    assert "kReleaseAllWaitTicks" in runtime
+    assert "kReleaseAllPollTicks" in runtime
+    assert "logical_state_held" in header
     assert "host_state_uncertain" in header
     assert "GPIO_NUM_19" not in (runtime + header + main_source)
     assert "GPIO_NUM_20" not in (runtime + header + main_source)

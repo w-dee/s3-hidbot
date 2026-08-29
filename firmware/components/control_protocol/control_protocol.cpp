@@ -21,7 +21,7 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -39,6 +39,9 @@ constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
     control_session::kTokenHexLength * 4 + (sizeof(kCapabilityJson) - 1) + 32 + 10 + 1;
 static_assert(kMaximumHelloResponseBytes <= control_session::kMaxResponseBytes);
+constexpr std::size_t kMaximumReleaseAllResponseBytes =
+    kPrefixLength + 150 + control_session::kTokenHexLength + 1;
+static_assert(kMaximumReleaseAllResponseBytes <= control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
     return value != nullptr && std::strlen(value) <= maximum_length;
@@ -283,6 +286,28 @@ bool make_usb_status(control_session::ResponseFrame *frame,
                         json_bool(status.suspended),
                         json_bool(status.keyboard_ready),
                         json_bool(status.mouse_ready));
+}
+
+const char *release_state_json(ReleaseAllInterfaceState state) {
+    return state == ReleaseAllInterfaceState::kSubmitted ? "submitted" : "already_up";
+}
+
+bool make_release_all(control_session::ResponseFrame *frame,
+                      ResponseSession session,
+                      std::int32_t id,
+                      ReleaseAllResult result) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"keyboard\":\"%s\",\"mouse\":\"%s\"}}\n",
+                        static_cast<long>(id), session_field,
+                        release_state_json(result.keyboard),
+                        release_state_json(result.mouse));
 }
 
 bool make_hello(control_session::ResponseFrame *frame,
@@ -635,6 +660,7 @@ void Protocol::handle_frame(std::string_view payload) {
     auto &response = prepare_response_scratch();
     bool completed = false;
     bool semantically_valid = false;
+    bool cache_response = true;
     if (command == "system.ping") {
         if (!validate_no_params(params)) {
             make_error(&response, current_session, true, id, "INVALID_PARAMS", "system.ping accepts no params");
@@ -656,6 +682,27 @@ void Protocol::handle_frame(std::string_view payload) {
             semantically_valid = true;
             completed = make_usb_status(&response, current_session, id,
                                         config_.usb_status_provider(config_.usb_status_context));
+        }
+    } else if (command == "hid.release_all") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS", "hid.release_all accepts no params");
+        } else {
+            semantically_valid = true;
+            const ReleaseAllResult release_result = config_.release_all_provider != nullptr
+                                                         ? config_.release_all_provider(config_.release_all_context)
+                                                         : ReleaseAllResult{};
+            if (release_result.authority_lost ||
+                config_.authority_epoch_provider(config_.authority_epoch_context) != authority_epoch) {
+                semantically_valid = false;
+                cache_response = false;
+                completed = make_error(&response, kUncorrelatableSession, true, id,
+                                       "SESSION_MISMATCH", "request session is not active");
+            } else if (!release_result.success) {
+                completed = make_error(&response, current_session, true, id,
+                                       "HID_SAFETY_PENDING", "all-up safety release is pending");
+            } else {
+                completed = make_release_all(&response, current_session, id, release_result);
+            }
         }
     } else {
         if (!validate_no_params(params)) {
@@ -681,7 +728,9 @@ void Protocol::handle_frame(std::string_view payload) {
         return;
     }
 
-    session_.cache_completed_request(id, payload, authority_epoch, response);
+    if (cache_response) {
+        session_.cache_completed_request(id, payload, authority_epoch, response);
+    }
     write_frame(response);
     finish();
 }

@@ -57,6 +57,7 @@ def hello_response(request_id: int, nonce: str, session: str = TOKEN) -> bytes:
                 "system.info-v1",
                 "usb.status-v1",
                 "hid.lease-v1",
+                "hid.release-all-v1",
             ],
         },
     )
@@ -128,6 +129,30 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(client.lease_ms, 5000)
         self.assertEqual(client.ping(), {"pong": True})
         self.assertEqual(transport.writes[0], TRANSPORT_SYNC)
+
+    def test_release_all_returns_typed_result_and_canonical_params(self) -> None:
+        def on_write(transport: FakeTransport, data: bytes) -> None:
+            if data == TRANSPORT_SYNC:
+                return
+            request_value = request_object(data)
+            if request_value["cmd"] == "protocol.hello":
+                transport.chunks.append(hello_response(request_value["id"], request_value["params"]["client_nonce"]))
+            elif request_value["cmd"] == "hid.release_all":
+                self.assertEqual(request_value["params"], {})
+                transport.chunks.append(
+                    response(
+                        request_value["id"],
+                        TOKEN,
+                        result={"keyboard": "already_up", "mouse": "submitted"},
+                    )
+                )
+
+        transport = FakeTransport(on_write)
+        client = self.make_client(transport)
+        client.connect()
+        result = client.release_all()
+        self.assertEqual(result.keyboard, "already_up")
+        self.assertEqual(result.mouse, "submitted")
 
     def test_hello_retry_is_byte_identical_and_nonce_is_stable(self) -> None:
         hello_writes = 0

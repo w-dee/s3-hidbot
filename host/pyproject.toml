@@ -16,4 +16,4 @@ where = ["src"]
 hidbotctl = "hidbot.cli:main"
 
 [tool.s3-hidbot]
-scope = "U3.3 host serial transport and diagnostic CLI; HID commands remain deferred"
+scope = "U4.2 host serial transport and safety-only hid.release_all API; unsafe HID commands remain deferred"

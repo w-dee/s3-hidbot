@@ -6,10 +6,10 @@ The control plane uses the onboard USB-UART path. Native USB-OTG remains the
 separate TinyUSB HID Device path. A host must never assume that opening a serial
 device proves that the HID USB path is attached, or vice versa.
 
-U4.1 extends the bounded JSON control core with a mandatory session lease and
-the HID runtime safety foundation; public HID commands remain deferred.
-It implements `protocol.hello`, `system.ping`, `system.info`, and `usb.status`.
-It has no UART HID command, asynchronous event, production host client, USB
+U4.2 extends the bounded JSON control core with the mandatory session lease,
+HID runtime safety foundation, and the safety-only `hid.release_all` command.
+It implements `protocol.hello`, `system.ping`, `system.info`, `usb.status`, and
+`hid.release_all`. It has no UART HID report command, asynchronous event, USB
 reconnect, GPIO action, or reset command. Receiving a diagnostic UART request
 cannot send a Keyboard or Mouse report.
 
@@ -156,7 +156,7 @@ initial capability list:
 
 ```text
   protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
-  hid.lease-v1
+  hid.lease-v1, hid.release-all-v1
 ```
 
 For a successful hello, top-level `session` equals `result.session`. Both are
@@ -166,15 +166,15 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","hid.lease-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","hid.lease-v1","hid.release-all-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
 values are fixed-length lowercase hexadecimal tokens.
 
 Adding a future capability does not itself require changing protocol version
-`v`; hosts must use the advertised capability list. U4.1 advertises only the
-lease foundation; HID report and release-all capabilities remain deferred. All normal requests require the
+`v`; hosts must use the advertised capability list. U4.2 adds the safety-only
+release-all capability; unsafe HID report capabilities remain deferred. All normal requests require the
 exact current session; USB mount does not automatically create one.
 
 The response `session` field is a correlation/epoch identity, not an
@@ -335,7 +335,8 @@ automatically replays an old logical command; its result is left to the caller
 as unknown/session-lost.
 
 U3.1/U3.2 expose only `ping()`, `info()`, and `usb_status()` after
-`connect()`/hello. No HID command, event, release-all, or arbitrary raw command
+`connect()`/hello; U4.2 additionally exposes the safety-only
+`Client.release_all()` API. No HID report command, event, or arbitrary raw command
 API exists; the hello result exposes read-only `lease_ms` metadata. Closing the
 client only closes the injected transport and invalidates local session state;
 it sends no UART command.
@@ -401,9 +402,9 @@ readiness (including endpoint-busy state), not inferred capability bits.
 The internal mailbox has EMPTY/WRITING/READY/EXECUTING/CANCELED states and
 stores both the attach generation and authority epoch with each operation.
 The executor checks both tokens, mounted state, non-suspended state, and the
-safety barrier immediately before TinyUSB report submission. U4.1 does not expose a
-synchronous public HID submit command; cancellation and timeout ownership for
-such commands remain deferred to the report-command slices.
+safety barrier immediately before TinyUSB report submission. U4.2's bounded
+release-all ticket is the only public HID operation; unsafe report commands
+remain deferred.
 
 Each mount starts a monotonically increasing attach generation. It remains
 separate from the authority epoch: attach generation advances only at mount
@@ -441,15 +442,15 @@ instantaneous endpoint availability, including endpoint-busy state; they are
 not a promise that a host will remain attached or that a queued report will be
 delivered.
 The existing Configuration 1, Boot Keyboard/Mouse interfaces, endpoints
-0x81/0x82, descriptors, and VID/PID are unchanged. No public HID command is
-implemented in U4.1. The optional BOOT-button diagnostic remains build-time
+0x81/0x82, descriptors, and VID/PID are unchanged. U4.2 exposes only the
+safety-only `hid.release_all`; unsafe HID report commands remain absent. The optional BOOT-button diagnostic remains build-time
 disabled by default and routes any enabled test report through the runtime.
 
 Control sessions have a mandatory 5000 ms lease measured by the monotonic
 `esp_timer_get_time()` clock. The existing UART RX loop services expiry after
 each bounded read (normally within 100 ms); no additional timer task exists.
-Successful hello starts the lease and advertises `lease_ms:5000` plus only
-`hid.lease-v1`. A valid current-session request, exact retry, or operational
+Successful hello starts the lease and advertises `lease_ms:5000` plus
+`hid.lease-v1` and `hid.release-all-v1`. A valid current-session request, exact retry, or operational
 command result refreshes it. Malformed, epoch-mismatched, session-mismatched,
 stale/conflicting, unknown, and semantically invalid requests do not. Expiry
 revokes authority first, clears the normal retry cache, and requests runtime
@@ -461,15 +462,37 @@ refreshes the lease only within its captured authority epoch. A hello while
 suspended is permitted for diagnostics and captures the suspended epoch, but
 resume invalidates it and requires a fresh hello. Lease expiry and takeover
 allow diagnostic commands while safety is pending; future unsafe HID commands
-are not yet exposed. `hid.release_all` and report capabilities remain deferred
-to later slices.
+are not yet exposed.
 
 ## Deferred control safety
 
-`hid.release_all` and report commands are deferred. A future release-all must
-report independent Keyboard and Mouse interface outcomes and cannot promise
-cross-endpoint atomicity. Duplicate retries must replay the cached result, not
-repeat a side effect.
+`hid.release_all` is the only public HID operation in U4.2. It accepts the
+normal no-params request (`params` omitted or `{}`) and reports independent
+Keyboard and Mouse outcomes. A successful result is exactly:
+
+```json
+{"keyboard":"already_up","mouse":"submitted"}
+```
+
+`already_up` means the runtime knows that interface is all-up, not uncertain,
+and has no relevant queued or in-flight operation. `submitted` means the
+TinyUSB all-up report was accepted by `tud_hid_n_report`; it does not promise
+completion or host/OS processing. Cross-endpoint atomicity is not promised.
+
+If either interface cannot be proven safe within the bounded operation window,
+the response is the existing error envelope with exactly
+`HID_SAFETY_PENDING` / `all-up safety release is pending` and no result object.
+Partial release is therefore pending overall; already submitted interfaces are
+not duplicated. Suspended or unmounted known-clean interfaces may return
+`already_up`; safety-required suspended interfaces remain pending. A lifecycle
+authority change returns `SESSION_MISMATCH` and is never cached or lease
+refreshed.
+
+Exact retries (same ID and bytes) replay the cached success or pending error
+without restarting the operation. A new request ID reevaluates current state.
+The `hid.release-all-v1` capability advertises this command. Public keyboard,
+mouse-report, and release-all CLI commands are not exposed; only the host
+`Client.release_all()` API is provided.
 
 ## BOOT-button diagnostic
 

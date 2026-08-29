@@ -20,10 +20,12 @@ from .errors import (
 from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
+    ReleaseAllResult,
     Response,
     build_command_frame,
     build_hello_frame,
     parse_response,
+    validate_release_all_result,
     validate_hello_response,
 )
 
@@ -331,6 +333,12 @@ class Client:
     def usb_status(self) -> object:
         with self._lock:
             return self._request_locked("usb.status")
+
+    def release_all(self) -> ReleaseAllResult:
+        """Request a bounded, safety-only all-up operation on both HID interfaces."""
+
+        with self._lock:
+            return validate_release_all_result(self._request_locked("hid.release_all"))
 
     def close(self) -> None:
         with self._lock:

@@ -3,6 +3,11 @@
 #include <cstring>
 
 #ifndef HID_RUNTIME_NATIVE_TEST
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
+
+#ifndef HID_RUNTIME_NATIVE_TEST
 #include "class/hid/hid_device.h"
 #include "device/usbd.h"
 #endif
@@ -65,8 +70,46 @@ void StateMachine::clear_interface(InterfaceState &interface_state) {
     interface_state.in_flight.store(false, std::memory_order_release);
     interface_state.safety_required.store(false, std::memory_order_release);
     interface_state.host_state_uncertain.store(false, std::memory_order_release);
+    interface_state.logical_state_held.store(false, std::memory_order_release);
     interface_state.keyboard = {};
     interface_state.mouse = {};
+}
+
+void StateMachine::cancel_release_ticket() {
+    if (!release_ticket_.active.load(std::memory_order_acquire)) {
+        return;
+    }
+    release_ticket_.canceled.store(true, std::memory_order_release);
+    release_ticket_.keyboard.store(ReleaseAllInterfaceState::kCanceled,
+                                   std::memory_order_release);
+    release_ticket_.mouse.store(ReleaseAllInterfaceState::kCanceled,
+                                std::memory_order_release);
+    release_ticket_.active.store(false, std::memory_order_release);
+}
+
+bool StateMachine::known_all_up(Interface interface) const {
+    const InterfaceState &interface_state = state(interface);
+    if (interface_state.logical_state_held.load(std::memory_order_acquire) ||
+        interface_state.in_flight.load(std::memory_order_acquire) ||
+        interface_state.safety_required.load(std::memory_order_acquire) ||
+        interface_state.host_state_uncertain.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const std::uint8_t slot_state = interface_state.slot_state.load(std::memory_order_acquire);
+    if (slot_state == kSlotWriting || slot_state == kSlotReady ||
+        slot_state == kSlotExecuting) {
+        return false;
+    }
+    return true;
+}
+
+void StateMachine::set_release_outcome(Interface interface,
+                                        ReleaseAllInterfaceState outcome) {
+    if (interface == Interface::kKeyboard) {
+        release_ticket_.keyboard.store(outcome, std::memory_order_release);
+    } else {
+        release_ticket_.mouse.store(outcome, std::memory_order_release);
+    }
 }
 
 void StateMachine::preserve_suspend_safety(InterfaceState &interface_state) {
@@ -102,6 +145,7 @@ void StateMachine::preserve_suspend_safety(InterfaceState &interface_state) {
 }
 
 void StateMachine::on_mount() {
+    cancel_release_ticket();
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     generation_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -114,6 +158,7 @@ void StateMachine::on_mount() {
 }
 
 void StateMachine::on_unmount() {
+    cancel_release_ticket();
     // Invalidate first: work from an older attach or authority epoch can never
     // be accepted by a later executor pass, even if it races this callback.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -128,6 +173,7 @@ void StateMachine::on_unmount() {
 }
 
 void StateMachine::on_suspend() {
+    cancel_release_ticket();
     // This is the control-authority linearization boundary. It intentionally
     // precedes the UART task's eventual session/cache cleanup notification.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -148,6 +194,7 @@ void StateMachine::on_suspend() {
 }
 
 void StateMachine::on_resume() {
+    cancel_release_ticket();
     // A session established during suspend is diagnostic-only; resume must
     // never silently restore it as HID-control authority.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -299,6 +346,74 @@ void StateMachine::request_release_all() {
     release_requested_.store(true, std::memory_order_release);
 }
 
+void StateMachine::begin_release_all() {
+    // Only the UART/control task starts a public operation. A second request
+    // while one is being observed coalesces with the existing mailbox work.
+    if (release_ticket_.active.load(std::memory_order_acquire)) {
+        return;
+    }
+    release_ticket_.attach_generation.store(attach_generation(), std::memory_order_release);
+    release_ticket_.authority_epoch.store(authority_epoch(), std::memory_order_release);
+    release_ticket_.keyboard.store(ReleaseAllInterfaceState::kUnresolved,
+                                    std::memory_order_release);
+    release_ticket_.mouse.store(ReleaseAllInterfaceState::kUnresolved,
+                                std::memory_order_release);
+    release_ticket_.failed_before_finalization.store(false, std::memory_order_release);
+    release_ticket_.canceled.store(false, std::memory_order_release);
+    release_ticket_.finalized.store(false, std::memory_order_release);
+    release_ticket_.active.store(true, std::memory_order_release);
+
+    bool needs_safety_request = false;
+    for (const Interface interface : {Interface::kKeyboard, Interface::kMouse}) {
+        if (known_all_up(interface)) {
+            set_release_outcome(interface, ReleaseAllInterfaceState::kAlreadyUp);
+            continue;
+        }
+        needs_safety_request = true;
+        InterfaceState &interface_state = state(interface);
+        const std::uint8_t slot_state = interface_state.slot_state.load(std::memory_order_acquire);
+        const bool existing_safety = interface_state.safety_required.load(std::memory_order_acquire) ||
+                                     interface_state.in_flight.load(std::memory_order_acquire) ||
+                                     slot_state == kSlotWriting || slot_state == kSlotReady ||
+                                     slot_state == kSlotExecuting;
+        if (existing_safety || !mounted_and_active(interface)) {
+            if (!mounted_and_active(interface) &&
+                (interface_state.logical_state_held.load(std::memory_order_acquire) ||
+                 interface_state.host_state_uncertain.load(std::memory_order_acquire))) {
+                // The public operation is pending because TinyUSB cannot
+                // accept a report now, but the safety requirement persists so
+                // the executor can perform the all-up release once readiness
+                // returns. This is not a replay of the public request.
+                interface_state.safety_required.store(true, std::memory_order_release);
+            }
+            set_release_outcome(interface, ReleaseAllInterfaceState::kPending);
+        }
+    }
+
+    if (needs_safety_request) {
+        request_release_all();
+    }
+}
+
+ReleaseAllSnapshot StateMachine::release_all_snapshot() const {
+    return ReleaseAllSnapshot{
+        .attach_generation = release_ticket_.attach_generation.load(std::memory_order_acquire),
+        .authority_epoch = release_ticket_.authority_epoch.load(std::memory_order_acquire),
+        .keyboard = release_ticket_.keyboard.load(std::memory_order_acquire),
+        .mouse = release_ticket_.mouse.load(std::memory_order_acquire),
+        .active = release_ticket_.active.load(std::memory_order_acquire),
+        .finalized = release_ticket_.finalized.load(std::memory_order_acquire),
+        .failed_before_finalization =
+            release_ticket_.failed_before_finalization.load(std::memory_order_acquire),
+        .canceled = release_ticket_.canceled.load(std::memory_order_acquire),
+    };
+}
+
+void StateMachine::finalize_release_all() {
+    release_ticket_.finalized.store(true, std::memory_order_release);
+    release_ticket_.active.store(false, std::memory_order_release);
+}
+
 void StateMachine::cancel_queued(Interface interface) {
     InterfaceState &interface_state = state(interface);
     std::uint8_t expected = kSlotReady;
@@ -398,6 +513,12 @@ void StateMachine::execute(SubmitFn submit, void *context) {
                                      interface_state.slot_report, length);
         if (!accepted) {
             interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
+            if (safety_kind && release_ticket_.active.load(std::memory_order_acquire) &&
+                release_ticket_.attach_generation.load(std::memory_order_acquire) == current_generation &&
+                release_ticket_.authority_epoch.load(std::memory_order_acquire) == current_authority_epoch) {
+                set_release_outcome(interface, ReleaseAllInterfaceState::kPending);
+                release_ticket_.failed_before_finalization.store(true, std::memory_order_release);
+            }
             // Unsafe reports are discarded. Safety reports remain required and
             // are retried only in the safe all-up direction.
             continue;
@@ -417,11 +538,28 @@ void StateMachine::execute(SubmitFn submit, void *context) {
                  report_index < interface_state.keyboard.keycodes.size(); ++report_index) {
                 interface_state.keyboard.keycodes[report_index] = interface_state.slot_report[report_index + 2];
             }
+            interface_state.logical_state_held.store(
+                unsafe_report_holds_state(kind, interface_state.slot_report, length),
+                std::memory_order_release);
         } else if (kind == ReportKind::kUnsafeMouse) {
             interface_state.mouse.buttons = static_cast<std::uint8_t>(interface_state.slot_report[0] & 0x1fU);
+            interface_state.logical_state_held.store(
+                unsafe_report_holds_state(kind, interface_state.slot_report, length),
+                std::memory_order_release);
         } else {
             interface_state.keyboard = {};
             interface_state.mouse = {};
+            interface_state.logical_state_held.store(false, std::memory_order_release);
+        }
+        if (safety_kind && release_ticket_.active.load(std::memory_order_acquire) &&
+            release_ticket_.attach_generation.load(std::memory_order_acquire) == current_generation &&
+            release_ticket_.authority_epoch.load(std::memory_order_acquire) == current_authority_epoch) {
+            const auto current_outcome = interface == Interface::kKeyboard
+                                             ? release_ticket_.keyboard.load(std::memory_order_acquire)
+                                             : release_ticket_.mouse.load(std::memory_order_acquire);
+            if (current_outcome == ReleaseAllInterfaceState::kUnresolved) {
+                set_release_outcome(interface, ReleaseAllInterfaceState::kSubmitted);
+            }
         }
         interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
         break;
@@ -464,6 +602,19 @@ bool StateMachine::report_failed(std::uint8_t instance) {
     interface_state.in_flight.store(false, std::memory_order_release);
     interface_state.host_state_uncertain.store(true, std::memory_order_release);
     interface_state.safety_required.store(true, std::memory_order_release);
+    if (release_ticket_.active.load(std::memory_order_acquire) &&
+        release_ticket_.attach_generation.load(std::memory_order_acquire) ==
+            interface_state.in_flight_generation &&
+        release_ticket_.authority_epoch.load(std::memory_order_acquire) ==
+            interface_state.in_flight_authority_epoch &&
+        (interface_state.in_flight_kind == ReportKind::kSafetyKeyboard ||
+         interface_state.in_flight_kind == ReportKind::kSafetyMouse)) {
+        set_release_outcome(static_cast<Interface>(instance),
+                            ReleaseAllInterfaceState::kPending);
+        if (!release_ticket_.finalized.load(std::memory_order_acquire)) {
+            release_ticket_.failed_before_finalization.store(true, std::memory_order_release);
+        }
+    }
     return true;
 }
 
@@ -523,6 +674,47 @@ bool Runtime::queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_
 }
 
 void Runtime::request_release_all() { state_machine_.request_release_all(); }
+
+ReleaseAllResult Runtime::release_all() {
+    state_machine_.begin_release_all();
+    constexpr TickType_t kReleaseAllWaitTicks = pdMS_TO_TICKS(100);
+    constexpr TickType_t kReleaseAllPollTicks = pdMS_TO_TICKS(1);
+    const TickType_t wait_start = xTaskGetTickCount();
+    while (true) {
+        const ReleaseAllSnapshot snapshot = state_machine_.release_all_snapshot();
+        const AuthorityEpoch current_epoch = state_machine_.authority_epoch();
+        const std::uint32_t current_generation = state_machine_.attach_generation();
+        if (snapshot.canceled || snapshot.authority_epoch != current_epoch ||
+            snapshot.attach_generation != current_generation) {
+            state_machine_.finalize_release_all();
+            return ReleaseAllResult{.success = false, .authority_lost = true};
+        }
+        const bool keyboard_terminal = snapshot.keyboard == ReleaseAllInterfaceState::kAlreadyUp ||
+                                       snapshot.keyboard == ReleaseAllInterfaceState::kSubmitted ||
+                                       snapshot.keyboard == ReleaseAllInterfaceState::kPending;
+        const bool mouse_terminal = snapshot.mouse == ReleaseAllInterfaceState::kAlreadyUp ||
+                                    snapshot.mouse == ReleaseAllInterfaceState::kSubmitted ||
+                                    snapshot.mouse == ReleaseAllInterfaceState::kPending;
+        if (keyboard_terminal && mouse_terminal) {
+            const bool success = !snapshot.failed_before_finalization &&
+                                 snapshot.keyboard != ReleaseAllInterfaceState::kPending &&
+                                 snapshot.mouse != ReleaseAllInterfaceState::kPending;
+            state_machine_.finalize_release_all();
+            return ReleaseAllResult{.success = success,
+                                    .authority_lost = false,
+                                    .keyboard = snapshot.keyboard,
+                                    .mouse = snapshot.mouse};
+        }
+        if (xTaskGetTickCount() - wait_start >= kReleaseAllWaitTicks) {
+            state_machine_.finalize_release_all();
+            return ReleaseAllResult{.success = false,
+                                    .authority_lost = false,
+                                    .keyboard = ReleaseAllInterfaceState::kPending,
+                                    .mouse = ReleaseAllInterfaceState::kPending};
+        }
+        vTaskDelay(kReleaseAllPollTicks);
+    }
+}
 
 bool Runtime::submit_report(void *, std::uint8_t instance, const std::uint8_t *report,
                             std::uint16_t length) {

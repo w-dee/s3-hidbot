@@ -9,6 +9,7 @@ from hidbot.protocol import (
     build_command_frame,
     build_hello_frame,
     parse_response,
+    validate_release_all_result,
     validate_hello_response,
 )
 
@@ -22,6 +23,19 @@ def frame_payload(value: object) -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_release_all_result_is_strict(self) -> None:
+        result = validate_release_all_result({"keyboard": "already_up", "mouse": "submitted"})
+        self.assertEqual(result.keyboard, "already_up")
+        self.assertEqual(result.mouse, "submitted")
+        for value in (
+            {},
+            {"keyboard": "already_up"},
+            {"keyboard": "already_up", "mouse": "submitted", "extra": False},
+            {"keyboard": "held", "mouse": "submitted"},
+        ):
+            with self.assertRaises(ProtocolError):
+                validate_release_all_result(value)
+
     def test_strict_response_and_hello_validation(self) -> None:
         response = parse_response(
             frame_payload(

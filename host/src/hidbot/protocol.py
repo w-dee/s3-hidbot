@@ -6,7 +6,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, cast
 
 from .errors import ProtocolError
 from .framing import FRAME_PREFIX, MAX_MACHINE_FRAME_BYTES
@@ -29,6 +29,7 @@ REQUIRED_CAPABILITIES = frozenset(
         "system.info-v1",
         "usb.status-v1",
         "hid.lease-v1",
+        "hid.release-all-v1",
     }
 )
 
@@ -57,6 +58,12 @@ class HelloResponse:
     protocol_version: int
     capabilities: tuple[str, ...]
     lease_ms: int
+
+
+@dataclass(frozen=True)
+class ReleaseAllResult:
+    keyboard: Literal["already_up", "submitted"]
+    mouse: Literal["already_up", "submitted"]
 
 
 def _reject_constant(value: str) -> None:
@@ -281,4 +288,19 @@ def validate_hello_response(
         protocol_version=result["protocol_version"],
         capabilities=tuple(capabilities),
         lease_ms=result["lease_ms"],
+    )
+
+
+def validate_release_all_result(value: Any) -> ReleaseAllResult:
+    """Validate the strict per-interface release_all result object."""
+
+    if not isinstance(value, dict) or set(value) != {"keyboard", "mouse"}:
+        raise ProtocolError("hid.release_all result fields are invalid")
+    keyboard = value["keyboard"]
+    mouse = value["mouse"]
+    if keyboard not in {"already_up", "submitted"} or mouse not in {"already_up", "submitted"}:
+        raise ProtocolError("hid.release_all result state is invalid")
+    return ReleaseAllResult(
+        keyboard=cast(Literal["already_up", "submitted"], keyboard),
+        mouse=cast(Literal["already_up", "submitted"], mouse),
     )

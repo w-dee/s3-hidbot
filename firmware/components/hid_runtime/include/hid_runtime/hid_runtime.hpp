@@ -43,6 +43,46 @@ using AuthorityEpoch = std::uint32_t;
 using SubmitFn = bool (*)(void *context, std::uint8_t instance,
                           const std::uint8_t *report, std::uint16_t length);
 
+enum class ReleaseAllInterfaceState : std::uint8_t {
+    kUnresolved,
+    kAlreadyUp,
+    kSubmitted,
+    kPending,
+    kCanceled,
+};
+
+// Fixed-size, heap-free outcome bridge between the UART/control task and the
+// TinyUSB SOF executor. Interface outcomes are historical: kSubmitted means
+// tud_hid_n_report() accepted the all-up report, not that the host completed it.
+struct ReleaseAllTicket {
+    std::atomic<std::uint32_t> attach_generation{0};
+    std::atomic<AuthorityEpoch> authority_epoch{0};
+    std::atomic<ReleaseAllInterfaceState> keyboard{ReleaseAllInterfaceState::kUnresolved};
+    std::atomic<ReleaseAllInterfaceState> mouse{ReleaseAllInterfaceState::kUnresolved};
+    std::atomic_bool active{false};
+    std::atomic_bool finalized{false};
+    std::atomic_bool failed_before_finalization{false};
+    std::atomic_bool canceled{false};
+};
+
+struct ReleaseAllSnapshot {
+    std::uint32_t attach_generation = 0;
+    AuthorityEpoch authority_epoch = 0;
+    ReleaseAllInterfaceState keyboard = ReleaseAllInterfaceState::kUnresolved;
+    ReleaseAllInterfaceState mouse = ReleaseAllInterfaceState::kUnresolved;
+    bool active = false;
+    bool finalized = false;
+    bool failed_before_finalization = false;
+    bool canceled = false;
+};
+
+struct ReleaseAllResult {
+    bool success = false;
+    bool authority_lost = false;
+    ReleaseAllInterfaceState keyboard = ReleaseAllInterfaceState::kPending;
+    ReleaseAllInterfaceState mouse = ReleaseAllInterfaceState::kPending;
+};
+
 // TinyUSB-independent state and mailbox core. Producers may run from the
 // control/application task; execute() is called only from the TinyUSB task.
 // The fixed one-slot-per-interface mailbox never allocates or blocks.
@@ -70,6 +110,9 @@ class StateMachine {
     // Internal safety primitive. It may be called repeatedly; only interfaces
     // with held or uncertain host state require an all-up report.
     void request_release_all();
+    void begin_release_all();
+    ReleaseAllSnapshot release_all_snapshot() const;
+    void finalize_release_all();
     void cancel_queued(Interface interface);
 
     // TinyUSB-task executor and completion notifications.
@@ -101,6 +144,10 @@ class StateMachine {
         std::uint8_t in_flight_report[8]{};
         std::atomic_bool safety_required{false};
         std::atomic_bool host_state_uncertain{false};
+        // A lock-free summary used by the control task when deciding whether
+        // an interface is already known all-up. The detailed report structs
+        // remain executor-owned and are not read cross-task.
+        std::atomic_bool logical_state_held{false};
         KeyboardState keyboard{};
         MouseState mouse{};
     };
@@ -120,6 +167,9 @@ class StateMachine {
                       const std::uint8_t *report, std::uint8_t length);
     void clear_interface(InterfaceState &interface_state);
     void preserve_suspend_safety(InterfaceState &interface_state);
+    void cancel_release_ticket();
+    bool known_all_up(Interface interface) const;
+    void set_release_outcome(Interface interface, ReleaseAllInterfaceState outcome);
 
     // ESP32-S3 has native lock-free 32-bit atomics. Keep this fixed-width
     // publication token independent from attach generation so the lifecycle
@@ -133,6 +183,7 @@ class StateMachine {
     std::atomic<std::uint8_t> status_bits_{0};  // mounted, suspended, kbd-ready, mouse-ready
     std::atomic_bool release_requested_{false};
     InterfaceState interfaces_[2]{};
+    ReleaseAllTicket release_ticket_{};
 };
 
 // Hardware adapter. All tud_hid_* calls are confined to service_sof(), which
@@ -152,6 +203,7 @@ class Runtime {
     bool queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                             std::int8_t vertical, std::int8_t horizontal);
     void request_release_all();
+    ReleaseAllResult release_all();
     void service_sof();
     void on_report_complete(std::uint8_t instance);
     bool on_report_failed(std::uint8_t instance);
