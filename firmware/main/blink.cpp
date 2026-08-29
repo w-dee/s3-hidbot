@@ -91,6 +91,36 @@ control_protocol::KeyboardReportResult keyboard_report(
     };
 }
 
+control_protocol::MouseReportResult mouse_report(
+    void *, const control_protocol::MouseReportRequest &request) {
+    const hid_runtime::MouseReportResult result =
+        s_hid_runtime.mouse_report(request.buttons, request.x, request.y,
+                                   request.wheel, request.pan);
+    const auto failure = [](hid_runtime::MouseReportFailure value) {
+        switch (value) {
+            case hid_runtime::MouseReportFailure::kBusy:
+                return control_protocol::MouseReportFailure::kBusy;
+            case hid_runtime::MouseReportFailure::kSafetyPending:
+                return control_protocol::MouseReportFailure::kSafetyPending;
+            case hid_runtime::MouseReportFailure::kAuthorityLost:
+                return control_protocol::MouseReportFailure::kAuthorityLost;
+            case hid_runtime::MouseReportFailure::kNone:
+                return control_protocol::MouseReportFailure::kNone;
+            case hid_runtime::MouseReportFailure::kNotReady:
+            default:
+                return control_protocol::MouseReportFailure::kNotReady;
+        }
+    };
+    return control_protocol::MouseReportResult{
+        .success = result.success,
+        .authority_lost = result.authority_lost,
+        .state = result.state == hid_runtime::MouseReportState::kAlreadySet
+                     ? control_protocol::MouseReportState::kAlreadySet
+                     : control_protocol::MouseReportState::kSubmitted,
+        .failure = failure(result.failure),
+    };
+}
+
 static_assert(kHidInterfaceCount == 2);
 static_assert(kKeyboardInterface != kMouseInterface);
 static_assert(kKeyboardEndpoint != kMouseEndpoint);
@@ -350,6 +380,8 @@ extern "C" void app_main() {
         .release_all_context = nullptr,
         .keyboard_report_provider = keyboard_report,
         .keyboard_report_context = nullptr,
+        .mouse_report_provider = mouse_report,
+        .mouse_report_context = nullptr,
     };
     ESP_ERROR_CHECK(uart_control_transport::start(&protocol_config));
 #if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC

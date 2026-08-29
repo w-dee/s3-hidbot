@@ -6,13 +6,14 @@ The control plane uses the onboard USB-UART path. Native USB-OTG remains the
 separate TinyUSB HID Device path. A host must never assume that opening a serial
 device proves that the HID USB path is attached, or vice versa.
 
-U4.3 extends the bounded JSON control core with the mandatory session lease,
+U4.4 extends the bounded JSON control core with the mandatory session lease,
 HID runtime safety foundation, the safety-only `hid.release_all` command, and
-the public absolute `hid.keyboard.report` command. It implements
+the public absolute `hid.keyboard.report` and relative `hid.mouse.report`
+commands. It implements
 `protocol.hello`, `system.ping`, `system.info`, `usb.status`,
-`hid.release_all`, and `hid.keyboard.report`. There is still no mouse report,
-keyboard helper, HID CLI, asynchronous event, USB reconnect, GPIO action, or
-reset command.
+`hid.release_all`, `hid.keyboard.report`, and `hid.mouse.report`. There is
+still no keyboard helper, HID CLI, asynchronous event, USB reconnect, GPIO
+action, or reset command.
 
 The configured ESP-IDF console UART is used without application hardcoding of
 its UART number, pins, or baud rate. The UART RX control task is the sole
@@ -157,7 +158,8 @@ initial capability list:
 
 ```text
   protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
-  hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1
+  hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
+  hid.mouse-report-v1
 ```
 
 For a successful hello, top-level `session` equals `result.session`. Both are
@@ -167,7 +169,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
@@ -175,9 +177,9 @@ values are fixed-length lowercase hexadecimal tokens.
 
 Adding a future capability does not itself require changing protocol version
 `v`; hosts must use the advertised capability list. U4.2 adds the safety-only
-release-all capability and U4.3 adds the absolute keyboard-report capability;
-mouse-report capability remains absent. All normal requests require the exact
-current session; USB mount does not automatically create one.
+release-all capability, U4.3 adds the absolute keyboard-report capability, and
+U4.4 adds the relative mouse-report capability. All normal requests require
+the exact current session; USB mount does not automatically create one.
 
 The response `session` field is a correlation/epoch identity, not an
 authentication credential. A `session:null` response cannot be trusted as
@@ -341,7 +343,8 @@ ID conflicts/stale IDs, or session mismatch.
 
 Hosts that use `Client.keyboard_report(modifiers, keys)` perform the same
 fail-fast validation and preserve caller order. No keyboard type/chord helper,
-raw HID API, keyboard CLI, or mouse report API is provided in U4.3.
+raw HID API, or keyboard CLI is provided; U4.4 adds only the explicit
+`Client.mouse_report(buttons, x, y, wheel, pan)` API.
 
 ## Future U3 host correlation contract
 
@@ -384,7 +387,7 @@ bounded depth/member/string limits. Normal completion requires the expected
 ID and current session. Hello additionally requires the expected nonce,
 matching top-level/result sessions, a valid boot ID, `s3-hidbot` identity, the
 baseline capabilities plus `hid.lease-v1`, `hid.release-all-v1`, and
-`hid.keyboard-report-v1`, exact lease metadata, and a
+`hid.keyboard-report-v1`, `hid.mouse-report-v1`, exact lease metadata, and a
 unique bounded capability list. A stale hello
 with the wrong nonce never establishes a session. `session:null` errors are
 retained only as bounded untrusted diagnostics and cannot complete a request.
@@ -403,8 +406,9 @@ as unknown/session-lost.
 U3.1/U3.2 expose only `ping()`, `info()`, and `usb_status()` after
 `connect()`/hello; U4.2 additionally exposes the safety-only
 `Client.release_all()` API and U4.3 adds `Client.keyboard_report()` for the
-absolute keyboard report contract below. No mouse report, HID CLI, or
-arbitrary raw command API exists; the hello result exposes read-only `lease_ms`
+absolute keyboard report contract below. U4.4 adds
+`Client.mouse_report()` for relative mouse reports. No HID CLI or arbitrary
+raw command API exists; the hello result exposes read-only `lease_ms`
 metadata. Closing the client only closes the injected transport and invalidates
 local session state; it sends no UART command.
 
@@ -471,7 +475,7 @@ stores both the attach generation and authority epoch with each operation.
 The executor checks both tokens, mounted state, non-suspended state, and the
 safety barrier immediately before TinyUSB report submission. U4.2's bounded
 release-all ticket remains the only public safety operation; U4.3's keyboard
-ticket is the only public unsafe report path.
+ticket and U4.4's mouse ticket are the explicit public unsafe report paths.
 
 Each mount starts a monotonically increasing attach generation. It remains
 separate from the authority epoch: attach generation advances only at mount
@@ -510,7 +514,8 @@ not a promise that a host will remain attached or that a queued report will be
 delivered.
 The existing Configuration 1, Boot Keyboard/Mouse interfaces, endpoints
 0x81/0x82, descriptors, and VID/PID are unchanged. U4.2 exposes the
-safety-only `hid.release_all`; U4.3 adds only the public keyboard report path.
+safety-only `hid.release_all`; U4.3 adds the public keyboard report path and
+U4.4 adds the public mouse report path.
 The optional BOOT-button diagnostic remains build-time
 disabled by default and routes any enabled test report through the runtime.
 
@@ -518,7 +523,8 @@ Control sessions have a mandatory 5000 ms lease measured by the monotonic
 `esp_timer_get_time()` clock. The existing UART RX loop services expiry after
 each bounded read (normally within 100 ms); no additional timer task exists.
 Successful hello starts the lease and advertises `lease_ms:5000` plus
-`hid.lease-v1`, `hid.release-all-v1`, and `hid.keyboard-report-v1`. A valid current-session request, exact retry, or operational
+`hid.lease-v1`, `hid.release-all-v1`, `hid.keyboard-report-v1`, and
+`hid.mouse-report-v1`. A valid current-session request, exact retry, or operational
 command result refreshes it. Malformed, epoch-mismatched, session-mismatched,
 stale/conflicting, unknown, and semantically invalid requests do not. Expiry
 revokes authority first, clears the normal retry cache, and requests runtime
@@ -529,8 +535,8 @@ activating the new session. Exact hello retry replays its cached bytes and
 refreshes the lease only within its captured authority epoch. A hello while
 suspended is permitted for diagnostics and captures the suspended epoch, but
 resume invalidates it and requires a fresh hello. Lease expiry and takeover
-allow diagnostic commands while safety is pending; the U4.3 keyboard report
-path remains blocked until the global safety barrier is clear.
+allow diagnostic commands while safety is pending; the U4.3 keyboard and U4.4
+mouse report paths remain blocked until the global safety barrier is clear.
 
 ## Deferred control safety
 
@@ -559,10 +565,47 @@ refreshed.
 
 Exact retries (same ID and bytes) replay the cached success or pending error
 without restarting the operation. A new request ID reevaluates current state.
-The `hid.release-all-v1` and `hid.keyboard-report-v1` capabilities advertise
-these commands. Public keyboard/mouse/release-all CLI commands are not
-exposed; host APIs are `Client.release_all()` and
-`Client.keyboard_report(modifiers, keys)`.
+The `hid.release-all-v1`, `hid.keyboard-report-v1`, and
+`hid.mouse-report-v1` capabilities advertise these commands. Public
+keyboard/mouse/release-all CLI commands are not exposed; host APIs are
+`Client.release_all()`, `Client.keyboard_report(modifiers, keys)`, and
+`Client.mouse_report(buttons, x, y, wheel, pan)`.
+
+## U4.4 relative mouse reports
+
+`hid.mouse.report` accepts exactly five required parameters:
+
+```json
+{"v":1,"id":8,"session":"<token>","cmd":"hid.mouse.report","params":{"buttons":0,"x":1,"y":0,"wheel":0,"pan":0}}
+```
+
+`buttons` is an absolute persistent bitmap in `0..31`: bit 0 is Left, bit 1
+Right, bit 2 Middle, bit 3 Backward, and bit 4 Forward. `x`, `y`, `wheel`,
+and `pan` are one-report relative deltas in `-127..127`; they are not stored
+as logical state. Boolean, fractional, missing, null, and extra fields are
+invalid, and `-128` is outside the descriptor's logical range.
+
+The Mouse report uses interface 1, report ID 0, and the five-byte layout
+`[buttons, x, y, wheel, pan]`. `submitted` means only that the task-affine
+TinyUSB call accepted those bytes; it does not promise host polling or a
+cursor event. `already_set` is allowed only for zero deltas with the same
+confirmed buttons and no uncertainty, safety work, ticket, or in-flight
+report. A nonzero relative delta always submits for a new request ID.
+
+An exact same-ID/byte retry replays the cached response and never submits a
+second relative report. Operational failures are cached for exact retries;
+new IDs reevaluate current readiness. Mouse tickets capture attach and
+authority epochs, use bounded claim/cancel transitions, and are discarded on
+timeout, lifecycle invalidation, or safety barriers, so they cannot create a
+ghost movement or button transition later. `report_complete` confirms only
+buttons; `report_failed` leaves buttons unconfirmed, requires safety release,
+revokes authority, and never retries or inverses relative motion.
+
+`hid.release_all` may submit a Mouse all-up report
+`[0,0,0,0,0]` when held or uncertain state requires recovery. It never
+synthesizes an inverse movement. Mouse unsafe reports are blocked by the same
+global `HID_SAFETY_PENDING` barrier as Keyboard reports; `HID_BUSY`,
+`HID_NOT_READY`, and `SESSION_MISMATCH` retain their existing meanings.
 
 ## BOOT-button diagnostic
 

@@ -74,6 +74,7 @@ class FakeTransport:
                             "hid.lease-v1",
                             "hid.release-all-v1",
                             "hid.keyboard-report-v1",
+                            "hid.mouse-report-v1",
                         ],
                     },
                 )

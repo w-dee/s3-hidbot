@@ -16,4 +16,4 @@ where = ["src"]
 hidbotctl = "hidbot.cli:main"
 
 [tool.s3-hidbot]
-scope = "U4.3 host serial transport, safety-only hid.release_all, and absolute hid.keyboard.report API"
+scope = "U4.4 host serial transport, safety-only hid.release_all, absolute hid.keyboard.report, and relative hid.mouse.report APIs"

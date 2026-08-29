@@ -112,6 +112,25 @@ struct KeyboardSource {
     }
 };
 
+struct MouseSource {
+    control_protocol::MouseReportResult result{
+        .success = true,
+        .authority_lost = false,
+        .state = control_protocol::MouseReportState::kSubmitted,
+        .failure = control_protocol::MouseReportFailure::kNone,
+    };
+    control_protocol::MouseReportRequest request{};
+    int calls = 0;
+
+    static control_protocol::MouseReportResult get(
+        void *context, const control_protocol::MouseReportRequest &request) {
+        auto *source = static_cast<MouseSource *>(context);
+        source->request = request;
+        ++source->calls;
+        return source->result;
+    }
+};
+
 void increment_authority(void *context) {
     ++static_cast<AuthoritySource *>(context)->epoch;
 }
@@ -168,6 +187,8 @@ struct LeaseFixture {
             .release_all_context = &release,
             .keyboard_report_provider = nullptr,
             .keyboard_report_context = nullptr,
+            .mouse_report_provider = nullptr,
+            .mouse_report_context = nullptr,
         };
         assert(protocol.initialize(config, RandomSource::fill, &random));
     }
@@ -185,6 +206,7 @@ struct Fixture {
     AuthoritySource authority;
     ReleaseSource release;
     KeyboardSource keyboard;
+    MouseSource mouse;
     control_protocol::Protocol protocol;
 
     explicit Fixture(std::uint8_t random_seed = 0) {
@@ -209,6 +231,8 @@ struct Fixture {
             .release_all_context = &release,
             .keyboard_report_provider = KeyboardSource::get,
             .keyboard_report_context = &keyboard,
+            .mouse_report_provider = MouseSource::get,
+            .mouse_report_context = &mouse,
         };
         assert(protocol.initialize(config, RandomSource::fill, &random));
     }
@@ -423,7 +447,7 @@ void test_nonce_session_and_hello_cache() {
     assert(first_hello.find(session_marker) != first_hello.rfind(session_marker));
     require_contains(first_hello, "\"protocol.hello-v1\"");
     require_contains(first_hello, "\"usb.status-v1\"");
-    assert(first_hello.find("hid.mouse.report-v1") == std::string::npos);
+    require_contains(first_hello, "hid.mouse-report-v1");
 
     fixture.payload(hello_request(1, kNonceA));
     assert(fixture.sink.last() == first_hello);
@@ -739,6 +763,68 @@ void test_keyboard_report_schema_result_and_cache() {
     assert(fixture.keyboard.calls == 1);
 }
 
+void test_mouse_report_schema_result_and_cache() {
+    Fixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+    require_contains(fixture.sink.last(), "hid.mouse-report-v1");
+
+    const std::string valid = request(
+        2, session, "hid.mouse.report",
+        "{\"buttons\":3,\"x\":1,\"y\":-2,\"wheel\":0,\"pan\":4}");
+    fixture.payload(valid);
+    const std::string success = fixture.sink.last();
+    require_contains(success, "\"state\":\"submitted\"");
+    assert(fixture.mouse.calls == 1);
+    assert(fixture.mouse.request.buttons == 3 && fixture.mouse.request.x == 1 &&
+           fixture.mouse.request.y == -2 && fixture.mouse.request.wheel == 0 &&
+           fixture.mouse.request.pan == 4);
+    fixture.payload(valid);
+    assert(fixture.sink.last() == success);
+    assert(fixture.mouse.calls == 1);
+
+    const char *valid_edges[] = {
+        "{\"buttons\":0,\"x\":-127,\"y\":127,\"wheel\":-127,\"pan\":127}",
+        "{\"buttons\":31,\"x\":127,\"y\":-127,\"wheel\":127,\"pan\":-127}",
+    };
+    int edge_id = 20;
+    for (const char *params : valid_edges) {
+        fixture.payload(request(edge_id++, session, "hid.mouse.report", params));
+        require_contains(fixture.sink.last(), "\"state\":\"submitted\"");
+    }
+    assert(fixture.mouse.calls == 3);
+
+    const char *invalid[] = {
+        "{}",
+        "{\"buttons\":true,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":-1,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":32,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":0,\"x\":-128,\"y\":0,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":0,\"x\":128,\"y\":0,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0.5,\"y\":0,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":-128,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":128,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":0.5,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":true,\"wheel\":0,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":-128,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":128,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":true,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":0.5,\"pan\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":-128}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":128}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":0.5}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":true}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":0}",
+        "{\"buttons\":0,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":0,\"extra\":1}",
+    };
+    int invalid_id = 22;
+    for (const char *params : invalid) {
+        fixture.payload(request(invalid_id++, session, "hid.mouse.report", params));
+        require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    }
+    assert(fixture.mouse.calls == 3);
+}
+
 }  // namespace
 
 int main() {
@@ -753,5 +839,6 @@ int main() {
     test_same_rx_batch_observes_published_epoch();
     test_release_all_result_cache_and_pending_error();
     test_keyboard_report_schema_result_and_cache();
+    test_mouse_report_schema_result_and_cache();
     return 0;
 }

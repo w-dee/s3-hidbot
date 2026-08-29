@@ -21,15 +21,19 @@ from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
     KeyboardReportResult,
+    MouseReportResult,
     ReleaseAllResult,
     Response,
     build_keyboard_report_frame,
+    build_mouse_report_frame,
     build_command_frame,
     build_hello_frame,
     parse_response,
     validate_keyboard_report_result,
     validate_keyboard_report_inputs,
+    validate_mouse_report_inputs,
     validate_release_all_result,
+    validate_mouse_report_result,
     validate_hello_response,
 )
 
@@ -360,6 +364,21 @@ class Client:
             request_id, session = self._allocate_request_id_locked()
             frame = build_keyboard_report_frame(request_id, session, modifiers, keys)
             return validate_keyboard_report_result(
+                self._request_frame_locked(request_id, session, frame)
+            )
+
+    def mouse_report(
+        self, buttons: int, x: int, y: int, wheel: int, pan: int
+    ) -> MouseReportResult:
+        """Submit one relative Boot mouse report through the v1 protocol."""
+
+        with self._lock:
+            validate_mouse_report_inputs(buttons, x, y, wheel, pan)
+            request_id, session = self._allocate_request_id_locked()
+            frame = build_mouse_report_frame(
+                request_id, session, buttons, x, y, wheel, pan
+            )
+            return validate_mouse_report_result(
                 self._request_frame_locked(request_id, session, frame)
             )
 

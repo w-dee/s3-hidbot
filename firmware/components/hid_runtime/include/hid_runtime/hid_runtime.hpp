@@ -88,6 +88,59 @@ struct KeyboardReportResult {
     KeyboardReportFailure failure = KeyboardReportFailure::kNotReady;
 };
 
+enum class MouseReportFailure : std::uint8_t {
+    kNone,
+    kNotReady,
+    kBusy,
+    kSafetyPending,
+    kAuthorityLost,
+};
+
+enum class MouseReportBeginResult : std::uint8_t {
+    kAlreadySet,
+    kPublished,
+    kNotReady,
+    kBusy,
+    kSafetyPending,
+    kAuthorityLost,
+};
+
+enum class MouseReportState : std::uint8_t {
+    kAlreadySet,
+    kSubmitted,
+};
+
+enum class MouseReportTicketState : std::uint8_t {
+    kFree,
+    kWriting,
+    kPublished,
+    kClaimed,
+    kSubmitted,
+    kNotReady,
+    kCanceled,
+};
+
+enum class MouseReportTicketOutcome : std::uint8_t {
+    kNone,
+    kSubmitted,
+    kNotReady,
+    kBusy,
+    kSafetyPending,
+    kAuthorityLost,
+};
+
+struct MouseReportSnapshot {
+    MouseReportTicketState state = MouseReportTicketState::kFree;
+    MouseReportTicketOutcome outcome = MouseReportTicketOutcome::kNone;
+};
+
+struct MouseReportResult {
+    bool success = false;
+    bool authority_lost = false;
+    MouseReportState state = MouseReportState::kSubmitted;
+    MouseReportFailure failure = MouseReportFailure::kNotReady;
+};
+
 // This is deliberately separate from attach_generation.  It is a lock-free
 // lifecycle publication token that defines HID-control authority boundaries.
 // Unsigned wrap is well-defined; practical lifecycle frequency cannot reach it.
@@ -169,6 +222,17 @@ class StateMachine {
     bool cancel_keyboard_report();
     void finalize_keyboard_report();
 
+    // Public mouse reports use a dedicated fixed-size ticket. Relative axes
+    // are kept only in the ticket/in-flight identity; confirmed state stores
+    // the persistent button bitmap alone.
+    MouseReportBeginResult begin_mouse_report(std::uint8_t buttons,
+                                              std::int8_t x, std::int8_t y,
+                                              std::int8_t vertical,
+                                              std::int8_t horizontal);
+    MouseReportSnapshot mouse_report_snapshot() const;
+    bool cancel_mouse_report();
+    void finalize_mouse_report();
+
     // Internal safety primitive. It may be called repeatedly; only interfaces
     // with held or uncertain host state require an all-up report.
     void request_release_all();
@@ -221,6 +285,7 @@ class StateMachine {
         std::atomic<std::uint32_t> confirmed_sequence{0};
         std::atomic<std::uint32_t> confirmed_low{0};
         std::atomic<std::uint32_t> confirmed_high{0};
+        std::atomic<std::uint8_t> confirmed_mouse_buttons{0};
         KeyboardState keyboard{};
         MouseState mouse{};
     };
@@ -242,14 +307,20 @@ class StateMachine {
     void preserve_suspend_safety(InterfaceState &interface_state);
     void cancel_release_ticket();
     void cancel_keyboard_ticket(KeyboardReportTicketOutcome outcome);
+    void cancel_mouse_ticket(MouseReportTicketOutcome outcome);
     bool known_all_up(Interface interface) const;
     void set_release_outcome(Interface interface, ReleaseAllInterfaceState outcome);
     void write_confirmed_keyboard(const std::uint8_t *report);
     std::array<std::uint8_t, 8> read_confirmed_keyboard() const;
     bool confirmed_keyboard_equals(const std::uint8_t *report) const;
+    void write_confirmed_mouse(std::uint8_t buttons);
+    std::uint8_t read_confirmed_mouse() const;
     bool process_keyboard_ticket(SubmitFn submit, void *context,
                                  std::uint32_t current_generation,
                                  AuthorityEpoch current_authority_epoch);
+    bool process_mouse_ticket(SubmitFn submit, void *context,
+                              std::uint32_t current_generation,
+                              AuthorityEpoch current_authority_epoch);
 
     struct KeyboardReportTicket {
         std::atomic<KeyboardReportTicketState> state{KeyboardReportTicketState::kFree};
@@ -258,6 +329,15 @@ class StateMachine {
         std::atomic<std::uint32_t> release_epoch{0};
         std::atomic<KeyboardReportTicketOutcome> outcome{KeyboardReportTicketOutcome::kNone};
         std::uint8_t report[8]{};
+    };
+
+    struct MouseReportTicket {
+        std::atomic<MouseReportTicketState> state{MouseReportTicketState::kFree};
+        std::atomic<std::uint32_t> attach_generation{0};
+        std::atomic<AuthorityEpoch> authority_epoch{0};
+        std::atomic<std::uint32_t> release_epoch{0};
+        std::atomic<MouseReportTicketOutcome> outcome{MouseReportTicketOutcome::kNone};
+        std::uint8_t report[5]{};
     };
 
     // ESP32-S3 has native lock-free 32-bit atomics. Keep this fixed-width
@@ -275,6 +355,7 @@ class StateMachine {
     InterfaceState interfaces_[2]{};
     ReleaseAllTicket release_ticket_{};
     KeyboardReportTicket keyboard_ticket_{};
+    MouseReportTicket mouse_ticket_{};
 };
 
 // Hardware adapter. All tud_hid_* calls are confined to service_sof(), which
@@ -295,6 +376,8 @@ class Runtime {
                             std::int8_t vertical, std::int8_t horizontal);
     KeyboardReportResult keyboard_report(
         std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes);
+    MouseReportResult mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
+                                   std::int8_t vertical, std::int8_t horizontal);
     void request_release_all();
     ReleaseAllResult release_all();
     void service_sof();

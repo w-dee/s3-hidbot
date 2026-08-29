@@ -32,6 +32,7 @@ REQUIRED_CAPABILITIES = frozenset(
         "hid.lease-v1",
         "hid.release-all-v1",
         "hid.keyboard-report-v1",
+        "hid.mouse-report-v1",
     }
 )
 
@@ -70,6 +71,11 @@ class ReleaseAllResult:
 
 @dataclass(frozen=True)
 class KeyboardReportResult:
+    state: Literal["already_set", "submitted"]
+
+
+@dataclass(frozen=True)
+class MouseReportResult:
     state: Literal["already_set", "submitted"]
 
 
@@ -281,6 +287,39 @@ def build_keyboard_report_frame(
     )
 
 
+def validate_mouse_report_inputs(buttons: int, x: int, y: int, wheel: int, pan: int) -> None:
+    if type(buttons) is not int or not 0 <= buttons <= 31:
+        raise ProtocolError("mouse report buttons are invalid")
+    for name, value in (("x", x), ("y", y), ("wheel", wheel), ("pan", pan)):
+        if type(value) is not int or not -127 <= value <= 127:
+            raise ProtocolError(f"mouse report {name} is invalid")
+
+
+def build_mouse_report_frame(
+    request_id: int,
+    session: str,
+    buttons: int,
+    x: int,
+    y: int,
+    wheel: int,
+    pan: int,
+) -> bytes:
+    if type(request_id) is not int or not 0 <= request_id <= MAX_ID:
+        raise ProtocolError("request id is invalid")
+    if not isinstance(session, str) or TOKEN_PATTERN.fullmatch(session) is None:
+        raise ProtocolError("session is invalid")
+    validate_mouse_report_inputs(buttons, x, y, wheel, pan)
+    return _serialize_request(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "session": session,
+            "cmd": "hid.mouse.report",
+            "params": {"buttons": buttons, "x": x, "y": y, "wheel": wheel, "pan": pan},
+        }
+    )
+
+
 def validate_hello_response(
     response: Response,
     *,
@@ -362,3 +401,12 @@ def validate_keyboard_report_result(value: Any) -> KeyboardReportResult:
     if state not in {"already_set", "submitted"}:
         raise ProtocolError("hid.keyboard.report result state is invalid")
     return KeyboardReportResult(state=cast(Literal["already_set", "submitted"], state))
+
+
+def validate_mouse_report_result(value: Any) -> MouseReportResult:
+    if not isinstance(value, dict) or set(value) != {"state"}:
+        raise ProtocolError("hid.mouse.report result fields are invalid")
+    state = value["state"]
+    if state not in {"already_set", "submitted"}:
+        raise ProtocolError("hid.mouse.report result state is invalid")
+    return MouseReportResult(state=cast(Literal["already_set", "submitted"], state))

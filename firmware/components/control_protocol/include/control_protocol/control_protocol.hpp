@@ -72,6 +72,37 @@ struct KeyboardReportResult {
 using KeyboardReportProvider = KeyboardReportResult (*)(
     void *context, const KeyboardReportRequest &request);
 
+enum class MouseReportState : std::uint8_t {
+    kAlreadySet,
+    kSubmitted,
+};
+
+enum class MouseReportFailure : std::uint8_t {
+    kNone,
+    kNotReady,
+    kBusy,
+    kSafetyPending,
+    kAuthorityLost,
+};
+
+struct MouseReportRequest {
+    std::uint8_t buttons = 0;
+    std::int8_t x = 0;
+    std::int8_t y = 0;
+    std::int8_t wheel = 0;
+    std::int8_t pan = 0;
+};
+
+struct MouseReportResult {
+    bool success = false;
+    bool authority_lost = false;
+    MouseReportState state = MouseReportState::kSubmitted;
+    MouseReportFailure failure = MouseReportFailure::kNotReady;
+};
+
+using MouseReportProvider = MouseReportResult (*)(
+    void *context, const MouseReportRequest &request);
+
 struct Config {
     Metadata metadata;
     UsbStatusProvider usb_status_provider;
@@ -92,6 +123,8 @@ struct Config {
     void *release_all_context;
     KeyboardReportProvider keyboard_report_provider;
     void *keyboard_report_context;
+    MouseReportProvider mouse_report_provider;
+    void *mouse_report_context;
 };
 
 class Protocol {

@@ -505,6 +505,125 @@ void test_keyboard_report_submit_false_is_not_replayed() {
     assert((state.keyboard_state().keycodes == std::array<std::uint8_t, 6>{}));
 }
 
+void test_mouse_report_ticket_relative_and_confirmed_state() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+
+    // A clean zero-delta report is already_set, but every nonzero relative
+    // delta is a fresh operation even when the payload is unchanged.
+    assert(state.begin_mouse_report(0, 0, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kAlreadySet);
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kBusy);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1 && sink.instance == 1 && sink.length == 5 &&
+           sink.report[0] == 0 && sink.report[1] == 1);
+    assert(state.mouse_report_snapshot().state ==
+           hid_runtime::MouseReportTicketState::kSubmitted);
+    state.report_complete(1);
+    state.finalize_mouse_report();
+
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2 && sink.instance == 1 && sink.report[1] == 1);
+    state.report_complete(1);
+    state.finalize_mouse_report();
+    assert(state.mouse_state().buttons == 0);
+
+    // Button state is provisional until completion; relative axes never
+    // become persistent logical state.
+    assert(state.begin_mouse_report(3, 1, -2, 4, -5) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 3 && sink.report[0] == 3 && sink.report[1] == 1 &&
+           sink.report[2] == static_cast<std::uint8_t>(-2) && sink.report[3] == 4 &&
+           sink.report[4] == static_cast<std::uint8_t>(-5));
+    assert(state.mouse_state().buttons == 3);
+    state.report_complete(1);
+    state.finalize_mouse_report();
+    assert(state.mouse_state().buttons == 3);
+    assert(state.begin_mouse_report(3, 0, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kAlreadySet);
+}
+
+void test_mouse_report_ticket_cancellation_and_failure() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    assert(state.cancel_mouse_report());
+    state.execute(Sink::submit, &sink);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    state.finalize_mouse_report();
+
+    // Lifecycle invalidation cancels published work and prevents later replay.
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    const auto epoch = state.authority_epoch();
+    state.on_suspend();
+    assert(state.authority_epoch() != epoch);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    assert(state.mouse_report_snapshot().outcome ==
+           hid_runtime::MouseReportTicketOutcome::kAuthorityLost);
+    state.finalize_mouse_report();
+    state.on_resume();
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+
+    // TinyUSB submit=false is terminal for the unsafe report and does not
+    // cause a later SOF retry or an inverse movement.
+    sink.accept = false;
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1 &&
+           state.mouse_report_snapshot().state ==
+               hid_runtime::MouseReportTicketState::kNotReady);
+    state.finalize_mouse_report();
+    sink.accept = true;
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1);
+
+    // A failed relative-only report enters the existing safety barrier; only
+    // the zero all-up safety report may follow.
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2);
+    assert(state.report_failed(1));
+    assert(state.safety_required(hid_runtime::Interface::kMouse));
+    state.finalize_mouse_report();
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 3 && sink.instance == 1 && sink.report[0] == 0 &&
+           sink.report[1] == 0);
+    state.report_complete(1);
+}
+
+void test_mouse_release_all_during_in_flight() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1 && state.report_in_flight(hid_runtime::Interface::kMouse));
+    state.request_release_all();
+    state.report_complete(1);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2 && sink.instance == 1 && sink.report[0] == 0 &&
+           sink.report[1] == 0 && sink.report[2] == 0 && sink.report[3] == 0 &&
+           sink.report[4] == 0);
+    state.report_complete(1);
+    assert(!state.safety_required(hid_runtime::Interface::kMouse));
+}
+
 }  // namespace
 
 int main() {
@@ -525,5 +644,8 @@ int main() {
     test_keyboard_report_ticket_and_confirmed_state();
     test_keyboard_report_ticket_cancellation_and_barriers();
     test_keyboard_report_submit_false_is_not_replayed();
+    test_mouse_report_ticket_relative_and_confirmed_state();
+    test_mouse_report_ticket_cancellation_and_failure();
+    test_mouse_release_all_during_in_flight();
     return 0;
 }

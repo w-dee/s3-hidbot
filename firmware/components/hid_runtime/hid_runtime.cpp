@@ -74,6 +74,8 @@ void StateMachine::clear_interface(InterfaceState &interface_state) {
     if (&interface_state == &interfaces_[0]) {
         const std::uint8_t all_up[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         write_confirmed_keyboard(all_up);
+    } else {
+        write_confirmed_mouse(0);
     }
     interface_state.keyboard = {};
     interface_state.mouse = {};
@@ -125,6 +127,15 @@ bool StateMachine::confirmed_keyboard_equals(const std::uint8_t *report) const {
                                       report[4], report[5], report[6], report[7]};
 }
 
+void StateMachine::write_confirmed_mouse(std::uint8_t buttons) {
+    interfaces_[1].confirmed_mouse_buttons.store(
+        static_cast<std::uint8_t>(buttons & 0x1fU), std::memory_order_release);
+}
+
+std::uint8_t StateMachine::read_confirmed_mouse() const {
+    return interfaces_[1].confirmed_mouse_buttons.load(std::memory_order_acquire);
+}
+
 void StateMachine::cancel_release_ticket() {
     if (!release_ticket_.active.load(std::memory_order_acquire)) {
         return;
@@ -145,6 +156,19 @@ void StateMachine::cancel_keyboard_ticket(KeyboardReportTicketOutcome outcome) {
                 ticket_state, KeyboardReportTicketState::kCanceled,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
             keyboard_ticket_.outcome.store(outcome, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+void StateMachine::cancel_mouse_ticket(MouseReportTicketOutcome outcome) {
+    auto ticket_state = mouse_ticket_.state.load(std::memory_order_acquire);
+    while (ticket_state == MouseReportTicketState::kWriting ||
+           ticket_state == MouseReportTicketState::kPublished) {
+        if (mouse_ticket_.state.compare_exchange_weak(
+                ticket_state, MouseReportTicketState::kCanceled,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            mouse_ticket_.outcome.store(outcome, std::memory_order_release);
             return;
         }
     }
@@ -210,6 +234,7 @@ void StateMachine::preserve_suspend_safety(InterfaceState &interface_state) {
 void StateMachine::on_mount() {
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     generation_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -224,6 +249,7 @@ void StateMachine::on_mount() {
 void StateMachine::on_unmount() {
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     // Invalidate first: work from an older attach or authority epoch can never
     // be accepted by a later executor pass, even if it races this callback.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -240,6 +266,7 @@ void StateMachine::on_unmount() {
 void StateMachine::on_suspend() {
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     // This is the control-authority linearization boundary. It intentionally
     // precedes the UART task's eventual session/cache cleanup notification.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -262,6 +289,7 @@ void StateMachine::on_suspend() {
 void StateMachine::on_resume() {
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     // A session established during suspend is diagnostic-only; resume must
     // never silently restore it as HID-control authority.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -479,6 +507,127 @@ void StateMachine::finalize_keyboard_report() {
     }
 }
 
+MouseReportBeginResult StateMachine::begin_mouse_report(
+    std::uint8_t buttons, std::int8_t x, std::int8_t y, std::int8_t vertical,
+    std::int8_t horizontal) {
+    // Reap only terminal ticket states. The in-flight interface bit remains
+    // the authoritative barrier until TinyUSB reports completion.
+    auto ticket_state = mouse_ticket_.state.load(std::memory_order_acquire);
+    while (ticket_state == MouseReportTicketState::kSubmitted ||
+           ticket_state == MouseReportTicketState::kNotReady ||
+           ticket_state == MouseReportTicketState::kCanceled) {
+        if (mouse_ticket_.state.compare_exchange_weak(
+                ticket_state, MouseReportTicketState::kFree,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            ticket_state = MouseReportTicketState::kFree;
+            break;
+        }
+    }
+    if (ticket_state != MouseReportTicketState::kFree) {
+        return MouseReportBeginResult::kBusy;
+    }
+
+    const StatusSnapshot snapshot = status();
+    if (!snapshot.mounted || snapshot.suspended || !snapshot.mouse_ready) {
+        return MouseReportBeginResult::kNotReady;
+    }
+    if (release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
+        return MouseReportBeginResult::kSafetyPending;
+    }
+    InterfaceState &mouse = state(Interface::kMouse);
+    if (mouse.in_flight.load(std::memory_order_acquire) ||
+        mouse.slot_state.load(std::memory_order_acquire) != kSlotEmpty) {
+        return MouseReportBeginResult::kBusy;
+    }
+
+    const bool no_relative_delta = x == 0 && y == 0 && vertical == 0 && horizontal == 0;
+    if (no_relative_delta &&
+        static_cast<std::uint8_t>(buttons & 0x1fU) == read_confirmed_mouse() &&
+        !mouse.host_state_uncertain.load(std::memory_order_acquire) &&
+        !mouse.safety_required.load(std::memory_order_acquire)) {
+        return MouseReportBeginResult::kAlreadySet;
+    }
+
+    MouseReportTicketState expected = MouseReportTicketState::kFree;
+    if (!mouse_ticket_.state.compare_exchange_strong(
+            expected, MouseReportTicketState::kWriting,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return MouseReportBeginResult::kBusy;
+    }
+    const std::uint32_t generation = attach_generation();
+    const AuthorityEpoch epoch = authority_epoch();
+    const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
+    mouse_ticket_.attach_generation.store(generation, std::memory_order_relaxed);
+    mouse_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
+    mouse_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
+    mouse_ticket_.report[0] = static_cast<std::uint8_t>(buttons & 0x1fU);
+    mouse_ticket_.report[1] = static_cast<std::uint8_t>(x);
+    mouse_ticket_.report[2] = static_cast<std::uint8_t>(y);
+    mouse_ticket_.report[3] = static_cast<std::uint8_t>(vertical);
+    mouse_ticket_.report[4] = static_cast<std::uint8_t>(horizontal);
+    mouse_ticket_.outcome.store(MouseReportTicketOutcome::kNone, std::memory_order_relaxed);
+
+    if (generation != attach_generation() || epoch != authority_epoch() ||
+        release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !mounted_and_active(Interface::kMouse) ||
+        release_requested_.load(std::memory_order_acquire) || any_safety_required() ||
+        mouse.in_flight.load(std::memory_order_acquire) ||
+        mouse.slot_state.load(std::memory_order_acquire) != kSlotEmpty) {
+        const bool authority_lost = generation != attach_generation() || epoch != authority_epoch();
+        mouse_ticket_.outcome.store(
+            authority_lost ? MouseReportTicketOutcome::kAuthorityLost
+                           : MouseReportTicketOutcome::kSafetyPending,
+            std::memory_order_release);
+        mouse_ticket_.state.store(MouseReportTicketState::kCanceled,
+                                  std::memory_order_release);
+        return authority_lost ? MouseReportBeginResult::kAuthorityLost
+                              : MouseReportBeginResult::kSafetyPending;
+    }
+    MouseReportTicketState publishing = MouseReportTicketState::kWriting;
+    if (!mouse_ticket_.state.compare_exchange_strong(
+            publishing, MouseReportTicketState::kPublished,
+            std::memory_order_release, std::memory_order_acquire)) {
+        const MouseReportTicketOutcome canceled_outcome =
+            mouse_ticket_.outcome.load(std::memory_order_acquire);
+        return canceled_outcome == MouseReportTicketOutcome::kAuthorityLost
+                   ? MouseReportBeginResult::kAuthorityLost
+                   : MouseReportBeginResult::kSafetyPending;
+    }
+    return MouseReportBeginResult::kPublished;
+}
+
+MouseReportSnapshot StateMachine::mouse_report_snapshot() const {
+    return MouseReportSnapshot{
+        .state = mouse_ticket_.state.load(std::memory_order_acquire),
+        .outcome = mouse_ticket_.outcome.load(std::memory_order_acquire),
+    };
+}
+
+bool StateMachine::cancel_mouse_report() {
+    MouseReportTicketState expected = MouseReportTicketState::kPublished;
+    if (!mouse_ticket_.state.compare_exchange_strong(
+            expected, MouseReportTicketState::kCanceled,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+    mouse_ticket_.outcome.store(MouseReportTicketOutcome::kNotReady,
+                                std::memory_order_release);
+    return true;
+}
+
+void StateMachine::finalize_mouse_report() {
+    auto state = mouse_ticket_.state.load(std::memory_order_acquire);
+    while (state == MouseReportTicketState::kSubmitted ||
+           state == MouseReportTicketState::kNotReady ||
+           state == MouseReportTicketState::kCanceled) {
+        if (mouse_ticket_.state.compare_exchange_weak(
+                state, MouseReportTicketState::kFree,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
 bool StateMachine::queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                                       std::int8_t vertical, std::int8_t horizontal) {
     const std::uint8_t report[5] = {
@@ -534,6 +683,7 @@ void StateMachine::request_release_all() {
     release_request_authority_epoch_.store(authority_epoch(), std::memory_order_release);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kSafetyPending);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kSafetyPending);
     release_requested_.store(true, std::memory_order_release);
 }
 
@@ -700,6 +850,89 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
     return true;
 }
 
+bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
+                                         std::uint32_t current_generation,
+                                         AuthorityEpoch current_authority_epoch) {
+    MouseReportTicketState expected = MouseReportTicketState::kPublished;
+    if (!mouse_ticket_.state.compare_exchange_strong(
+            expected, MouseReportTicketState::kClaimed,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+
+    const std::uint32_t ticket_generation =
+        mouse_ticket_.attach_generation.load(std::memory_order_relaxed);
+    const AuthorityEpoch ticket_epoch =
+        mouse_ticket_.authority_epoch.load(std::memory_order_relaxed);
+    const std::uint32_t ticket_release_epoch =
+        mouse_ticket_.release_epoch.load(std::memory_order_relaxed);
+    InterfaceState &mouse = state(Interface::kMouse);
+    const bool authority_lost = ticket_generation != current_generation ||
+                                ticket_epoch != current_authority_epoch;
+    const bool safety_pending =
+        ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        release_requested_.load(std::memory_order_acquire) || any_safety_required();
+    const bool not_ready = !mounted_and_active(Interface::kMouse);
+    const bool busy = mouse.in_flight.load(std::memory_order_acquire) ||
+                      mouse.slot_state.load(std::memory_order_acquire) != kSlotEmpty;
+    if (authority_lost || safety_pending || not_ready || busy) {
+        const MouseReportTicketOutcome outcome =
+            authority_lost ? MouseReportTicketOutcome::kAuthorityLost
+            : safety_pending ? MouseReportTicketOutcome::kSafetyPending
+            : busy ? MouseReportTicketOutcome::kBusy
+                  : MouseReportTicketOutcome::kNotReady;
+        mouse_ticket_.outcome.store(outcome, std::memory_order_release);
+        mouse_ticket_.state.store(MouseReportTicketState::kCanceled,
+                                  std::memory_order_release);
+        return false;
+    }
+
+    if (ticket_generation != attach_generation() ||
+        ticket_epoch != authority_epoch() ||
+        ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !mounted_and_active(Interface::kMouse) ||
+        release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
+        const bool current_authority = ticket_generation == attach_generation() &&
+                                       ticket_epoch == authority_epoch();
+        mouse_ticket_.outcome.store(
+            current_authority ? MouseReportTicketOutcome::kSafetyPending
+                              : MouseReportTicketOutcome::kAuthorityLost,
+            std::memory_order_release);
+        mouse_ticket_.state.store(MouseReportTicketState::kCanceled,
+                                  std::memory_order_release);
+        return false;
+    }
+
+    const bool accepted = submit(context, static_cast<std::uint8_t>(Interface::kMouse),
+                                 mouse_ticket_.report, sizeof(mouse_ticket_.report));
+    if (!accepted) {
+        mouse_ticket_.outcome.store(MouseReportTicketOutcome::kNotReady,
+                                    std::memory_order_release);
+        mouse_ticket_.state.store(MouseReportTicketState::kNotReady,
+                                  std::memory_order_release);
+        return false;
+    }
+
+    mouse.in_flight_generation = current_generation;
+    mouse.in_flight_authority_epoch = current_authority_epoch;
+    mouse.in_flight_kind = ReportKind::kUnsafeMouse;
+    mouse.in_flight_length = sizeof(mouse_ticket_.report);
+    std::memcpy(mouse.in_flight_report, mouse_ticket_.report,
+                sizeof(mouse_ticket_.report));
+    mouse.in_flight.store(true, std::memory_order_release);
+    mouse.mouse.buttons = mouse_ticket_.report[0] & 0x1fU;
+    mouse.logical_state_held.store(
+        unsafe_report_holds_state(ReportKind::kUnsafeMouse,
+                                  mouse_ticket_.report,
+                                  sizeof(mouse_ticket_.report)),
+        std::memory_order_release);
+    mouse_ticket_.outcome.store(MouseReportTicketOutcome::kSubmitted,
+                                std::memory_order_release);
+    mouse_ticket_.state.store(MouseReportTicketState::kSubmitted,
+                              std::memory_order_release);
+    return true;
+}
+
 void StateMachine::execute(SubmitFn submit, void *context) {
     if (submit == nullptr) {
         return;
@@ -725,6 +958,14 @@ void StateMachine::execute(SubmitFn submit, void *context) {
     const bool keyboard_submitted = process_keyboard_ticket(
         submit, context, current_generation, current_authority_epoch);
     if (keyboard_submitted) {
+        return;
+    }
+    // Mouse public work has the same immediate, task-affine semantics. Safety
+    // requests cancel published mouse work before this point, and the final
+    // epoch/safety checks above prevent a stale relative report.
+    const bool mouse_submitted = process_mouse_ticket(
+        submit, context, current_generation, current_authority_epoch);
+    if (mouse_submitted) {
         return;
     }
     for (const Interface interface : {Interface::kKeyboard, Interface::kMouse}) {
@@ -886,11 +1127,15 @@ bool StateMachine::report_complete(std::uint8_t instance,
         interface_state.mouse = {};
         if (kind == ReportKind::kSafetyKeyboard) {
             write_confirmed_keyboard(completed_report);
+        } else {
+            write_confirmed_mouse(0);
         }
     } else {
         interface_state.host_state_uncertain.store(false, std::memory_order_release);
         if (kind == ReportKind::kUnsafeKeyboard) {
             write_confirmed_keyboard(completed_report);
+        } else if (kind == ReportKind::kUnsafeMouse) {
+            write_confirmed_mouse(completed_report[0]);
         }
     }
     // Publish the confirmed/provisional transition before clearing the
@@ -1066,6 +1311,81 @@ KeyboardReportResult Runtime::keyboard_report(
             // CLAIMED is a bounded TinyUSB-task section. It is never
             // canceled by the control task; yield only to let that section
             // publish its terminal outcome.
+            taskYIELD();
+        }
+    }
+}
+
+MouseReportResult Runtime::mouse_report(std::uint8_t buttons, std::int8_t x,
+                                        std::int8_t y, std::int8_t vertical,
+                                        std::int8_t horizontal) {
+    const MouseReportBeginResult begin =
+        state_machine_.begin_mouse_report(buttons, x, y, vertical, horizontal);
+    if (begin == MouseReportBeginResult::kAlreadySet) {
+        return MouseReportResult{.success = true,
+                                 .authority_lost = false,
+                                 .state = MouseReportState::kAlreadySet,
+                                 .failure = MouseReportFailure::kNone};
+    }
+    if (begin != MouseReportBeginResult::kPublished) {
+        const MouseReportFailure failure =
+            begin == MouseReportBeginResult::kBusy
+                ? MouseReportFailure::kBusy
+                : begin == MouseReportBeginResult::kSafetyPending
+                      ? MouseReportFailure::kSafetyPending
+                      : begin == MouseReportBeginResult::kAuthorityLost
+                            ? MouseReportFailure::kAuthorityLost
+                            : MouseReportFailure::kNotReady;
+        return MouseReportResult{.success = false,
+                                 .authority_lost = failure == MouseReportFailure::kAuthorityLost,
+                                 .state = MouseReportState::kSubmitted,
+                                 .failure = failure};
+    }
+
+    constexpr TickType_t kMouseReportWaitTicks = pdMS_TO_TICKS(100);
+    constexpr TickType_t kMouseReportPollTicks = pdMS_TO_TICKS(1);
+    const TickType_t wait_start = xTaskGetTickCount();
+    while (true) {
+        const MouseReportSnapshot snapshot = state_machine_.mouse_report_snapshot();
+        if (snapshot.state == MouseReportTicketState::kSubmitted) {
+            state_machine_.finalize_mouse_report();
+            return MouseReportResult{.success = true,
+                                     .authority_lost = false,
+                                     .state = MouseReportState::kSubmitted,
+                                     .failure = MouseReportFailure::kNone};
+        }
+        if (snapshot.state == MouseReportTicketState::kNotReady ||
+            snapshot.state == MouseReportTicketState::kCanceled) {
+            const MouseReportFailure failure =
+                snapshot.outcome == MouseReportTicketOutcome::kAuthorityLost
+                    ? MouseReportFailure::kAuthorityLost
+                    : snapshot.outcome == MouseReportTicketOutcome::kSafetyPending
+                          ? MouseReportFailure::kSafetyPending
+                          : snapshot.outcome == MouseReportTicketOutcome::kBusy
+                                ? MouseReportFailure::kBusy
+                                : MouseReportFailure::kNotReady;
+            state_machine_.finalize_mouse_report();
+            return MouseReportResult{.success = false,
+                                     .authority_lost = failure == MouseReportFailure::kAuthorityLost,
+                                     .state = MouseReportState::kSubmitted,
+                                     .failure = failure};
+        }
+        if (snapshot.state == MouseReportTicketState::kPublished) {
+            if (xTaskGetTickCount() - wait_start >= kMouseReportWaitTicks) {
+                if (state_machine_.cancel_mouse_report()) {
+                    state_machine_.finalize_mouse_report();
+                    return MouseReportResult{.success = false,
+                                             .authority_lost = false,
+                                             .state = MouseReportState::kSubmitted,
+                                             .failure = MouseReportFailure::kNotReady};
+                }
+            } else {
+                vTaskDelay(kMouseReportPollTicks);
+            }
+        } else {
+            // CLAIMED is a bounded TinyUSB-task section. It is never
+            // canceled by the control task; yield only to let that section
+            // publish its immediate outcome.
             taskYIELD();
         }
     }

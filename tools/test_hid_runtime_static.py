@@ -79,11 +79,19 @@ def main() -> int:
     assert "confirmed_sequence" in header
     assert "confirmed_keyboard_equals" in runtime
     assert "keyboard_ticket_.state.compare_exchange_strong" in runtime
+    assert "MouseReportTicket" in header
+    assert "begin_mouse_report" in header
+    assert "process_mouse_ticket" in runtime
+    assert "mouse_ticket_.state.compare_exchange_strong" in runtime
+    assert "confirmed_mouse_buttons" in header
+    assert "static_cast<std::uint8_t>(Interface::kMouse)" in runtime
+    assert "mouse_ticket_.report, sizeof(mouse_ticket_.report)" in runtime
     assert "tud_hid_n_report(instance, 0, report, length)" in runtime
     assert "GPIO_NUM_19" not in (runtime + header + main_source)
     assert "GPIO_NUM_20" not in (runtime + header + main_source)
     assert "CONFIG_TINYUSB_HID_COUNT=2" in sdkconfig
     assert "hid.lease-v1" in protocol
+    assert "hid.mouse-report-v1" in protocol
     assert '\\"lease_ms\\":%lu' in protocol
     print("PASS: HID runtime task-affinity/lifecycle/safety static contract")
     return 0

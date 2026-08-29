@@ -8,10 +8,12 @@ from hidbot.protocol import (
     REQUIRED_CAPABILITIES,
     build_command_frame,
     build_keyboard_report_frame,
+    build_mouse_report_frame,
     build_hello_frame,
     parse_response,
     validate_release_all_result,
     validate_keyboard_report_result,
+    validate_mouse_report_result,
     validate_hello_response,
 )
 
@@ -41,6 +43,40 @@ class ProtocolTests(unittest.TestCase):
                 build_keyboard_report_frame(1, TOKEN, 0, keys)
         with self.assertRaises(ProtocolError):
             validate_keyboard_report_result({"state": "queued"})
+
+    def test_mouse_report_builder_ranges_and_strict_result(self) -> None:
+        frame = build_mouse_report_frame(3, TOKEN, 3, 1, -2, 0, 4)
+        self.assertEqual(
+            frame,
+            b'@HIDBOT {"v":1,"id":3,"session":"0123456789abcdef0123456789abcdef",'
+            b'"cmd":"hid.mouse.report","params":{"buttons":3,"x":1,"y":-2,"wheel":0,"pan":4}}\n',
+        )
+        build_mouse_report_frame(4, TOKEN, 0, -127, 127, -127, 127)
+        build_mouse_report_frame(5, TOKEN, 31, 127, -127, 127, -127)
+        self.assertEqual(validate_mouse_report_result({"state": "submitted"}).state, "submitted")
+        for values in (
+            (True, 0, 0, 0, 0),
+            (-1, 0, 0, 0, 0),
+            (32, 0, 0, 0, 0),
+            (0, -128, 0, 0, 0),
+            (0, 128, 0, 0, 0),
+            (0, 0.5, 0, 0, 0),
+            (0, 0, -128, 0, 0),
+            (0, 0, 128, 0, 0),
+            (0, 0, 0, -128, 0),
+            (0, 0, 0, 128, 0),
+            (0, 0, 0, True, 0),
+            (0, 0, 0, 0, False),
+        ):
+            with self.assertRaises(ProtocolError):
+                build_mouse_report_frame(1, TOKEN, *values)
+        for value in (
+            {},
+            {"state": "queued"},
+            {"state": "submitted", "extra": False},
+        ):
+            with self.assertRaises(ProtocolError):
+                validate_mouse_report_result(value)
 
     def test_release_all_result_is_strict(self) -> None:
         result = validate_release_all_result({"keyboard": "already_up", "mouse": "submitted"})

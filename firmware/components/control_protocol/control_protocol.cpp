@@ -21,7 +21,7 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -45,6 +45,9 @@ static_assert(kMaximumReleaseAllResponseBytes <= control_session::kMaxResponseBy
 constexpr std::size_t kMaximumKeyboardReportResponseBytes =
     kPrefixLength + 150 + control_session::kTokenHexLength + 1;
 static_assert(kMaximumKeyboardReportResponseBytes <= control_session::kMaxResponseBytes);
+constexpr std::size_t kMaximumMouseReportResponseBytes =
+    kPrefixLength + 150 + control_session::kTokenHexLength + 1;
+static_assert(kMaximumMouseReportResponseBytes <= control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
     return value != nullptr && std::strlen(value) <= maximum_length;
@@ -402,6 +405,33 @@ bool validate_keyboard_report_params(const cJSON *params,
     return true;
 }
 
+bool validate_mouse_report_params(const cJSON *params,
+                                  MouseReportRequest *request) {
+    static constexpr const char *kFields[] = {"buttons", "x", "y", "wheel", "pan"};
+    if (request == nullptr || !cJSON_IsObject(params) ||
+        !object_has_only_fields(params, kFields, 5)) {
+        return false;
+    }
+    const cJSON *buttons = cJSON_GetObjectItemCaseSensitive(params, "buttons");
+    const cJSON *x = cJSON_GetObjectItemCaseSensitive(params, "x");
+    const cJSON *y = cJSON_GetObjectItemCaseSensitive(params, "y");
+    const cJSON *wheel = cJSON_GetObjectItemCaseSensitive(params, "wheel");
+    const cJSON *pan = cJSON_GetObjectItemCaseSensitive(params, "pan");
+    if (!is_integer_number(buttons) || buttons->valuedouble < 0 || buttons->valuedouble > 31 ||
+        !is_integer_number(x) || x->valuedouble < -127 || x->valuedouble > 127 ||
+        !is_integer_number(y) || y->valuedouble < -127 || y->valuedouble > 127 ||
+        !is_integer_number(wheel) || wheel->valuedouble < -127 || wheel->valuedouble > 127 ||
+        !is_integer_number(pan) || pan->valuedouble < -127 || pan->valuedouble > 127) {
+        return false;
+    }
+    request->buttons = static_cast<std::uint8_t>(buttons->valuedouble);
+    request->x = static_cast<std::int8_t>(x->valuedouble);
+    request->y = static_cast<std::int8_t>(y->valuedouble);
+    request->wheel = static_cast<std::int8_t>(wheel->valuedouble);
+    request->pan = static_cast<std::int8_t>(pan->valuedouble);
+    return true;
+}
+
 bool make_keyboard_report(control_session::ResponseFrame *frame,
                           ResponseSession session,
                           std::int32_t id,
@@ -441,6 +471,50 @@ bool make_keyboard_error(control_session::ResponseFrame *frame,
             break;
         case KeyboardReportFailure::kNotReady:
         case KeyboardReportFailure::kNone:
+            break;
+    }
+    return make_error(frame, session, true, id, code, message);
+}
+
+bool make_mouse_report(control_session::ResponseFrame *frame,
+                       ResponseSession session,
+                       std::int32_t id,
+                       MouseReportResult result) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
+    const char *state = result.state == MouseReportState::kAlreadySet
+                            ? "already_set"
+                            : "submitted";
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{\"state\":\"%s\"}}\n",
+                        static_cast<long>(id), session_field, state);
+}
+
+bool make_mouse_error(control_session::ResponseFrame *frame,
+                      ResponseSession session,
+                      std::int32_t id,
+                      MouseReportFailure failure) {
+    const char *code = "HID_NOT_READY";
+    const char *message = "mouse endpoint is not ready";
+    switch (failure) {
+        case MouseReportFailure::kBusy:
+            code = "HID_BUSY";
+            message = "mouse report is busy";
+            break;
+        case MouseReportFailure::kSafetyPending:
+            code = "HID_SAFETY_PENDING";
+            message = "HID safety recovery is pending";
+            break;
+        case MouseReportFailure::kAuthorityLost:
+            code = "SESSION_MISMATCH";
+            message = "request session is not active";
+            break;
+        case MouseReportFailure::kNotReady:
+        case MouseReportFailure::kNone:
             break;
     }
     return make_error(frame, session, true, id, code, message);
@@ -817,6 +891,33 @@ void Protocol::handle_frame(std::string_view payload) {
             } else {
                 completed = make_keyboard_report(&response, current_session, id,
                                                  keyboard_result);
+            }
+        }
+    } else if (command == "hid.mouse.report") {
+        MouseReportRequest mouse_request{};
+        if (!validate_mouse_report_params(params, &mouse_request)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "mouse report params are invalid");
+        } else {
+            semantically_valid = true;
+            const MouseReportResult mouse_result =
+                config_.mouse_report_provider != nullptr
+                    ? config_.mouse_report_provider(config_.mouse_report_context,
+                                                    mouse_request)
+                    : MouseReportResult{};
+            if (mouse_result.authority_lost ||
+                mouse_result.failure == MouseReportFailure::kAuthorityLost ||
+                config_.authority_epoch_provider(config_.authority_epoch_context) != authority_epoch) {
+                semantically_valid = false;
+                cache_response = false;
+                completed = make_error(&response, kUncorrelatableSession, true, id,
+                                       "SESSION_MISMATCH", "request session is not active");
+            } else if (!mouse_result.success) {
+                completed = make_mouse_error(&response, current_session, id,
+                                             mouse_result.failure);
+            } else {
+                completed = make_mouse_report(&response, current_session, id,
+                                              mouse_result);
             }
         }
     } else {

@@ -1,7 +1,7 @@
 """Pure Python host-side control-plane core for s3-hidbot."""
 
 from .client import Client, HelloResult
-from .protocol import KeyboardReportResult, ReleaseAllResult
+from .protocol import KeyboardReportResult, MouseReportResult, ReleaseAllResult
 from .errors import (
     CompatibilityError,
     HidbotError,
@@ -18,6 +18,7 @@ __all__ = [
     "HelloResult",
     "ReleaseAllResult",
     "KeyboardReportResult",
+    "MouseReportResult",
     "CompatibilityError",
     "HidbotError",
     "ProtocolError",

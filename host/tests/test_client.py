@@ -59,6 +59,7 @@ def hello_response(request_id: int, nonce: str, session: str = TOKEN) -> bytes:
                 "hid.lease-v1",
                 "hid.release-all-v1",
                 "hid.keyboard-report-v1",
+                "hid.mouse-report-v1",
             ],
         },
     )
@@ -182,6 +183,49 @@ class ClientTests(unittest.TestCase):
         for modifiers, keys in ((True, []), (0, [5, 4]), (0, [0]), (0, [0xE0])):
             with self.assertRaises(ProtocolError):
                 client.keyboard_report(modifiers, keys)
+        self.assertEqual(transport.writes, [])
+
+    def test_mouse_report_returns_typed_result_and_canonical_params(self) -> None:
+        def on_write(transport: FakeTransport, data: bytes) -> None:
+            if data == TRANSPORT_SYNC:
+                return
+            request_value = request_object(data)
+            if request_value["cmd"] == "protocol.hello":
+                transport.chunks.append(
+                    hello_response(request_value["id"], request_value["params"]["client_nonce"])
+                )
+            elif request_value["cmd"] == "hid.mouse.report":
+                self.assertEqual(
+                    list(request_value["params"]), ["buttons", "x", "y", "wheel", "pan"]
+                )
+                self.assertEqual(
+                    request_value["params"],
+                    {"buttons": 3, "x": 1, "y": -2, "wheel": 0, "pan": 4},
+                )
+                transport.chunks.append(
+                    response(request_value["id"], TOKEN, result={"state": "submitted"})
+                )
+
+        transport = FakeTransport(on_write)
+        client = self.make_client(transport)
+        client.connect()
+        result = client.mouse_report(3, 1, -2, 0, 4)
+        self.assertEqual(result.state, "submitted")
+
+    def test_mouse_report_rejects_invalid_input_before_transport_write(self) -> None:
+        transport = FakeTransport()
+        client = self.make_client(transport)
+        client._session = TOKEN
+        for values in (
+            (True, 0, 0, 0, 0),
+            (32, 0, 0, 0, 0),
+            (0, -128, 0, 0, 0),
+            (0, 128, 0, 0, 0),
+            (0, 0.5, 0, 0, 0),
+            (0, 0, 0, False, 0),
+        ):
+            with self.assertRaises(ProtocolError):
+                client.mouse_report(*values)
         self.assertEqual(transport.writes, [])
 
     def test_hello_retry_is_byte_identical_and_nonce_is_stable(self) -> None:
