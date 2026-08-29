@@ -108,6 +108,14 @@ separate direct UART writer. ESP-IDF ROM boot output, panic output, and any
 writer that bypasses stdout locking are outside this guarantee. Host parsers
 must therefore accept only complete prefixed frames and ignore other lines.
 
+U3.4.1 stack hardening keeps the request JSON parse buffer and reusable
+response formatting scratch on the instance-owned `Protocol` object. The UART
+RX task remains the sole protocol consumer, so this reuse is non-reentrant and
+does not add a second synchronization mechanism. UART machine-writer
+serialization hardening through the UART VFS remains deferred; this milestone
+intentionally leaves the `flockfile`/`fflush`/direct-driver-writer path, UART
+TX-buffer setting, and sdkconfig unchanged for root-cause isolation.
+
 ## Boot epoch and control session
 
 At each MCU boot U2 generates a 16-byte `boot_id` using ESP-IDF

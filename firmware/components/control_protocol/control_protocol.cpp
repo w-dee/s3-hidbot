@@ -354,6 +354,11 @@ bool Protocol::write_frame(const control_session::ResponseFrame &frame) const {
            config_.output(config_.output_context, frame.bytes, frame.length);
 }
 
+control_session::ResponseFrame &Protocol::prepare_response_scratch() {
+    response_scratch_ = {};
+    return response_scratch_;
+}
+
 void Protocol::on_usb_unmount() {
     if (initialized_) {
         session_.revoke_for_unmount();
@@ -365,7 +370,7 @@ void Protocol::handle_framing_event(const control_framing::Event &event) {
         return;
     }
     if (event.kind == control_framing::EventKind::kOverlongProtocolFrame) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, false, 0, "LINE_TOO_LONG", "request line exceeds 512 bytes")) {
             write_frame(response);
         }
@@ -378,19 +383,19 @@ void Protocol::handle_framing_event(const control_framing::Event &event) {
 
 void Protocol::handle_frame(std::string_view payload) {
     if (payload.size() > control_session::kMaxRequestBytes) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, false, 0, "LINE_TOO_LONG", "request line exceeds 512 bytes")) {
             write_frame(response);
         }
         return;
     }
 
-    char json[control_session::kMaxRequestBytes + 1]{};
-    std::memcpy(json, payload.data(), payload.size());
+    std::memcpy(request_json_scratch_, payload.data(), payload.size());
+    request_json_scratch_[payload.size()] = '\0';
     const char *parse_end = nullptr;
-    cJSON *root = cJSON_ParseWithLengthOpts(json, payload.size() + 1, &parse_end, true);
+    cJSON *root = cJSON_ParseWithLengthOpts(request_json_scratch_, payload.size() + 1, &parse_end, true);
     if (root == nullptr) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, false, 0, "MALFORMED_JSON", "request is not valid JSON")) {
             write_frame(response);
         }
@@ -400,7 +405,7 @@ void Protocol::handle_frame(std::string_view payload) {
     auto finish = [&root]() { cJSON_Delete(root); };
     if (!cJSON_IsObject(root) || !is_json_tree_bounded(root, 0) ||
         !object_has_no_duplicate_keys(root)) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, false, 0, "INVALID_REQUEST", "request must be a bounded object")) {
             write_frame(response);
         }
@@ -410,7 +415,7 @@ void Protocol::handle_frame(std::string_view payload) {
 
     std::int32_t id = 0;
     if (!parse_id(root, &id)) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, false, 0, "INVALID_REQUEST", "id must be a non-negative int32")) {
             write_frame(response);
         }
@@ -420,7 +425,7 @@ void Protocol::handle_frame(std::string_view payload) {
 
     const cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "v");
     if (!is_integer_number(version)) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "v must be an integer")) {
             write_frame(response);
         }
@@ -428,7 +433,7 @@ void Protocol::handle_frame(std::string_view payload) {
         return;
     }
     if (version->valuedouble != kProtocolVersion) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "UNSUPPORTED_PROTOCOL_VERSION", "only protocol version 1 is supported")) {
             write_frame(response);
         }
@@ -438,7 +443,7 @@ void Protocol::handle_frame(std::string_view payload) {
 
     std::string_view command;
     if (!get_bounded_nonempty_string(root, "cmd", kMaxCommandBytes, &command)) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "cmd must be a bounded non-empty string")) {
             write_frame(response);
         }
@@ -449,7 +454,7 @@ void Protocol::handle_frame(std::string_view payload) {
     if (command == "protocol.hello") {
         static constexpr const char *kHelloFields[] = {"v", "id", "cmd", "params"};
         if (!object_has_only_fields(root, kHelloFields, 4)) {
-            control_session::ResponseFrame response{};
+            auto &response = prepare_response_scratch();
             if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "hello envelope has unknown fields")) {
                 write_frame(response);
             }
@@ -460,7 +465,7 @@ void Protocol::handle_frame(std::string_view payload) {
         std::string_view client_nonce;
         const cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
         if (!validate_hello_params(params, &client_nonce)) {
-            control_session::ResponseFrame response{};
+            auto &response = prepare_response_scratch();
             if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_PARAMS", "client_nonce must be 32 lowercase hex characters")) {
                 write_frame(response);
             }
@@ -477,7 +482,7 @@ void Protocol::handle_frame(std::string_view payload) {
             return;
         }
         if (cache_result == control_session::HelloCacheResult::kNonceConflict) {
-            control_session::ResponseFrame response{};
+            auto &response = prepare_response_scratch();
             if (make_error(&response, kUncorrelatableSession, true, id, "CLIENT_NONCE_CONFLICT", "client_nonce was previously used with different request bytes")) {
                 write_frame(response);
             }
@@ -487,7 +492,7 @@ void Protocol::handle_frame(std::string_view payload) {
 
         char new_session[control_session::kTokenStorageBytes]{};
         session_.generate_token(new_session);
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (!make_hello(&response,
                         ResponseSession{true, std::string_view(new_session, control_session::kTokenHexLength)},
                         id,
@@ -508,7 +513,7 @@ void Protocol::handle_frame(std::string_view payload) {
 
     static constexpr const char *kNormalFields[] = {"v", "id", "session", "cmd", "params"};
     if (!object_has_only_fields(root, kNormalFields, 5)) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "request envelope has unknown fields")) {
             write_frame(response);
         }
@@ -519,7 +524,7 @@ void Protocol::handle_frame(std::string_view payload) {
     std::string_view session;
     if (!get_bounded_nonempty_string(root, "session", control_session::kTokenHexLength, &session) ||
         !control_session::is_lower_hex_token(session)) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_REQUEST", "session must be 32 lowercase hex characters")) {
             write_frame(response);
         }
@@ -528,7 +533,7 @@ void Protocol::handle_frame(std::string_view payload) {
     }
     const cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
     if (params != nullptr && !cJSON_IsObject(params)) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_PARAMS", "params must be an object")) {
             write_frame(response);
         }
@@ -540,7 +545,7 @@ void Protocol::handle_frame(std::string_view payload) {
     const control_session::RequestCacheResult cache_result =
         session_.inspect_request(session, id, payload, &cached_response);
     if (cache_result == control_session::RequestCacheResult::kSessionMismatch) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "SESSION_MISMATCH", "request session is not active")) {
             write_frame(response);
         }
@@ -558,7 +563,7 @@ void Protocol::handle_frame(std::string_view payload) {
     }
     if (cache_result == control_session::RequestCacheResult::kIdConflict ||
         cache_result == control_session::RequestCacheResult::kIdStale) {
-        control_session::ResponseFrame response{};
+        auto &response = prepare_response_scratch();
         const char *code = cache_result == control_session::RequestCacheResult::kIdConflict ?
             "REQUEST_ID_CONFLICT" : "REQUEST_ID_STALE";
         const char *message = cache_result == control_session::RequestCacheResult::kIdConflict ?
@@ -571,7 +576,7 @@ void Protocol::handle_frame(std::string_view payload) {
         return;
     }
 
-    control_session::ResponseFrame response{};
+    auto &response = prepare_response_scratch();
     bool completed = false;
     if (command == "system.ping") {
         if (!validate_no_params(params)) {

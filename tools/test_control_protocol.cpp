@@ -387,12 +387,51 @@ void test_request_cache_and_commands() {
     }
 }
 
+void test_response_scratch_reuse() {
+    Fixture fixture;
+
+    fixture.payload("{bad");
+    require_contains(fixture.sink.last(), "\"code\":\"MALFORMED_JSON\"");
+
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+    const std::string hello_response = fixture.sink.last();
+    assert(hello_response.find("MALFORMED_JSON") == std::string::npos);
+
+    fixture.payload(request(2, session, "system.ping"));
+    const std::string ping_response = fixture.sink.last();
+    require_contains(ping_response, "\"pong\":true");
+    assert(ping_response.find("MALFORMED_JSON") == std::string::npos);
+
+    fixture.payload(request(3, session, "system.ping", "null"));
+    const std::string invalid_params_response = fixture.sink.last();
+    require_contains(invalid_params_response, "\"code\":\"INVALID_PARAMS\"");
+    assert(invalid_params_response.find("\"pong\":true") == std::string::npos);
+
+    fixture.payload(request(4, session, "system.info"));
+    const std::string info_response = fixture.sink.last();
+    require_contains(info_response, "\"project\":\"s3-hidbot\"");
+    assert(info_response.find("\"pong\":true") == std::string::npos);
+    assert(info_response.find("INVALID_PARAMS") == std::string::npos);
+
+    const std::string status_request = request(5, session, "usb.status");
+    fixture.payload(status_request);
+    const std::string status_response = fixture.sink.last();
+    require_contains(status_response, "\"mounted\":false");
+    assert(status_response.find("\"project\":") == std::string::npos);
+    assert(status_response.find("\"pong\":true") == std::string::npos);
+
+    fixture.payload(status_request);
+    assert(fixture.sink.last() == status_response);
+}
+
 }  // namespace
 
 int main() {
     test_strict_envelope_and_framing();
     test_nonce_session_and_hello_cache();
     test_request_cache_and_commands();
+    test_response_scratch_reuse();
     test_stale_response_correlation();
     return 0;
 }

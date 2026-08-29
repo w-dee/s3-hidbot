@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
+PROTOCOL_HEADER = ROOT / "firmware/components/control_protocol/include/control_protocol/control_protocol.hpp"
 SESSION = ROOT / "firmware/components/control_session/control_session.cpp"
 TRANSPORT = ROOT / "firmware/components/uart_control_transport/uart_control_transport.cpp"
 MAIN = ROOT / "firmware/main/blink.cpp"
@@ -13,11 +14,17 @@ MAIN = ROOT / "firmware/main/blink.cpp"
 
 def main() -> int:
     protocol = PROTOCOL.read_text(encoding="utf-8")
+    protocol_header = PROTOCOL_HEADER.read_text(encoding="utf-8")
     session = SESSION.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
     main_source = MAIN.read_text(encoding="utf-8")
 
     assert "config_.output(config_.output_context" in protocol
+    assert "request_json_scratch_" in protocol_header
+    assert "response_scratch_" in protocol_header
+    assert "prepare_response_scratch()" in protocol
+    assert "control_session::ResponseFrame response{}" not in protocol
+    assert "char json[control_session::kMaxRequestBytes + 1]" not in protocol
     assert "struct ResponseSession" in protocol
     assert "kUncorrelatableSession" in protocol
     assert "\\\"session\\\":%s" in protocol

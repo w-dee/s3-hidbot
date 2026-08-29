@@ -46,11 +46,17 @@ class Protocol {
 
   private:
     void handle_frame(std::string_view payload);
+    control_session::ResponseFrame &prepare_response_scratch();
     bool write_frame(const control_session::ResponseFrame &frame) const;
 
     Config config_{};
     control_session::State session_{};
     bool initialized_ = false;
+    // Protocol is consumed only by the UART RX task. Keeping these reusable
+    // workspaces on the Protocol instance avoids placing multi-kilobyte JSON
+    // and response buffers on that task's stack.
+    char request_json_scratch_[control_session::kMaxRequestBytes + 1]{};
+    control_session::ResponseFrame response_scratch_{};
 };
 
 }  // namespace control_protocol
