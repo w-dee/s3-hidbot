@@ -1,5 +1,8 @@
 *.pyc
 .*
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
 /firmware/build/
 /firmware/sdkconfig
 /firmware/managed_components/

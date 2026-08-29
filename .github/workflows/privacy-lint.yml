@@ -7,11 +7,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   privacy-lint:
+    name: Tier A - privacy and static checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Run static guards
+        run: ./tools/test-static.sh
       - name: Run privacy lint tests
         run: python3 tools/test_privacy_lint.py
       - name: Check tracked files

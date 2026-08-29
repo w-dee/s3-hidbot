@@ -1,0 +1,36 @@
+name: Non-hardware validation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-native:
+    name: Tier B - host and native
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host clean install, import, CLI, and tests
+        run: ./tools/test-host.sh
+      - name: IDF-independent native C++ tests
+        run: ./tools/test-native.sh
+
+  firmware:
+    name: Tier C - ESP-IDF firmware
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    container: espressif/idf:v5.5.4
+    steps:
+      - uses: actions/checkout@v4
+      - name: IDF-dependent native protocol tests
+        run: ./tools/test-control-protocol.sh
+      - name: ESP-IDF v5.5.4 esp32s3 firmware build
+        run: ./tools/test-firmware.sh
