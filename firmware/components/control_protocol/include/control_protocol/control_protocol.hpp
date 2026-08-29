@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <string_view>
 
 #include "control_framing/control_framing.hpp"
@@ -43,6 +44,34 @@ struct ReleaseAllResult {
 
 using ReleaseAllProvider = ReleaseAllResult (*)(void *context);
 
+enum class KeyboardReportState : std::uint8_t {
+    kAlreadySet,
+    kSubmitted,
+};
+
+enum class KeyboardReportFailure : std::uint8_t {
+    kNone,
+    kNotReady,
+    kBusy,
+    kSafetyPending,
+    kAuthorityLost,
+};
+
+struct KeyboardReportRequest {
+    std::uint8_t modifiers = 0;
+    std::array<std::uint8_t, 6> keycodes{};
+};
+
+struct KeyboardReportResult {
+    bool success = false;
+    bool authority_lost = false;
+    KeyboardReportState state = KeyboardReportState::kSubmitted;
+    KeyboardReportFailure failure = KeyboardReportFailure::kNotReady;
+};
+
+using KeyboardReportProvider = KeyboardReportResult (*)(
+    void *context, const KeyboardReportRequest &request);
+
 struct Config {
     Metadata metadata;
     UsbStatusProvider usb_status_provider;
@@ -61,6 +90,8 @@ struct Config {
     void *hid_safety_failure_context;
     ReleaseAllProvider release_all_provider;
     void *release_all_context;
+    KeyboardReportProvider keyboard_report_provider;
+    void *keyboard_report_context;
 };
 
 class Protocol {

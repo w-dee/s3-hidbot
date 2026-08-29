@@ -35,6 +35,59 @@ struct MouseState {
     std::uint8_t buttons = 0;
 };
 
+enum class KeyboardReportFailure : std::uint8_t {
+    kNone,
+    kNotReady,
+    kBusy,
+    kSafetyPending,
+    kAuthorityLost,
+};
+
+enum class KeyboardReportBeginResult : std::uint8_t {
+    kAlreadySet,
+    kPublished,
+    kNotReady,
+    kBusy,
+    kSafetyPending,
+    kAuthorityLost,
+};
+
+enum class KeyboardReportState : std::uint8_t {
+    kAlreadySet,
+    kSubmitted,
+};
+
+enum class KeyboardReportTicketState : std::uint8_t {
+    kFree,
+    kWriting,
+    kPublished,
+    kClaimed,
+    kSubmitted,
+    kNotReady,
+    kCanceled,
+};
+
+enum class KeyboardReportTicketOutcome : std::uint8_t {
+    kNone,
+    kSubmitted,
+    kNotReady,
+    kBusy,
+    kSafetyPending,
+    kAuthorityLost,
+};
+
+struct KeyboardReportSnapshot {
+    KeyboardReportTicketState state = KeyboardReportTicketState::kFree;
+    KeyboardReportTicketOutcome outcome = KeyboardReportTicketOutcome::kNone;
+};
+
+struct KeyboardReportResult {
+    bool success = false;
+    bool authority_lost = false;
+    KeyboardReportState state = KeyboardReportState::kSubmitted;
+    KeyboardReportFailure failure = KeyboardReportFailure::kNotReady;
+};
+
 // This is deliberately separate from attach_generation.  It is a lock-free
 // lifecycle publication token that defines HID-control authority boundaries.
 // Unsigned wrap is well-defined; practical lifecycle frequency cannot reach it.
@@ -107,6 +160,15 @@ class StateMachine {
     bool queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                             std::int8_t vertical, std::int8_t horizontal);
 
+    // Public keyboard reports use a dedicated fixed-size ticket.  The
+    // control task publishes the payload and the TinyUSB SOF executor claims
+    // and resolves it without ever reading a partially-written report.
+    KeyboardReportBeginResult begin_keyboard_report(
+        std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes);
+    KeyboardReportSnapshot keyboard_report_snapshot() const;
+    bool cancel_keyboard_report();
+    void finalize_keyboard_report();
+
     // Internal safety primitive. It may be called repeatedly; only interfaces
     // with held or uncertain host state require an all-up report.
     void request_release_all();
@@ -117,8 +179,12 @@ class StateMachine {
 
     // TinyUSB-task executor and completion notifications.
     void execute(SubmitFn submit, void *context);
-    bool report_complete(std::uint8_t instance);
-    bool report_failed(std::uint8_t instance);
+    bool report_complete(std::uint8_t instance,
+                         const std::uint8_t *report = nullptr,
+                         std::uint16_t length = 0);
+    bool report_failed(std::uint8_t instance,
+                       const std::uint8_t *report = nullptr,
+                       std::uint16_t length = 0);
 
     KeyboardState keyboard_state() const;
     MouseState mouse_state() const;
@@ -148,6 +214,13 @@ class StateMachine {
         // an interface is already known all-up. The detailed report structs
         // remain executor-owned and are not read cross-task.
         std::atomic_bool logical_state_held{false};
+        // Seqlock-protected confirmed keyboard Boot report.  The detailed
+        // KeyboardState remains executor-owned; producers only consume this
+        // immutable snapshot when deciding whether a new request is
+        // already_set.
+        std::atomic<std::uint32_t> confirmed_sequence{0};
+        std::atomic<std::uint32_t> confirmed_low{0};
+        std::atomic<std::uint32_t> confirmed_high{0};
         KeyboardState keyboard{};
         MouseState mouse{};
     };
@@ -168,13 +241,30 @@ class StateMachine {
     void clear_interface(InterfaceState &interface_state);
     void preserve_suspend_safety(InterfaceState &interface_state);
     void cancel_release_ticket();
+    void cancel_keyboard_ticket(KeyboardReportTicketOutcome outcome);
     bool known_all_up(Interface interface) const;
     void set_release_outcome(Interface interface, ReleaseAllInterfaceState outcome);
+    void write_confirmed_keyboard(const std::uint8_t *report);
+    std::array<std::uint8_t, 8> read_confirmed_keyboard() const;
+    bool confirmed_keyboard_equals(const std::uint8_t *report) const;
+    bool process_keyboard_ticket(SubmitFn submit, void *context,
+                                 std::uint32_t current_generation,
+                                 AuthorityEpoch current_authority_epoch);
+
+    struct KeyboardReportTicket {
+        std::atomic<KeyboardReportTicketState> state{KeyboardReportTicketState::kFree};
+        std::atomic<std::uint32_t> attach_generation{0};
+        std::atomic<AuthorityEpoch> authority_epoch{0};
+        std::atomic<std::uint32_t> release_epoch{0};
+        std::atomic<KeyboardReportTicketOutcome> outcome{KeyboardReportTicketOutcome::kNone};
+        std::uint8_t report[8]{};
+    };
 
     // ESP32-S3 has native lock-free 32-bit atomics. Keep this fixed-width
     // publication token independent from attach generation so the lifecycle
     // callback never needs to wait for the UART/control task.
     static_assert(std::atomic<AuthorityEpoch>::is_always_lock_free);
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
     std::atomic<std::uint32_t> generation_{0};
     std::atomic<AuthorityEpoch> authority_epoch_{0};
     std::atomic<std::uint32_t> release_epoch_{0};
@@ -184,6 +274,7 @@ class StateMachine {
     std::atomic_bool release_requested_{false};
     InterfaceState interfaces_[2]{};
     ReleaseAllTicket release_ticket_{};
+    KeyboardReportTicket keyboard_ticket_{};
 };
 
 // Hardware adapter. All tud_hid_* calls are confined to service_sof(), which
@@ -202,11 +293,17 @@ class Runtime {
                                const std::array<std::uint8_t, 6> &keycodes);
     bool queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                             std::int8_t vertical, std::int8_t horizontal);
+    KeyboardReportResult keyboard_report(
+        std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes);
     void request_release_all();
     ReleaseAllResult release_all();
     void service_sof();
-    void on_report_complete(std::uint8_t instance);
-    bool on_report_failed(std::uint8_t instance);
+    void on_report_complete(std::uint8_t instance,
+                            const std::uint8_t *report = nullptr,
+                            std::uint16_t length = 0);
+    bool on_report_failed(std::uint8_t instance,
+                          const std::uint8_t *report = nullptr,
+                          std::uint16_t length = 0);
 
     // Results are consumed by the application task for bounded diagnostic
     // logging; the TinyUSB callback itself never logs or blocks.

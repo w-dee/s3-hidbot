@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -30,6 +31,7 @@ REQUIRED_CAPABILITIES = frozenset(
         "usb.status-v1",
         "hid.lease-v1",
         "hid.release-all-v1",
+        "hid.keyboard-report-v1",
     }
 )
 
@@ -64,6 +66,11 @@ class HelloResponse:
 class ReleaseAllResult:
     keyboard: Literal["already_up", "submitted"]
     mouse: Literal["already_up", "submitted"]
+
+
+@dataclass(frozen=True)
+class KeyboardReportResult:
+    state: Literal["already_set", "submitted"]
 
 
 def _reject_constant(value: str) -> None:
@@ -232,6 +239,48 @@ def build_command_frame(request_id: int, session: str, command: str) -> bytes:
     )
 
 
+def validate_keyboard_report_inputs(modifiers: int, keys: Sequence[int]) -> list[int]:
+    if type(modifiers) is not int or not 0 <= modifiers <= 255:
+        raise ProtocolError("keyboard report modifiers are invalid")
+    if isinstance(keys, (str, bytes, bytearray)) or not isinstance(keys, Sequence):
+        raise ProtocolError("keyboard report keys are invalid")
+    try:
+        values = list(keys)
+    except TypeError as exc:
+        raise ProtocolError("keyboard report keys are invalid") from exc
+    if len(values) > 6:
+        raise ProtocolError("keyboard report keys exceed six entries")
+    previous = -1
+    for value in values:
+        if type(value) is not int or not 0 <= value <= 255:
+            raise ProtocolError("keyboard report key usage is invalid")
+        if value <= previous:
+            raise ProtocolError("keyboard report keys must be strictly ascending")
+        if not (0x04 <= value <= 0xA4 or 0xB0 <= value <= 0xDD):
+            raise ProtocolError("keyboard report key usage is not allowed")
+        previous = value
+    return values
+
+
+def build_keyboard_report_frame(
+    request_id: int, session: str, modifiers: int, keys: Sequence[int]
+) -> bytes:
+    if type(request_id) is not int or not 0 <= request_id <= MAX_ID:
+        raise ProtocolError("request id is invalid")
+    if not isinstance(session, str) or TOKEN_PATTERN.fullmatch(session) is None:
+        raise ProtocolError("session is invalid")
+    values = validate_keyboard_report_inputs(modifiers, keys)
+    return _serialize_request(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "session": session,
+            "cmd": "hid.keyboard.report",
+            "params": {"modifiers": modifiers, "keys": values},
+        }
+    )
+
+
 def validate_hello_response(
     response: Response,
     *,
@@ -304,3 +353,12 @@ def validate_release_all_result(value: Any) -> ReleaseAllResult:
         keyboard=cast(Literal["already_up", "submitted"], keyboard),
         mouse=cast(Literal["already_up", "submitted"], mouse),
     )
+
+
+def validate_keyboard_report_result(value: Any) -> KeyboardReportResult:
+    if not isinstance(value, dict) or set(value) != {"state"}:
+        raise ProtocolError("hid.keyboard.report result fields are invalid")
+    state = value["state"]
+    if state not in {"already_set", "submitted"}:
+        raise ProtocolError("hid.keyboard.report result state is invalid")
+    return KeyboardReportResult(state=cast(Literal["already_set", "submitted"], state))

@@ -21,7 +21,7 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -42,6 +42,9 @@ static_assert(kMaximumHelloResponseBytes <= control_session::kMaxResponseBytes);
 constexpr std::size_t kMaximumReleaseAllResponseBytes =
     kPrefixLength + 150 + control_session::kTokenHexLength + 1;
 static_assert(kMaximumReleaseAllResponseBytes <= control_session::kMaxResponseBytes);
+constexpr std::size_t kMaximumKeyboardReportResponseBytes =
+    kPrefixLength + 150 + control_session::kTokenHexLength + 1;
+static_assert(kMaximumKeyboardReportResponseBytes <= control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
     return value != nullptr && std::strlen(value) <= maximum_length;
@@ -356,6 +359,91 @@ bool validate_hello_params(const cJSON *params, std::string_view *client_nonce) 
         return false;
     }
     return control_session::is_lower_hex_token(*client_nonce);
+}
+
+bool allowed_keyboard_usage(std::uint8_t usage) {
+    return (usage >= 0x04U && usage <= 0xA4U) ||
+           (usage >= 0xB0U && usage <= 0xDDU);
+}
+
+bool validate_keyboard_report_params(const cJSON *params,
+                                    KeyboardReportRequest *request) {
+    static constexpr const char *kFields[] = {"modifiers", "keys"};
+    if (request == nullptr || !cJSON_IsObject(params) ||
+        !object_has_only_fields(params, kFields, 2)) {
+        return false;
+    }
+    const cJSON *modifiers = cJSON_GetObjectItemCaseSensitive(params, "modifiers");
+    if (!is_integer_number(modifiers) || modifiers->valuedouble < 0 ||
+        modifiers->valuedouble > 255) {
+        return false;
+    }
+    const cJSON *keys = cJSON_GetObjectItemCaseSensitive(params, "keys");
+    if (!cJSON_IsArray(keys) || cJSON_GetArraySize(keys) < 0 ||
+        cJSON_GetArraySize(keys) > 6) {
+        return false;
+    }
+    request->modifiers = static_cast<std::uint8_t>(modifiers->valuedouble);
+    request->keycodes = {};
+    int previous = -1;
+    int key_index = 0;
+    for (const cJSON *key = keys->child; key != nullptr; key = key->next) {
+        if (!is_integer_number(key) || key->valuedouble < 0 || key->valuedouble > 255) {
+            return false;
+        }
+        const int value = static_cast<int>(key->valuedouble);
+        if (value <= previous || !allowed_keyboard_usage(static_cast<std::uint8_t>(value))) {
+            return false;
+        }
+        request->keycodes[static_cast<std::size_t>(key_index++)] =
+            static_cast<std::uint8_t>(value);
+        previous = value;
+    }
+    return true;
+}
+
+bool make_keyboard_report(control_session::ResponseFrame *frame,
+                          ResponseSession session,
+                          std::int32_t id,
+                          KeyboardReportResult result) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
+    const char *state = result.state == KeyboardReportState::kAlreadySet
+                            ? "already_set"
+                            : "submitted";
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{\"state\":\"%s\"}}\n",
+                        static_cast<long>(id), session_field, state);
+}
+
+bool make_keyboard_error(control_session::ResponseFrame *frame,
+                         ResponseSession session,
+                         std::int32_t id,
+                         KeyboardReportFailure failure) {
+    const char *code = "HID_NOT_READY";
+    const char *message = "keyboard endpoint is not ready";
+    switch (failure) {
+        case KeyboardReportFailure::kBusy:
+            code = "HID_BUSY";
+            message = "keyboard report is busy";
+            break;
+        case KeyboardReportFailure::kSafetyPending:
+            code = "HID_SAFETY_PENDING";
+            message = "HID safety recovery is pending";
+            break;
+        case KeyboardReportFailure::kAuthorityLost:
+            code = "SESSION_MISMATCH";
+            message = "request session is not active";
+            break;
+        case KeyboardReportFailure::kNotReady:
+        case KeyboardReportFailure::kNone:
+            break;
+    }
+    return make_error(frame, session, true, id, code, message);
 }
 
 }  // namespace
@@ -702,6 +790,33 @@ void Protocol::handle_frame(std::string_view payload) {
                                        "HID_SAFETY_PENDING", "all-up safety release is pending");
             } else {
                 completed = make_release_all(&response, current_session, id, release_result);
+            }
+        }
+    } else if (command == "hid.keyboard.report") {
+        KeyboardReportRequest keyboard_request{};
+        if (!validate_keyboard_report_params(params, &keyboard_request)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "keyboard report params are invalid");
+        } else {
+            semantically_valid = true;
+            const KeyboardReportResult keyboard_result =
+                config_.keyboard_report_provider != nullptr
+                    ? config_.keyboard_report_provider(config_.keyboard_report_context,
+                                                       keyboard_request)
+                    : KeyboardReportResult{};
+            if (keyboard_result.authority_lost ||
+                keyboard_result.failure == KeyboardReportFailure::kAuthorityLost ||
+                config_.authority_epoch_provider(config_.authority_epoch_context) != authority_epoch) {
+                semantically_valid = false;
+                cache_response = false;
+                completed = make_error(&response, kUncorrelatableSession, true, id,
+                                       "SESSION_MISMATCH", "request session is not active");
+            } else if (!keyboard_result.success) {
+                completed = make_keyboard_error(&response, current_session, id,
+                                                keyboard_result.failure);
+            } else {
+                completed = make_keyboard_report(&response, current_session, id,
+                                                 keyboard_result);
             }
         }
     } else {

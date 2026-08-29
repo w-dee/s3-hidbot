@@ -71,8 +71,58 @@ void StateMachine::clear_interface(InterfaceState &interface_state) {
     interface_state.safety_required.store(false, std::memory_order_release);
     interface_state.host_state_uncertain.store(false, std::memory_order_release);
     interface_state.logical_state_held.store(false, std::memory_order_release);
+    if (&interface_state == &interfaces_[0]) {
+        const std::uint8_t all_up[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        write_confirmed_keyboard(all_up);
+    }
     interface_state.keyboard = {};
     interface_state.mouse = {};
+}
+
+void StateMachine::write_confirmed_keyboard(const std::uint8_t *report) {
+    InterfaceState &keyboard = interfaces_[0];
+    keyboard.confirmed_sequence.fetch_add(1, std::memory_order_acq_rel);
+    std::uint32_t low = 0;
+    std::uint32_t high = 0;
+    if (report != nullptr) {
+        for (std::size_t index = 0; index < 4; ++index) {
+            low |= static_cast<std::uint32_t>(report[index]) << (index * 8U);
+            high |= static_cast<std::uint32_t>(report[index + 4]) << (index * 8U);
+        }
+    }
+    keyboard.confirmed_low.store(low, std::memory_order_relaxed);
+    keyboard.confirmed_high.store(high, std::memory_order_relaxed);
+    keyboard.confirmed_sequence.fetch_add(1, std::memory_order_release);
+}
+
+std::array<std::uint8_t, 8> StateMachine::read_confirmed_keyboard() const {
+    const InterfaceState &keyboard = interfaces_[0];
+    std::array<std::uint8_t, 8> report{};
+    while (true) {
+        const std::uint32_t first = keyboard.confirmed_sequence.load(std::memory_order_acquire);
+        if ((first & 1U) != 0) {
+            continue;
+        }
+        const std::uint32_t low = keyboard.confirmed_low.load(std::memory_order_relaxed);
+        const std::uint32_t high = keyboard.confirmed_high.load(std::memory_order_relaxed);
+        const std::uint32_t second = keyboard.confirmed_sequence.load(std::memory_order_acquire);
+        if (first == second && (second & 1U) == 0) {
+            for (std::size_t index = 0; index < 4; ++index) {
+                report[index] = static_cast<std::uint8_t>(low >> (index * 8U));
+                report[index + 4] = static_cast<std::uint8_t>(high >> (index * 8U));
+            }
+            return report;
+        }
+    }
+}
+
+bool StateMachine::confirmed_keyboard_equals(const std::uint8_t *report) const {
+    if (report == nullptr) {
+        return false;
+    }
+    return read_confirmed_keyboard() ==
+           std::array<std::uint8_t, 8>{report[0], report[1], report[2], report[3],
+                                      report[4], report[5], report[6], report[7]};
 }
 
 void StateMachine::cancel_release_ticket() {
@@ -85,6 +135,19 @@ void StateMachine::cancel_release_ticket() {
     release_ticket_.mouse.store(ReleaseAllInterfaceState::kCanceled,
                                 std::memory_order_release);
     release_ticket_.active.store(false, std::memory_order_release);
+}
+
+void StateMachine::cancel_keyboard_ticket(KeyboardReportTicketOutcome outcome) {
+    auto ticket_state = keyboard_ticket_.state.load(std::memory_order_acquire);
+    while (ticket_state == KeyboardReportTicketState::kWriting ||
+           ticket_state == KeyboardReportTicketState::kPublished) {
+        if (keyboard_ticket_.state.compare_exchange_weak(
+                ticket_state, KeyboardReportTicketState::kCanceled,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            keyboard_ticket_.outcome.store(outcome, std::memory_order_release);
+            return;
+        }
+    }
 }
 
 bool StateMachine::known_all_up(Interface interface) const {
@@ -146,6 +209,7 @@ void StateMachine::preserve_suspend_safety(InterfaceState &interface_state) {
 
 void StateMachine::on_mount() {
     cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     generation_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -159,6 +223,7 @@ void StateMachine::on_mount() {
 
 void StateMachine::on_unmount() {
     cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     // Invalidate first: work from an older attach or authority epoch can never
     // be accepted by a later executor pass, even if it races this callback.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -174,6 +239,7 @@ void StateMachine::on_unmount() {
 
 void StateMachine::on_suspend() {
     cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     // This is the control-authority linearization boundary. It intentionally
     // precedes the UART task's eventual session/cache cleanup notification.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -195,6 +261,7 @@ void StateMachine::on_suspend() {
 
 void StateMachine::on_resume() {
     cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     // A session established during suspend is diagnostic-only; resume must
     // never silently restore it as HID-control authority.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -289,6 +356,129 @@ bool StateMachine::queue_keyboard_report(std::uint8_t modifiers,
                         sizeof(report));
 }
 
+KeyboardReportBeginResult StateMachine::begin_keyboard_report(
+    std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes) {
+    // Reap only terminal ticket states. A submitted ticket may still have a
+    // report-complete callback pending, but report_in_flight remains the
+    // authoritative busy barrier for a replacement request.
+    auto ticket_state = keyboard_ticket_.state.load(std::memory_order_acquire);
+    while (ticket_state == KeyboardReportTicketState::kSubmitted ||
+           ticket_state == KeyboardReportTicketState::kNotReady ||
+           ticket_state == KeyboardReportTicketState::kCanceled) {
+        if (keyboard_ticket_.state.compare_exchange_weak(
+                ticket_state, KeyboardReportTicketState::kFree,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            ticket_state = KeyboardReportTicketState::kFree;
+            break;
+        }
+    }
+    if (ticket_state != KeyboardReportTicketState::kFree) {
+        return KeyboardReportBeginResult::kBusy;
+    }
+
+    const StatusSnapshot snapshot = status();
+    if (!snapshot.mounted || snapshot.suspended || !snapshot.keyboard_ready) {
+        return KeyboardReportBeginResult::kNotReady;
+    }
+    if (release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
+        return KeyboardReportBeginResult::kSafetyPending;
+    }
+    InterfaceState &keyboard = state(Interface::kKeyboard);
+    if (keyboard.in_flight.load(std::memory_order_acquire) ||
+        keyboard.slot_state.load(std::memory_order_acquire) != kSlotEmpty) {
+        return KeyboardReportBeginResult::kBusy;
+    }
+
+    const std::uint8_t report[8] = {
+        modifiers, 0, keycodes[0], keycodes[1], keycodes[2], keycodes[3], keycodes[4], keycodes[5],
+    };
+    const bool desired_all_up = modifiers == 0 && keycodes == std::array<std::uint8_t, 6>{};
+    if (!desired_all_up && confirmed_keyboard_equals(report) &&
+        !keyboard.host_state_uncertain.load(std::memory_order_acquire) &&
+        !keyboard.safety_required.load(std::memory_order_acquire)) {
+        return KeyboardReportBeginResult::kAlreadySet;
+    }
+
+    KeyboardReportTicketState expected = KeyboardReportTicketState::kFree;
+    if (!keyboard_ticket_.state.compare_exchange_strong(
+            expected,
+            KeyboardReportTicketState::kWriting,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return KeyboardReportBeginResult::kBusy;
+    }
+    const std::uint32_t generation = attach_generation();
+    const AuthorityEpoch epoch = authority_epoch();
+    const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
+    keyboard_ticket_.attach_generation.store(generation, std::memory_order_relaxed);
+    keyboard_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
+    keyboard_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
+    std::memcpy(keyboard_ticket_.report, report, sizeof(report));
+    keyboard_ticket_.outcome.store(KeyboardReportTicketOutcome::kNone, std::memory_order_relaxed);
+
+    if (generation != attach_generation() || epoch != authority_epoch() ||
+        release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !mounted_and_active(Interface::kKeyboard) ||
+        release_requested_.load(std::memory_order_acquire) || any_safety_required() ||
+        keyboard.in_flight.load(std::memory_order_acquire) ||
+        keyboard.slot_state.load(std::memory_order_acquire) != kSlotEmpty) {
+        keyboard_ticket_.outcome.store(
+            generation != attach_generation() || epoch != authority_epoch()
+                ? KeyboardReportTicketOutcome::kAuthorityLost
+                : KeyboardReportTicketOutcome::kSafetyPending,
+            std::memory_order_release);
+        keyboard_ticket_.state.store(KeyboardReportTicketState::kCanceled,
+                                     std::memory_order_release);
+        return generation != attach_generation() || epoch != authority_epoch()
+                   ? KeyboardReportBeginResult::kAuthorityLost
+                   : KeyboardReportBeginResult::kSafetyPending;
+    }
+    KeyboardReportTicketState publishing = KeyboardReportTicketState::kWriting;
+    if (!keyboard_ticket_.state.compare_exchange_strong(
+            publishing, KeyboardReportTicketState::kPublished,
+            std::memory_order_release, std::memory_order_acquire)) {
+        // A lifecycle/safety callback won the WRITING -> CANCELED race. Do
+        // not resurrect that ticket by storing PUBLISHED after cancellation.
+        const KeyboardReportTicketOutcome canceled_outcome =
+            keyboard_ticket_.outcome.load(std::memory_order_acquire);
+        return canceled_outcome == KeyboardReportTicketOutcome::kAuthorityLost
+                   ? KeyboardReportBeginResult::kAuthorityLost
+                   : KeyboardReportBeginResult::kSafetyPending;
+    }
+    return KeyboardReportBeginResult::kPublished;
+}
+
+KeyboardReportSnapshot StateMachine::keyboard_report_snapshot() const {
+    return KeyboardReportSnapshot{
+        .state = keyboard_ticket_.state.load(std::memory_order_acquire),
+        .outcome = keyboard_ticket_.outcome.load(std::memory_order_acquire),
+    };
+}
+
+bool StateMachine::cancel_keyboard_report() {
+    KeyboardReportTicketState expected = KeyboardReportTicketState::kPublished;
+    if (!keyboard_ticket_.state.compare_exchange_strong(
+            expected, KeyboardReportTicketState::kCanceled,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+    keyboard_ticket_.outcome.store(KeyboardReportTicketOutcome::kNotReady,
+                                   std::memory_order_release);
+    return true;
+}
+
+void StateMachine::finalize_keyboard_report() {
+    auto state = keyboard_ticket_.state.load(std::memory_order_acquire);
+    while (state == KeyboardReportTicketState::kSubmitted ||
+           state == KeyboardReportTicketState::kNotReady ||
+           state == KeyboardReportTicketState::kCanceled) {
+        if (keyboard_ticket_.state.compare_exchange_weak(
+                state, KeyboardReportTicketState::kFree,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
 bool StateMachine::queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                                       std::int8_t vertical, std::int8_t horizontal) {
     const std::uint8_t report[5] = {
@@ -343,6 +533,7 @@ void StateMachine::request_release_all() {
     release_request_generation_.store(attach_generation(), std::memory_order_release);
     release_request_authority_epoch_.store(authority_epoch(), std::memory_order_release);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kSafetyPending);
     release_requested_.store(true, std::memory_order_release);
 }
 
@@ -421,6 +612,94 @@ void StateMachine::cancel_queued(Interface interface) {
         expected, kSlotCanceled, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
+bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
+                                            std::uint32_t current_generation,
+                                            AuthorityEpoch current_authority_epoch) {
+    KeyboardReportTicketState expected = KeyboardReportTicketState::kPublished;
+    if (!keyboard_ticket_.state.compare_exchange_strong(
+            expected, KeyboardReportTicketState::kClaimed,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+
+    const std::uint32_t ticket_generation =
+        keyboard_ticket_.attach_generation.load(std::memory_order_relaxed);
+    const AuthorityEpoch ticket_epoch =
+        keyboard_ticket_.authority_epoch.load(std::memory_order_relaxed);
+    const std::uint32_t ticket_release_epoch =
+        keyboard_ticket_.release_epoch.load(std::memory_order_relaxed);
+    InterfaceState &keyboard = state(Interface::kKeyboard);
+    const bool authority_lost = ticket_generation != current_generation ||
+                                ticket_epoch != current_authority_epoch;
+    const bool safety_pending =
+        ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        release_requested_.load(std::memory_order_acquire) || any_safety_required();
+    const bool not_ready = !mounted_and_active(Interface::kKeyboard);
+    const bool busy = keyboard.in_flight.load(std::memory_order_acquire) ||
+                      keyboard.slot_state.load(std::memory_order_acquire) != kSlotEmpty;
+    if (authority_lost || safety_pending || not_ready || busy) {
+        const KeyboardReportTicketOutcome outcome =
+            authority_lost       ? KeyboardReportTicketOutcome::kAuthorityLost
+            : safety_pending     ? KeyboardReportTicketOutcome::kSafetyPending
+            : busy               ? KeyboardReportTicketOutcome::kBusy
+                                 : KeyboardReportTicketOutcome::kNotReady;
+        keyboard_ticket_.outcome.store(outcome, std::memory_order_release);
+        keyboard_ticket_.state.store(KeyboardReportTicketState::kCanceled,
+                                     std::memory_order_release);
+        return false;
+    }
+
+    // Keep the final pre-submit window explicit. Lifecycle callbacks publish
+    // their epoch before control/session cleanup, so a callback observed here
+    // invalidates the claimed ticket without allowing a stale key report.
+    if (ticket_generation != attach_generation() ||
+        ticket_epoch != authority_epoch() ||
+        ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !mounted_and_active(Interface::kKeyboard) ||
+        release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
+        keyboard_ticket_.outcome.store(
+            ticket_generation != attach_generation() || ticket_epoch != authority_epoch()
+                ? KeyboardReportTicketOutcome::kAuthorityLost
+                : KeyboardReportTicketOutcome::kSafetyPending,
+            std::memory_order_release);
+        keyboard_ticket_.state.store(KeyboardReportTicketState::kCanceled,
+                                     std::memory_order_release);
+        return false;
+    }
+
+    const bool accepted = submit(context, static_cast<std::uint8_t>(Interface::kKeyboard),
+                                 keyboard_ticket_.report, sizeof(keyboard_ticket_.report));
+    if (!accepted) {
+        keyboard_ticket_.outcome.store(KeyboardReportTicketOutcome::kNotReady,
+                                       std::memory_order_release);
+        keyboard_ticket_.state.store(KeyboardReportTicketState::kNotReady,
+                                     std::memory_order_release);
+        return false;
+    }
+
+    keyboard.in_flight_generation = current_generation;
+    keyboard.in_flight_authority_epoch = current_authority_epoch;
+    keyboard.in_flight_kind = ReportKind::kUnsafeKeyboard;
+    keyboard.in_flight_length = sizeof(keyboard_ticket_.report);
+    std::memcpy(keyboard.in_flight_report, keyboard_ticket_.report,
+                sizeof(keyboard_ticket_.report));
+    keyboard.in_flight.store(true, std::memory_order_release);
+    keyboard.keyboard.modifiers = keyboard_ticket_.report[0];
+    for (std::size_t key_index = 0; key_index < keyboard.keyboard.keycodes.size(); ++key_index) {
+        keyboard.keyboard.keycodes[key_index] = keyboard_ticket_.report[key_index + 2];
+    }
+    keyboard.logical_state_held.store(
+        unsafe_report_holds_state(ReportKind::kUnsafeKeyboard,
+                                  keyboard_ticket_.report,
+                                  sizeof(keyboard_ticket_.report)),
+        std::memory_order_release);
+    keyboard_ticket_.outcome.store(KeyboardReportTicketOutcome::kSubmitted,
+                                   std::memory_order_release);
+    keyboard_ticket_.state.store(KeyboardReportTicketState::kSubmitted,
+                                 std::memory_order_release);
+    return true;
+}
+
 void StateMachine::execute(SubmitFn submit, void *context) {
     if (submit == nullptr) {
         return;
@@ -440,6 +719,14 @@ void StateMachine::execute(SubmitFn submit, void *context) {
     const bool release_requested_for_current_attach =
         release_requested && request_generation == current_generation &&
         request_authority_epoch == current_authority_epoch;
+    // A public keyboard ticket has priority over ordinary mailboxes. It is a
+    // single immediate TinyUSB call; a canceled/stale ticket never falls
+    // through to a later SOF for replay.
+    const bool keyboard_submitted = process_keyboard_ticket(
+        submit, context, current_generation, current_authority_epoch);
+    if (keyboard_submitted) {
+        return;
+    }
     for (const Interface interface : {Interface::kKeyboard, Interface::kMouse}) {
         InterfaceState &interface_state = state(interface);
         if (release_requested_for_current_attach) {
@@ -566,7 +853,9 @@ void StateMachine::execute(SubmitFn submit, void *context) {
     }
 }
 
-bool StateMachine::report_complete(std::uint8_t instance) {
+bool StateMachine::report_complete(std::uint8_t instance,
+                                    const std::uint8_t *report,
+                                    std::uint16_t length) {
     if (instance > static_cast<std::uint8_t>(Interface::kMouse)) {
         return false;
     }
@@ -576,20 +865,44 @@ bool StateMachine::report_complete(std::uint8_t instance) {
         interface_state.in_flight_authority_epoch != authority_epoch()) {
         return false;
     }
+    if (report != nullptr && length != interface_state.in_flight_length) {
+        return false;
+    }
+    if (report != nullptr &&
+        std::memcmp(report, interface_state.in_flight_report, length) != 0) {
+        return false;
+    }
     const ReportKind kind = interface_state.in_flight_kind;
-    interface_state.in_flight.store(false, std::memory_order_release);
+    const std::uint8_t completed_report[8] = {
+        interface_state.in_flight_report[0], interface_state.in_flight_report[1],
+        interface_state.in_flight_report[2], interface_state.in_flight_report[3],
+        interface_state.in_flight_report[4], interface_state.in_flight_report[5],
+        interface_state.in_flight_report[6], interface_state.in_flight_report[7],
+    };
     if (kind == ReportKind::kSafetyKeyboard || kind == ReportKind::kSafetyMouse) {
         interface_state.safety_required.store(false, std::memory_order_release);
         interface_state.host_state_uncertain.store(false, std::memory_order_release);
         interface_state.keyboard = {};
         interface_state.mouse = {};
+        if (kind == ReportKind::kSafetyKeyboard) {
+            write_confirmed_keyboard(completed_report);
+        }
     } else {
         interface_state.host_state_uncertain.store(false, std::memory_order_release);
+        if (kind == ReportKind::kUnsafeKeyboard) {
+            write_confirmed_keyboard(completed_report);
+        }
     }
+    // Publish the confirmed/provisional transition before clearing the
+    // in-flight bit. A producer that observes !in_flight must never see the
+    // previous confirmed payload and submit a duplicate same-state report.
+    interface_state.in_flight.store(false, std::memory_order_release);
     return true;
 }
 
-bool StateMachine::report_failed(std::uint8_t instance) {
+bool StateMachine::report_failed(std::uint8_t instance,
+                                 const std::uint8_t *report,
+                                 std::uint16_t length) {
     if (instance > static_cast<std::uint8_t>(Interface::kMouse)) {
         return false;
     }
@@ -599,7 +912,12 @@ bool StateMachine::report_failed(std::uint8_t instance) {
         interface_state.in_flight_authority_epoch != authority_epoch()) {
         return false;
     }
-    interface_state.in_flight.store(false, std::memory_order_release);
+    // TinyUSB reports transferred bytes for a failed input transfer; a short
+    // transfer is itself the failure evidence and cannot be payload-matched.
+    if (report != nullptr && length == interface_state.in_flight_length &&
+        std::memcmp(report, interface_state.in_flight_report, length) != 0) {
+        return false;
+    }
     interface_state.host_state_uncertain.store(true, std::memory_order_release);
     interface_state.safety_required.store(true, std::memory_order_release);
     if (release_ticket_.active.load(std::memory_order_acquire) &&
@@ -615,6 +933,9 @@ bool StateMachine::report_failed(std::uint8_t instance) {
             release_ticket_.failed_before_finalization.store(true, std::memory_order_release);
         }
     }
+    // Keep the safety/uncertainty barrier published before another producer can
+    // observe the report as no longer in flight.
+    interface_state.in_flight.store(false, std::memory_order_release);
     return true;
 }
 
@@ -671,6 +992,83 @@ bool Runtime::queue_keyboard_report(std::uint8_t modifiers,
 bool Runtime::queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                                  std::int8_t vertical, std::int8_t horizontal) {
     return state_machine_.queue_mouse_report(buttons, x, y, vertical, horizontal);
+}
+
+KeyboardReportResult Runtime::keyboard_report(
+    std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes) {
+    const KeyboardReportBeginResult begin =
+        state_machine_.begin_keyboard_report(modifiers, keycodes);
+    if (begin == KeyboardReportBeginResult::kAlreadySet) {
+        return KeyboardReportResult{.success = true,
+                                    .authority_lost = false,
+                                    .state = KeyboardReportState::kAlreadySet,
+                                    .failure = KeyboardReportFailure::kNone};
+    }
+    if (begin != KeyboardReportBeginResult::kPublished) {
+        const KeyboardReportFailure failure =
+            begin == KeyboardReportBeginResult::kBusy
+                ? KeyboardReportFailure::kBusy
+                : begin == KeyboardReportBeginResult::kSafetyPending
+                      ? KeyboardReportFailure::kSafetyPending
+                      : begin == KeyboardReportBeginResult::kAuthorityLost
+                            ? KeyboardReportFailure::kAuthorityLost
+                            : KeyboardReportFailure::kNotReady;
+        return KeyboardReportResult{.success = false,
+                                    .authority_lost = failure == KeyboardReportFailure::kAuthorityLost,
+                                    .state = KeyboardReportState::kSubmitted,
+                                    .failure = failure};
+    }
+
+    constexpr TickType_t kKeyboardReportWaitTicks = pdMS_TO_TICKS(100);
+    constexpr TickType_t kKeyboardReportPollTicks = pdMS_TO_TICKS(1);
+    const TickType_t wait_start = xTaskGetTickCount();
+    while (true) {
+        const KeyboardReportSnapshot snapshot = state_machine_.keyboard_report_snapshot();
+        if (snapshot.state == KeyboardReportTicketState::kSubmitted) {
+            state_machine_.finalize_keyboard_report();
+            return KeyboardReportResult{.success = true,
+                                        .authority_lost = false,
+                                        .state = KeyboardReportState::kSubmitted,
+                                        .failure = KeyboardReportFailure::kNone};
+        }
+        if (snapshot.state == KeyboardReportTicketState::kNotReady ||
+            snapshot.state == KeyboardReportTicketState::kCanceled) {
+            const KeyboardReportFailure failure =
+                snapshot.outcome == KeyboardReportTicketOutcome::kAuthorityLost
+                    ? KeyboardReportFailure::kAuthorityLost
+                    : snapshot.outcome == KeyboardReportTicketOutcome::kSafetyPending
+                          ? KeyboardReportFailure::kSafetyPending
+                          : snapshot.outcome == KeyboardReportTicketOutcome::kBusy
+                                ? KeyboardReportFailure::kBusy
+                                : KeyboardReportFailure::kNotReady;
+            state_machine_.finalize_keyboard_report();
+            return KeyboardReportResult{.success = false,
+                                        .authority_lost = failure == KeyboardReportFailure::kAuthorityLost,
+                                        .state = KeyboardReportState::kSubmitted,
+                                        .failure = failure};
+        }
+        if (snapshot.state == KeyboardReportTicketState::kPublished) {
+            if (xTaskGetTickCount() - wait_start >= kKeyboardReportWaitTicks) {
+                // HID_NOT_READY is valid only when this CAS wins. If the
+                // executor claimed concurrently, keep waiting for its
+                // immediate terminal outcome instead of inventing an error.
+                if (state_machine_.cancel_keyboard_report()) {
+                    state_machine_.finalize_keyboard_report();
+                    return KeyboardReportResult{.success = false,
+                                                .authority_lost = false,
+                                                .state = KeyboardReportState::kSubmitted,
+                                                .failure = KeyboardReportFailure::kNotReady};
+                }
+            } else {
+                vTaskDelay(kKeyboardReportPollTicks);
+            }
+        } else {
+            // CLAIMED is a bounded TinyUSB-task section. It is never
+            // canceled by the control task; yield only to let that section
+            // publish its terminal outcome.
+            taskYIELD();
+        }
+    }
 }
 
 void Runtime::request_release_all() { state_machine_.request_release_all(); }
@@ -735,15 +1133,19 @@ void Runtime::set_result(Interface interface, bool failed) {
     result_bits_.fetch_or(bit, std::memory_order_release);
 }
 
-void Runtime::on_report_complete(std::uint8_t instance) {
-    if (state_machine_.report_complete(instance) &&
+void Runtime::on_report_complete(std::uint8_t instance,
+                                 const std::uint8_t *report,
+                                 std::uint16_t length) {
+    if (state_machine_.report_complete(instance, report, length) &&
         instance <= static_cast<std::uint8_t>(Interface::kMouse)) {
         set_result(static_cast<Interface>(instance), false);
     }
 }
 
-bool Runtime::on_report_failed(std::uint8_t instance) {
-    if (state_machine_.report_failed(instance) &&
+bool Runtime::on_report_failed(std::uint8_t instance,
+                               const std::uint8_t *report,
+                               std::uint16_t length) {
+    if (state_machine_.report_failed(instance, report, length) &&
         instance <= static_cast<std::uint8_t>(Interface::kMouse)) {
         set_result(static_cast<Interface>(instance), true);
         return true;

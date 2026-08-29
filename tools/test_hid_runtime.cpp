@@ -392,6 +392,119 @@ void test_release_ticket_partial_and_clean_unmounted() {
     assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
 }
 
+void test_keyboard_report_ticket_and_confirmed_state() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    const std::array<std::uint8_t, 6> keys = {4, 5, 0xA4, 0xB0, 0xDD, 0};
+
+    // The all-up report is unsafe even when the confirmed state is initially
+    // all-up. It is published once, then resolved by the SOF executor.
+    const std::array<std::uint8_t, 6> all_up{};
+    assert(state.begin_keyboard_report(0, all_up) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(state.keyboard_report_snapshot().state ==
+           hid_runtime::KeyboardReportTicketState::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1 && sink.instance == 0 && sink.length == 8);
+    assert(state.keyboard_report_snapshot().state ==
+           hid_runtime::KeyboardReportTicketState::kSubmitted);
+    state.report_complete(0);
+    state.finalize_keyboard_report();
+
+    assert(state.begin_keyboard_report(2, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    // A second request while the first ticket is still published is busy.
+    assert(state.begin_keyboard_report(2, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kBusy);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2 && sink.instance == 0 && sink.report[0] == 2 &&
+           sink.report[2] == 4 && sink.report[5] == 0xB0 && sink.report[6] == 0xDD);
+    state.report_complete(0);
+    state.finalize_keyboard_report();
+    assert(state.begin_keyboard_report(2, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kAlreadySet);
+
+    // U4.2 safety recovery still owns a confirmed held keyboard state that
+    // originated through the public ticket path.
+    state.begin_release_all();
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 3 && sink.instance == 0 && sink.report[0] == 0 &&
+           sink.report[2] == 0);
+    state.report_complete(0);
+    state.finalize_release_all();
+
+    // An in-flight report remains busy until its completion callback commits
+    // the provisional state to the confirmed snapshot.
+    assert(state.begin_keyboard_report(0, all_up) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(state.begin_keyboard_report(0, all_up) ==
+           hid_runtime::KeyboardReportBeginResult::kBusy);
+    state.report_complete(0);
+    state.finalize_keyboard_report();
+}
+
+void test_keyboard_report_ticket_cancellation_and_barriers() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    const std::array<std::uint8_t, 6> keys = {4, 0, 0, 0, 0, 0};
+
+    // Timeout/control cancellation wins before SOF and cannot become a ghost
+    // keypress on any later executor pass.
+    assert(state.begin_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(state.cancel_keyboard_report());
+    state.execute(Sink::submit, &sink);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    state.finalize_keyboard_report();
+
+    // Lifecycle publication cancels a published ticket and advances the
+    // authority barrier before the executor can claim it.
+    assert(state.begin_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    const auto epoch = state.authority_epoch();
+    state.on_suspend();
+    assert(state.authority_epoch() != epoch);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    assert(state.keyboard_report_snapshot().outcome ==
+           hid_runtime::KeyboardReportTicketOutcome::kAuthorityLost);
+    state.finalize_keyboard_report();
+    state.on_resume();
+
+    // A mouse safety requirement is global: keyboard unsafe work is rejected
+    // until the all-up barrier completes.
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(state.queue_mouse_report(1, 0, 0, 0, 0));
+    state.execute(Sink::submit, &sink);
+    state.request_release_all();
+    assert(state.begin_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kSafetyPending);
+}
+
+void test_keyboard_report_submit_false_is_not_replayed() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    sink.accept = false;
+    const std::array<std::uint8_t, 6> keys = {4, 0, 0, 0, 0, 0};
+    assert(state.begin_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1);
+    assert(state.keyboard_report_snapshot().state ==
+           hid_runtime::KeyboardReportTicketState::kNotReady);
+    state.finalize_keyboard_report();
+    sink.accept = true;
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1);
+    assert((state.keyboard_state().keycodes == std::array<std::uint8_t, 6>{}));
+}
+
 }  // namespace
 
 int main() {
@@ -409,5 +522,8 @@ int main() {
     test_release_ticket_states_and_historical_submission();
     test_release_ticket_failure_and_lifecycle_cancellation();
     test_release_ticket_partial_and_clean_unmounted();
+    test_keyboard_report_ticket_and_confirmed_state();
+    test_keyboard_report_ticket_cancellation_and_barriers();
+    test_keyboard_report_submit_false_is_not_replayed();
     return 0;
 }

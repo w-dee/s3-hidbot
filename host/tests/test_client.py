@@ -58,6 +58,7 @@ def hello_response(request_id: int, nonce: str, session: str = TOKEN) -> bytes:
                 "usb.status-v1",
                 "hid.lease-v1",
                 "hid.release-all-v1",
+                "hid.keyboard-report-v1",
             ],
         },
     )
@@ -153,6 +154,35 @@ class ClientTests(unittest.TestCase):
         result = client.release_all()
         self.assertEqual(result.keyboard, "already_up")
         self.assertEqual(result.mouse, "submitted")
+
+    def test_keyboard_report_returns_typed_result_and_canonical_params(self) -> None:
+        def on_write(transport: FakeTransport, data: bytes) -> None:
+            if data == TRANSPORT_SYNC:
+                return
+            request_value = request_object(data)
+            if request_value["cmd"] == "protocol.hello":
+                transport.chunks.append(hello_response(request_value["id"], request_value["params"]["client_nonce"]))
+            elif request_value["cmd"] == "hid.keyboard.report":
+                self.assertEqual(
+                    list(request_value["params"]), ["modifiers", "keys"]
+                )
+                self.assertEqual(request_value["params"], {"modifiers": 2, "keys": [4, 5]})
+                transport.chunks.append(response(request_value["id"], TOKEN, result={"state": "submitted"}))
+
+        transport = FakeTransport(on_write)
+        client = self.make_client(transport)
+        client.connect()
+        result = client.keyboard_report(2, (4, 5))
+        self.assertEqual(result.state, "submitted")
+
+    def test_keyboard_report_rejects_invalid_input_before_transport_write(self) -> None:
+        transport = FakeTransport()
+        client = self.make_client(transport)
+        client._session = TOKEN
+        for modifiers, keys in ((True, []), (0, [5, 4]), (0, [0]), (0, [0xE0])):
+            with self.assertRaises(ProtocolError):
+                client.keyboard_report(modifiers, keys)
+        self.assertEqual(transport.writes, [])
 
     def test_hello_retry_is_byte_identical_and_nonce_is_stable(self) -> None:
         hello_writes = 0

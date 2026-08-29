@@ -73,6 +73,7 @@ class FakeTransport:
                             "usb.status-v1",
                             "hid.lease-v1",
                             "hid.release-all-v1",
+                            "hid.keyboard-report-v1",
                         ],
                     },
                 )

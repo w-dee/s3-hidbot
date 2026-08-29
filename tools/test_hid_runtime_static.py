@@ -72,6 +72,14 @@ def main() -> int:
     assert "kReleaseAllPollTicks" in runtime
     assert "logical_state_held" in header
     assert "host_state_uncertain" in header
+    assert "KeyboardReportTicket" in header
+    assert "kPublished" in header and "kClaimed" in header and "kCanceled" in header
+    assert "begin_keyboard_report" in header
+    assert "cancel_keyboard_report" in runtime
+    assert "confirmed_sequence" in header
+    assert "confirmed_keyboard_equals" in runtime
+    assert "keyboard_ticket_.state.compare_exchange_strong" in runtime
+    assert "tud_hid_n_report(instance, 0, report, length)" in runtime
     assert "GPIO_NUM_19" not in (runtime + header + main_source)
     assert "GPIO_NUM_20" not in (runtime + header + main_source)
     assert "CONFIG_TINYUSB_HID_COUNT=2" in sdkconfig

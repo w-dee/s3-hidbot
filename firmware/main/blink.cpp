@@ -62,6 +62,35 @@ control_protocol::ReleaseAllResult release_all(void *) {
     };
 }
 
+control_protocol::KeyboardReportResult keyboard_report(
+    void *, const control_protocol::KeyboardReportRequest &request) {
+    const hid_runtime::KeyboardReportResult result =
+        s_hid_runtime.keyboard_report(request.modifiers, request.keycodes);
+    const auto failure = [](hid_runtime::KeyboardReportFailure value) {
+        switch (value) {
+            case hid_runtime::KeyboardReportFailure::kBusy:
+                return control_protocol::KeyboardReportFailure::kBusy;
+            case hid_runtime::KeyboardReportFailure::kSafetyPending:
+                return control_protocol::KeyboardReportFailure::kSafetyPending;
+            case hid_runtime::KeyboardReportFailure::kAuthorityLost:
+                return control_protocol::KeyboardReportFailure::kAuthorityLost;
+            case hid_runtime::KeyboardReportFailure::kNone:
+                return control_protocol::KeyboardReportFailure::kNone;
+            case hid_runtime::KeyboardReportFailure::kNotReady:
+            default:
+                return control_protocol::KeyboardReportFailure::kNotReady;
+        }
+    };
+    return control_protocol::KeyboardReportResult{
+        .success = result.success,
+        .authority_lost = result.authority_lost,
+        .state = result.state == hid_runtime::KeyboardReportState::kAlreadySet
+                     ? control_protocol::KeyboardReportState::kAlreadySet
+                     : control_protocol::KeyboardReportState::kSubmitted,
+        .failure = failure(result.failure),
+    };
+}
+
 static_assert(kHidInterfaceCount == 2);
 static_assert(kKeyboardInterface != kMouseInterface);
 static_assert(kKeyboardEndpoint != kMouseEndpoint);
@@ -217,16 +246,17 @@ extern "C" void tud_sof_cb(uint32_t) {
     s_hid_runtime.service_sof();
 }
 
-extern "C" void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *, uint16_t) {
-    s_hid_runtime.on_report_complete(instance);
+extern "C" void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report,
+                                            uint16_t length) {
+    s_hid_runtime.on_report_complete(instance, report, length);
 }
 
 extern "C" void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t report_type,
-                                           uint8_t const *, uint16_t) {
+                                           uint8_t const *report, uint16_t length) {
     // Host-to-device HID output reports (for example keyboard LEDs) are not
     // project-owned input state and must not trigger the input safety path.
     if (report_type == HID_REPORT_TYPE_INPUT) {
-        if (s_hid_runtime.on_report_failed(instance)) {
+        if (s_hid_runtime.on_report_failed(instance, report, length)) {
             uart_control_transport::on_hid_safety_failure();
         }
     }
@@ -318,6 +348,8 @@ extern "C" void app_main() {
         .hid_safety_failure_context = nullptr,
         .release_all_provider = release_all,
         .release_all_context = nullptr,
+        .keyboard_report_provider = keyboard_report,
+        .keyboard_report_context = nullptr,
     };
     ESP_ERROR_CHECK(uart_control_transport::start(&protocol_config));
 #if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC

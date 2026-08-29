@@ -7,9 +7,11 @@ from hidbot.errors import ProtocolError
 from hidbot.protocol import (
     REQUIRED_CAPABILITIES,
     build_command_frame,
+    build_keyboard_report_frame,
     build_hello_frame,
     parse_response,
     validate_release_all_result,
+    validate_keyboard_report_result,
     validate_hello_response,
 )
 
@@ -23,6 +25,23 @@ def frame_payload(value: object) -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_keyboard_report_builder_and_strict_result(self) -> None:
+        frame = build_keyboard_report_frame(3, TOKEN, 2, [4, 5, 0xA4, 0xB0, 0xDD])
+        self.assertEqual(
+            frame,
+            b'@HIDBOT {"v":1,"id":3,"session":"0123456789abcdef0123456789abcdef",'
+            b'"cmd":"hid.keyboard.report","params":{"modifiers":2,"keys":[4,5,164,176,221]}}\n',
+        )
+        self.assertEqual(validate_keyboard_report_result({"state": "submitted"}).state, "submitted")
+        for modifiers in (-1, 256, True, 1.5):
+            with self.assertRaises(ProtocolError):
+                build_keyboard_report_frame(1, TOKEN, modifiers, [])
+        for keys in ([4, 4], [5, 4], [0], [1], [3], [0xA5], [0xDE], [0xE0], list(range(4, 11))):
+            with self.assertRaises(ProtocolError):
+                build_keyboard_report_frame(1, TOKEN, 0, keys)
+        with self.assertRaises(ProtocolError):
+            validate_keyboard_report_result({"state": "queued"})
+
     def test_release_all_result_is_strict(self) -> None:
         result = validate_release_all_result({"keyboard": "already_up", "mouse": "submitted"})
         self.assertEqual(result.keyboard, "already_up")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -20,11 +20,15 @@ from .errors import (
 from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
+    KeyboardReportResult,
     ReleaseAllResult,
     Response,
+    build_keyboard_report_frame,
     build_command_frame,
     build_hello_frame,
     parse_response,
+    validate_keyboard_report_result,
+    validate_keyboard_report_inputs,
     validate_release_all_result,
     validate_hello_response,
 )
@@ -279,7 +283,7 @@ class Client:
             self._invalidate_session()
             return self._hello_locked()
 
-    def _request_locked(self, command: str) -> object:
+    def _allocate_request_id_locked(self) -> tuple[int, str]:
         self._ensure_open()
         if self._session is None:
             raise SessionLostError("client has no active session")
@@ -289,15 +293,17 @@ class Client:
         assert self._session is not None
         request_id = self._next_request_id
         self._next_request_id += 1
+        return request_id, self._session
+
+    def _request_frame_locked(self, request_id: int, session: str, frame: bytes) -> object:
         # This frame is immutable for every retry attempt.
-        frame = build_command_frame(request_id, self._session, command)
         diagnostics: tuple[str, ...] = ()
         unmatched_count = 0
         for _attempt in range(1, self._max_attempts + 1):
             self._write(frame)
             response, attempt_diagnostics, unmatched_count = self._wait_for_response(
                 expected_id=request_id,
-                expected_session=self._session,
+                expected_session=session,
                 hello=False,
                 unmatched_count=unmatched_count,
             )
@@ -305,12 +311,12 @@ class Client:
             if response is None:
                 continue
             if response.error is not None:
-                assert response.session == self._session
+                assert response.session == session
                 raise RemoteError(
                     response.error.code,
                     response.error.message,
                     request_id=request_id,
-                    session=self._session,
+                    session=session,
                 )
             if not response.ok:
                 raise ProtocolError("correlated response has an invalid ok/result shape")
@@ -320,6 +326,12 @@ class Client:
             request_id=request_id,
             attempts=self._max_attempts,
             diagnostics=diagnostics,
+        )
+
+    def _request_locked(self, command: str) -> object:
+        request_id, session = self._allocate_request_id_locked()
+        return self._request_frame_locked(
+            request_id, session, build_command_frame(request_id, session, command)
         )
 
     def ping(self) -> object:
@@ -339,6 +351,17 @@ class Client:
 
         with self._lock:
             return validate_release_all_result(self._request_locked("hid.release_all"))
+
+    def keyboard_report(self, modifiers: int, keys: Sequence[int]) -> KeyboardReportResult:
+        """Submit one absolute Boot keyboard report through the v1 protocol."""
+
+        with self._lock:
+            validate_keyboard_report_inputs(modifiers, keys)
+            request_id, session = self._allocate_request_id_locked()
+            frame = build_keyboard_report_frame(request_id, session, modifiers, keys)
+            return validate_keyboard_report_result(
+                self._request_frame_locked(request_id, session, frame)
+            )
 
     def close(self) -> None:
         with self._lock:

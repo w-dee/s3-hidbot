@@ -93,6 +93,25 @@ struct ReleaseSource {
     }
 };
 
+struct KeyboardSource {
+    control_protocol::KeyboardReportResult result{
+        .success = true,
+        .authority_lost = false,
+        .state = control_protocol::KeyboardReportState::kSubmitted,
+        .failure = control_protocol::KeyboardReportFailure::kNone,
+    };
+    control_protocol::KeyboardReportRequest request{};
+    int calls = 0;
+
+    static control_protocol::KeyboardReportResult get(
+        void *context, const control_protocol::KeyboardReportRequest &request) {
+        auto *source = static_cast<KeyboardSource *>(context);
+        source->request = request;
+        ++source->calls;
+        return source->result;
+    }
+};
+
 void increment_authority(void *context) {
     ++static_cast<AuthoritySource *>(context)->epoch;
 }
@@ -147,6 +166,8 @@ struct LeaseFixture {
             .hid_safety_failure_context = this,
             .release_all_provider = ReleaseSource::get,
             .release_all_context = &release,
+            .keyboard_report_provider = nullptr,
+            .keyboard_report_context = nullptr,
         };
         assert(protocol.initialize(config, RandomSource::fill, &random));
     }
@@ -163,6 +184,7 @@ struct Fixture {
     StatusSource status;
     AuthoritySource authority;
     ReleaseSource release;
+    KeyboardSource keyboard;
     control_protocol::Protocol protocol;
 
     explicit Fixture(std::uint8_t random_seed = 0) {
@@ -185,6 +207,8 @@ struct Fixture {
             .hid_safety_failure_context = nullptr,
             .release_all_provider = ReleaseSource::get,
             .release_all_context = &release,
+            .keyboard_report_provider = KeyboardSource::get,
+            .keyboard_report_context = &keyboard,
         };
         assert(protocol.initialize(config, RandomSource::fill, &random));
     }
@@ -676,6 +700,45 @@ void test_release_all_result_cache_and_pending_error() {
     assert(fixture.release.calls == 2);
 }
 
+void test_keyboard_report_schema_result_and_cache() {
+    Fixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+    require_contains(fixture.sink.last(), "hid.keyboard-report-v1");
+
+    const std::string valid = request(
+        2, session, "hid.keyboard.report", "{\"modifiers\":2,\"keys\":[4,5,164,176,221]}");
+    fixture.payload(valid);
+    const std::string success = fixture.sink.last();
+    require_contains(success, "\"state\":\"submitted\"");
+    assert(fixture.keyboard.calls == 1);
+    assert(fixture.keyboard.request.modifiers == 2);
+    assert(fixture.keyboard.request.keycodes[0] == 4 && fixture.keyboard.request.keycodes[4] == 221);
+    fixture.payload(valid);
+    assert(fixture.sink.last() == success);
+    assert(fixture.keyboard.calls == 1);
+
+    const char *invalid[] = {
+        "{}", "{\"modifiers\":true,\"keys\":[]}",
+        "{\"modifiers\":0.5,\"keys\":[]}",
+        "{\"modifiers\":0,\"keys\":[4,4]}",
+        "{\"modifiers\":0,\"keys\":[5,4]}",
+        "{\"modifiers\":0,\"keys\":[0]}",
+        "{\"modifiers\":0,\"keys\":[3]}",
+        "{\"modifiers\":0,\"keys\":[165]}",
+        "{\"modifiers\":0,\"keys\":[222]}",
+        "{\"modifiers\":0,\"keys\":[224]}",
+        "{\"modifiers\":0,\"keys\":[4,5,6,7,8,9,10]}",
+        "{\"modifiers\":0,\"keys\":[4],\"extra\":1}",
+    };
+    for (const char *params : invalid) {
+        fixture.payload(request(3, session, "hid.keyboard.report", params));
+        require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    }
+    // Invalid requests do not consume the provider or cache a runtime result.
+    assert(fixture.keyboard.calls == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -689,5 +752,6 @@ int main() {
     test_authority_epoch_barrier_and_retry_scoping();
     test_same_rx_batch_observes_published_epoch();
     test_release_all_result_cache_and_pending_error();
+    test_keyboard_report_schema_result_and_cache();
     return 0;
 }

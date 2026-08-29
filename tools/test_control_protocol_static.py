@@ -62,6 +62,10 @@ def main() -> int:
     assert "hid.release-all-v1" in protocol
     assert "make_release_all" in protocol
     assert "release_all_provider" in protocol_header
+    assert 'command == "hid.keyboard.report"' in protocol
+    assert "hid.keyboard-report-v1" in protocol
+    assert "hid.mouse.report-v1" not in protocol
+    assert "keyboard_report_provider" in protocol_header
     assert "tud_hid_n_keyboard_report" not in main_source
     assert "tud_hid_n_report" not in main_source
     print("PASS: U2 protocol/HID/UART static boundaries")
