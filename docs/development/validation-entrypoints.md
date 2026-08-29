@@ -1,7 +1,10 @@
 # Validation entrypoints
 
-The repository-owned scripts below are the canonical local and CI entrypoints.
-CI invokes these scripts; it does not contain a separate hidden test recipe.
+The repository-owned scripts below are the canonical local and CI validation
+entrypoints. This document is authoritative for prerequisites, command
+composition, and CI tiers; README and the contributor runbook link here
+instead of copying the test recipes. CI invokes these scripts and does not
+contain a separate hidden test recipe.
 
 ## Prerequisites
 
@@ -77,3 +80,23 @@ required pull-request run. No hardware workflow or artifact publishing is
 part of this slice. The official IDF container is pinned by release tag; a
 large mutable toolchain cache is intentionally deferred until its cache key
 and invalidation policy can be tested against `dependencies.lock`.
+
+## CI guarantees and limits
+
+CI guarantees that the tracked privacy/static checks, clean host install and
+CLI tests, IDF-independent native tests, the IDF-dependent protocol tests, and
+the ESP-IDF v5.5.4 `esp32s3` firmware build pass for the tested revision.
+
+CI does not prove real USB enumeration, host HID delivery, physical lifecycle
+behavior, mouse button/wheel/pan behavior, or long-duration hardware soak.
+Those are separate gates documented in
+[`hardware-validation.md`](hardware-validation.md).
+
+## Related documents
+
+- [`codex-runbook.md`](codex-runbook.md) — contributor procedure and review
+  gates.
+- [`hardware-validation.md`](hardware-validation.md) — physical safety and
+  evidence scope.
+- [`uart-control-plane.md`](uart-control-plane.md) — protocol/runtime
+  contract.

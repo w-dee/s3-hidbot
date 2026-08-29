@@ -6,7 +6,7 @@ The control plane uses the onboard USB-UART path. Native USB-OTG remains the
 separate TinyUSB HID Device path. A host must never assume that opening a serial
 device proves that the HID USB path is attached, or vice versa.
 
-U4.4 extends the bounded JSON control core with the mandatory session lease,
+The current v1 implementation extends the bounded JSON control core with the mandatory session lease,
 HID runtime safety foundation, the safety-only `hid.release_all` command, and
 the public absolute `hid.keyboard.report` and relative `hid.mouse.report`
 commands. It implements
@@ -22,7 +22,7 @@ line-oriented VFS read.
 
 ## Framing and synchronization
 
-The future JSON control wire format is:
+The JSON control wire format is:
 
 ```text
 @HIDBOT <compact-json>\n
@@ -52,10 +52,10 @@ new hello, and does not change control-session state.
 
 ## Strict JSON envelope
 
-Requests must be bounded JSON objects with no duplicate object key. U2 uses
-the ESP-IDF cJSON parser followed by project-owned recursive duplicate-key and
-depth/member/string-limit checks. Every envelope allows only its listed fields;
-unknown fields fail closed.
+Requests must be bounded JSON objects with no duplicate object key. The
+firmware uses the ESP-IDF cJSON parser followed by project-owned recursive
+duplicate-key and depth/member/string-limit checks. Every envelope allows only
+its listed fields; unknown fields fail closed.
 
 ```json
 {"v":1,"id":12,"cmd":"protocol.hello","params":{"client_nonce":"0123456789abcdef0123456789abcdef"}}
@@ -74,7 +74,7 @@ unknown fields fail closed.
 - `params` may be omitted for a normal request and then means `{}`. `null`,
   arrays, and scalar values are `INVALID_PARAMS`.
 - `protocol.hello` requires exactly `{ "client_nonce": "..." }` params.
-  The U2 diagnostic commands accept only omitted or empty-object params.
+  The read-only diagnostic commands accept only omitted or empty-object params.
 
 Success and error frames use these envelopes:
 
@@ -115,28 +115,29 @@ project-owned diagnostic output should preserve that invariant.
 The previous implementation called `uart_write_bytes()` directly after
 `fflush()`. Although the UART driver `tx_mux` serialized that call, it bypassed
 the UART VFS write lock held by normal console output and could split a
-diagnostic line around a machine frame. U3.4.2 removes that bypass.
+diagnostic line around a machine frame. The current writer replaces that
+bypass.
 
-The protocol response buffer is fixed at 1024 bytes. All U2 formatters use
+The protocol response buffer is fixed at 1024 bytes. All formatters use
 bounded `vsnprintf` serialization and fail closed to a bounded
 `INTERNAL_ERROR` when a formatter cannot serialize; because the NUL terminator
 occupies the last storage byte, generated logical responses are at most 1023
 bytes. The hello format has a compile-time maximum calculation based on
 bounded metadata, four 32-hex values (top-level/result session, boot ID, and
 client nonce), fixed capabilities, maximum ID, prefix, and LF; host-native
-tests assert every U2 success and error response is within the logical bound.
+tests assert every success and error response is within the logical bound.
 
 Machine frames must not use ESP_LOG or printf, and project code must not add a
 separate direct UART writer. ESP-IDF ROM boot output, panic output, and any
 writer that bypasses stdout locking are outside this guarantee. Host parsers
 must therefore accept only complete prefixed frames and ignore other lines.
 
-U3.4.1 stack hardening keeps the request JSON parse buffer and reusable
-response formatting scratch on the instance-owned `Protocol` object. The UART
-RX task remains the sole protocol consumer, so this reuse is non-reentrant and
-does not add a second synchronization mechanism. U3.4.2 uses the stdout
-console-VFS single-write path described above; it does not change the UART
-TX-buffer setting, sdkconfig, RX framing, or protocol/session semantics.
+Stack hardening keeps the request JSON parse buffer and reusable response
+formatting scratch on the instance-owned `Protocol` object. The UART RX task
+remains the sole protocol consumer, so this reuse is non-reentrant and does
+not add a second synchronization mechanism. The stdout console-VFS single-write
+path described above does not change the UART TX-buffer setting, sdkconfig, RX
+framing, or protocol/session semantics.
 
 The current implementation and validation do not include a synthetic concurrent
 writer stress task. That remains a separate, bounded, default-disabled hardware
@@ -144,7 +145,7 @@ validation gate.
 
 ## Boot epoch and control session
 
-At each MCU boot U2 generates a 16-byte `boot_id` using ESP-IDF
+At each MCU boot, the firmware generates a 16-byte `boot_id` using ESP-IDF
 `esp_fill_random()`, rendered as 32 lowercase hexadecimal characters. In
 ESP-IDF v5.5.4 this API has no error return. The value is an epoch marker, not
 an authentication credential, and is returned from every successful hello.
@@ -175,11 +176,11 @@ The complete successful-hello shape is:
 The angle-bracket values above are documentation placeholders only; wire
 values are fixed-length lowercase hexadecimal tokens.
 
-Adding a future capability does not itself require changing protocol version
-`v`; hosts must use the advertised capability list. U4.2 adds the safety-only
-release-all capability, U4.3 adds the absolute keyboard-report capability, and
-U4.4 adds the relative mouse-report capability. All normal requests require
-the exact current session; USB mount does not automatically create one.
+Adding a capability does not itself require changing protocol version `v`;
+hosts must use the advertised capability list. The safety release, absolute
+keyboard-report, and relative mouse-report capabilities are advertised without
+changing `v`. All normal requests require the exact current session; USB mount
+does not automatically create one.
 
 The response `session` field is a correlation/epoch identity, not an
 authentication credential. A `session:null` response cannot be trusted as
@@ -224,8 +225,8 @@ id < last_id                          REQUEST_ID_STALE
 ```
 
 ID gaps are permitted. IDs never wrap; after `2147483647`, the host establishes
-a new session. A cache hit replays only the result and never repeats a future
-HID action. The session and authority-epoch check occurs before normal-cache
+a new session. A cache hit replays only the result and never repeats a HID
+action. The session and authority-epoch check occurs before normal-cache
 replay. An old-epoch exact retry therefore returns `SESSION_MISMATCH`, does not
 refresh the lease, and never replays a cached success. Pre-command parse,
 schema, or session errors, stale IDs, and ID conflicts do not replace the
@@ -246,8 +247,8 @@ epoch in its control session. A normal request compares the captured epoch to
 the current acquire-loaded epoch before semantic processing, cache replay, or
 lease refresh. That request-side comparison is the linearization point for
 read-only commands: a response may finish after a later lifecycle publication
-only if it had already passed the comparison. Future unsafe HID work has an
-additional executor-side epoch barrier.
+only if it had already passed the comparison. Unsafe HID work has an additional
+executor-side epoch barrier.
 
 The mailbox's attach generation remains a distinct mount/unmount token. It
 prevents old-attach work from reaching a new attach. Mailbox entries carry both
@@ -262,15 +263,15 @@ state as needing an all-up safety release, and publishes
 `mounted=true, suspended=true, keyboard_ready=false, mouse_ready=false`.
 It sends no report while suspended. Resume advances authority again and retains
 that safety requirement. The SOF executor sends all-up safety work before any
-future unsafe work and blocks unsafe submission until required safety work has
+unsafe work and blocks unsafe submission until required safety work has
 completed. The UART RX cleanup notification is deliberately eventual and
 coalesced; atomic epoch comparison is the correctness barrier.
 
-When HID state is introduced, a hello takeover first revokes old authority,
-starts any required safety release, and then activates the new session. The
-U4.1 runtime provides that internal safety boundary.
+A hello takeover first revokes old authority, starts any required safety
+release, and then activates the new session. The runtime provides that internal
+safety boundary.
 
-## U2 diagnostic commands
+## Read-only diagnostic commands
 
 - `system.ping` returns `{ "pong": true }`.
 - `system.info` returns bounded static project, target, ESP-IDF version, and
@@ -280,9 +281,9 @@ U4.1 runtime provides that internal safety boundary.
   `keyboard_ready`, and `mouse_ready` booleans. It queries status only and
   never submits a HID report.
 
-Lifecycle transitions do not produce asynchronous U2 machine events.
+Lifecycle transitions do not produce asynchronous machine events.
 
-## U4.3 absolute keyboard reports
+## Absolute keyboard reports
 
 `hid.keyboard.report` is the first public unsafe HID operation. Its only
 accepted parameter object has exactly these fields:
@@ -294,8 +295,8 @@ accepted parameter object has exactly these fields:
 `modifiers` is an integer bitmap in `0..255` (Left Control, Left Shift,
 Left Alt, Left GUI, Right Control, Right Shift, Right Alt, and Right GUI from
 least to most significant bit). `keys` is an ascending array of zero through
-six distinct integer usages. U4.3 permits exactly `0x04..0xA4` and
-`0xB0..0xDD`; modifier usages and reserved/error ranges are rejected. The
+six distinct integer usages. The implementation permits exactly `0x04..0xA4`
+and `0xB0..0xDD`; modifier usages and reserved/error ranges are rejected. The
 firmware never sorts caller input. The report is the unchanged Boot keyboard
 8-byte layout: modifier byte, reserved zero byte, then the six usages padded
 with zero; report ID and keyboard instance are both zero.
@@ -343,12 +344,12 @@ ID conflicts/stale IDs, or session mismatch.
 
 Hosts that use `Client.keyboard_report(modifiers, keys)` perform the same
 fail-fast validation and preserve caller order. No keyboard type/chord helper,
-raw HID API, or keyboard CLI is provided; U4.4 adds only the explicit
-`Client.mouse_report(buttons, x, y, wheel, pan)` API.
+raw HID API, or keyboard CLI is provided; the separate explicit mouse primitive
+is `Client.mouse_report(buttons, x, y, wheel, pan)`.
 
-## Future U3 host correlation contract
+## Host correlation contract
 
-For a normal request, a future host accepts a response only when its type,
+For a normal request, the host accepts a response only when its type,
 protocol version, expected ID, expected current session, and response schema
 all match. A wrong-session or malformed frame cannot satisfy the request; the
 host should discard it within bounded limits and continue waiting.
@@ -357,21 +358,20 @@ For hello, the host additionally requires the expected ID, `ok:true`, exact
 `result.client_nonce`, valid top-level and result session tokens that are equal,
 valid `boot_id`, expected project/protocol version, exact `lease_ms:5000`, and
 a valid capabilities list. A wrong-nonce/stale frame must never establish a
-session. U3.1/U3.2 fix
-the bounded discard limit and timeout recovery (`TRANSPORT_SYNC` followed by a
-fresh hello) in the generic host client.
+session. The client applies the bounded discard limit and timeout recovery
+(`TRANSPORT_SYNC` followed by a fresh hello) in the generic host core.
 
-U2.1 is a pre-freeze v1 wire hardening. Protocol `v` remains `1` and the
-capability list is unchanged; no new capability is advertised. The nonce
-identifies a hello attempt, the boot ID identifies an MCU boot epoch, and the
-request ID identifies a request within the current control session.
+The v1 wire hardening keeps protocol `v` at `1` and uses the advertised
+capability list. The nonce identifies a hello attempt, the boot ID identifies
+an MCU boot epoch, and the request ID identifies a request within the current
+control session.
 
-## U3.1/U3.2 pure host core
+## Host client and pure transport core
 
-The first host slices established a generic byte-transport core. U3.3 adds the
-board-specific serial adapter and thin CLI in `host/src/hidbot`; protocol logic
-continues to depend only on the generic transport interface. Host tests use
-fake transports and never open a real tty.
+The host package contains a generic byte-transport core and a board-specific
+serial adapter with a thin CLI in `host/src/hidbot`; protocol logic depends
+only on the generic transport interface. Host tests use fake transports and
+never open a real tty.
 
 The receive framer is byte-oriented and bounded to the 1024-byte machine-frame
 limit. It accepts only an exact `@HIDBOT ` prefix at the beginning of a line,
@@ -403,17 +403,15 @@ before another normal request. A session loss, reset, or fresh hello never
 automatically replays an old logical command; its result is left to the caller
 as unknown/session-lost.
 
-U3.1/U3.2 expose only `ping()`, `info()`, and `usb_status()` after
-`connect()`/hello; U4.2 additionally exposes the safety-only
-`Client.release_all()` API and U4.3 adds `Client.keyboard_report()` for the
-absolute keyboard report contract below. U4.4 adds
-`Client.mouse_report()` for relative mouse reports. No HID CLI or arbitrary
-raw command API exists; the hello result exposes read-only `lease_ms`
-metadata. Closing the client only closes the injected transport and invalidates
-local session state; it sends no UART command.
+After `connect()`/hello, the host client exposes `ping()`, `info()`,
+`usb_status()`, the safety-only `Client.release_all()` API, and the explicit
+`Client.keyboard_report()` and `Client.mouse_report()` primitive APIs. No HID
+CLI or arbitrary raw command API exists; the hello result exposes read-only
+`lease_ms` metadata. Closing the client only closes the injected transport and
+invalidates local session state; it sends no UART command.
 
 The current Freenove FNK0085 materials identify CH343 as the USB-UART bridge.
-The U3.3 hardware characterization observed safe idle as DTR=true and RTS=true
+Hardware characterization observed safe idle as DTR=true and RTS=true
 on the tested board/host. DTR=false-to-true and a transition through both false
 could reset the application; an RTS-only transition had no observed effect.
 The exact circuit mapping was not inferred, and software cannot prove that an
@@ -421,7 +419,7 @@ electrical glitch is impossible. Production transport code therefore sets both
 lines true before open, never changes them during normal use, restores both to
 true immediately before close, and does not expose line override options.
 
-## U3.3 serial transport and CLI
+## Serial transport and CLI
 
 `PySerialTransport` is a bounded implementation of the generic byte transport.
 It uses pyserial `>=3.5,<4` with explicit 8N1, no software or hardware flow
@@ -445,14 +443,14 @@ errors use stderr. Exit codes are 0 success, 2 configuration, 3 transport,
 4 protocol/compatibility/session, 5 remote command, and 6 timeout.
 
 The characterization and this transport policy were established for the
-Freenove ESP32-S3 WROOM Board / FNK0085 CH343 path during the U3.3 milestone.
-The measured true/true open/close sequence was repeated five times without
-reset, download boot, or native HID disconnect. It is a board/host policy, not
-an authentication mechanism; OS permissions and exclusive ownership are the
-local coordination boundary. A future hardware gate must perform real serial
-protocol round-trip validation; U3.3 itself does not open the real port.
+Freenove ESP32-S3 WROOM Board / FNK0085 CH343 path. The measured true/true
+open/close sequence was repeated five times without reset, download boot, or
+native HID disconnect. It is a board/host policy, not an authentication
+mechanism; OS permissions and exclusive ownership are the local coordination
+boundary. The accepted hardware evidence and its limits are maintained in
+[`hardware-validation.md`](hardware-validation.md).
 
-## U4.1 HID runtime and control lease
+## HID runtime and control lease
 
 The `hid_runtime` component owns HID lifecycle state and is the only project
 code that calls TinyUSB HID report APIs. `tud_sof_cb_enable(true)` enables the
@@ -473,9 +471,9 @@ readiness (including endpoint-busy state), not inferred capability bits.
 The internal mailbox has EMPTY/WRITING/READY/EXECUTING/CANCELED states and
 stores both the attach generation and authority epoch with each operation.
 The executor checks both tokens, mounted state, non-suspended state, and the
-safety barrier immediately before TinyUSB report submission. U4.2's bounded
-release-all ticket remains the only public safety operation; U4.3's keyboard
-ticket and U4.4's mouse ticket are the explicit public unsafe report paths.
+safety barrier immediately before TinyUSB report submission. The bounded
+release-all ticket remains the only public safety operation; keyboard and mouse
+tickets are the explicit public unsafe report paths.
 
 Each mount starts a monotonically increasing attach generation. It remains
 separate from the authority epoch: attach generation advances only at mount
@@ -513,9 +511,8 @@ instantaneous endpoint availability, including endpoint-busy state; they are
 not a promise that a host will remain attached or that a queued report will be
 delivered.
 The existing Configuration 1, Boot Keyboard/Mouse interfaces, endpoints
-0x81/0x82, descriptors, and VID/PID are unchanged. U4.2 exposes the
-safety-only `hid.release_all`; U4.3 adds the public keyboard report path and
-U4.4 adds the public mouse report path.
+0x81/0x82, descriptors, and VID/PID are unchanged. The public commands are the
+safety-only `hid.release_all`, `hid.keyboard.report`, and `hid.mouse.report`.
 The optional BOOT-button diagnostic remains build-time
 disabled by default and routes any enabled test report through the runtime.
 
@@ -535,13 +532,13 @@ activating the new session. Exact hello retry replays its cached bytes and
 refreshes the lease only within its captured authority epoch. A hello while
 suspended is permitted for diagnostics and captures the suspended epoch, but
 resume invalidates it and requires a fresh hello. Lease expiry and takeover
-allow diagnostic commands while safety is pending; the U4.3 keyboard and U4.4
-mouse report paths remain blocked until the global safety barrier is clear.
+allow diagnostic commands while safety is pending; keyboard and mouse report
+paths remain blocked until the global safety barrier is clear.
 
-## Deferred control safety
+## Public safety release
 
-`hid.release_all` is the public safety operation in U4.2. U4.3 adds the
-separate unsafe `hid.keyboard.report`; it accepts the
+`hid.release_all` is the public safety operation. The separate unsafe
+`hid.keyboard.report` accepts the
 normal no-params request (`params` omitted or `{}`) and reports independent
 Keyboard and Mouse outcomes. A successful result is exactly:
 
@@ -571,7 +568,7 @@ keyboard/mouse/release-all CLI commands are not exposed; host APIs are
 `Client.release_all()`, `Client.keyboard_report(modifiers, keys)`, and
 `Client.mouse_report(buttons, x, y, wheel, pan)`.
 
-## U4.4 relative mouse reports
+## Relative mouse reports
 
 `hid.mouse.report` accepts exactly five required parameters:
 

@@ -1,11 +1,17 @@
 # Project instructions
 
-## Operational documentation
+## Start here
 
-- This file contains stable repository invariants. Detailed procedures are in
-  `docs/development/codex-runbook.md` and
-  `docs/development/hardware-validation.md`.
-- Read the hardware-validation runbook before physical s3-hidbot work.
+- This file contains stable repository and agent invariants; it is not a
+  project-history or current-status document.
+- Before changing code, read
+  [`docs/development/codex-runbook.md`](docs/development/codex-runbook.md).
+- Use [`docs/development/validation-entrypoints.md`](docs/development/validation-entrypoints.md)
+  for canonical local and CI checks.
+- Read [`docs/development/hardware-validation.md`](docs/development/hardware-validation.md)
+  before any physical s3-hidbot work.
+- Read [`docs/development/uart-control-plane.md`](docs/development/uart-control-plane.md)
+  when changing protocol, host, or HID behavior.
 
 ## Privacy
 

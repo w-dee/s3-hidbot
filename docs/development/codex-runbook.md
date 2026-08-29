@@ -48,10 +48,14 @@ into tracked files.
 
 `firmware/` is the ESP-IDF project root. Run `idf.py` from that directory (or
 pass it with `-C firmware`); do not treat the repository root as the project
-root. A repository wrapper script has not been established.
+root. The canonical repository wrappers and their IDF prerequisites are
+listed in [`validation-entrypoints.md`](validation-entrypoints.md); do not
+duplicate their test logic in ad-hoc commands.
 
 The UART Control Plane v1 transport invariants and deferred protocol decisions
-are documented in [`uart-control-plane.md`](uart-control-plane.md).
+are documented in [`uart-control-plane.md`](uart-control-plane.md). Physical
+procedures and the current evidence/deferred matrix belong to
+[`hardware-validation.md`](hardware-validation.md).
 
 ## Machine-local configuration
 
@@ -71,3 +75,12 @@ Keep these stages separate:
 Do not silently carry a task across a gate. Do not commit failed validation or
 unintended/generated tracked files, and do not automatically commit on `main`.
 Push only when a human explicitly requests it.
+
+## Related documents
+
+- [`validation-entrypoints.md`](validation-entrypoints.md) — canonical local
+  and CI validation commands.
+- [`hardware-validation.md`](hardware-validation.md) — physical safety and
+  hardware evidence.
+- [`uart-control-plane.md`](uart-control-plane.md) — normative protocol and
+  runtime contract.
