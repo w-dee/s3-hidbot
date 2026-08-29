@@ -69,11 +69,12 @@ python3 -m pip install ./host
 export S3_HIDBOT_SERIAL=/dev/serial/by-id/<s3-hidbot-uart>
 hidbotctl hello
 hidbotctl usb-status
+hidbotctl release-all
 ```
 
-The first safe interactions are `hello` and `usb-status`. The CLI currently
-implements only `hello`, `ping`, `info`, and `usb-status`; HID report
-operations are Python API only.
+The first safe interactions are `hello` and `usb-status`; `release-all` is the
+explicit safety recovery operation. The CLI also exposes `release-all`, while
+keyboard and mouse report injection remain Python API only.
 
 ## Python HID primitive API
 
@@ -107,8 +108,8 @@ documented development fixture and test scope. `HARDWARE DEFERRED` means no
 such claim is made yet.
 
 - `IMPLEMENTED`: Composite Keyboard + Mouse HID, UART control plane, session
-  lease, authority/lifecycle safety, `hid.release_all`, keyboard and mouse
-  primitive APIs.
+  lease, authority/lifecycle safety, `hid.release_all` and its
+  `hidbotctl release-all` safety command, keyboard and mouse primitive APIs.
 - `NATIVE VALIDATED`: framing, strict protocol parsing, session/cache/lease
   behavior, HID safety state machine, host client, CLI, and firmware build.
 - `HARDWARE VALIDATED`: composite HID enumeration, UART control reliability,
@@ -143,7 +144,8 @@ HID, or physical lifecycle validation.
 
 ## Limitations
 
-There is no HID CLI, raw JSON command mode, type/click/drag helper, VBUS
-monitor implementation, or hardware runner in this foundation. Review the
-hardware gate before connecting both USB paths or sending an unsafe HID
-primitive.
+There is no keyboard/mouse report CLI, raw JSON command mode,
+type/click/drag helper, VBUS monitor implementation, or hardware runner in
+this foundation. Review the hardware gate before connecting both USB paths or
+sending an unsafe HID primitive. Use `hidbotctl release-all` for explicit
+safety recovery.

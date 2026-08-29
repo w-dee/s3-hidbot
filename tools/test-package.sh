@@ -208,7 +208,7 @@ assert "site-packages" in Path(hidbot.__file__).parts
 print(f"PASS: installed import/version check for {Path(artifact).name}")
 PY
     env -u PYTHONPATH "$venv_cli" --help >/dev/null
-    for command in hello ping info usb-status; do
+    for command in hello ping info usb-status release-all; do
         set +e
         env -u PYTHONPATH -u S3_HIDBOT_SERIAL -u S3_HIDBOT_BAUD \
             "$venv_cli" "$command" >"$temporary_directory/cli-$command.log" 2>&1

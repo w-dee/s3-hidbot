@@ -22,6 +22,7 @@ from .errors import (
     TransportError,
 )
 from .serial_transport import PySerialTransport
+from .protocol import ReleaseAllResult
 
 
 DEFAULT_BAUD = 115200
@@ -73,7 +74,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--attempts", default=str(DEFAULT_ATTEMPTS), help="maximum request attempts")
     parser.add_argument("--json", action="store_true", help="emit one compact JSON result")
     parser.add_argument("--verbose", action="store_true", help="reserved for diagnostic verbosity")
-    parser.add_argument("command", choices=("hello", "ping", "info", "usb-status"))
+    parser.add_argument(
+        "command", choices=("hello", "ping", "info", "usb-status", "release-all")
+    )
     return parser
 
 
@@ -87,6 +90,9 @@ def _result_value(command: str, result: object) -> object:
     if command == "hello":
         assert isinstance(result, HelloResult)
         return _hello_value(result)
+    if command == "release-all":
+        assert isinstance(result, ReleaseAllResult)
+        return asdict(result)
     return result
 
 
@@ -152,8 +158,10 @@ def main(
                 result = client.ping()
             elif args.command == "info":
                 result = client.info()
-            else:
+            elif args.command == "usb-status":
                 result = client.usb_status()
+            else:
+                result = client.release_all()
             _print_result(args.command, result, as_json=args.json, output=output)
             return 0
         finally:

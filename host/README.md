@@ -21,22 +21,24 @@ the repository root. The serial device is selected through the machine-local
 `S3_HIDBOT_SERIAL` environment variable or an explicit `--port` argument; do
 not put a machine-specific device path in project files.
 
-## Safe diagnostic commands
+## Safe diagnostic and recovery commands
 
-The `hidbotctl` command is intentionally limited to the four diagnostic
-commands `hello`, `ping`, `info`, and `usb-status`. The first safe interactions
-with a device are `hello` and `usb-status`:
+The `hidbotctl` command exposes the four diagnostic commands `hello`, `ping`,
+`info`, and `usb-status`, plus the safety recovery command `release-all`. The
+first safe interactions with a device are `hello` and `usb-status`:
 
 ```bash
 export S3_HIDBOT_SERIAL="<serial-device>"
 hidbotctl hello
 hidbotctl usb-status
+hidbotctl release-all
 ```
 
 The package also exposes Python primitive APIs such as `Client`,
 `PySerialTransport`, `release_all()`, `keyboard_report()`, and
 `mouse_report()`. These are bounded protocol primitives, not a high-level
-typing, clicking, dragging, or pointer-automation layer. Review the
+typing, clicking, dragging, or pointer-automation layer; keyboard and mouse
+report CLI commands are not yet provided. Review the
 [project safety and protocol documentation](https://github.com/w-dee/s3-hidbot/blob/main/docs/development/uart-control-plane.md)
 before using an unsafe primitive. The package is distributed under the
 [MIT License](LICENSE).

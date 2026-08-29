@@ -83,6 +83,14 @@ class FakeTransport:
             self.chunks.append(response(value["id"], TOKEN, result={"pong": True}))
         elif value["cmd"] == "system.info":
             self.chunks.append(response(value["id"], TOKEN, result={"project": "s3-hidbot"}))
+        elif value["cmd"] == "hid.release_all":
+            self.chunks.append(
+                response(
+                    value["id"],
+                    TOKEN,
+                    result={"keyboard": "already_up", "mouse": "submitted"},
+                )
+            )
         else:
             self.chunks.append(response(value["id"], TOKEN, result={"mounted": True}))
 
@@ -128,7 +136,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(kwargs["write_timeout"], 1.0)
 
     def test_env_fallback_and_commands(self) -> None:
-        for command in ("ping", "info", "usb-status"):
+        for command in ("ping", "info", "usb-status", "release-all"):
             code, output, errors, _ = self.run_cli(
                 [command],
                 {"S3_HIDBOT_SERIAL": "env-port", "S3_HIDBOT_BAUD": "115200"},
@@ -142,6 +150,32 @@ class CliTests(unittest.TestCase):
         self.assertEqual(errors, "")
         factory_call = next(call for call in calls if call[0] == "factory")
         self.assertEqual(factory_call[1], ("env-port", 115200))
+
+    def test_release_all_success_and_protocol_sequence(self) -> None:
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "release-all"],
+            {"S3_HIDBOT_SERIAL": "env-port"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(
+            json.loads(output), {"keyboard": "already_up", "mouse": "submitted"}
+        )
+        commands = [
+            json.loads(call[1][len(FRAME_PREFIX) : -1])["cmd"]
+            for call in calls
+            if call[0] == "write" and call[1] != TRANSPORT_SYNC
+        ]
+        self.assertEqual(commands, ["protocol.hello", "hid.release_all"])
+
+    def test_release_all_json_uses_compact_result_policy(self) -> None:
+        code, output, errors, _ = self.run_cli(
+            ["--port", "dummy-port", "--json", "release-all"],
+            {"S3_HIDBOT_SERIAL": "env-port"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(output, '{"keyboard":"already_up","mouse":"submitted"}\n')
 
     def test_missing_port_and_malformed_baud_are_config_errors(self) -> None:
         code, _, errors, _ = self.run_cli(["hello"], {})
@@ -228,6 +262,40 @@ class CliTests(unittest.TestCase):
             5,
         )
         self.assertIn("UNKNOWN_COMMAND", errors.getvalue())
+
+    def test_release_all_remote_error_uses_existing_exit_code(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class ReleaseErrorTransport(FakeTransport):
+            def write(self, data: bytes) -> None:
+                self.calls.append(("write", data))
+                if data == TRANSPORT_SYNC:
+                    return
+                value = json.loads(data[len(FRAME_PREFIX) : -1])
+                if value["cmd"] == "protocol.hello":
+                    super().write(data)
+                else:
+                    self.chunks.append(
+                        response(
+                            value["id"],
+                            TOKEN,
+                            error={"code": "HID_SAFETY_PENDING", "message": "pending"},
+                        )
+                    )
+
+        transport = ReleaseErrorTransport(calls)
+        output = io.StringIO()
+        errors = io.StringIO()
+        self.assertEqual(
+            main(
+                ["--port", "dummy-port", "release-all"],
+                transport_factory=lambda *args, **kwargs: transport,
+                output=output,
+                error_output=errors,
+            ),
+            5,
+        )
+        self.assertIn("HID_SAFETY_PENDING", errors.getvalue())
 
 
 if __name__ == "__main__":
