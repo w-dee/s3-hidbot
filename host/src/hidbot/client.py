@@ -50,6 +50,7 @@ class HelloResult:
     boot_id: str
     client_nonce: str
     capabilities: tuple[str, ...]
+    lease_ms: int
 
 
 class Client:
@@ -87,6 +88,7 @@ class Client:
         self._session: str | None = None
         self._boot_id: str | None = None
         self._capabilities: tuple[str, ...] = ()
+        self._lease_ms: int | None = None
         self._next_hello_id = 0
         self._next_request_id = 0
 
@@ -102,6 +104,10 @@ class Client:
     def capabilities(self) -> tuple[str, ...]:
         return self._capabilities
 
+    @property
+    def lease_ms(self) -> int | None:
+        return self._lease_ms
+
     def _ensure_open(self) -> None:
         if self._closed:
             raise TransportError("client is closed")
@@ -110,6 +116,7 @@ class Client:
         self._session = None
         self._boot_id = None
         self._capabilities = ()
+        self._lease_ms = None
 
     def _write(self, data: bytes) -> None:
         try:
@@ -247,12 +254,14 @@ class Client:
             self._session = hello.session
             self._boot_id = hello.boot_id
             self._capabilities = hello.capabilities
+            self._lease_ms = hello.lease_ms
             self._next_request_id = 0
             return HelloResult(
                 hello.session,
                 hello.boot_id,
                 hello.client_nonce,
                 hello.capabilities,
+                hello.lease_ms,
             )
         raise RequestTimeoutError(
             "timed out waiting for a correlated protocol.hello response",

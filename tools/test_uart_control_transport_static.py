@@ -36,6 +36,11 @@ def main() -> int:
     assert "uart_driver_install(kConsoleUart" in source
     assert "uart_vfs_dev_use_driver(kConsoleUart)" in source
     assert "uart_read_bytes(kConsoleUart" in source
+    assert "s_hid_failure_pending.store(true, std::memory_order_release);" in source
+    assert "s_protocol.on_hid_safety_failure();" in source
+    assert "s_lifecycle_invalidation_pending.store(true, std::memory_order_release);" in source
+    assert "s_protocol.on_hid_lifecycle_invalidation();" in source
+    assert "service_pending_notifications();" in source
     print("PASS: UART machine writer static contract")
     return 0
 

@@ -18,7 +18,8 @@ def main() -> int:
     assert source.count(guard) == 5
     assert source.count("#endif") >= source.count(guard)
     assert "tud_hid_n_keyboard_report" not in source
-    assert "tud_hid_n_mouse_report" in source
+    assert "queue_mouse_report" in source
+    assert "tud_hid_n_mouse_report" not in source
     assert "GPIO_NUM_19" not in source
     assert "GPIO_NUM_20" not in source
     print("PASS: default BOOT diagnostic and HID safety static contract")

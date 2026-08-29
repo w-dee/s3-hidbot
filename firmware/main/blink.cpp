@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
+#include "hid_runtime/hid_runtime.hpp"
 #include "uart_control_transport/uart_control_transport.hpp"
 #include "class/hid/hid_device.h"
 #include "device/usbd.h"
@@ -30,13 +31,20 @@ constexpr uint8_t kHidPollingIntervalMs = 10;
 constexpr uint8_t kKeyboardStringIndex = 4;
 constexpr uint8_t kMouseStringIndex = 5;
 
+hid_runtime::Runtime s_hid_runtime;
+
 control_protocol::UsbStatus usb_status(void *) {
-    return control_protocol::UsbStatus{
-        .mounted = tud_mounted(),
-        .suspended = tud_suspended(),
-        .keyboard_ready = tud_hid_n_ready(kKeyboardInterface),
-        .mouse_ready = tud_hid_n_ready(kMouseInterface),
-    };
+    const hid_runtime::StatusSnapshot status = s_hid_runtime.status_snapshot();
+    return control_protocol::UsbStatus{status.mounted, status.suspended,
+                                       status.keyboard_ready, status.mouse_ready};
+}
+
+control_session::AuthorityEpoch hid_authority_epoch(void *) {
+    return s_hid_runtime.authority_epoch();
+}
+
+void request_hid_safety_release(void *) {
+    s_hid_runtime.request_release_all();
 }
 
 static_assert(kHidInterfaceCount == 2);
@@ -163,17 +171,24 @@ void usb_event_handler(tinyusb_event_t *event, void *argument) {
 
     switch (event->id) {
         case TINYUSB_EVENT_ATTACHED:
+            s_hid_runtime.on_mount();
+            uart_control_transport::on_hid_lifecycle_invalidation();
             ESP_LOGI(kLogTag, "USB HID mounted");
             break;
         case TINYUSB_EVENT_DETACHED:
+            s_hid_runtime.on_unmount();
+            uart_control_transport::on_hid_lifecycle_invalidation();
             ESP_LOGI(kLogTag, "USB HID unmounted");
-            uart_control_transport::on_usb_unmount();
             break;
         case TINYUSB_EVENT_SUSPENDED:
+            s_hid_runtime.on_suspend();
+            uart_control_transport::on_hid_lifecycle_invalidation();
             ESP_LOGI(kLogTag, "USB HID suspended (remote wakeup: %s)",
                      event->suspended.remote_wakeup ? "enabled" : "disabled");
             break;
         case TINYUSB_EVENT_RESUMED:
+            s_hid_runtime.on_resume();
+            uart_control_transport::on_hid_lifecycle_invalidation();
             ESP_LOGI(kLogTag, "USB HID resumed");
             break;
         default:
@@ -182,6 +197,25 @@ void usb_event_handler(tinyusb_event_t *event, void *argument) {
 }
 
 }  // namespace
+
+extern "C" void tud_sof_cb(uint32_t) {
+    s_hid_runtime.service_sof();
+}
+
+extern "C" void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *, uint16_t) {
+    s_hid_runtime.on_report_complete(instance);
+}
+
+extern "C" void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t report_type,
+                                           uint8_t const *, uint16_t) {
+    // Host-to-device HID output reports (for example keyboard LEDs) are not
+    // project-owned input state and must not trigger the input safety path.
+    if (report_type == HID_REPORT_TYPE_INPUT) {
+        if (s_hid_runtime.on_report_failed(instance)) {
+            uart_control_transport::on_hid_safety_failure();
+        }
+    }
+}
 
 extern "C" uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
     switch (instance) {
@@ -216,6 +250,7 @@ extern "C" void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 }
 
 extern "C" void app_main() {
+    s_hid_runtime.initialize();
     const gpio_config_t configuration = {
         .pin_bit_mask = 1ULL << kOnboardLed,
         .mode = GPIO_MODE_OUTPUT,
@@ -254,8 +289,18 @@ extern "C" void app_main() {
         },
         .usb_status_provider = usb_status,
         .usb_status_context = nullptr,
+        .authority_epoch_provider = hid_authority_epoch,
+        .authority_epoch_context = nullptr,
         .output = nullptr,
         .output_context = nullptr,
+        .now = nullptr,
+        .now_context = nullptr,
+        .lease_expired = request_hid_safety_release,
+        .lease_expired_context = nullptr,
+        .session_takeover = request_hid_safety_release,
+        .session_takeover_context = nullptr,
+        .hid_safety_failure = request_hid_safety_release,
+        .hid_safety_failure_context = nullptr,
     };
     ESP_ERROR_CHECK(uart_control_transport::start(&protocol_config));
 #if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
@@ -270,16 +315,15 @@ extern "C" void app_main() {
 #if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
         const bool button_pressed = gpio_get_level(kBootButton) == 0;
         if (button.update(button_pressed)) {
-            if (tud_hid_n_ready(kMouseInterface)) {
-                const bool sent = tud_hid_n_mouse_report(kMouseInterface, 0, 0, 10, 0, 0, 0);
-                if (sent) {
-                    ESP_LOGI(kLogTag, "MOUSE TEST REPORT SENT");
-                } else {
-                    ESP_LOGI(kLogTag, "MOUSE TEST REPORT DROPPED SEND FAILURE");
-                }
-            } else {
+            if (!s_hid_runtime.queue_mouse_report(0, 10, 0, 0, 0)) {
                 ESP_LOGI(kLogTag, "MOUSE TEST REPORT DROPPED NOT READY");
             }
+        }
+        if (s_hid_runtime.take_report_sent(hid_runtime::Interface::kMouse)) {
+            ESP_LOGI(kLogTag, "MOUSE TEST REPORT SENT");
+        }
+        if (s_hid_runtime.take_report_failed(hid_runtime::Interface::kMouse)) {
+            ESP_LOGI(kLogTag, "MOUSE TEST REPORT DROPPED SEND FAILURE");
         }
 #endif
 

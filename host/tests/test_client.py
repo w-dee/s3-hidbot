@@ -50,11 +50,13 @@ def hello_response(request_id: int, nonce: str, session: str = TOKEN) -> bytes:
             "client_nonce": nonce,
             "boot_id": BOOT_ID,
             "session": session,
+            "lease_ms": 5000,
             "capabilities": [
                 "protocol.hello-v1",
                 "system.ping-v1",
                 "system.info-v1",
                 "usb.status-v1",
+                "hid.lease-v1",
             ],
         },
     )
@@ -122,6 +124,8 @@ class ClientTests(unittest.TestCase):
         client = self.make_client(transport)
         hello = client.connect()
         self.assertEqual(hello.session, TOKEN)
+        self.assertEqual(hello.lease_ms, 5000)
+        self.assertEqual(client.lease_ms, 5000)
         self.assertEqual(client.ping(), {"pong": True})
         self.assertEqual(transport.writes[0], TRANSPORT_SYNC)
 

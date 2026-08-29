@@ -43,11 +43,22 @@ def main() -> int:
     assert "write_protocol_frame" in transport
     assert "return uart_control_transport::write_machine(data, length);" in transport
     assert "s_protocol.handle_framing_event(event);" in transport
-    assert "s_unmount_pending.store(true, std::memory_order_release);" in transport
-    assert "s_protocol.on_usb_unmount();" in transport
-    assert "tud_hid_n_ready(kKeyboardInterface)" in main_source
-    assert "tud_hid_n_ready(kMouseInterface)" in main_source
+    assert "s_lifecycle_invalidation_pending.store(true, std::memory_order_release);" in transport
+    assert "s_protocol.on_hid_lifecycle_invalidation();" in transport
+    assert "authority_epoch_provider" in protocol_header
+    assert "AuthorityEpochProvider" in protocol_header
+    assert "session_.inspect_request(session, id, payload, authority_epoch" in protocol
+    assert "session_.inspect_hello(client_nonce, payload, authority_epoch" in protocol
+    assert "session_authority_epoch_" in session
+    assert "hello_cache_.authority_epoch != current_epoch" in session
+    assert "request_cache_.authority_epoch != current_epoch" in session
+    assert "session_authority_epoch_ != current_epoch" in session
+    assert "status_snapshot()" in main_source
+    assert "service_sof()" in main_source
+    assert "on_hid_safety_failure" in protocol
+    assert "hid_safety_failure" in protocol_header
     assert "tud_hid_n_keyboard_report" not in main_source
+    assert "tud_hid_n_report" not in main_source
     print("PASS: U2 protocol/HID/UART static boundaries")
     return 0
 

@@ -56,10 +56,19 @@ void State::clear_hello_cache() {
 }
 
 void State::initialize(RandomFill random_fill, void *random_context) {
+    initialize(random_fill, random_context, nullptr, nullptr);
+}
+
+void State::initialize(RandomFill random_fill, void *random_context,
+                       NowFn now_fn, void *now_context) {
     random_fill_ = random_fill;
     random_context_ = random_context;
+    now_fn_ = now_fn;
+    now_context_ = now_context;
     active_session_ = false;
     current_session_[0] = '\0';
+    session_authority_epoch_ = 0;
+    lease_deadline_us_ = 0;
     clear_normal_cache();
     clear_hello_cache();
     generate_token(boot_id_);
@@ -77,6 +86,47 @@ bool State::has_active_session() const {
     return active_session_;
 }
 
+bool State::authority_epoch_matches(AuthorityEpoch current_epoch) const {
+    return active_session_ && session_authority_epoch_ == current_epoch;
+}
+
+AuthorityEpoch State::session_authority_epoch() const {
+    return session_authority_epoch_;
+}
+
+std::uint64_t State::now() const {
+    return now_fn_ != nullptr ? now_fn_(now_context_) : 0;
+}
+
+bool State::refresh_lease() {
+    if (!active_session_) {
+        return false;
+    }
+    lease_deadline_us_ = now() + kLeaseMicroseconds;
+    return true;
+}
+
+bool State::service_lease() {
+    if (!active_session_ || now() < lease_deadline_us_) {
+        return false;
+    }
+    clear_authority();
+    return true;
+}
+
+void State::clear_authority() {
+    active_session_ = false;
+    current_session_[0] = '\0';
+    session_authority_epoch_ = 0;
+    lease_deadline_us_ = 0;
+    clear_normal_cache();
+    clear_hello_cache();
+}
+
+void State::revoke_for_takeover() {
+    clear_authority();
+}
+
 void State::generate_token(char output[kTokenStorageBytes]) {
     std::uint8_t random_bytes[kTokenHexLength / 2]{};
     if (random_fill_ != nullptr) {
@@ -91,11 +141,16 @@ void State::generate_token(char output[kTokenStorageBytes]) {
 
 HelloCacheResult State::inspect_hello(std::string_view client_nonce,
                                       std::string_view request_bytes,
+                                      AuthorityEpoch current_epoch,
                                       const ResponseFrame **cached_response) const {
     if (cached_response != nullptr) {
         *cached_response = nullptr;
     }
-    if (!hello_cache_.valid || !same_token(hello_cache_.client_nonce, client_nonce)) {
+    // Retry authority is scoped to the lifecycle authority epoch. A matching
+    // nonce from an older epoch is a fresh hello, not a resurrection of the
+    // previous session or response.
+    if (!hello_cache_.valid || hello_cache_.authority_epoch != current_epoch ||
+        !same_token(hello_cache_.client_nonce, client_nonce)) {
         return HelloCacheResult::kNewClient;
     }
     if (!same_request(hello_cache_.request, hello_cache_.request_length, request_bytes)) {
@@ -110,29 +165,38 @@ HelloCacheResult State::inspect_hello(std::string_view client_nonce,
 void State::activate_hello(std::string_view client_nonce,
                            std::string_view request_bytes,
                            const char *new_session,
+                           AuthorityEpoch authority_epoch,
                            const ResponseFrame &response) {
     copy_token(current_session_, std::string_view(new_session, kTokenHexLength));
     active_session_ = true;
+    session_authority_epoch_ = authority_epoch;
+    lease_deadline_us_ = now() + kLeaseMicroseconds;
     clear_normal_cache();
     hello_cache_ = HelloCache{};
     hello_cache_.valid = true;
     copy_token(hello_cache_.client_nonce, client_nonce);
     copy_request(hello_cache_.request, &hello_cache_.request_length, request_bytes);
     copy_token(hello_cache_.session, std::string_view(new_session, kTokenHexLength));
+    hello_cache_.authority_epoch = authority_epoch;
     hello_cache_.response = response;
 }
 
 RequestCacheResult State::inspect_request(std::string_view session,
                                           std::int32_t id,
                                           std::string_view request_bytes,
+                                          AuthorityEpoch current_epoch,
                                           const ResponseFrame **cached_response) const {
     if (cached_response != nullptr) {
         *cached_response = nullptr;
     }
-    if (!active_session_ || !same_token(current_session_, session)) {
+    // This check is intentionally before normal-cache replay and lease
+    // refresh. An old exact retry must never make a retired session look live.
+    if (!active_session_ || session_authority_epoch_ != current_epoch ||
+        !same_token(current_session_, session)) {
         return RequestCacheResult::kSessionMismatch;
     }
-    if (!request_cache_.valid || id > request_cache_.id) {
+    if (!request_cache_.valid || request_cache_.authority_epoch != current_epoch ||
+        id > request_cache_.id) {
         return RequestCacheResult::kAcceptNew;
     }
     if (id < request_cache_.id) {
@@ -149,19 +213,22 @@ RequestCacheResult State::inspect_request(std::string_view session,
 
 void State::cache_completed_request(std::int32_t id,
                                     std::string_view request_bytes,
+                                    AuthorityEpoch authority_epoch,
                                     const ResponseFrame &response) {
     request_cache_ = RequestCache{};
     request_cache_.valid = true;
     request_cache_.id = id;
+    request_cache_.authority_epoch = authority_epoch;
     copy_request(request_cache_.request, &request_cache_.request_length, request_bytes);
     request_cache_.response = response;
 }
 
-void State::revoke_for_unmount() {
-    active_session_ = false;
-    current_session_[0] = '\0';
-    clear_normal_cache();
-    clear_hello_cache();
+void State::revoke_for_lifecycle_invalidation(AuthorityEpoch current_epoch) {
+    if ((active_session_ && session_authority_epoch_ != current_epoch) ||
+        (hello_cache_.valid && hello_cache_.authority_epoch != current_epoch) ||
+        (request_cache_.valid && request_cache_.authority_epoch != current_epoch)) {
+        clear_authority();
+    }
 }
 
 }  // namespace control_session

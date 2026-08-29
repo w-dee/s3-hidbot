@@ -100,6 +100,7 @@ def _print_result(command: str, result: object, *, as_json: bool, output: TextIO
         print(f"session: {value['session']}", file=output)
         print(f"boot_id: {value['boot_id']}", file=output)
         print(f"client_nonce: {value['client_nonce']}", file=output)
+        print(f"lease_ms: {value['lease_ms']}", file=output)
         print(f"capabilities: {', '.join(value['capabilities'])}", file=output)
         return
     print(json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True), file=output)

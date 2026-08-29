@@ -65,11 +65,13 @@ class FakeTransport:
                         "client_nonce": value["params"]["client_nonce"],
                         "boot_id": TOKEN,
                         "session": TOKEN,
+                        "lease_ms": 5000,
                         "capabilities": [
                             "protocol.hello-v1",
                             "system.ping-v1",
                             "system.info-v1",
                             "usb.status-v1",
+                            "hid.lease-v1",
                         ],
                     },
                 )

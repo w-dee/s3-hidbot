@@ -21,7 +21,7 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -37,7 +37,7 @@ constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
 // vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
-    control_session::kTokenHexLength * 4 + (sizeof(kCapabilityJson) - 1) + 10 + 1;
+    control_session::kTokenHexLength * 4 + (sizeof(kCapabilityJson) - 1) + 32 + 10 + 1;
 static_assert(kMaximumHelloResponseBytes <= control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
@@ -305,13 +305,14 @@ bool make_hello(control_session::ResponseFrame *frame,
                         "\"session\":%s,\"ok\":true,\"result\":{"
                         "\"project\":\"%s\",\"protocol_version\":1,"
                         "\"client_nonce\":\"%s\",\"boot_id\":\"%s\","
-                        "\"session\":\"%s\",\"capabilities\":%s}}\n",
+                        "\"session\":\"%s\",\"lease_ms\":%lu,\"capabilities\":%s}}\n",
                         static_cast<long>(id),
                         session_field,
                         metadata.project,
                         client_nonce,
                         boot_id,
                         result_session,
+                        static_cast<unsigned long>(control_session::kLeaseMilliseconds),
                         kCapabilityJson);
 }
 
@@ -337,15 +338,17 @@ bool validate_hello_params(const cJSON *params, std::string_view *client_nonce) 
 bool Protocol::initialize(const Config &config,
                           control_session::RandomFill random_fill,
                           void *random_context) {
-    if (config.output == nullptr || config.usb_status_provider == nullptr || random_fill == nullptr ||
+    if (config.output == nullptr || config.usb_status_provider == nullptr ||
+        config.authority_epoch_provider == nullptr || random_fill == nullptr ||
         !is_safe_metadata_string(config.metadata.project) ||
         !is_safe_metadata_string(config.metadata.target) ||
         !is_safe_metadata_string(config.metadata.idf_version)) {
         return false;
     }
     config_ = config;
-    session_.initialize(random_fill, random_context);
+    session_.initialize(random_fill, random_context, config.now, config.now_context);
     initialized_ = true;
+    lease_revoke_notified_ = false;
     return true;
 }
 
@@ -359,9 +362,44 @@ control_session::ResponseFrame &Protocol::prepare_response_scratch() {
     return response_scratch_;
 }
 
-void Protocol::on_usb_unmount() {
+void Protocol::on_hid_lifecycle_invalidation() {
     if (initialized_) {
-        session_.revoke_for_unmount();
+        // Lifecycle publication is the primary correctness barrier. This
+        // serialized cleanup only retires cached/session state from an older
+        // epoch; it cannot revoke a hello that already captured the current
+        // epoch before this coalesced notification was consumed.
+        session_.revoke_for_lifecycle_invalidation(
+            config_.authority_epoch_provider(config_.authority_epoch_context));
+        lease_revoke_notified_ = false;
+    }
+}
+
+void Protocol::on_hid_safety_failure() {
+    if (!initialized_) {
+        return;
+    }
+    // HID report delivery is now uncertain. Revoke authority in the protocol
+    // task before asking the runtime to maintain its interface safety state.
+    session_.revoke_for_takeover();
+    lease_revoke_notified_ = false;
+    if (config_.hid_safety_failure != nullptr) {
+        config_.hid_safety_failure(config_.hid_safety_failure_context);
+    }
+}
+
+void Protocol::service() {
+    if (!initialized_) {
+        return;
+    }
+    on_hid_lifecycle_invalidation();
+    if (!session_.service_lease()) {
+        return;
+    }
+    if (!lease_revoke_notified_) {
+        lease_revoke_notified_ = true;
+        if (config_.lease_expired != nullptr) {
+            config_.lease_expired(config_.lease_expired_context);
+        }
     }
 }
 
@@ -473,10 +511,13 @@ void Protocol::handle_frame(std::string_view payload) {
             return;
         }
 
+        const control_session::AuthorityEpoch authority_epoch =
+            config_.authority_epoch_provider(config_.authority_epoch_context);
         const control_session::ResponseFrame *cached_response = nullptr;
         const control_session::HelloCacheResult cache_result =
-            session_.inspect_hello(client_nonce, payload, &cached_response);
+            session_.inspect_hello(client_nonce, payload, authority_epoch, &cached_response);
         if (cache_result == control_session::HelloCacheResult::kExactRetry) {
+            session_.refresh_lease();
             write_frame(*cached_response);
             finish();
             return;
@@ -490,6 +531,15 @@ void Protocol::handle_frame(std::string_view payload) {
             return;
         }
 
+        if (session_.has_active_session()) {
+            // Revoke first so the old authority cannot issue another command
+            // while the safety release is being started by the runtime.
+            const bool current_epoch_session = session_.authority_epoch_matches(authority_epoch);
+            session_.revoke_for_takeover();
+            if (current_epoch_session && config_.session_takeover != nullptr) {
+                config_.session_takeover(config_.session_takeover_context);
+            }
+        }
         char new_session[control_session::kTokenStorageBytes]{};
         session_.generate_token(new_session);
         auto &response = prepare_response_scratch();
@@ -505,7 +555,8 @@ void Protocol::handle_frame(std::string_view payload) {
             finish();
             return;
         }
-        session_.activate_hello(client_nonce, payload, new_session, response);
+        session_.activate_hello(client_nonce, payload, new_session, authority_epoch, response);
+        lease_revoke_notified_ = false;
         write_frame(response);
         finish();
         return;
@@ -541,9 +592,13 @@ void Protocol::handle_frame(std::string_view payload) {
         return;
     }
 
+    // This acquire-backed value is the request-side authority linearization
+    // point. inspect_request checks it before any normal cache replay.
+    const control_session::AuthorityEpoch authority_epoch =
+        config_.authority_epoch_provider(config_.authority_epoch_context);
     const control_session::ResponseFrame *cached_response = nullptr;
     const control_session::RequestCacheResult cache_result =
-        session_.inspect_request(session, id, payload, &cached_response);
+        session_.inspect_request(session, id, payload, authority_epoch, &cached_response);
     if (cache_result == control_session::RequestCacheResult::kSessionMismatch) {
         auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "SESSION_MISMATCH", "request session is not active")) {
@@ -557,6 +612,7 @@ void Protocol::handle_frame(std::string_view payload) {
         std::string_view(session_.current_session(), control_session::kTokenHexLength),
     };
     if (cache_result == control_session::RequestCacheResult::kExactRetry) {
+        session_.refresh_lease();
         write_frame(*cached_response);
         finish();
         return;
@@ -578,22 +634,26 @@ void Protocol::handle_frame(std::string_view payload) {
 
     auto &response = prepare_response_scratch();
     bool completed = false;
+    bool semantically_valid = false;
     if (command == "system.ping") {
         if (!validate_no_params(params)) {
             make_error(&response, current_session, true, id, "INVALID_PARAMS", "system.ping accepts no params");
         } else {
+            semantically_valid = true;
             completed = make_ping(&response, current_session, id);
         }
     } else if (command == "system.info") {
         if (!validate_no_params(params)) {
             make_error(&response, current_session, true, id, "INVALID_PARAMS", "system.info accepts no params");
         } else {
+            semantically_valid = true;
             completed = make_info(&response, current_session, id, config_.metadata);
         }
     } else if (command == "usb.status") {
         if (!validate_no_params(params)) {
             make_error(&response, current_session, true, id, "INVALID_PARAMS", "usb.status accepts no params");
         } else {
+            semantically_valid = true;
             completed = make_usb_status(&response, current_session, id,
                                         config_.usb_status_provider(config_.usb_status_context));
         }
@@ -605,6 +665,13 @@ void Protocol::handle_frame(std::string_view payload) {
         }
     }
 
+    if (semantically_valid) {
+        // A valid current-session request, including an operational error,
+        // proves the authority is alive. Invalid envelopes/params never
+        // refresh this deadline.
+        session_.refresh_lease();
+    }
+
     if (!completed) {
         if (response.length == 0) {
             make_error(&response, current_session, true, id, "INTERNAL_ERROR", "response serialization failed");
@@ -614,7 +681,7 @@ void Protocol::handle_frame(std::string_view payload) {
         return;
     }
 
-    session_.cache_completed_request(id, payload, response);
+    session_.cache_completed_request(id, payload, authority_epoch, response);
     write_frame(response);
     finish();
 }

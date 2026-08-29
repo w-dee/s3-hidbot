@@ -19,10 +19,17 @@ inline constexpr std::size_t kMaxWireMachineFrameBytes = 1024;
 // core handles bounded JSON/session commands and has no HID command dispatch.
 esp_err_t start(const control_protocol::Config *protocol_config);
 
-// Requests revocation of the active control session and retry caches. The USB
-// lifecycle owner calls this only for native USB HID detach; it performs no
-// HID action or blocking work in the callback.
-void on_usb_unmount();
+// Publishes eventual protocol/session cleanup after a native HID lifecycle
+// authority boundary. The runtime's atomic authority epoch is the immediate
+// correctness barrier; this callback stays non-blocking and performs no HID
+// action. It is valid for suspend, resume, detach, and mount notifications.
+void on_hid_lifecycle_invalidation();
+
+// Requests protocol-task authority revocation after an input HID report
+// failure. The TinyUSB callback only publishes an atomic notification; the
+// RX task performs the session mutation and invokes the configured safety
+// callback.
+void on_hid_safety_failure();
 
 // Writes a bounded machine-readable frame without routing it through ESP_LOG
 // or printf. Future protocol responses and events must use this sole path.

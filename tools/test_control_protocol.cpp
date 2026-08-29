@@ -16,6 +16,8 @@ constexpr std::size_t kMaxLogicalMachineFrameBytes = 1023;
 
 struct Sink {
     std::vector<std::string> frames;
+    void (*after_write)(void *context) = nullptr;
+    void *after_write_context = nullptr;
 
     static bool write(void *context, const std::uint8_t *data, std::size_t length) {
         auto *sink = static_cast<Sink *>(context);
@@ -35,6 +37,9 @@ struct Sink {
         const bool has_error = frame.find("\"error\":") != std::string::npos;
         assert(has_result != has_error);
         sink->frames.push_back(frame);
+        if (sink->after_write != nullptr) {
+            sink->after_write(sink->after_write_context);
+        }
         return true;
     }
 
@@ -64,10 +69,80 @@ struct StatusSource {
     }
 };
 
+struct AuthoritySource {
+    control_session::AuthorityEpoch epoch = 10;
+
+    static control_session::AuthorityEpoch get(void *context) {
+        return static_cast<AuthoritySource *>(context)->epoch;
+    }
+};
+
+void increment_authority(void *context) {
+    ++static_cast<AuthoritySource *>(context)->epoch;
+}
+
+struct LeaseClock {
+    std::uint64_t value = 0;
+
+    static std::uint64_t now(void *context) {
+        return static_cast<LeaseClock *>(context)->value;
+    }
+};
+
+struct LeaseFixture {
+    Sink sink;
+    RandomSource random;
+    LeaseClock clock;
+    AuthoritySource authority;
+    int expired_callbacks = 0;
+    int takeover_callbacks = 0;
+    int hid_failure_callbacks = 0;
+    control_protocol::Protocol protocol;
+
+    static void expired(void *context) {
+        ++static_cast<LeaseFixture *>(context)->expired_callbacks;
+    }
+
+    static void takeover(void *context) {
+        ++static_cast<LeaseFixture *>(context)->takeover_callbacks;
+    }
+
+    static void hid_failure(void *context) {
+        ++static_cast<LeaseFixture *>(context)->hid_failure_callbacks;
+    }
+
+    LeaseFixture() {
+        const control_protocol::Config config{
+            .metadata = {"s3-hidbot", "esp32s3", "v5.5.4"},
+            .usb_status_provider = StatusSource::get,
+            .usb_status_context = nullptr,
+            .authority_epoch_provider = AuthoritySource::get,
+            .authority_epoch_context = &authority,
+            .output = Sink::write,
+            .output_context = &sink,
+            .now = LeaseClock::now,
+            .now_context = &clock,
+            .lease_expired = LeaseFixture::expired,
+            .lease_expired_context = this,
+            .session_takeover = LeaseFixture::takeover,
+            .session_takeover_context = this,
+            .hid_safety_failure = LeaseFixture::hid_failure,
+            .hid_safety_failure_context = this,
+        };
+        assert(protocol.initialize(config, RandomSource::fill, &random));
+    }
+
+    void payload(std::string_view json) {
+        protocol.handle_framing_event(
+            control_framing::Event{control_framing::EventKind::kFrame, json});
+    }
+};
+
 struct Fixture {
     Sink sink;
     RandomSource random;
     StatusSource status;
+    AuthoritySource authority;
     control_protocol::Protocol protocol;
 
     explicit Fixture(std::uint8_t random_seed = 0) {
@@ -76,8 +151,18 @@ struct Fixture {
             .metadata = {"s3-hidbot", "esp32s3", "v5.5.4"},
             .usb_status_provider = StatusSource::get,
             .usb_status_context = &status,
+            .authority_epoch_provider = AuthoritySource::get,
+            .authority_epoch_context = &authority,
             .output = Sink::write,
             .output_context = &sink,
+            .now = nullptr,
+            .now_context = nullptr,
+            .lease_expired = nullptr,
+            .lease_expired_context = nullptr,
+            .session_takeover = nullptr,
+            .session_takeover_context = nullptr,
+            .hid_safety_failure = nullptr,
+            .hid_safety_failure_context = nullptr,
         };
         assert(protocol.initialize(config, RandomSource::fill, &random));
     }
@@ -307,7 +392,8 @@ void test_nonce_session_and_hello_cache() {
     require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
     require_top_level_session(fixture.sink.last(), {});
 
-    fixture.protocol.on_usb_unmount();
+    ++fixture.authority.epoch;
+    fixture.protocol.on_hid_lifecycle_invalidation();
     fixture.payload(request(1, second_session, "system.ping"));
     require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
     require_top_level_session(fixture.sink.last(), {});
@@ -426,6 +512,116 @@ void test_response_scratch_reuse() {
     assert(fixture.sink.last() == status_response);
 }
 
+void test_lease_refresh_expiry_and_takeover() {
+    LeaseFixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string first = fixture.sink.last();
+    const std::string first_session = extract_string(first, "session");
+    require_contains(first, "\"lease_ms\":5000");
+    require_contains(first, "\"hid.lease-v1\"");
+
+    fixture.clock.value = control_session::kLeaseMicroseconds - 1;
+    fixture.protocol.service();
+    assert(fixture.expired_callbacks == 0);
+    fixture.payload(request(2, first_session, "system.ping"));
+    assert(fixture.sink.last().find("\"pong\":true") != std::string::npos);
+
+    fixture.clock.value += control_session::kLeaseMicroseconds - 1;
+    fixture.protocol.service();
+    assert(fixture.expired_callbacks == 0);
+    fixture.clock.value += 1;
+    fixture.protocol.service();
+    assert(fixture.expired_callbacks == 1);
+    fixture.payload(request(3, first_session, "system.ping"));
+    require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
+
+    fixture.payload(hello_request(4, kNonceB));
+    const std::string second = fixture.sink.last();
+    const std::string second_session = extract_string(second, "session");
+    assert(second_session != first_session);
+    fixture.payload(hello_request(5, kNonceA));
+    assert(fixture.takeover_callbacks == 1);
+    const std::string third = fixture.sink.last();
+    fixture.payload(hello_request(5, kNonceA));
+    assert(fixture.sink.last() == third);
+    assert(fixture.takeover_callbacks == 1);
+}
+
+void test_hid_failure_revokes_authority() {
+    LeaseFixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+
+    fixture.protocol.on_hid_safety_failure();
+    assert(fixture.hid_failure_callbacks == 1);
+    fixture.payload(request(2, session, "system.ping"));
+    require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
+
+    fixture.payload(hello_request(3, kNonceB));
+    assert(fixture.sink.last().find("\"ok\":true") != std::string::npos);
+}
+
+void test_authority_epoch_barrier_and_retry_scoping() {
+    LeaseFixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session_a = extract_string(fixture.sink.last(), "session");
+    const std::string ping = request(2, session_a, "system.ping");
+
+    fixture.payload(ping);
+    const std::string same_epoch_response = fixture.sink.last();
+    fixture.payload(ping);
+    assert(fixture.sink.last() == same_epoch_response);
+
+    // The normal exact-retry cache is checked only after the current
+    // authority epoch validates the session.
+    ++fixture.authority.epoch;
+    fixture.payload(ping);
+    require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
+    require_top_level_session(fixture.sink.last(), {});
+
+    // Exact hello retries are stable in one epoch. Across an epoch transition
+    // the same nonce and bytes create a fresh session rather than replaying A.
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string hello_b = fixture.sink.last();
+    const std::string session_b = extract_string(hello_b, "session");
+    assert(session_b != session_a);
+    fixture.payload(hello_request(1, kNonceA));
+    assert(fixture.sink.last() == hello_b);
+
+    // A hello accepted while the link is suspended is current only until the
+    // resume lifecycle publication advances the injected authority epoch.
+    ++fixture.authority.epoch;
+    fixture.payload(hello_request(3, kNonceB));
+    const std::string suspended_session = extract_string(fixture.sink.last(), "session");
+    ++fixture.authority.epoch;
+    fixture.payload(request(4, suspended_session, "usb.status"));
+    require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
+    fixture.payload(hello_request(3, kNonceB));
+    assert(extract_string(fixture.sink.last(), "session") != suspended_session);
+}
+
+void test_same_rx_batch_observes_published_epoch() {
+    Fixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+
+    // The write for frame A models lifecycle publication before frame B is
+    // dispatched from the same framing batch. Frame B must not inherit A's
+    // old session or exact-cache authority.
+    fixture.sink.after_write = increment_authority;
+    fixture.sink.after_write_context = &fixture.authority;
+    control_framing::Transport transport;
+    feed_wire(&transport,
+              &fixture.protocol,
+              std::string(control_framing::kFramePrefix) +
+                  request(2, session, "system.ping") + "\n" +
+                  std::string(control_framing::kFramePrefix) +
+                  request(3, session, "system.ping") + "\n");
+    assert(fixture.sink.frames.size() >= 3);
+    require_contains(fixture.sink.frames[fixture.sink.frames.size() - 2], "\"pong\":true");
+    require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
+}
+
 }  // namespace
 
 int main() {
@@ -434,5 +630,9 @@ int main() {
     test_request_cache_and_commands();
     test_response_scratch_reuse();
     test_stale_response_correlation();
+    test_lease_refresh_expiry_and_takeover();
+    test_hid_failure_revokes_authority();
+    test_authority_epoch_barrier_and_retry_scoping();
+    test_same_rx_batch_observes_published_epoch();
     return 0;
 }

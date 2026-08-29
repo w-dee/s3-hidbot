@@ -1,0 +1,175 @@
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+
+namespace hid_runtime {
+
+enum class Interface : std::uint8_t {
+    kKeyboard = 0,
+    kMouse = 1,
+};
+
+enum class ReportKind : std::uint8_t {
+    kUnsafeKeyboard,
+    kUnsafeMouse,
+    kSafetyKeyboard,
+    kSafetyMouse,
+};
+
+struct StatusSnapshot {
+    bool mounted = false;
+    bool suspended = false;
+    bool keyboard_ready = false;
+    bool mouse_ready = false;
+};
+
+struct KeyboardState {
+    std::uint8_t modifiers = 0;
+    std::array<std::uint8_t, 6> keycodes{};
+};
+
+struct MouseState {
+    std::uint8_t buttons = 0;
+};
+
+// This is deliberately separate from attach_generation.  It is a lock-free
+// lifecycle publication token that defines HID-control authority boundaries.
+// Unsigned wrap is well-defined; practical lifecycle frequency cannot reach it.
+using AuthorityEpoch = std::uint32_t;
+
+using SubmitFn = bool (*)(void *context, std::uint8_t instance,
+                          const std::uint8_t *report, std::uint16_t length);
+
+// TinyUSB-independent state and mailbox core. Producers may run from the
+// control/application task; execute() is called only from the TinyUSB task.
+// The fixed one-slot-per-interface mailbox never allocates or blocks.
+class StateMachine {
+  public:
+    StateMachine();
+
+    void on_mount();
+    void on_unmount();
+    void on_suspend();
+    void on_resume();
+    void set_ready(Interface interface, bool ready);
+
+    StatusSnapshot status() const;
+    std::uint32_t attach_generation() const;
+    AuthorityEpoch authority_epoch() const;
+
+    // Unsafe reports are accepted only while mounted, ready, and safety-clear.
+    // A rejected report is discarded and is never replayed later.
+    bool queue_keyboard_report(std::uint8_t modifiers,
+                               const std::array<std::uint8_t, 6> &keycodes);
+    bool queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
+                            std::int8_t vertical, std::int8_t horizontal);
+
+    // Internal safety primitive. It may be called repeatedly; only interfaces
+    // with held or uncertain host state require an all-up report.
+    void request_release_all();
+    void cancel_queued(Interface interface);
+
+    // TinyUSB-task executor and completion notifications.
+    void execute(SubmitFn submit, void *context);
+    bool report_complete(std::uint8_t instance);
+    bool report_failed(std::uint8_t instance);
+
+    KeyboardState keyboard_state() const;
+    MouseState mouse_state() const;
+    bool safety_required(Interface interface) const;
+    bool host_state_uncertain(Interface interface) const;
+    bool report_in_flight(Interface interface) const;
+
+  private:
+    struct InterfaceState {
+        std::atomic<std::uint8_t> slot_state{0};  // empty, writing, ready, executing
+        std::uint32_t slot_generation = 0;
+        AuthorityEpoch slot_authority_epoch = 0;
+        std::uint32_t slot_release_epoch = 0;
+        ReportKind slot_kind = ReportKind::kUnsafeKeyboard;
+        std::uint8_t slot_length = 0;
+        std::uint8_t slot_report[8]{};
+
+        std::atomic_bool in_flight{false};
+        std::uint32_t in_flight_generation = 0;
+        AuthorityEpoch in_flight_authority_epoch = 0;
+        ReportKind in_flight_kind = ReportKind::kUnsafeKeyboard;
+        std::uint8_t in_flight_length = 0;
+        std::uint8_t in_flight_report[8]{};
+        std::atomic_bool safety_required{false};
+        std::atomic_bool host_state_uncertain{false};
+        KeyboardState keyboard{};
+        MouseState mouse{};
+    };
+
+    static constexpr std::uint8_t kSlotEmpty = 0;
+    static constexpr std::uint8_t kSlotWriting = 1;
+    static constexpr std::uint8_t kSlotReady = 2;
+    static constexpr std::uint8_t kSlotExecuting = 3;
+    static constexpr std::uint8_t kSlotCanceled = 4;
+
+    InterfaceState &state(Interface interface);
+    const InterfaceState &state(Interface interface) const;
+    bool mounted_and_active(Interface interface) const;
+    bool any_safety_required() const;
+    bool queue_safety(Interface interface);
+    bool queue_report(Interface interface, ReportKind kind,
+                      const std::uint8_t *report, std::uint8_t length);
+    void clear_interface(InterfaceState &interface_state);
+    void preserve_suspend_safety(InterfaceState &interface_state);
+
+    // ESP32-S3 has native lock-free 32-bit atomics. Keep this fixed-width
+    // publication token independent from attach generation so the lifecycle
+    // callback never needs to wait for the UART/control task.
+    static_assert(std::atomic<AuthorityEpoch>::is_always_lock_free);
+    std::atomic<std::uint32_t> generation_{0};
+    std::atomic<AuthorityEpoch> authority_epoch_{0};
+    std::atomic<std::uint32_t> release_epoch_{0};
+    std::atomic<std::uint32_t> release_request_generation_{0};
+    std::atomic<AuthorityEpoch> release_request_authority_epoch_{0};
+    std::atomic<std::uint8_t> status_bits_{0};  // mounted, suspended, kbd-ready, mouse-ready
+    std::atomic_bool release_requested_{false};
+    InterfaceState interfaces_[2]{};
+};
+
+// Hardware adapter. All tud_hid_* calls are confined to service_sof(), which
+// is invoked by TinyUSB's public SOF callback in TinyUSB task context.
+class Runtime {
+  public:
+    void initialize();
+    void on_mount();
+    void on_unmount();
+    void on_suspend();
+    void on_resume();
+    StatusSnapshot status_snapshot() const;
+    AuthorityEpoch authority_epoch() const;
+
+    bool queue_keyboard_report(std::uint8_t modifiers,
+                               const std::array<std::uint8_t, 6> &keycodes);
+    bool queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
+                            std::int8_t vertical, std::int8_t horizontal);
+    void request_release_all();
+    void service_sof();
+    void on_report_complete(std::uint8_t instance);
+    bool on_report_failed(std::uint8_t instance);
+
+    // Results are consumed by the application task for bounded diagnostic
+    // logging; the TinyUSB callback itself never logs or blocks.
+    bool take_report_sent(Interface interface);
+    bool take_report_failed(Interface interface);
+
+    StateMachine &state_machine() { return state_machine_; }
+
+  private:
+    static bool submit_report(void *, std::uint8_t instance,
+                              const std::uint8_t *report, std::uint16_t length);
+    void set_result(Interface interface, bool failed);
+
+    StateMachine state_machine_;
+    std::atomic<std::uint8_t> result_bits_{0};  // sent bits 0/1, failed bits 2/3
+};
+
+}  // namespace hid_runtime

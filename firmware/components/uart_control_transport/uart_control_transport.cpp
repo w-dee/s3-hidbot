@@ -7,6 +7,7 @@
 
 #include "control_framing/control_framing.hpp"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
 #include "esp_log.h"
@@ -26,7 +27,8 @@ constexpr TickType_t kRxReadWaitTicks = pdMS_TO_TICKS(100);
 
 control_framing::Transport s_transport;
 control_protocol::Protocol s_protocol;
-std::atomic_bool s_unmount_pending{false};
+std::atomic_bool s_lifecycle_invalidation_pending{false};
+std::atomic_bool s_hid_failure_pending{false};
 bool s_started = false;
 
 void fill_random(void *, std::uint8_t *output, std::size_t length) {
@@ -39,13 +41,24 @@ bool write_protocol_frame(void *, const std::uint8_t *data, std::size_t length) 
     return uart_control_transport::write_machine(data, length);
 }
 
+std::uint64_t monotonic_now(void *) {
+    return static_cast<std::uint64_t>(esp_timer_get_time());
+}
+
 void consume_framing_event(void *, const control_framing::Event &event) {
     s_protocol.handle_framing_event(event);
 }
 
-void revoke_pending_session() {
-    if (s_unmount_pending.exchange(false, std::memory_order_acq_rel)) {
-        s_protocol.on_usb_unmount();
+void service_pending_notifications() {
+    if (s_lifecycle_invalidation_pending.exchange(false, std::memory_order_acq_rel)) {
+        s_protocol.on_hid_lifecycle_invalidation();
+        // A retired lifecycle epoch invalidates any delayed report-failure
+        // notification before it can revoke a current-epoch session.
+        s_hid_failure_pending.store(false, std::memory_order_release);
+        return;
+    }
+    if (s_hid_failure_pending.exchange(false, std::memory_order_acq_rel)) {
+        s_protocol.on_hid_safety_failure();
     }
 }
 
@@ -58,12 +71,17 @@ void control_rx_task(void *) {
                                                kRxReadWaitTicks);
         // The TinyUSB lifecycle callback only sets this atomic flag. Keeping
         // session mutation in this task avoids concurrent protocol-state access.
-        revoke_pending_session();
+        service_pending_notifications();
+        s_protocol.service();
         if (bytes_read > 0) {
             s_transport.consume(buffer.data(),
                                 static_cast<std::size_t>(bytes_read),
                                 consume_framing_event,
                                 nullptr);
+            // A callback can publish an authority epoch between two frames in
+            // this same RX batch. Each request has its own epoch barrier;
+            // this second pass makes cache/session cleanup prompt as well.
+            service_pending_notifications();
         }
     }
 }
@@ -98,6 +116,8 @@ esp_err_t start(const control_protocol::Config *protocol_config) {
     control_protocol::Config configured_protocol = *protocol_config;
     configured_protocol.output = write_protocol_frame;
     configured_protocol.output_context = nullptr;
+    configured_protocol.now = monotonic_now;
+    configured_protocol.now_context = nullptr;
     if (!s_protocol.initialize(configured_protocol, fill_random, nullptr)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -133,11 +153,20 @@ esp_err_t start(const control_protocol::Config *protocol_config) {
     return ESP_OK;
 }
 
-void on_usb_unmount() {
+void on_hid_lifecycle_invalidation() {
     if (s_started) {
         // This callback must remain non-blocking and does not emit a machine
-        // frame. The UART RX task applies the revoke before its next request.
-        s_unmount_pending.store(true, std::memory_order_release);
+        // frame. The runtime epoch already blocks old authority immediately;
+        // the RX task performs serialized cache/session maintenance.
+        s_lifecycle_invalidation_pending.store(true, std::memory_order_release);
+    }
+}
+
+void on_hid_safety_failure() {
+    if (s_started) {
+        // Keep the TinyUSB callback non-blocking; the RX task revokes protocol
+        // authority in its serialized state domain.
+        s_hid_failure_pending.store(true, std::memory_order_release);
     }
 }
 

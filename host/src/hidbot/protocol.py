@@ -13,6 +13,7 @@ from .framing import FRAME_PREFIX, MAX_MACHINE_FRAME_BYTES
 
 
 PROTOCOL_VERSION = 1
+LEASE_MS = 5000
 MAX_REQUEST_FRAME_BYTES = 512
 MAX_ID = 2_147_483_647
 MAX_TOKEN_LENGTH = 32
@@ -27,6 +28,7 @@ REQUIRED_CAPABILITIES = frozenset(
         "system.ping-v1",
         "system.info-v1",
         "usb.status-v1",
+        "hid.lease-v1",
     }
 )
 
@@ -54,6 +56,7 @@ class HelloResponse:
     project: str
     protocol_version: int
     capabilities: tuple[str, ...]
+    lease_ms: int
 
 
 def _reject_constant(value: str) -> None:
@@ -242,6 +245,7 @@ def validate_hello_response(
         "boot_id",
         "session",
         "capabilities",
+        "lease_ms",
     }
     if set(result) != required:
         raise ProtocolError("hello result fields are invalid")
@@ -267,6 +271,8 @@ def validate_hello_response(
         or not REQUIRED_CAPABILITIES.issubset(capabilities)
     ):
         raise ProtocolError("hello response capabilities are incompatible")
+    if type(result["lease_ms"]) is not int or result["lease_ms"] != LEASE_MS:
+        raise ProtocolError("hello response lease is incompatible")
     return HelloResponse(
         session=response.session,
         boot_id=boot_id,
@@ -274,4 +280,5 @@ def validate_hello_response(
         project=result["project"],
         protocol_version=result["protocol_version"],
         capabilities=tuple(capabilities),
+        lease_ms=result["lease_ms"],
     )

@@ -10,6 +10,8 @@ inline constexpr std::size_t kTokenHexLength = 32;
 inline constexpr std::size_t kTokenStorageBytes = kTokenHexLength + 1;
 inline constexpr std::size_t kMaxRequestBytes = 504;
 inline constexpr std::size_t kMaxResponseBytes = 1024;
+inline constexpr std::uint32_t kLeaseMilliseconds = 5000;
+inline constexpr std::uint64_t kLeaseMicroseconds = 5000000;
 
 struct ResponseFrame {
     std::uint8_t bytes[kMaxResponseBytes]{};
@@ -17,6 +19,8 @@ struct ResponseFrame {
 };
 
 using RandomFill = void (*)(void *context, std::uint8_t *output, std::size_t length);
+using NowFn = std::uint64_t (*)(void *context);
+using AuthorityEpoch = std::uint32_t;
 
 enum class HelloCacheResult : std::uint8_t {
     kNewClient,
@@ -38,31 +42,40 @@ enum class RequestCacheResult : std::uint8_t {
 class State {
   public:
     void initialize(RandomFill random_fill, void *random_context);
+    void initialize(RandomFill random_fill, void *random_context,
+                    NowFn now, void *now_context);
 
     const char *boot_id() const;
     const char *current_session() const;
     bool has_active_session() const;
+    bool authority_epoch_matches(AuthorityEpoch current_epoch) const;
+    AuthorityEpoch session_authority_epoch() const;
+    bool refresh_lease();
+    bool service_lease();
+    void revoke_for_takeover();
 
     HelloCacheResult inspect_hello(std::string_view client_nonce,
                                    std::string_view request_bytes,
+                                   AuthorityEpoch current_epoch,
                                    const ResponseFrame **cached_response) const;
     void activate_hello(std::string_view client_nonce,
                         std::string_view request_bytes,
                         const char *new_session,
+                        AuthorityEpoch authority_epoch,
                         const ResponseFrame &response);
     void generate_token(char output[kTokenStorageBytes]);
 
     RequestCacheResult inspect_request(std::string_view session,
                                        std::int32_t id,
                                        std::string_view request_bytes,
+                                       AuthorityEpoch current_epoch,
                                        const ResponseFrame **cached_response) const;
     void cache_completed_request(std::int32_t id,
                                  std::string_view request_bytes,
+                                 AuthorityEpoch authority_epoch,
                                  const ResponseFrame &response);
 
-    // USB unmount is a safety boundary. It revokes the active control session
-    // and both retry caches so a cached hello cannot revive that session.
-    void revoke_for_unmount();
+    void revoke_for_lifecycle_invalidation(AuthorityEpoch current_epoch);
 
   private:
     struct HelloCache {
@@ -71,6 +84,7 @@ class State {
         char request[kMaxRequestBytes + 1]{};
         std::size_t request_length = 0;
         char session[kTokenStorageBytes]{};
+        AuthorityEpoch authority_epoch = 0;
         ResponseFrame response{};
     };
 
@@ -79,6 +93,7 @@ class State {
         std::int32_t id = 0;
         char request[kMaxRequestBytes + 1]{};
         std::size_t request_length = 0;
+        AuthorityEpoch authority_epoch = 0;
         ResponseFrame response{};
     };
 
@@ -91,12 +106,18 @@ class State {
                              std::string_view request);
     void clear_normal_cache();
     void clear_hello_cache();
+    std::uint64_t now() const;
+    void clear_authority();
 
     RandomFill random_fill_ = nullptr;
     void *random_context_ = nullptr;
     char boot_id_[kTokenStorageBytes]{};
     char current_session_[kTokenStorageBytes]{};
     bool active_session_ = false;
+    AuthorityEpoch session_authority_epoch_ = 0;
+    NowFn now_fn_ = nullptr;
+    void *now_context_ = nullptr;
+    std::uint64_t lease_deadline_us_ = 0;
     HelloCache hello_cache_{};
     RequestCache request_cache_{};
 };

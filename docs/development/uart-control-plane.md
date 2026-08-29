@@ -6,11 +6,12 @@ The control plane uses the onboard USB-UART path. Native USB-OTG remains the
 separate TinyUSB HID Device path. A host must never assume that opening a serial
 device proves that the HID USB path is attached, or vice versa.
 
-U2 establishes a bounded JSON control core for handshake and diagnostics only.
+U4.1 extends the bounded JSON control core with a mandatory session lease and
+the HID runtime safety foundation; public HID commands remain deferred.
 It implements `protocol.hello`, `system.ping`, `system.info`, and `usb.status`.
-It has no UART HID command, control lease, asynchronous event, production host
-client, USB reconnect, GPIO action, or reset command. Receiving a U2 UART
-request cannot send a Keyboard or Mouse report.
+It has no UART HID command, asynchronous event, production host client, USB
+reconnect, GPIO action, or reset command. Receiving a diagnostic UART request
+cannot send a Keyboard or Mouse report.
 
 The configured ESP-IDF console UART is used without application hardcoding of
 its UART number, pins, or baud rate. The UART RX control task is the sole
@@ -154,7 +155,8 @@ the new token. The result retains the same `session` and includes an exact
 initial capability list:
 
 ```text
-protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1
+  protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
+  hid.lease-v1
 ```
 
 For a successful hello, top-level `session` equals `result.session`. Both are
@@ -164,15 +166,15 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","hid.lease-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
 values are fixed-length lowercase hexadecimal tokens.
 
 Adding a future capability does not itself require changing protocol version
-`v`; hosts must use the advertised capability list. U2 does not advertise HID,
-release-all, event, or lease capabilities. All normal requests require the
+`v`; hosts must use the advertised capability list. U4.1 advertises only the
+lease foundation; HID report and release-all capabilities remain deferred. All normal requests require the
 exact current session; USB mount does not automatically create one.
 
 The response `session` field is a correlation/epoch identity, not an
@@ -189,8 +191,10 @@ the current token. A successful hello and exact hello retry contain the new
 session token.
 
 Hello and normal-request retry state are separate one-entry fixed-capacity
-caches. The hello cache holds the client nonce, exact normalized JSON bytes,
-serialized response, and resulting session:
+caches. Both are scoped to the current HID authority epoch as well as their
+existing request identity. The hello cache holds the client nonce, exact
+normalized JSON bytes, serialized response, resulting session, and authority
+epoch:
 
 ```text
 same nonce + same bytes       replay the cached response only
@@ -198,10 +202,15 @@ same nonce + different bytes  CLIENT_NONCE_CONFLICT
 new nonce                     establish a new session
 ```
 
-Exact hello retry neither regenerates a session nor repeats takeover work.
+Exact hello retry neither regenerates a session nor repeats takeover work, but
+only in the same authority epoch. After a suspend, resume, unmount, or mount,
+the same nonce and exact hello bytes are a fresh handshake with a new session,
+fresh lease, and fresh response. This lets a host recover without changing its
+nonce while preventing an old cached hello from resurrecting authority.
 
-The normal-request cache holds an ID, exact normalized JSON bytes, and complete
-serialized result. With the active session, requests follow these rules:
+The normal-request cache holds an ID, exact normalized JSON bytes, complete
+serialized result, and authority epoch. With the active session in the same
+authority epoch, requests follow these rules:
 
 ```text
 id > last_id                         new request
@@ -212,20 +221,50 @@ id < last_id                          REQUEST_ID_STALE
 
 ID gaps are permitted. IDs never wrap; after `2147483647`, the host establishes
 a new session. A cache hit replays only the result and never repeats a future
-HID action. Pre-command parse, schema, or session errors, stale IDs, and ID
-conflicts do not replace the completed-request cache.
+HID action. The session and authority-epoch check occurs before normal-cache
+replay. An old-epoch exact retry therefore returns `SESSION_MISMATCH`, does not
+refresh the lease, and never replays a cached success. Pre-command parse,
+schema, or session errors, stale IDs, and ID conflicts do not replace the
+completed-request cache.
 
-## USB unmount boundary
+## HID lifecycle authority boundaries
 
-Native USB HID detach is a control-session safety boundary. It revokes the
-active session and clears both normal and hello retry caches. An old cached
-hello response therefore cannot revive its revoked session after unmount; the
-same hello sent again establishes a fresh session. U2 has no held HID state to
-restore.
+Native USB HID lifecycle publication is a control-session safety boundary.
+Physical cable removal is not guaranteed to yield an immediate TinyUSB unmount
+on every board because this firmware does not yet include a board-specific
+VBUS monitor. The guarantee begins when firmware publishes a suspend, resume,
+unmount, or mount lifecycle event, not when a host physically notices cable
+removal.
 
-When HID state is introduced, a hello takeover must first clear old logical
-state, perform any possible safety release, revoke the old session, and then
-activate the new session. U2 does not yet implement that release behavior.
+`hid_runtime` owns a lock-free fixed-width atomic authority epoch. It advances
+on every suspend, resume, unmount, and mount. A successful hello captures that
+epoch in its control session. A normal request compares the captured epoch to
+the current acquire-loaded epoch before semantic processing, cache replay, or
+lease refresh. That request-side comparison is the linearization point for
+read-only commands: a response may finish after a later lifecycle publication
+only if it had already passed the comparison. Future unsafe HID work has an
+additional executor-side epoch barrier.
+
+The mailbox's attach generation remains a distinct mount/unmount token. It
+prevents old-attach work from reaching a new attach. Mailbox entries carry both
+the attach generation and authority epoch; report completion/failure records
+carry them too, so a late callback cannot clear safety state for a later epoch.
+Unmount clears old attach logical state, uncertainty, queued work, and pending
+all-up safety work. Mount starts a clean all-up attach.
+
+Suspend is different: configuration may resume against the same host. Suspend
+cancels unsafe queued work, treats held, in-flight, and uncertain interface
+state as needing an all-up safety release, and publishes
+`mounted=true, suspended=true, keyboard_ready=false, mouse_ready=false`.
+It sends no report while suspended. Resume advances authority again and retains
+that safety requirement. The SOF executor sends all-up safety work before any
+future unsafe work and blocks unsafe submission until required safety work has
+completed. The UART RX cleanup notification is deliberately eventual and
+coalesced; atomic epoch comparison is the correctness barrier.
+
+When HID state is introduced, a hello takeover first revokes old authority,
+starts any required safety release, and then activates the new session. The
+U4.1 runtime provides that internal safety boundary.
 
 ## U2 diagnostic commands
 
@@ -248,8 +287,9 @@ host should discard it within bounded limits and continue waiting.
 
 For hello, the host additionally requires the expected ID, `ok:true`, exact
 `result.client_nonce`, valid top-level and result session tokens that are equal,
-valid `boot_id`, expected project/protocol version, and a valid capabilities
-list. A wrong-nonce/stale frame must never establish a session. U3.1/U3.2 fix
+valid `boot_id`, expected project/protocol version, exact `lease_ms:5000`, and
+a valid capabilities list. A wrong-nonce/stale frame must never establish a
+session. U3.1/U3.2 fix
 the bounded discard limit and timeout recovery (`TRANSPORT_SYNC` followed by a
 fresh hello) in the generic host client.
 
@@ -278,7 +318,8 @@ missing envelope fields, invalid IDs/tokens, inconsistent `ok` versus
 bounded depth/member/string limits. Normal completion requires the expected
 ID and current session. Hello additionally requires the expected nonce,
 matching top-level/result sessions, a valid boot ID, `s3-hidbot` identity, the
-four baseline capabilities, and a unique bounded capability list. A stale hello
+four baseline capabilities plus `hid.lease-v1`, exact lease metadata, and a
+unique bounded capability list. A stale hello
 with the wrong nonce never establishes a session. `session:null` errors are
 retained only as bounded untrusted diagnostics and cannot complete a request.
 
@@ -294,9 +335,10 @@ automatically replays an old logical command; its result is left to the caller
 as unknown/session-lost.
 
 U3.1/U3.2 expose only `ping()`, `info()`, and `usb_status()` after
-`connect()`/hello. No HID command, lease, event, release-all, or arbitrary raw
-command API exists. Closing the client only closes the injected transport and
-invalidates local session state; it sends no UART command.
+`connect()`/hello. No HID command, event, release-all, or arbitrary raw command
+API exists; the hello result exposes read-only `lease_ms` metadata. Closing the
+client only closes the injected transport and invalidates local session state;
+it sends no UART command.
 
 The current Freenove FNK0085 materials identify CH343 as the USB-UART bridge.
 The U3.3 hardware characterization observed safe idle as DTR=true and RTS=true
@@ -338,13 +380,91 @@ an authentication mechanism; OS permissions and exclusive ownership are the
 local coordination boundary. A future hardware gate must perform real serial
 protocol round-trip validation; U3.3 itself does not open the real port.
 
-## Deferred control safety
+## U4.1 HID runtime and control lease
 
-U2 has no control lease. A later slice will make a bounded mandatory lease part
-of the command contract; session validity must not be documented as permanent.
-That future lease may be refreshed only by a valid current-session request with
-a valid envelope, known command, and semantically valid params. Malformed,
-invalid, unknown, and session-mismatched input must not refresh it.
+The `hid_runtime` component owns HID lifecycle state and is the only project
+code that calls TinyUSB HID report APIs. `tud_sof_cb_enable(true)` enables the
+public TinyUSB SOF callback; `tud_sof_cb()` invokes a bounded, heap-free,
+one-slot-per-interface executor (at most one report submission per SOF) in
+TinyUSB task context. Lifecycle callbacks
+and the executor therefore share one TinyUSB ordering domain. SOF processing
+does not log, write UART, parse JSON, wait on a mutex, or allocate.
+
+On ESP32-S3, the DWC2 bus-reset/configuration-reset sequence does not preserve
+the SOF enable state established before enumeration. `hid_runtime` therefore
+re-arms the SOF callback from `Runtime::on_mount()` for every configured attach,
+including re-attach and host reconfiguration. The post-mount SOF path
+continuously refreshes the readiness snapshot even when its HID mailbox is
+empty. `keyboard_ready` and `mouse_ready` remain the actual TinyUSB endpoint
+readiness (including endpoint-busy state), not inferred capability bits.
+
+The internal mailbox has EMPTY/WRITING/READY/EXECUTING/CANCELED states and
+stores both the attach generation and authority epoch with each operation.
+The executor checks both tokens, mounted state, non-suspended state, and the
+safety barrier immediately before TinyUSB report submission. U4.1 does not expose a
+synchronous public HID submit command; cancellation and timeout ownership for
+such commands remain deferred to the report-command slices.
+
+Each mount starts a monotonically increasing attach generation. It remains
+separate from the authority epoch: attach generation advances only at mount
+and unmount while authority advances at every suspend, resume, unmount, and
+mount. Queued work is canceled when either token differs at the final executor
+check. Internal safety requests are generated under the current resumed epoch.
+Unmount clears queued and in-flight bookkeeping, logical state, uncertainty,
+and pending safety work; a later attach starts from all-up state, with no old
+operation or all-up release carried across it.
+
+Keyboard and Mouse logical state is separate from host-state uncertainty. A
+successful submission is provisional until `tud_hid_report_complete_cb`; a
+`tud_hid_report_failed_cb` marks that interface uncertain and requires an
+all-up safety report, including when the failed report was itself all-up. The
+input-report failure callback also publishes a non-blocking notification; the
+UART RX task revokes the control session authority before invoking the runtime
+safety callback. Host-to-device output reports are not treated as project HID
+state and do not trigger this path.
+Keyboard and Mouse safety release is independent, so a successful Keyboard
+release never clears a pending Mouse release. Only safety all-up reports may
+be retried automatically. Unsafe reports that are not ready, are canceled by
+detach, suspend, an authority-epoch change, or fail submission are discarded
+and never replayed. During suspend, all held, in-flight, or uncertain state is
+preserved as a safety-release requirement; late callbacks from that earlier
+epoch are ignored. After resume, the executor prioritizes required all-up work
+and blocks every unsafe interface until this safety barrier is clear.
+
+`usb.status` reads an atomic runtime snapshot (`mounted`, `suspended`,
+`keyboard_ready`, and `mouse_ready`). Valid states include active configured
+(`mounted=true, suspended=false`, with readiness varying), suspended configured
+(`mounted=true, suspended=true, keyboard_ready=false, mouse_ready=false`),
+and unmounted (all false). `link_active = mounted && !suspended` is an internal
+concept; the wire schema has no new `link_active` field. The ready fields are
+instantaneous endpoint availability, including endpoint-busy state; they are
+not a promise that a host will remain attached or that a queued report will be
+delivered.
+The existing Configuration 1, Boot Keyboard/Mouse interfaces, endpoints
+0x81/0x82, descriptors, and VID/PID are unchanged. No public HID command is
+implemented in U4.1. The optional BOOT-button diagnostic remains build-time
+disabled by default and routes any enabled test report through the runtime.
+
+Control sessions have a mandatory 5000 ms lease measured by the monotonic
+`esp_timer_get_time()` clock. The existing UART RX loop services expiry after
+each bounded read (normally within 100 ms); no additional timer task exists.
+Successful hello starts the lease and advertises `lease_ms:5000` plus only
+`hid.lease-v1`. A valid current-session request, exact retry, or operational
+command result refreshes it. Malformed, epoch-mismatched, session-mismatched,
+stale/conflicting, unknown, and semantically invalid requests do not. Expiry
+revokes authority first, clears the normal retry cache, and requests runtime
+safety release.
+
+A new hello nonce revokes old authority and starts safety release before
+activating the new session. Exact hello retry replays its cached bytes and
+refreshes the lease only within its captured authority epoch. A hello while
+suspended is permitted for diagnostics and captures the suspended epoch, but
+resume invalidates it and requires a fresh hello. Lease expiry and takeover
+allow diagnostic commands while safety is pending; future unsafe HID commands
+are not yet exposed. `hid.release_all` and report capabilities remain deferred
+to later slices.
+
+## Deferred control safety
 
 `hid.release_all` and report commands are deferred. A future release-all must
 report independent Keyboard and Mouse interface outcomes and cannot promise
@@ -369,3 +489,8 @@ They do not prove UART serialization under concurrent hardware tasks. A later
 hardware gate must capture bounded synthetic common-writer frames alongside
 ordinary logs and verify byte integrity, count, and sequence while ignoring
 non-protocol text. That test must not send a HID report.
+
+The authority-epoch barrier intentionally does not claim that every physical
+OTG cable removal will generate an immediate firmware lifecycle event. The
+current board integration has no verified VBUS-comparator GPIO path, so adding
+board-evidenced VBUS monitoring remains a future optional hardware improvement.

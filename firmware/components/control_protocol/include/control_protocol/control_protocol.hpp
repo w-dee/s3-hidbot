@@ -25,14 +25,26 @@ struct UsbStatus {
 };
 
 using UsbStatusProvider = UsbStatus (*)(void *context);
+using AuthorityEpochProvider = control_session::AuthorityEpoch (*)(void *context);
 using OutputSink = bool (*)(void *context, const std::uint8_t *data, std::size_t length);
+using SafetyCallback = void (*)(void *context);
 
 struct Config {
     Metadata metadata;
     UsbStatusProvider usb_status_provider;
     void *usb_status_context;
+    AuthorityEpochProvider authority_epoch_provider;
+    void *authority_epoch_context;
     OutputSink output;
     void *output_context;
+    control_session::NowFn now;
+    void *now_context;
+    SafetyCallback lease_expired;
+    void *lease_expired_context;
+    SafetyCallback session_takeover;
+    void *session_takeover_context;
+    SafetyCallback hid_safety_failure;
+    void *hid_safety_failure_context;
 };
 
 class Protocol {
@@ -42,7 +54,9 @@ class Protocol {
                     void *random_context);
 
     void handle_framing_event(const control_framing::Event &event);
-    void on_usb_unmount();
+    void on_hid_lifecycle_invalidation();
+    void on_hid_safety_failure();
+    void service();
 
   private:
     void handle_frame(std::string_view payload);
@@ -52,6 +66,7 @@ class Protocol {
     Config config_{};
     control_session::State session_{};
     bool initialized_ = false;
+    bool lease_revoke_notified_ = false;
     // Protocol is consumed only by the UART RX task. Keeping these reusable
     // workspaces on the Protocol instance avoids placing multi-kilobyte JSON
     // and response buffers on that task's stack.

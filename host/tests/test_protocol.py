@@ -37,6 +37,7 @@ class ProtocolTests(unittest.TestCase):
                         "client_nonce": OTHER_TOKEN,
                         "boot_id": TOKEN,
                         "session": TOKEN,
+                        "lease_ms": 5000,
                         "capabilities": sorted(REQUIRED_CAPABILITIES),
                     },
                 }
@@ -106,10 +107,17 @@ class ProtocolTests(unittest.TestCase):
                 "client_nonce": OTHER_TOKEN,
                 "boot_id": TOKEN,
                 "session": TOKEN,
+                "lease_ms": 5000,
                 "capabilities": sorted(REQUIRED_CAPABILITIES),
             },
         }
         base["result"]["capabilities"] = ["protocol.hello-v1"]
+        with self.assertRaises(ProtocolError):
+            validate_hello_response(
+                parse_response(frame_payload(base)), expected_id=0, expected_nonce=OTHER_TOKEN
+            )
+        base["result"]["capabilities"] = sorted(REQUIRED_CAPABILITIES)
+        base["result"]["lease_ms"] = 4999
         with self.assertRaises(ProtocolError):
             validate_hello_response(
                 parse_response(frame_payload(base)), expected_id=0, expected_nonce=OTHER_TOKEN
