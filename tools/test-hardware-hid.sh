@@ -16,4 +16,4 @@ if (( $# > 0 )); then
 fi
 
 "$python_bin" "$repository_root/tools/test_hid_hardware_smoke.py"
-echo "PASS: read-only HID observer/discovery unit tests"
+echo "PASS: read-only HID observer/discovery and F24 smoke unit tests"

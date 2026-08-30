@@ -19,10 +19,11 @@ contain a separate hidden test recipe.
   require an activated ESP-IDF v5.5.4 environment. Keep activation paths in
   local shell configuration; do not add them to this repository.
 - The ESP-IDF project root is `firmware/`.
-- `test-hardware-hid.sh` runs the U5.4.1 Linux HID observer/discovery unit
-  tests without touching `/dev/input`, sysfs, serial, or USB. A physical
-  observer run is a separate, explicit `./tools/test-hardware-hid.sh
-  --hardware` operation and is never part of CI.
+- `test-hardware-hid.sh` runs the U5.4.1/U5.4.2 Linux HID
+  observer/discovery and F24 orchestration unit tests without touching
+  `/dev/input`, sysfs, serial, or USB. A physical observer/smoke run is a
+  separate, explicit `./tools/test-hardware-hid.sh --hardware` operation and
+  is never part of CI.
 
 The host entrypoint creates a temporary virtual environment, stages the
 `host/` package in a temporary directory, installs it as a normal distribution
@@ -72,12 +73,16 @@ The existing `sdkconfig.defaults` and `dependencies.lock` provide the target
 and dependency source of truth; no `set-target` step is required for a fresh
 checkout. Build output remains ignored and must never be tracked.
 
-`test-hardware-hid.sh` is the canonical U5.4.1 observer entrypoint. With no
-arguments it executes only the stdlib unit tests. The optional `--hardware`
-form performs Linux-only, read-only event-device discovery and an initial
-drain for the documented HID fixture; it does not open the UART, create a
-client session, or send a HID report. The physical form requires a separate
-hardware review gate and is not a CI command.
+`test-hardware-hid.sh` is the canonical U5.4.1/U5.4.2 observer entrypoint.
+With no arguments it executes only the stdlib unit tests. The optional
+`--hardware` form performs Linux-only, read-only event-device discovery and an
+initial drain for the documented HID fixture; it does not open the UART,
+create a client session, or send a HID report. Adding `--keyboard` selects the
+separate bounded F24 down/observe/up smoke transaction, using the existing
+host `Client` and transport APIs after observer readiness. It requires
+`--port` or the machine-local `S3_HIDBOT_SERIAL` value and never prints that
+value. Both physical forms require a separate hardware review gate and are not
+CI commands; ordinary no-argument validation remains hardware-free.
 
 `test-nonhardware.sh` is the complete A-D suite (static, privacy, host,
 package artifacts, IDF-independent native, and IDF-dependent protocol

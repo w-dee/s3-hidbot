@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Read-only Linux HID event discovery for the U5.4.1 hardware gate.
+"""Read-only Linux HID discovery and opt-in F24 keyboard smoke support.
 
-This slice deliberately stops after discovering and opening the two evdev
-sources.  It never opens the UART, creates a host Client, or sends a HID
-report.  Physical access is guarded by the explicit ``--hardware`` flag.
+The default mode deliberately stops after discovering and opening the two
+evdev sources.  The optional ``--hardware --keyboard`` mode is the separately
+gated F24 physical smoke path.  It is never entered without the explicit
+``--hardware`` opt-in.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +20,8 @@ import re
 import selectors
 import struct
 import sys
-from typing import Callable, Iterable, TextIO
+import time
+from typing import Any, Callable, Iterable, TextIO
 
 
 DEFAULT_VID = 0x303A
@@ -27,6 +30,7 @@ DEFAULT_PRODUCT = "s3-hidbot"
 DEFAULT_KEYBOARD_INTERFACE = 0
 DEFAULT_MOUSE_INTERFACE = 1
 KEY_F24 = 194
+F24_USAGE = 0x73
 REL_X = 0
 EV_KEY = 0x01
 EV_REL = 0x02
@@ -34,6 +38,9 @@ EV_SYN = 0x00
 SYN_REPORT = 0x00
 SYN_DROPPED = 0x03
 EVENT_NAME = re.compile(r"event[0-9]+\Z")
+DEFAULT_BAUD = 115200
+DEFAULT_EVENT_TIMEOUT = 2.0
+DEFAULT_QUIET_TAIL = 0.15
 
 
 class DiscoveryError(RuntimeError):
@@ -42,6 +49,14 @@ class DiscoveryError(RuntimeError):
 
 class ObserverError(RuntimeError):
     """An event stream could not be decoded as complete input records."""
+
+
+class KeyboardSmokeError(RuntimeError):
+    """A bounded F24 smoke phase failed with a reportable exit code."""
+
+    def __init__(self, message: str, *, exit_code: int = 5) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 @dataclass(frozen=True)
@@ -405,6 +420,278 @@ def discover_devices(
     return keyboard, mouse
 
 
+def discover_keyboard(
+    *,
+    dev_input_root: Path = Path("/dev/input"),
+    sysfs_root: Path = Path("/sys"),
+    identity: DeviceIdentity = DeviceIdentity(),
+    keyboard_interface: int = DEFAULT_KEYBOARD_INTERFACE,
+    keyboard_event: str | None = None,
+) -> InputCandidate:
+    """Find exactly one validated F24-capable keyboard event source."""
+
+    return _select_one(
+        "keyboard",
+        _event_paths(dev_input_root, keyboard_event),
+        sysfs_root / "class" / "input",
+        identity,
+        keyboard_interface,
+        "key",
+        KEY_F24,
+    )
+
+
+def _report_state(result: object) -> str:
+    """Read the typed host result without duplicating the protocol model."""
+
+    if isinstance(result, dict):
+        state = result.get("state")
+    else:
+        state = getattr(result, "state", None)
+    return state if isinstance(state, str) else "unknown"
+
+
+def _release_result(result: object) -> dict[str, str]:
+    """Convert the existing typed release result to bounded evidence."""
+
+    if isinstance(result, dict):
+        keyboard = result.get("keyboard")
+        mouse = result.get("mouse")
+    else:
+        keyboard = getattr(result, "keyboard", None)
+        mouse = getattr(result, "mouse", None)
+    if keyboard not in {"already_up", "submitted"} or mouse not in {
+        "already_up",
+        "submitted",
+    }:
+        raise KeyboardSmokeError("release_all returned an invalid result", exit_code=3)
+    return {"keyboard": keyboard, "mouse": mouse}
+
+
+def _wait_for_f24(
+    observer: Any,
+    expected_value: int,
+    timeout: float,
+    *,
+    clock: Callable[[], float],
+) -> tuple[float, int]:
+    """Wait once within a finite deadline and reject relevant surprises."""
+
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("event timeout must be positive")
+    started = clock()
+    events = observer.wait_events(timeout)
+    matched = False
+    for event in events:
+        if is_syn_dropped(event):
+            raise KeyboardSmokeError(
+                "SYN_DROPPED made F24 evidence incomplete", exit_code=5
+            )
+        if event.event_type == EV_SYN:
+            continue
+        if event.event_type == EV_KEY:
+            if is_f24_event(event, expected_value) and not matched:
+                matched = True
+                continue
+            raise KeyboardSmokeError(
+                "unexpected keyboard key event during F24 smoke", exit_code=5
+            )
+    if matched:
+        return max(0.0, (clock() - started) * 1000.0), 1
+    raise KeyboardSmokeError(f"timed out waiting for F24 value {expected_value}", exit_code=5)
+
+
+def _quiet_tail(
+    observer: Any,
+    timeout: float,
+) -> None:
+    """Catch duplicate or unrelated keyboard events in a short bounded tail."""
+
+    if timeout <= 0:
+        return
+    for event in observer.wait_events(timeout):
+        if is_syn_dropped(event):
+            raise KeyboardSmokeError(
+                "SYN_DROPPED made F24 quiet-tail evidence incomplete", exit_code=5
+            )
+        if event.event_type == EV_SYN:
+            continue
+        if event.event_type == EV_KEY:
+            raise KeyboardSmokeError(
+                "unexpected or repeated keyboard key event after F24 report",
+                exit_code=5,
+            )
+
+
+def run_keyboard_smoke(
+    candidate: InputCandidate,
+    *,
+    serial_port: str,
+    baudrate: int = DEFAULT_BAUD,
+    event_timeout: float = DEFAULT_EVENT_TIMEOUT,
+    quiet_tail: float = DEFAULT_QUIET_TAIL,
+    observer_factory: Callable[[Path], Any] = ReadOnlyEventObserver,
+    transport_factory: Callable[[str, int, float], Any],
+    client_factory: Callable[[Any, float], Any],
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[int, dict[str, object]]:
+    """Run one bounded F24 down/up transaction using injected dependencies.
+
+    The injected seams keep all tests off physical `/dev/input` and serial
+    devices while the production path reuses the existing host transport and
+    ``Client`` APIs.  A successful run has one connect, one down, one explicit
+    all-up keyboard report, one final ``release_all``, and one close.
+    """
+
+    if not serial_port or baudrate <= 0:
+        raise ValueError("serial port and positive baudrate are required")
+    if (
+        not math.isfinite(event_timeout)
+        or event_timeout <= 0
+        or not math.isfinite(quiet_tail)
+        or quiet_tail < 0
+    ):
+        raise ValueError("event timeout must be positive and quiet tail non-negative")
+    started = clock()
+    evidence: dict[str, object] = {
+        "status": "fail",
+        "hardware_opt_in": True,
+        "mode": "keyboard",
+        "observer_state": "not_open",
+        "serial_accessed": False,
+        "keyboard": candidate.as_dict(),
+        "f24_usage": f"0x{F24_USAGE:02x}",
+        "down_submit": None,
+        "down_observed": False,
+        "down_latency_ms": None,
+        "up_submit": None,
+        "up_observed": False,
+        "up_latency_ms": None,
+        "cleanup_attempted": False,
+        "cleanup_result": None,
+    }
+    observer = observer_factory(candidate.path)
+    transport: Any | None = None
+    client: Any | None = None
+    session_started = False
+    down_accepted = False
+    down_observed = False
+    cleanup_error: Exception | None = None
+    primary_error: KeyboardSmokeError | None = None
+
+    try:
+        observer.open()
+        evidence["observer_state"] = "open"
+        evidence["initial_drain_events"] = observer.drain()
+        evidence["observer_state"] = "ready"
+
+        # This is deliberately after observer readiness: no serial or Client
+        # side effect happens until the selected F24 source is validated.
+        transport = transport_factory(serial_port, baudrate, event_timeout)
+        evidence["serial_accessed"] = True
+        transport.open()
+        client = client_factory(transport, event_timeout)
+        client.connect()
+        session_started = True
+
+        down_result = client.keyboard_report(modifiers=0, keys=[F24_USAGE])
+        down_state = _report_state(down_result)
+        evidence["down_submit"] = down_state
+        if down_state != "submitted":
+            raise KeyboardSmokeError(
+                "F24 down was not freshly submitted", exit_code=5
+            )
+        down_accepted = True
+        down_latency, _ = _wait_for_f24(
+            observer, 1, event_timeout, clock=clock
+        )
+        down_observed = True
+        evidence["down_observed"] = True
+        evidence["down_latency_ms"] = down_latency
+        _quiet_tail(observer, quiet_tail)
+
+        up_result = client.keyboard_report(modifiers=0, keys=[])
+        up_state = _report_state(up_result)
+        evidence["up_submit"] = up_state
+        if up_state != "submitted":
+            raise KeyboardSmokeError(
+                "F24 up was not freshly submitted", exit_code=5
+            )
+        up_latency, _ = _wait_for_f24(
+            observer, 0, event_timeout, clock=clock
+        )
+        evidence["up_observed"] = True
+        evidence["up_latency_ms"] = up_latency
+        _quiet_tail(observer, quiet_tail)
+
+        evidence["cleanup_attempted"] = True
+        try:
+            evidence["cleanup_result"] = _release_result(client.release_all())
+        except Exception as exc:
+            # The final release_all is safety cleanup, so a failure here is a
+            # distinct cleanup-only result rather than a primary report error.
+            cleanup_error = exc
+        evidence["status"] = "pass"
+    except KeyboardSmokeError as exc:
+        primary_error = exc
+    except ObserverError as exc:
+        primary_error = KeyboardSmokeError(str(exc), exit_code=5)
+    except (OSError, PermissionError) as exc:
+        primary_error = KeyboardSmokeError(
+            f"keyboard smoke I/O failed: {exc}", exit_code=4
+        )
+    except Exception as exc:
+        # Host Client/transport exceptions are control-plane failures.  Keep
+        # the original message while mapping them to the bounded smoke code.
+        primary_error = KeyboardSmokeError(
+            f"keyboard smoke control operation failed: {exc}", exit_code=3
+        )
+    finally:
+        if session_started and client is not None:
+            # If a down report was accepted but no matching down event arrived,
+            # make one bounded explicit-up attempt before the final safety call.
+            if down_accepted and not down_observed:
+                try:
+                    client.keyboard_report(modifiers=0, keys=[])
+                except Exception:
+                    pass
+            if not bool(evidence["cleanup_attempted"]):
+                evidence["cleanup_attempted"] = True
+                try:
+                    evidence["cleanup_result"] = _release_result(client.release_all())
+                except Exception as exc:
+                    cleanup_error = exc
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                if primary_error is None and cleanup_error is None:
+                    cleanup_error = exc
+        elif transport is not None:
+            try:
+                transport.close()
+            except Exception as exc:
+                if primary_error is None and cleanup_error is None:
+                    cleanup_error = exc
+        try:
+            observer.close()
+        except Exception as exc:
+            if primary_error is None and cleanup_error is None:
+                cleanup_error = exc
+
+    evidence["total_duration_ms"] = max(0.0, (clock() - started) * 1000.0)
+    if primary_error is not None:
+        evidence["error"] = str(primary_error)
+        if cleanup_error is not None:
+            evidence["cleanup_error"] = str(cleanup_error)
+        return primary_error.exit_code, evidence
+    if cleanup_error is not None:
+        evidence["status"] = "fail"
+        evidence["cleanup_error"] = str(cleanup_error)
+        return 6, evidence
+    return 0, evidence
+
+
 def _parse_cli_integer(value: str) -> int:
     try:
         return int(value, 0) if not value.isdigit() else int(value, 10)
@@ -414,7 +701,7 @@ def _parse_cli_integer(value: str) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Discover s3-hidbot Linux HID event sources (read-only)."
+        description="Discover s3-hidbot Linux HID sources and run gated smoke tests."
     )
     parser.add_argument(
         "--hardware",
@@ -429,6 +716,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mouse-interface", type=_parse_cli_integer, default=1)
     parser.add_argument("--keyboard-event")
     parser.add_argument("--mouse-event")
+    parser.add_argument(
+        "--keyboard",
+        action="store_true",
+        help="after discovery, run the opt-in F24 keyboard smoke transaction",
+    )
+    parser.add_argument("--port", help="serial port; otherwise S3_HIDBOT_SERIAL")
+    parser.add_argument("--baud", type=_parse_cli_integer, default=DEFAULT_BAUD)
+    parser.add_argument(
+        "--event-timeout",
+        type=float,
+        default=DEFAULT_EVENT_TIMEOUT,
+        help="bounded wait in seconds for each F24 event",
+    )
+    parser.add_argument(
+        "--quiet-tail",
+        type=float,
+        default=DEFAULT_QUIET_TAIL,
+        help="bounded post-event duplicate check in seconds",
+    )
     # These roots are primarily useful for deterministic tests and lab layouts.
     parser.add_argument("--dev-input-root", type=Path, default=Path("/dev/input"))
     parser.add_argument("--sysfs-root", type=Path, default=Path("/sys"))
@@ -456,12 +762,67 @@ def _emit_error(message: str, stream: TextIO) -> None:
     print(f"ERROR: {message}", file=stream)
 
 
+def _default_transport_factory(port: str, baudrate: int, timeout: float) -> Any:
+    """Construct the existing serial transport only after observer readiness."""
+
+    from hidbot.serial_transport import PySerialTransport
+
+    return PySerialTransport(
+        port,
+        baudrate,
+        read_timeout=min(0.05, timeout),
+        write_timeout=1.0,
+    )
+
+
+def _default_client_factory(transport: Any, timeout: float) -> Any:
+    """Construct the existing host Client; no protocol is duplicated here."""
+
+    from hidbot.client import Client
+
+    # A physical smoke report is a single observable action; do not let the
+    # client's normal bounded request retry turn one button test into repeats.
+    return Client(transport, timeout=timeout, max_attempts=1)
+
+
+def _emit_keyboard_evidence(
+    evidence: dict[str, object], *, as_json: bool, output: TextIO
+) -> None:
+    if as_json:
+        print(json.dumps(evidence, sort_keys=True), file=output)
+        return
+    if evidence.get("status") == "pass":
+        print("PASS: F24 keyboard smoke completed", file=output)
+    else:
+        print(f"FAIL: {evidence.get('error', 'keyboard smoke failed')}", file=output)
+    for key in (
+        "keyboard",
+        "f24_usage",
+        "observer_state",
+        "down_submit",
+        "down_observed",
+        "down_latency_ms",
+        "up_submit",
+        "up_observed",
+        "up_latency_ms",
+        "cleanup_attempted",
+        "cleanup_result",
+        "total_duration_ms",
+    ):
+        if key in evidence:
+            print(f"{key}: {evidence[key]}", file=output)
+
+
 def main(
     argv: list[str] | None = None,
     *,
     platform_name: str | None = None,
     discovery_fn: Callable[..., tuple[InputCandidate, InputCandidate]] = discover_devices,
+    keyboard_discovery_fn: Callable[..., InputCandidate] = discover_keyboard,
     observer_factory: Callable[[Path], ReadOnlyEventObserver] = ReadOnlyEventObserver,
+    transport_factory: Callable[[str, int, float], Any] | None = None,
+    client_factory: Callable[[Any, float], Any] | None = None,
+    clock: Callable[[], float] = time.monotonic,
     output: TextIO | None = None,
     errors: TextIO | None = None,
 ) -> int:
@@ -475,10 +836,52 @@ def main(
     if not args.hardware:
         _emit_error("--hardware is required for physical input discovery", err)
         return 2
+    if args.keyboard and (
+        not math.isfinite(args.event_timeout)
+        or args.event_timeout <= 0
+        or not math.isfinite(args.quiet_tail)
+        or args.quiet_tail < 0
+    ):
+        _emit_error("event timeout must be positive and quiet tail non-negative", err)
+        return 2
+    if args.keyboard and (args.baud <= 0):
+        _emit_error("baud must be positive", err)
+        return 2
     if args.vid < 0 or args.pid < 0:
         _emit_error("VID/PID must be non-negative", err)
         return 2
     identity = DeviceIdentity(args.vid, args.pid, args.product)
+    if args.keyboard:
+        serial_port = args.port or os.environ.get("S3_HIDBOT_SERIAL")
+        if not serial_port:
+            _emit_error("serial port is required via --port or S3_HIDBOT_SERIAL", err)
+            return 2
+        try:
+            candidate = keyboard_discovery_fn(
+                dev_input_root=args.dev_input_root,
+                sysfs_root=args.sysfs_root,
+                identity=identity,
+                keyboard_interface=args.keyboard_interface,
+                keyboard_event=args.keyboard_event,
+            )
+        except DiscoveryError as exc:
+            _emit_error(str(exc), err)
+            return 4
+        smoke_code, evidence = run_keyboard_smoke(
+            candidate,
+            serial_port=serial_port,
+            baudrate=args.baud,
+            event_timeout=args.event_timeout,
+            quiet_tail=args.quiet_tail,
+            observer_factory=observer_factory,
+            transport_factory=transport_factory or _default_transport_factory,
+            client_factory=client_factory or _default_client_factory,
+            clock=clock,
+        )
+        _emit_keyboard_evidence(evidence, as_json=args.json, output=out)
+        if smoke_code != 0 and not args.json:
+            _emit_error(str(evidence.get("error", "keyboard smoke failed")), err)
+        return smoke_code
     try:
         candidates = discovery_fn(
             dev_input_root=args.dev_input_root,

@@ -90,26 +90,50 @@ The corresponding native/CI coverage is authoritative in
 [`validation-entrypoints.md`](validation-entrypoints.md); protocol and safety
 semantics are authoritative in [`uart-control-plane.md`](uart-control-plane.md).
 
-## U5.4 read-only event observer
+## U5.4 read-only event observer and F24 smoke
 
-The first physical-smoke slice is discovery only. Run the no-hardware tests
-through `./tools/test-hardware-hid.sh`; they use fake sysfs and event records
-and do not access a board. A physical run must be explicitly opted into with
-`./tools/test-hardware-hid.sh --hardware` on Linux after this gate is approved.
+The observer/discovery and F24 orchestration are implemented and native-tested,
+but this slice is **not** a new hardware claim. The historical F24 row in the
+evidence matrix records the separately accepted direct-report gate; the smoke
+runner itself remains `IMPLEMENTED / NO-HARDWARE VALIDATED` until a dedicated
+physical gate is approved. Run the no-hardware tests through
+`./tools/test-hardware-hid.sh`; they use fake sysfs, event records, transport,
+and Client objects and do not access a board.
 
 In physical mode the observer enumerates `/dev/input/eventN`, validates the
 USB ancestor, VID/PID, product, interface number, and required capability,
-then opens exactly one keyboard and one mouse node with `O_RDONLY` and drains
-pending records before closing them. It never opens the USB-UART, creates a
-control session, sends a keyboard or mouse report, calls `EVIOCGRAB`, or
-changes host input state. Ambiguous or incomplete discovery fails closed.
+then opens the selected keyboard node with `O_RDONLY` and drains pending
+records before the F24 mode can construct the USB-UART transport. It never
+uses `EVIOCGRAB`, writes to an input node, or changes host input state.
+Ambiguous or incomplete discovery fails closed. The discovery-only mode still
+opens and drains exactly one keyboard and one mouse node for the U5.4.1
+baseline.
 
 The default temporary bring-up identity is VID `0x303a`, PID `0x4008`, and
 product `s3-hidbot`; `--vid`, `--pid`, and `--product` are explicit overrides
 for a future identity. Output uses generic event-node paths and does not
-print machine-local serial identifiers. This observer slice does not prove
-that a HID report was delivered to evdev; F24 and relative-mouse event
-injection remain separate, explicitly approved U5.4.2/U5.4.3 gates.
+print machine-local serial identifiers. An event override does not bypass the
+USB ancestry, identity, interface, or capability checks.
+
+The F24 smoke mode is explicitly selected with
+`./tools/test-hardware-hid.sh --hardware --keyboard` and requires the serial
+port from `--port` or `S3_HIDBOT_SERIAL`. Its bounded order is: discover the
+validated keyboard, open and drain the read-only observer, construct/open one
+transport, connect one Client session, submit one F24-down report, observe
+`KEY_F24` value `1`, submit one explicit keyboard all-up report, observe value
+`0`, request one final `release_all`, then close the Client/transport and
+observer. It does not use a subprocess per report, retry HID requests, or
+replay a timed-out event. A down report that was accepted but not observed gets
+one bounded best-effort all-up attempt before final cleanup. Any failure after
+session start attempts at most one final `release_all`; the primary failure is
+preserved and a cleanup-only failure is reported separately. `EV_SYN` records
+are ignored, `SYN_DROPPED` and unexpected key events fail closed, and a short
+quiet tail catches duplicate or unrelated key events.
+
+F24 is HID usage `0x73` / Linux `KEY_F24` (`194`). It is a diagnostic sentinel,
+not guaranteed side-effect-free input. This implementation is no-hardware
+validated only; a physical run requires a separate human gate and must verify
+the host-side effects before being classified as hardware evidence.
 
 ## Low-interference sentinel policy
 

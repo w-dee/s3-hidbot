@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pure tests for the U5.4.1 read-only HID observer/discovery layer."""
+"""Pure tests for the U5.4.1/U5.4.2 HID observer and F24 smoke layer."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -248,6 +249,219 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('"hid_reports_sent": 0', output.getvalue())
         self.assertIn('"observer_opened": true', output.getvalue())
         self.assertIn('"serial_accessed": false', output.getvalue())
+
+
+class KeyboardSmokeTests(unittest.TestCase):
+    candidate = smoke.InputCandidate(
+        Path("/dev/input/event0"),
+        "s3-hidbot keyboard",
+        0x303A,
+        0x4008,
+        "s3-hidbot",
+        0,
+        ("key",),
+    )
+
+    def make_fakes(
+        self,
+        *,
+        down_state: str = "submitted",
+        up_state: str = "submitted",
+        events: list[list[smoke.InputEvent]] | None = None,
+        release_error: Exception | None = None,
+    ) -> tuple[list[str], object, object, object, list[tuple[int, list[int]]]]:
+        actions: list[str] = []
+        report_calls: list[tuple[int, list[int]]] = []
+        event_batches = list(events or [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [],
+            [smoke.InputEvent(1, 2, smoke.EV_KEY, smoke.KEY_F24, 0)],
+            [],
+        ])
+
+        class FakeObserver:
+            def __init__(self, path: Path) -> None:
+                self.path = path
+
+            def open(self) -> None:
+                actions.append("observer_open")
+
+            def drain(self) -> int:
+                actions.append("drain")
+                return 0
+
+            def wait_events(self, timeout: float) -> list[smoke.InputEvent]:
+                del timeout
+                actions.append("observe")
+                return event_batches.pop(0) if event_batches else []
+
+            def close(self) -> None:
+                actions.append("observer_close")
+
+        class FakeTransport:
+            def open(self) -> None:
+                actions.append("transport_open")
+
+            def close(self) -> None:
+                actions.append("transport_close")
+
+        class FakeClient:
+            def __init__(self, transport: FakeTransport) -> None:
+                self.transport = transport
+
+            def connect(self) -> object:
+                actions.append("hello")
+                return SimpleNamespace(session="session")
+
+            def keyboard_report(self, modifiers: int, keys: list[int]) -> object:
+                report_calls.append((modifiers, list(keys)))
+                actions.append("keyboard_down" if keys else "keyboard_up")
+                state = down_state if keys else up_state
+                return SimpleNamespace(state=state)
+
+            def release_all(self) -> object:
+                actions.append("release_all")
+                if release_error is not None:
+                    raise release_error
+                return {"keyboard": "already_up", "mouse": "already_up"}
+
+            def close(self) -> None:
+                self.transport.close()
+
+        def transport_factory(port: str, baudrate: int, timeout: float) -> FakeTransport:
+            del port, baudrate, timeout
+            actions.append("transport_construct")
+            return FakeTransport()
+
+        def client_factory(transport: FakeTransport, timeout: float) -> FakeClient:
+            del timeout
+            actions.append("client_construct")
+            return FakeClient(transport)
+
+        return actions, FakeObserver, transport_factory, client_factory, report_calls
+
+    def execute(
+        self, **kwargs: object
+    ) -> tuple[int, dict[str, object], list[str], list[tuple[int, list[int]]]]:
+        actions, observer_factory, transport_factory, client_factory, report_calls = self.make_fakes(**kwargs)
+        code, evidence = smoke.run_keyboard_smoke(
+            self.candidate,
+            serial_port="fixture-port",
+            observer_factory=observer_factory,
+            transport_factory=transport_factory,
+            client_factory=client_factory,
+            clock=lambda: 1.0,
+        )
+        return code, evidence, actions, report_calls
+
+    def test_success_order_and_exact_client_calls(self) -> None:
+        code, evidence, actions, report_calls = self.execute()
+        self.assertEqual(code, 0)
+        self.assertEqual(evidence["status"], "pass")
+        self.assertEqual(
+            actions,
+            [
+                "observer_open",
+                "drain",
+                "transport_construct",
+                "transport_open",
+                "client_construct",
+                "hello",
+                "keyboard_down",
+                "observe",
+                "observe",
+                "keyboard_up",
+                "observe",
+                "observe",
+                "release_all",
+                "transport_close",
+                "observer_close",
+            ],
+        )
+        self.assertEqual(evidence["down_submit"], "submitted")
+        self.assertEqual(evidence["up_submit"], "submitted")
+        self.assertTrue(evidence["down_observed"])
+        self.assertTrue(evidence["up_observed"])
+        self.assertEqual(report_calls, [(0, [smoke.F24_USAGE]), (0, [])])
+
+    def test_no_hardware_keyboard_flag_does_not_discover_or_construct(self) -> None:
+        discovery = mock.Mock(side_effect=AssertionError("must not discover"))
+        transport = mock.Mock(side_effect=AssertionError("must not construct"))
+        result = smoke.main(
+            ["--keyboard"],
+            discovery_fn=discovery,
+            transport_factory=transport,
+            errors=io.StringIO(),
+        )
+        self.assertEqual(result, 2)
+        discovery.assert_not_called()
+        transport.assert_not_called()
+
+    def test_keyboard_mode_uses_keyboard_only_discovery(self) -> None:
+        candidate = self.candidate
+        keyboard_discovery = mock.Mock(return_value=candidate)
+        actions, observer_factory, transport_factory, client_factory, _ = self.make_fakes()
+        code = smoke.main(
+            ["--hardware", "--keyboard", "--port", "fixture-port", "--json"],
+            discovery_fn=mock.Mock(side_effect=AssertionError("mouse discovery")),
+            keyboard_discovery_fn=keyboard_discovery,
+            observer_factory=observer_factory,
+            transport_factory=transport_factory,
+            client_factory=client_factory,
+            clock=lambda: 1.0,
+            output=io.StringIO(),
+            errors=io.StringIO(),
+        )
+        self.assertEqual(code, 0)
+        keyboard_discovery.assert_called_once()
+        self.assertEqual(actions.count("transport_construct"), 1)
+
+    def test_down_submit_failure_does_not_wait_or_send_up(self) -> None:
+        code, evidence, actions, _ = self.execute(down_state="already_set")
+        self.assertEqual(code, 5)
+        self.assertEqual(evidence["cleanup_attempted"], True)
+        self.assertEqual(actions.count("observe"), 0)
+        self.assertEqual(actions.count("keyboard_up"), 0)
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_down_timeout_attempts_explicit_up_then_cleanup(self) -> None:
+        code, evidence, actions, _ = self.execute(events=[[]])
+        self.assertEqual(code, 5)
+        self.assertEqual(actions.count("keyboard_down"), 1)
+        self.assertEqual(actions.count("keyboard_up"), 1)
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_up_submit_failure_still_cleans_up(self) -> None:
+        code, evidence, actions, _ = self.execute(up_state="already_set")
+        self.assertEqual(code, 5)
+        self.assertEqual(actions.count("keyboard_down"), 1)
+        self.assertEqual(actions.count("keyboard_up"), 1)
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_up_timeout_still_cleans_up(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [],
+            [],
+        ]
+        code, evidence, actions, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertEqual(actions.count("keyboard_down"), 1)
+        self.assertEqual(actions.count("keyboard_up"), 1)
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_syn_dropped_fails_and_cleans_up(self) -> None:
+        events = [[smoke.InputEvent(1, 1, smoke.EV_SYN, smoke.SYN_DROPPED, 0)]]
+        code, evidence, actions, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_cleanup_only_failure_has_distinct_code(self) -> None:
+        code, evidence, actions, _ = self.execute(release_error=RuntimeError("cleanup"))
+        self.assertEqual(code, 6)
+        self.assertEqual(evidence["status"], "fail")
+        self.assertIn("cleanup_error", evidence)
+        self.assertEqual(actions.count("release_all"), 1)
 
 
 if __name__ == "__main__":
