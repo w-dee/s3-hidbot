@@ -274,7 +274,6 @@ class KeyboardSmokeTests(unittest.TestCase):
         report_calls: list[tuple[int, list[int]]] = []
         event_batches = list(events or [
             [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
-            [],
             [smoke.InputEvent(1, 2, smoke.EV_KEY, smoke.KEY_F24, 0)],
             [],
         ])
@@ -369,7 +368,6 @@ class KeyboardSmokeTests(unittest.TestCase):
                 "hello",
                 "keyboard_down",
                 "observe",
-                "observe",
                 "keyboard_up",
                 "observe",
                 "observe",
@@ -382,7 +380,215 @@ class KeyboardSmokeTests(unittest.TestCase):
         self.assertEqual(evidence["up_submit"], "submitted")
         self.assertTrue(evidence["down_observed"])
         self.assertTrue(evidence["up_observed"])
+        self.assertEqual(evidence["allowed_repeat_count"], 0)
+        self.assertFalse(evidence["event_evidence_truncated"])
         self.assertEqual(report_calls, [(0, [smoke.F24_USAGE]), (0, [])])
+
+    def test_up_wait_allows_f24_repeat_before_release(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [
+                smoke.InputEvent(1, 2, smoke.EV_KEY, smoke.KEY_F24, 2),
+                smoke.InputEvent(1, 3, smoke.EV_SYN, smoke.SYN_REPORT, 0),
+                smoke.InputEvent(1, 4, smoke.EV_KEY, smoke.KEY_F24, 0),
+                smoke.InputEvent(1, 5, smoke.EV_SYN, smoke.SYN_REPORT, 0),
+            ],
+            [],
+        ]
+        code, evidence, actions, _ = self.execute(events=events)
+        self.assertEqual(code, 0)
+        self.assertEqual(evidence["allowed_repeat_count"], 1)
+        self.assertFalse(evidence["repeat_limit_exceeded"])
+        self.assertEqual(evidence["up_observed"], True)
+        self.assertEqual(
+            [entry["classification"] for entry in evidence["event_evidence"]],
+            ["expected_down", "allowed_repeat", "ignored_syn", "expected_up", "ignored_syn"],
+        )
+        self.assertEqual(actions.count("keyboard_up"), 1)
+
+    def test_up_repeats_at_limit_without_release_times_out(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [
+                smoke.InputEvent(1, index, smoke.EV_KEY, smoke.KEY_F24, 2)
+                for index in range(2, 2 + smoke.MAX_ALLOWED_F24_REPEATS)
+            ],
+        ]
+        code, evidence, actions, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertFalse(evidence["up_observed"])
+        self.assertEqual(evidence["allowed_repeat_count"], smoke.MAX_ALLOWED_F24_REPEATS)
+        self.assertFalse(evidence["repeat_limit_exceeded"])
+        self.assertIn("timed out", evidence["error"])
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_up_repeat_over_limit_then_release_records_release_but_fails(self) -> None:
+        repeats = [
+            smoke.InputEvent(1, index, smoke.EV_KEY, smoke.KEY_F24, 2)
+            for index in range(2, 3 + smoke.MAX_ALLOWED_F24_REPEATS)
+        ]
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [*repeats, smoke.InputEvent(1, 99, smoke.EV_KEY, smoke.KEY_F24, 0)],
+        ]
+        code, evidence, actions, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertTrue(evidence["up_observed"])
+        self.assertEqual(
+            evidence["allowed_repeat_count"], smoke.MAX_ALLOWED_F24_REPEATS + 1
+        )
+        self.assertTrue(evidence["repeat_limit_exceeded"])
+        self.assertEqual(evidence["repeat_limit_event"]["phase"], "up_wait")
+        self.assertEqual(evidence["repeat_limit_event"]["value"], 2)
+        self.assertEqual(
+            evidence["repeat_limit_event"]["classification"], "repeat_limit_exceeded"
+        )
+        self.assertIn("autorepeat limit exceeded", evidence["error"])
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_up_repeat_over_limit_without_release_fails(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [
+                smoke.InputEvent(1, index, smoke.EV_KEY, smoke.KEY_F24, 2)
+                for index in range(2, 3 + smoke.MAX_ALLOWED_F24_REPEATS)
+            ],
+        ]
+        code, evidence, actions, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertFalse(evidence["up_observed"])
+        self.assertEqual(
+            evidence["allowed_repeat_count"], smoke.MAX_ALLOWED_F24_REPEATS + 1
+        )
+        self.assertTrue(evidence["repeat_limit_exceeded"])
+        self.assertIn("autorepeat limit exceeded", evidence["error"])
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_other_key_before_release_fails_with_event_evidence(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [
+                smoke.InputEvent(1, 2, smoke.EV_KEY, 30, 1),
+                smoke.InputEvent(1, 3, smoke.EV_KEY, smoke.KEY_F24, 0),
+            ],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertTrue(evidence["up_observed"])
+        self.assertEqual(evidence["unexpected_event"]["code"], 30)
+        self.assertEqual(evidence["unexpected_event"]["phase"], "up_wait")
+
+    def test_f24_press_during_up_wait_fails_closed(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [smoke.InputEvent(1, 2, smoke.EV_KEY, smoke.KEY_F24, 1)],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertFalse(evidence["up_observed"])
+        self.assertEqual(evidence["unexpected_event"]["value"], 1)
+
+    def test_release_then_other_key_same_batch_records_release_but_fails(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [
+                smoke.InputEvent(1, 2, smoke.EV_KEY, smoke.KEY_F24, 0),
+                smoke.InputEvent(1, 3, smoke.EV_KEY, 30, 1),
+            ],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertTrue(evidence["up_observed"])
+        self.assertEqual(evidence["unexpected_event"]["index"], 1)
+        self.assertEqual(
+            [entry["classification"] for entry in evidence["event_evidence"]],
+            ["expected_down", "expected_up", "unexpected"],
+        )
+
+    def test_release_then_repeat_same_batch_fails(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [
+                smoke.InputEvent(1, 2, smoke.EV_KEY, smoke.KEY_F24, 0),
+                smoke.InputEvent(1, 3, smoke.EV_KEY, smoke.KEY_F24, 2),
+            ],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertTrue(evidence["up_observed"])
+        self.assertEqual(evidence["unexpected_event"]["value"], 2)
+
+    def test_syn_dropped_fails_with_event_evidence(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [smoke.InputEvent(1, 2, smoke.EV_SYN, smoke.SYN_DROPPED, 0)],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertFalse(evidence["up_observed"])
+        self.assertEqual(evidence["event_evidence"][1]["classification"], "syn_dropped")
+
+    def test_down_repeat_remains_strict(self) -> None:
+        events = [[smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 2)]]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertEqual(evidence["event_evidence"][0]["classification"], "unexpected")
+
+    def test_up_quiet_tail_repeat_fails(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [smoke.InputEvent(1, 2, smoke.EV_KEY, smoke.KEY_F24, 0)],
+            [smoke.InputEvent(1, 3, smoke.EV_KEY, smoke.KEY_F24, 2)],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertTrue(evidence["up_observed"])
+        self.assertEqual(evidence["unexpected_event"]["phase"], "up_tail")
+
+    def test_event_evidence_is_bounded_and_marks_truncation(self) -> None:
+        down_events = [
+            smoke.InputEvent(1, index, smoke.EV_SYN, smoke.SYN_REPORT, 0)
+            for index in range(smoke.MAX_EVENT_EVIDENCE + 1)
+        ]
+        down_events.append(smoke.InputEvent(1, 99, smoke.EV_KEY, smoke.KEY_F24, 1))
+        events = [
+            down_events,
+            [smoke.InputEvent(1, 100, smoke.EV_KEY, smoke.KEY_F24, 0)],
+            [],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(evidence["event_evidence"]), smoke.MAX_EVENT_EVIDENCE)
+        self.assertTrue(evidence["event_evidence_truncated"])
+        self.assertEqual(evidence["allowed_repeat_count"], 0)
+        self.assertFalse(evidence["repeat_limit_exceeded"])
+        self.assertEqual(evidence["event_evidence"][0]["index"], 0)
+        self.assertEqual(
+            evidence["event_evidence"][-1]["index"], smoke.MAX_EVENT_EVIDENCE - 1
+        )
+
+    def test_up_repeats_at_limit_then_release_passes(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1)],
+            [
+                smoke.InputEvent(1, index, smoke.EV_KEY, smoke.KEY_F24, 2)
+                for index in range(2, 2 + smoke.MAX_ALLOWED_F24_REPEATS)
+            ]
+            + [
+                smoke.InputEvent(
+                    1,
+                    smoke.MAX_ALLOWED_F24_REPEATS + 2,
+                    smoke.EV_KEY,
+                    smoke.KEY_F24,
+                    0,
+                ),
+            ],
+            [],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 0)
+        self.assertEqual(evidence["allowed_repeat_count"], smoke.MAX_ALLOWED_F24_REPEATS)
+        self.assertFalse(evidence["repeat_limit_exceeded"])
 
     def test_no_hardware_keyboard_flag_does_not_discover_or_construct(self) -> None:
         discovery = mock.Mock(side_effect=AssertionError("must not discover"))

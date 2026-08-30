@@ -41,6 +41,10 @@ EVENT_NAME = re.compile(r"event[0-9]+\Z")
 DEFAULT_BAUD = 115200
 DEFAULT_EVENT_TIMEOUT = 2.0
 DEFAULT_QUIET_TAIL = 0.15
+MAX_EVENT_EVIDENCE = 32
+# The UP request follows the DOWN observation immediately.  Two queued F24
+# repeats absorb a short release race without accepting a repeat storm.
+MAX_ALLOWED_F24_REPEATS = 2
 
 
 class DiscoveryError(RuntimeError):
@@ -73,6 +77,62 @@ class InputEvent:
     event_type: int
     code: int
     value: int
+
+
+class _EventEvidence:
+    """Keep a small, structured trace without allowing unbounded output."""
+
+    def __init__(self, limit: int = MAX_EVENT_EVIDENCE) -> None:
+        self.limit = limit
+        self.events: list[dict[str, object]] = []
+        self.truncated = False
+        self.allowed_repeat_count = 0
+        self.unexpected_event: dict[str, object] | None = None
+        self.repeat_limit_event: dict[str, object] | None = None
+
+    def record(
+        self,
+        *,
+        phase: str,
+        batch: int,
+        index: int,
+        event: InputEvent,
+        classification: str,
+    ) -> None:
+        if classification in {"allowed_repeat", "repeat_limit_exceeded"}:
+            self.allowed_repeat_count += 1
+        entry = {
+            "phase": phase,
+            "batch": batch,
+            "index": index,
+            "type": event.event_type,
+            "code": event.code,
+            "value": event.value,
+            "timestamp_sec": event.seconds,
+            "timestamp_usec": event.microseconds,
+            "classification": classification,
+        }
+        if classification == "unexpected" and self.unexpected_event is None:
+            self.unexpected_event = entry
+        if (
+            classification == "repeat_limit_exceeded"
+            and self.repeat_limit_event is None
+        ):
+            self.repeat_limit_event = entry
+        if len(self.events) < self.limit:
+            self.events.append(entry)
+        else:
+            self.truncated = True
+
+    def update(self, evidence: dict[str, object]) -> None:
+        evidence["event_evidence"] = list(self.events)
+        evidence["event_evidence_truncated"] = self.truncated
+        evidence["allowed_repeat_count"] = self.allowed_repeat_count
+        evidence["repeat_limit_exceeded"] = self.repeat_limit_event is not None
+        if self.unexpected_event is not None:
+            evidence["unexpected_event"] = dict(self.unexpected_event)
+        if self.repeat_limit_event is not None:
+            evidence["repeat_limit_event"] = dict(self.repeat_limit_event)
 
 
 def is_syn_dropped(event: InputEvent) -> bool:
@@ -474,53 +534,125 @@ def _wait_for_f24(
     timeout: float,
     *,
     clock: Callable[[], float],
+    phase: str = "f24_wait",
+    batch_number: int = 0,
+    evidence: _EventEvidence | None = None,
+    observation: dict[str, object] | None = None,
 ) -> tuple[float, int]:
-    """Wait once within a finite deadline and reject relevant surprises."""
+    """Wait for one F24 edge while applying the phase-specific policy.
+
+    The down phase is strict.  The up phase may tolerate only F24 value 2
+    before the required value 0.  The complete batch is evaluated before a
+    failure is raised so evidence can report a release followed by an
+    unexpected event accurately.
+    """
 
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("event timeout must be positive")
     started = clock()
     events = observer.wait_events(timeout)
     matched = False
-    for event in events:
+    observed_repeats = 0
+    failure: tuple[str, InputEvent] | None = None
+    for index, event in enumerate(events):
+        classification = "ignored"
         if is_syn_dropped(event):
-            raise KeyboardSmokeError(
-                "SYN_DROPPED made F24 evidence incomplete", exit_code=5
-            )
-        if event.event_type == EV_SYN:
-            continue
-        if event.event_type == EV_KEY:
-            if is_f24_event(event, expected_value) and not matched:
+            classification = "syn_dropped"
+            if failure is None:
+                failure = ("SYN_DROPPED made F24 evidence incomplete", event)
+        elif event.event_type == EV_SYN:
+            classification = "ignored_syn"
+        elif event.event_type == EV_KEY:
+            if (
+                expected_value == 0
+                and not matched
+                and is_f24_event(event, 2)
+            ):
+                observed_repeats += 1
+                if observed_repeats <= MAX_ALLOWED_F24_REPEATS:
+                    classification = "allowed_repeat"
+                else:
+                    classification = "repeat_limit_exceeded"
+                    if failure is None:
+                        failure = (
+                            "F24 autorepeat limit exceeded before release",
+                            event,
+                        )
+            elif is_f24_event(event, expected_value) and not matched:
                 matched = True
-                continue
-            raise KeyboardSmokeError(
-                "unexpected keyboard key event during F24 smoke", exit_code=5
+                classification = (
+                    "expected_down" if expected_value == 1 else "expected_up"
+                )
+            else:
+                classification = "unexpected"
+                if failure is None:
+                    failure = (
+                        "unexpected keyboard key event during F24 smoke",
+                        event,
+                    )
+        if evidence is not None:
+            evidence.record(
+                phase=phase,
+                batch=batch_number,
+                index=index,
+                event=event,
+                classification=classification,
             )
+    elapsed = max(0.0, (clock() - started) * 1000.0)
+    if observation is not None:
+        observation["matched"] = matched
+        observation["latency_ms"] = elapsed if matched else None
+        observation["allowed_repeat_count"] = observed_repeats
+    if failure is not None:
+        raise KeyboardSmokeError(failure[0], exit_code=5)
     if matched:
-        return max(0.0, (clock() - started) * 1000.0), 1
-    raise KeyboardSmokeError(f"timed out waiting for F24 value {expected_value}", exit_code=5)
+        return elapsed, observed_repeats
+    raise KeyboardSmokeError(
+        f"timed out waiting for F24 value {expected_value}", exit_code=5
+    )
 
 
 def _quiet_tail(
     observer: Any,
     timeout: float,
+    *,
+    phase: str = "up_tail",
+    batch_number: int = 0,
+    evidence: _EventEvidence | None = None,
 ) -> None:
     """Catch duplicate or unrelated keyboard events in a short bounded tail."""
 
     if timeout <= 0:
         return
-    for event in observer.wait_events(timeout):
+    failure: tuple[str, InputEvent] | None = None
+    for index, event in enumerate(observer.wait_events(timeout)):
+        classification = "ignored"
         if is_syn_dropped(event):
-            raise KeyboardSmokeError(
-                "SYN_DROPPED made F24 quiet-tail evidence incomplete", exit_code=5
+            classification = "syn_dropped"
+            if failure is None:
+                failure = (
+                    "SYN_DROPPED made F24 quiet-tail evidence incomplete",
+                    event,
+                )
+        elif event.event_type == EV_SYN:
+            classification = "ignored_syn"
+        elif event.event_type == EV_KEY:
+            classification = "unexpected"
+            if failure is None:
+                failure = (
+                    "unexpected or repeated keyboard key event after F24 report",
+                    event,
+                )
+        if evidence is not None:
+            evidence.record(
+                phase=phase,
+                batch=batch_number,
+                index=index,
+                event=event,
+                classification=classification,
             )
-        if event.event_type == EV_SYN:
-            continue
-        if event.event_type == EV_KEY:
-            raise KeyboardSmokeError(
-                "unexpected or repeated keyboard key event after F24 report",
-                exit_code=5,
-            )
+    if failure is not None:
+        raise KeyboardSmokeError(failure[0], exit_code=5)
 
 
 def run_keyboard_smoke(
@@ -570,6 +702,8 @@ def run_keyboard_smoke(
         "cleanup_attempted": False,
         "cleanup_result": None,
     }
+    event_evidence = _EventEvidence()
+    event_evidence.update(evidence)
     observer = observer_factory(candidate.path)
     transport: Any | None = None
     client: Any | None = None
@@ -578,6 +712,21 @@ def run_keyboard_smoke(
     down_observed = False
     cleanup_error: Exception | None = None
     primary_error: KeyboardSmokeError | None = None
+    batch_number = 0
+
+    def next_batch() -> int:
+        nonlocal batch_number
+        current = batch_number
+        batch_number += 1
+        return current
+
+    def apply_observation(phase: str, observation: dict[str, object]) -> None:
+        if phase == "down_wait":
+            evidence["down_observed"] = bool(observation.get("matched"))
+            evidence["down_latency_ms"] = observation.get("latency_ms")
+        elif phase == "up_wait":
+            evidence["up_observed"] = bool(observation.get("matched"))
+            evidence["up_latency_ms"] = observation.get("latency_ms")
 
     try:
         observer.open()
@@ -602,13 +751,26 @@ def run_keyboard_smoke(
                 "F24 down was not freshly submitted", exit_code=5
             )
         down_accepted = True
-        down_latency, _ = _wait_for_f24(
-            observer, 1, event_timeout, clock=clock
-        )
+        down_observation: dict[str, object] = {}
+        try:
+            down_latency, _ = _wait_for_f24(
+                observer,
+                1,
+                event_timeout,
+                clock=clock,
+                phase="down_wait",
+                batch_number=next_batch(),
+                evidence=event_evidence,
+                observation=down_observation,
+            )
+        except KeyboardSmokeError:
+            apply_observation("down_wait", down_observation)
+            raise
         down_observed = True
-        evidence["down_observed"] = True
-        evidence["down_latency_ms"] = down_latency
-        _quiet_tail(observer, quiet_tail)
+        apply_observation(
+            "down_wait",
+            {"matched": True, "latency_ms": down_latency},
+        )
 
         up_result = client.keyboard_report(modifiers=0, keys=[])
         up_state = _report_state(up_result)
@@ -617,12 +779,32 @@ def run_keyboard_smoke(
             raise KeyboardSmokeError(
                 "F24 up was not freshly submitted", exit_code=5
             )
-        up_latency, _ = _wait_for_f24(
-            observer, 0, event_timeout, clock=clock
+        up_observation: dict[str, object] = {}
+        try:
+            up_latency, _ = _wait_for_f24(
+                observer,
+                0,
+                event_timeout,
+                clock=clock,
+                phase="up_wait",
+                batch_number=next_batch(),
+                evidence=event_evidence,
+                observation=up_observation,
+            )
+        except KeyboardSmokeError:
+            apply_observation("up_wait", up_observation)
+            raise
+        apply_observation(
+            "up_wait",
+            {"matched": True, "latency_ms": up_latency},
         )
-        evidence["up_observed"] = True
-        evidence["up_latency_ms"] = up_latency
-        _quiet_tail(observer, quiet_tail)
+        _quiet_tail(
+            observer,
+            quiet_tail,
+            phase="up_tail",
+            batch_number=next_batch(),
+            evidence=event_evidence,
+        )
 
         evidence["cleanup_attempted"] = True
         try:
@@ -680,6 +862,7 @@ def run_keyboard_smoke(
                 cleanup_error = exc
 
     evidence["total_duration_ms"] = max(0.0, (clock() - started) * 1000.0)
+    event_evidence.update(evidence)
     if primary_error is not None:
         evidence["error"] = str(primary_error)
         if cleanup_error is not None:
@@ -807,6 +990,12 @@ def _emit_keyboard_evidence(
         "up_latency_ms",
         "cleanup_attempted",
         "cleanup_result",
+        "allowed_repeat_count",
+        "repeat_limit_exceeded",
+        "repeat_limit_event",
+        "event_evidence_truncated",
+        "unexpected_event",
+        "event_evidence",
         "total_duration_ms",
     ):
         if key in evidence:

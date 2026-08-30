@@ -126,18 +126,38 @@ The previously attempted physical run stopped at this runner environment
 precondition because the host package was unavailable, before serial or HID
 activity. This is not an F24 functional failure; physical validation remains
 `NOT COMPLETED`.
-Its bounded order is: discover the
-validated keyboard, open and drain the read-only observer, construct/open one
-transport, connect one Client session, submit one F24-down report, observe
-`KEY_F24` value `1`, submit one explicit keyboard all-up report, observe value
-`0`, request one final `release_all`, then close the Client/transport and
-observer. It does not use a subprocess per report, retry HID requests, or
+
+The first physical F24 retry reached and observed the required `KEY_F24`
+value `1` (DOWN), then failed while waiting for the required value `0` (UP)
+after an unexpected `EV_KEY`. That run did not preserve the unexpected event's
+type, code, or value, so it does not prove that the event was an autorepeat.
+Autorepeat remains a plausible hypothesis only. The runner now shortens the
+held interval by submitting UP immediately after DOWN is observed. During the
+bounded UP wait it tolerates only pre-release `KEY_F24` value `2` events,
+records their count, and still requires a fresh value `0`. At most two such
+repeat events are tolerated; a third is an event-observation failure even if a
+release appears later in the same batch. Any other key, modifier, unexpected
+press/value, or `SYN_DROPPED` remains fail-closed. After the release is
+observed, the quiet tail remains strict: any `EV_KEY`, including a repeat,
+fails.
+
+Its bounded order is: discover the validated keyboard, open and drain the
+read-only observer, construct/open one transport, connect one Client session,
+submit one F24-down report, observe `KEY_F24` value `1`, submit one explicit
+keyboard all-up report, observe value `0` (with only pre-release F24 repeats
+tolerated), request one final `release_all`, then close the Client/transport
+and observer. It does not use a subprocess per report, retry HID requests, or
 replay a timed-out event. A down report that was accepted but not observed gets
 one bounded best-effort all-up attempt before final cleanup. Any failure after
 session start attempts at most one final `release_all`; the primary failure is
 preserved and a cleanup-only failure is reported separately. `EV_SYN` records
-are ignored, `SYN_DROPPED` and unexpected key events fail closed, and a short
-quiet tail catches duplicate or unrelated key events.
+are ignored, and bounded structured event evidence records phase, batch,
+position, timestamp, type, code, value, and classification. It separately
+reports the total observed pre-release repeat count and any repeat-limit event.
+The evidence has a small fixed limit and reports truncation rather than growing
+without bound.
+The runner remains `IMPLEMENTED / NO-HARDWARE VALIDATED`; the F24 UP event and
+full physical validation are still **NOT COMPLETED**.
 
 F24 is HID usage `0x73` / Linux `KEY_F24` (`194`). It is a diagnostic sentinel,
 not guaranteed side-effect-free input. This implementation is no-hardware
