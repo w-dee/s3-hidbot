@@ -4,6 +4,7 @@
 !.github/workflows/
 !.github/workflows/*.yml
 /firmware/build/
+/firmware/artifacts/
 /firmware/sdkconfig
 /firmware/managed_components/
 /host/build/

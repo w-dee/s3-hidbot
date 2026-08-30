@@ -54,6 +54,7 @@ Run these commands from the repository root:
 ./tools/test-native.sh
 ./tools/test-control-protocol.sh
 ./tools/test-firmware.sh
+./tools/test-firmware-artifact.sh
 ./tools/test-nonhardware.sh
 ./tools/test-hardware-hid.sh
 ./tools/run-hardware-hid.sh --hardware --keyboard --json
@@ -79,6 +80,13 @@ idf.py build
 The existing `sdkconfig.defaults` and `dependencies.lock` provide the target
 and dependency source of truth; no `set-target` step is required for a fresh
 checkout. Build output remains ignored and must never be tracked.
+
+`test-firmware-artifact.sh` is the focused U6.3A artifact contract entrypoint.
+It requires an activated ESP-IDF v5.5.4 environment, runs stdlib-only
+manifest/verifier/privacy tests, and performs two independent temporary
+artifact builds to verify byte-for-byte reproducibility. It does not use or
+modify the ordinary `firmware/build` directory and removes all temporary
+outputs when it exits.
 
 `test-hardware-hid.sh` is the no-hardware CI/unit-test entrypoint for the
 U5.4.1-U5.4.3 observer and keyboard/mouse smoke orchestration tests. With no arguments it
@@ -145,5 +153,7 @@ Those are separate gates documented in
   gates.
 - [`hardware-validation.md`](hardware-validation.md) — physical safety and
   evidence scope.
+- [`firmware-artifacts.md`](firmware-artifacts.md) — U6.3A artifact format and
+  provenance contract.
 - [`uart-control-plane.md`](uart-control-plane.md) — protocol/runtime
   contract.

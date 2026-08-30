@@ -1,0 +1,2 @@
+# Settings used only by the provenance-aware firmware artifact builder.
+CONFIG_APP_REPRODUCIBLE_BUILD=y
