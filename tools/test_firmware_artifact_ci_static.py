@@ -46,8 +46,18 @@ def main() -> int:
         raise AssertionError("dedicated workflow must not use mutable action tags")
 
     _required(text, r"EXPECTED_SHA:\s*\$\{\{\s*github\.sha\s*\}\}", "exact GitHub source revision")
-    _required(text, r"git\s+rev-parse\s+HEAD", "checkout identity check")
-    _required(text, r"git\s+show\s+-s\s+--format=%ct", "commit timestamp derivation")
+    _required(
+        text,
+        r'git\s+-c\s+"safe\.directory=\$GITHUB_WORKSPACE"\s+rev-parse\s+HEAD',
+        "workspace-scoped checkout identity check",
+    )
+    _required(
+        text,
+        r'git\s+-c\s+"safe\.directory=\$GITHUB_WORKSPACE"\s+\\\s*\n\s*show\s+-s\s+--format=%ct',
+        "workspace-scoped commit timestamp derivation",
+    )
+    if re.search(r"safe\.directory\s*=\s*\*|safe\.directory=/__w/|chown\s+-R|chmod\s+-R", text):
+        raise AssertionError("workflow must not use wildcard or persistent ownership workarounds")
     _required(text, r"SOURCE_DATE_EPOCH", "explicit SOURCE_DATE_EPOCH")
     _required(text, r"S3_HIDBOT_SOURCE_REVISION", "explicit source revision")
     _required(text, r"tools/privacy_lint\.py\s+--tracked", "repository privacy scan")
