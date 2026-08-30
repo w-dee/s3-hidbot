@@ -36,7 +36,11 @@ _SEMVER = re.compile(
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _REVISION40 = re.compile(r"[0-9a-f]{40}\Z")
 _PROFILE = re.compile(r"[a-z0-9][a-z0-9-]{0,30}\Z")
-_TOOL_VERSION = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+){0,3}\Z")
+_TOOL_VERSION = re.compile(
+    r"[0-9]+\.[0-9]+(?:\.[0-9]+){0,3}"
+    r"(?:(?:\.(?:dev|post)[0-9]+)|(?:a|b|rc)[0-9]+)?\Z"
+)
+_MAX_TOOL_VERSION_LENGTH = 31
 _LINUX_ROOT = b"/" + b"home" + b"/"
 _MAC_ROOT = b"/" + b"Users" + b"/"
 _LINUX_HOME = re.compile(_LINUX_ROOT + rb"(?!USER/|<user>/)[^/\r\n]+/")
@@ -125,8 +129,12 @@ def validate_profile(value: Any) -> str:
 
 
 def validate_tool_version(value: Any) -> str:
-    if not isinstance(value, str) or _TOOL_VERSION.fullmatch(value) is None:
-        raise _error("tool version must be a normalized numeric version")
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_TOOL_VERSION_LENGTH
+        or _TOOL_VERSION.fullmatch(value) is None
+    ):
+        raise _error("tool version must be a normalized constrained version")
     return value
 
 

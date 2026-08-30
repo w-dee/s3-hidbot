@@ -10,10 +10,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
+from build_firmware_artifact import _extract_version_number
 from firmware_artifact import (
     ArtifactError,
     create_deterministic_tar_gz,
     sha256_file,
+    validate_tool_version,
     verify_bundle_archive,
     verify_bundle_directory,
     write_deterministic_json,
@@ -82,7 +84,7 @@ def _build_synthetic_bundle(root: Path) -> Path:
             "reproducible": True,
             "source_date_epoch": 0,
             "container_image": None,
-            "tools": {"compiler": "14.2.0", "cmake": "3.30.2", "ninja": "1.12.1", "python": "3.12.3", "esptool": "4.12.0"},
+            "tools": {"compiler": "14.2.0", "cmake": "3.30.2", "ninja": "1.12.1", "python": "3.12.3", "esptool": "4.12.dev1"},
         },
         "provenance": {
             "dependencies_lock_sha256": files["provenance/dependencies.lock"]["sha256"],
@@ -129,6 +131,14 @@ def _expect_reject(bundle_factory: Callable[[Path], Path], mutate: Callable[[Pat
 
 
 def _assert_rejects() -> None:
+    for malformed in ("esptool 4.12.dev1", "4.12.dev1.dev2", "v4.12.dev1", "4.12 dev1", "../4.12", "4.12;rm", "9" * 32):
+        try:
+            validate_tool_version(malformed)
+        except ArtifactError:
+            pass
+        else:
+            raise AssertionError(f"malformed tool version was accepted: {malformed!r}")
+
     _expect_reject(_build_synthetic_bundle, lambda bundle: (bundle / "application.bin").write_bytes(b"tampered"))
     _expect_reject(_build_synthetic_bundle, lambda bundle: (bundle / "application.bin").unlink())
     _expect_reject(_build_synthetic_bundle, lambda bundle: (bundle / "unexpected").write_bytes(b"extra"))
@@ -175,6 +185,10 @@ def _assert_rejects() -> None:
     _expect_reject(
         _build_synthetic_bundle,
         lambda bundle: _rewrite_manifest(bundle, lambda manifest: manifest["build"].update(reproducible=False)),
+    )
+    _expect_reject(
+        _build_synthetic_bundle,
+        lambda bundle: _rewrite_manifest(bundle, lambda manifest: manifest["build"]["tools"].update(esptool="4.12.dev1.dev2")),
     )
 
     def missing_flash_image(bundle: Path) -> None:
@@ -239,12 +253,33 @@ def _assert_archive_safety_and_determinism() -> None:
             raise AssertionError("path traversal archive was accepted")
 
 
+def _assert_tool_version_extraction() -> None:
+    cases = {
+        "ESP-IDF v5.5.4": "5.5.4",
+        "cmake version 3.30.2": "3.30.2",
+        "1.12.1": "1.12.1",
+        "esptool.py v4.12.dev1": "4.12.dev1",
+        "tool 5.0rc1": "5.0rc1",
+        "tool 5.0.0.dev2": "5.0.0.dev2",
+    }
+    for output, expected in cases.items():
+        assert _extract_version_number(output, "test") == expected
+    for malformed in ("esptool.py v4.12.dev1.dev2",):
+        try:
+            _extract_version_number(malformed, "test")
+        except ArtifactError:
+            pass
+        else:
+            raise AssertionError(f"malformed tool output was accepted: {malformed!r}")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="s3-hidbot-artifact-test-") as temporary:
         bundle = _build_synthetic_bundle(Path(temporary))
         verify_bundle_directory(bundle)
     _assert_rejects()
     _assert_archive_safety_and_determinism()
+    _assert_tool_version_extraction()
     print("PASS: firmware artifact verifier, privacy, path safety, and deterministic archive tests")
     return 0
 

@@ -31,6 +31,7 @@ from firmware_artifact import (
     validate_profile,
     validate_source_date_epoch,
     validate_source_revision,
+    validate_tool_version,
     validate_version,
     verify_bundle_archive,
     verify_bundle_directory,
@@ -38,18 +39,27 @@ from firmware_artifact import (
 )
 
 
+_TOOL_VERSION_CANDIDATE = re.compile(
+    r"(?<![0-9A-Za-z])v?"
+    r"([0-9]+\.[0-9]+(?:\.[0-9]+){0,3}"
+    r"(?:(?:\.(?:dev|post)[0-9]+)|(?:a|b|rc)[0-9]+)?)"
+    r"(?![0-9A-Za-z.])"
+)
+
+
+def _extract_version_number(output: str, label: str) -> str:
+    match = _TOOL_VERSION_CANDIDATE.search(output)
+    if match is None:
+        raise ArtifactError(f"could not normalize {label} version")
+    return validate_tool_version(match.group(1))
+
+
 def _version_number(command: list[str], label: str) -> str:
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ArtifactError(f"could not obtain {label} version") from exc
-    match = re.search(
-        r"(?<![0-9.])([0-9]+\.[0-9]+(?:\.[0-9]+){0,3})(?![0-9.])",
-        result.stdout + result.stderr,
-    )
-    if match is None:
-        raise ArtifactError(f"could not normalize {label} version")
-    return match.group(1)
+    return _extract_version_number(result.stdout + result.stderr, label)
 
 
 def _copy_regular(source: Path, destination: Path) -> None:
