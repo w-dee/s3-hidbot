@@ -250,17 +250,20 @@ class Client:
                     expected_id=hello_id,
                     expected_nonce=nonce,
                 )
+            except CompatibilityError:
+                raise
             except ProtocolError as exc:
                 # A different nonce is a stale hello; do not let it establish
-                # a session. Other schema-valid identity failures are a peer
-                # compatibility error and must not be retried indefinitely.
+                # a session. Schema-valid identity/capability failures are
+                # raised as CompatibilityError; malformed data remains a
+                # ProtocolError and is not retried indefinitely.
                 if (
                     isinstance(response.result, dict)
                     and response.result.get("client_nonce") != nonce
                 ):
                     diagnostics = diagnostics + ("STALE_HELLO_NONCE",)
                     continue
-                raise CompatibilityError(str(exc)) from exc
+                raise
             self._session = hello.session
             self._boot_id = hello.boot_id
             self._capabilities = hello.capabilities
@@ -298,6 +301,13 @@ class Client:
         request_id = self._next_request_id
         self._next_request_id += 1
         return request_id, self._session
+
+    def _require_capability_locked(self, capability: str) -> None:
+        self._ensure_open()
+        if self._session is None:
+            raise SessionLostError("client has no active session")
+        if capability not in self._capabilities:
+            raise CompatibilityError(f"peer does not advertise {capability}")
 
     def _request_frame_locked(self, request_id: int, session: str, frame: bytes) -> object:
         # This frame is immutable for every retry attempt.
@@ -361,6 +371,7 @@ class Client:
 
         with self._lock:
             validate_keyboard_report_inputs(modifiers, keys)
+            self._require_capability_locked("hid.keyboard-report-v1")
             request_id, session = self._allocate_request_id_locked()
             frame = build_keyboard_report_frame(request_id, session, modifiers, keys)
             return validate_keyboard_report_result(
@@ -374,6 +385,7 @@ class Client:
 
         with self._lock:
             validate_mouse_report_inputs(buttons, x, y, wheel, pan)
+            self._require_capability_locked("hid.mouse-report-v1")
             request_id, session = self._allocate_request_id_locked()
             frame = build_mouse_report_frame(
                 request_id, session, buttons, x, y, wheel, pan

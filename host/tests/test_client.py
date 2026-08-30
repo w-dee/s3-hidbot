@@ -5,9 +5,15 @@ import unittest
 from collections import deque
 
 from hidbot.client import Client
-from hidbot.errors import ProtocolError, RemoteError, RequestTimeoutError, SessionLostError
+from hidbot.errors import (
+    CompatibilityError,
+    ProtocolError,
+    RemoteError,
+    RequestTimeoutError,
+    SessionLostError,
+)
 from hidbot.framing import FRAME_PREFIX, TRANSPORT_SYNC
-from hidbot.protocol import MAX_ID
+from hidbot.protocol import BASELINE_REQUIRED_CAPABILITIES, MAX_ID
 
 
 TOKEN = "0123456789abcdef0123456789abcdef"
@@ -40,7 +46,23 @@ def response(
     return FRAME_PREFIX + json.dumps(value, separators=(",", ":")).encode("ascii") + b"\n"
 
 
-def hello_response(request_id: int, nonce: str, session: str = TOKEN) -> bytes:
+def hello_response(
+    request_id: int,
+    nonce: str,
+    session: str = TOKEN,
+    capabilities: list[str] | None = None,
+) -> bytes:
+    if capabilities is None:
+        capabilities = [
+            "protocol.hello-v1",
+            "system.ping-v1",
+            "system.info-v1",
+            "usb.status-v1",
+            "hid.lease-v1",
+            "hid.release-all-v1",
+            "hid.keyboard-report-v1",
+            "hid.mouse-report-v1",
+        ]
     return response(
         request_id,
         session,
@@ -51,16 +73,7 @@ def hello_response(request_id: int, nonce: str, session: str = TOKEN) -> bytes:
             "boot_id": BOOT_ID,
             "session": session,
             "lease_ms": 5000,
-            "capabilities": [
-                "protocol.hello-v1",
-                "system.ping-v1",
-                "system.info-v1",
-                "usb.status-v1",
-                "hid.lease-v1",
-                "hid.release-all-v1",
-                "hid.keyboard-report-v1",
-                "hid.mouse-report-v1",
-            ],
+            "capabilities": capabilities,
         },
     )
 
@@ -185,6 +198,30 @@ class ClientTests(unittest.TestCase):
                 client.keyboard_report(modifiers, keys)
         self.assertEqual(transport.writes, [])
 
+    def test_keyboard_report_missing_capability_is_zero_wire_and_preserves_state(self) -> None:
+        transport = FakeTransport()
+        client = self.make_client(transport)
+        client._session = TOKEN
+        client._capabilities = tuple(BASELINE_REQUIRED_CAPABILITIES)
+        before_id = client._next_request_id
+        with self.assertRaises(CompatibilityError):
+            client.keyboard_report(0, [4])
+        self.assertEqual(client.session, TOKEN)
+        self.assertEqual(client._next_request_id, before_id)
+        self.assertEqual(transport.writes, [])
+
+    def test_missing_capability_still_validates_input_first(self) -> None:
+        transport = FakeTransport()
+        client = self.make_client(transport)
+        client._session = TOKEN
+        client._capabilities = tuple(BASELINE_REQUIRED_CAPABILITIES)
+        with self.assertRaises(ProtocolError):
+            client.keyboard_report(999, [4])
+        with self.assertRaises(ProtocolError):
+            client.mouse_report(0, -128, 0, 0, 0)
+        self.assertEqual(client._next_request_id, 0)
+        self.assertEqual(transport.writes, [])
+
     def test_mouse_report_returns_typed_result_and_canonical_params(self) -> None:
         def on_write(transport: FakeTransport, data: bytes) -> None:
             if data == TRANSPORT_SYNC:
@@ -227,6 +264,44 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 client.mouse_report(*values)
         self.assertEqual(transport.writes, [])
+
+    def test_mouse_report_missing_capability_is_zero_wire_and_preserves_state(self) -> None:
+        transport = FakeTransport()
+        client = self.make_client(transport)
+        client._session = TOKEN
+        client._capabilities = tuple(BASELINE_REQUIRED_CAPABILITIES)
+        before_id = client._next_request_id
+        with self.assertRaises(CompatibilityError):
+            client.mouse_report(0, 1, 0, 0, 0)
+        self.assertEqual(client.session, TOKEN)
+        self.assertEqual(client._next_request_id, before_id)
+        self.assertEqual(transport.writes, [])
+
+    def test_connect_missing_baseline_capability_fails_as_compatibility_error(self) -> None:
+        missing = sorted(BASELINE_REQUIRED_CAPABILITIES - {"hid.release-all-v1"})
+
+        def on_write(transport: FakeTransport, data: bytes) -> None:
+            if data == TRANSPORT_SYNC:
+                return
+            value = request_object(data)
+            if value["cmd"] == "protocol.hello":
+                transport.chunks.append(
+                    hello_response(
+                        value["id"],
+                        value["params"]["client_nonce"],
+                        capabilities=missing,
+                    )
+                )
+
+        transport = FakeTransport(on_write)
+        client = self.make_client(transport)
+        with self.assertRaises(CompatibilityError):
+            client.connect()
+        self.assertIsNone(client.session)
+        self.assertEqual(
+            len([item for item in transport.writes if item.startswith(FRAME_PREFIX)]),
+            1,
+        )
 
     def test_hello_retry_is_byte_identical_and_nonce_is_stable(self) -> None:
         hello_writes = 0

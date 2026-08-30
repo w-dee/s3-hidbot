@@ -358,9 +358,24 @@ host should discard it within bounded limits and continue waiting.
 For hello, the host additionally requires the expected ID, `ok:true`, exact
 `result.client_nonce`, valid top-level and result session tokens that are equal,
 valid `boot_id`, expected project/protocol version, exact `lease_ms:5000`, and
-a valid capabilities list. A wrong-nonce/stale frame must never establish a
-session. The client applies the bounded discard limit and timeout recovery
-(`TRANSPORT_SYNC` followed by a fresh hello) in the generic host core.
+a valid capabilities list. The host compatibility baseline is the six safe
+control-plane capabilities: `protocol.hello-v1`, `system.ping-v1`,
+`system.info-v1`, `usb.status-v1`, `hid.lease-v1`, and
+`hid.release-all-v1`. Keyboard and mouse report capabilities are optional;
+the corresponding Client methods fail locally before allocating an ID or
+writing a frame when the peer does not advertise them. Unknown additional
+capabilities are preserved and do not make an otherwise compatible peer fail.
+A wrong-nonce/stale frame must never establish a session. The client applies
+the bounded discard limit and timeout recovery (`TRANSPORT_SYNC` followed by a
+fresh hello) in the generic host core.
+
+`Client.info()` continues to return the raw result object for wire-compatible
+callers. External consumers that need typed compatibility inspection may use
+the pure host validators `validate_system_info()` and
+`evaluate_compatibility()`. Without `firmware.identity-v1`, `system.info`
+must have its legacy four-field shape. The host reserves the strict nested
+identity-v1 shape for a future producer; the current firmware does not
+advertise or produce that capability.
 
 The v1 wire hardening keeps protocol `v` at `1` and uses the advertised
 capability list. The nonce identifies a hello attempt, the boot ID identifies
@@ -387,9 +402,13 @@ missing envelope fields, invalid IDs/tokens, inconsistent `ok` versus
 bounded depth/member/string limits. Normal completion requires the expected
 ID and current session. Hello additionally requires the expected nonce,
 matching top-level/result sessions, a valid boot ID, `s3-hidbot` identity, the
-baseline capabilities plus `hid.lease-v1`, `hid.release-all-v1`, and
-`hid.keyboard-report-v1`, `hid.mouse-report-v1`, exact lease metadata, and a
-unique bounded capability list. A stale hello
+six-capability baseline (`protocol.hello-v1`, `system.ping-v1`,
+`system.info-v1`, `usb.status-v1`, `hid.lease-v1`, and
+`hid.release-all-v1`), exact lease metadata, and a unique bounded capability
+list. Keyboard and mouse report capabilities are optional; the corresponding
+Client methods fail locally before allocating an ID or writing a frame when
+the peer does not advertise them. Unknown additional capabilities are
+preserved and do not make an otherwise compatible peer fail. A stale hello
 with the wrong nonce never establishes a session. `session:null` errors are
 retained only as bounded untrusted diagnostics and cannot complete a request.
 

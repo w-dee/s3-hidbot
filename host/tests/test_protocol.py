@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 import unittest
 
-from hidbot.errors import ProtocolError
+from hidbot.errors import CompatibilityError, ProtocolError
 from hidbot.protocol import (
+    BASELINE_REQUIRED_CAPABILITIES,
+    CompatibilityResult,
+    FirmwareIdentity,
+    HelloResponse,
+    OPTIONAL_CAPABILITIES,
     REQUIRED_CAPABILITIES,
+    SystemInfo,
     build_command_frame,
     build_keyboard_report_frame,
     build_mouse_report_frame,
@@ -15,6 +21,8 @@ from hidbot.protocol import (
     validate_keyboard_report_result,
     validate_mouse_report_result,
     validate_hello_response,
+    validate_system_info,
+    evaluate_compatibility,
 )
 
 
@@ -191,6 +199,221 @@ class ProtocolTests(unittest.TestCase):
             validate_hello_response(
                 parse_response(frame_payload(base)), expected_id=0, expected_nonce=OTHER_TOKEN
             )
+
+    def test_hello_accepts_baseline_without_optional_hid_capabilities(self) -> None:
+        value = {
+            "type": "response",
+            "v": 1,
+            "id": 0,
+            "session": TOKEN,
+            "ok": True,
+            "result": {
+                "project": "s3-hidbot",
+                "protocol_version": 1,
+                "client_nonce": OTHER_TOKEN,
+                "boot_id": TOKEN,
+                "session": TOKEN,
+                "lease_ms": 5000,
+                "capabilities": sorted(BASELINE_REQUIRED_CAPABILITIES),
+            },
+        }
+        hello = validate_hello_response(
+            parse_response(frame_payload(value)), expected_id=0, expected_nonce=OTHER_TOKEN
+        )
+        self.assertEqual(set(hello.capabilities), BASELINE_REQUIRED_CAPABILITIES)
+
+    def test_hello_accepts_unknown_and_identity_optional_capabilities(self) -> None:
+        value = {
+            "type": "response",
+            "v": 1,
+            "id": 0,
+            "session": TOKEN,
+            "ok": True,
+            "result": {
+                "project": "s3-hidbot",
+                "protocol_version": 1,
+                "client_nonce": OTHER_TOKEN,
+                "boot_id": TOKEN,
+                "session": TOKEN,
+                "lease_ms": 5000,
+                "capabilities": sorted(
+                    BASELINE_REQUIRED_CAPABILITIES
+                    | {"firmware.identity-v1", "future.example-v1"}
+                ),
+            },
+        }
+        hello = validate_hello_response(
+            parse_response(frame_payload(value)), expected_id=0, expected_nonce=OTHER_TOKEN
+        )
+        self.assertIn("future.example-v1", hello.capabilities)
+        self.assertIn("firmware.identity-v1", hello.capabilities)
+
+    def test_hello_missing_baseline_is_compatibility_error(self) -> None:
+        value = {
+            "type": "response",
+            "v": 1,
+            "id": 0,
+            "session": TOKEN,
+            "ok": True,
+            "result": {
+                "project": "s3-hidbot",
+                "protocol_version": 1,
+                "client_nonce": OTHER_TOKEN,
+                "boot_id": TOKEN,
+                "session": TOKEN,
+                "lease_ms": 5000,
+                "capabilities": sorted(BASELINE_REQUIRED_CAPABILITIES - {"usb.status-v1"}),
+            },
+        }
+        with self.assertRaises(CompatibilityError):
+            validate_hello_response(
+                parse_response(frame_payload(value)), expected_id=0, expected_nonce=OTHER_TOKEN
+            )
+
+    def test_legacy_system_info_is_typed_without_identity(self) -> None:
+        info = validate_system_info(
+            {
+                "project": "s3-hidbot",
+                "target": "esp32s3",
+                "idf_version": "v5.5.4",
+                "protocol_version": 1,
+            },
+            capabilities=tuple(REQUIRED_CAPABILITIES),
+        )
+        self.assertIsInstance(info, SystemInfo)
+        self.assertIsNone(info.firmware)
+
+    def test_identity_system_info_is_strictly_typed(self) -> None:
+        info = validate_system_info(
+            {
+                "project": "s3-hidbot",
+                "target": "esp32s3",
+                "idf_version": "v5.5.4",
+                "protocol_version": 1,
+                "firmware": {
+                    "version": "0.1.0-dev",
+                    "source_revision": None,
+                    "app_elf_sha256": "a" * 64,
+                    "build_profile": "freenove-fnk0085",
+                },
+            },
+            capabilities=tuple(REQUIRED_CAPABILITIES) + ("firmware.identity-v1",),
+        )
+        self.assertIsInstance(info.firmware, FirmwareIdentity)
+        assert info.firmware is not None
+        self.assertEqual(info.firmware.version, "0.1.0-dev")
+
+    def test_identity_capability_and_system_info_shape_must_agree(self) -> None:
+        legacy = {
+            "project": "s3-hidbot",
+            "target": "esp32s3",
+            "idf_version": "v5.5.4",
+            "protocol_version": 1,
+        }
+        with self.assertRaises(CompatibilityError):
+            validate_system_info(
+                legacy,
+                capabilities=tuple(REQUIRED_CAPABILITIES) + ("firmware.identity-v1",),
+            )
+        with self.assertRaises(CompatibilityError):
+            validate_system_info(
+                {**legacy, "firmware": {}}, capabilities=tuple(REQUIRED_CAPABILITIES)
+            )
+
+    def test_invalid_identity_is_compatibility_error(self) -> None:
+        identity = {
+            "version": "0.1.0-dev",
+            "source_revision": None,
+            "app_elf_sha256": "a" * 64,
+            "build_profile": "freenove-fnk0085",
+        }
+        base = {
+            "project": "s3-hidbot",
+            "target": "esp32s3",
+            "idf_version": "v5.5.4",
+            "protocol_version": 1,
+            "firmware": identity,
+        }
+        for field, bad_value in (
+            ("version", "01.0.0"),
+            ("source_revision", "A" * 40),
+            ("app_elf_sha256", "a" * 63),
+            ("build_profile", "Freenove_FNK0085"),
+        ):
+            invalid = {**base, "firmware": {**identity, field: bad_value}}
+            with self.assertRaises(CompatibilityError):
+                validate_system_info(
+                    invalid,
+                    capabilities=tuple(REQUIRED_CAPABILITIES) + ("firmware.identity-v1",),
+                )
+
+    def test_compatibility_evaluator_is_pure_and_deterministic(self) -> None:
+        hello = HelloResponse(
+            session=TOKEN,
+            boot_id=TOKEN,
+            client_nonce=OTHER_TOKEN,
+            project="s3-hidbot",
+            protocol_version=1,
+            capabilities=tuple(sorted(REQUIRED_CAPABILITIES | {"future.example-v1"})),
+            lease_ms=5000,
+        )
+        info = {
+            "project": "s3-hidbot",
+            "target": "esp32s3",
+            "idf_version": "v5.5.4",
+            "protocol_version": 1,
+        }
+        result = evaluate_compatibility(hello, info)
+        self.assertIsInstance(result, CompatibilityResult)
+        self.assertTrue(result.compatible)
+        self.assertEqual(result.missing_baseline_capabilities, ())
+        self.assertEqual(
+            result.advertised_optional_capabilities,
+            tuple(sorted(OPTIONAL_CAPABILITIES & REQUIRED_CAPABILITIES)),
+        )
+        self.assertFalse(result.identity_available)
+        self.assertTrue(result.target_supported)
+
+        identity_result = evaluate_compatibility(
+            HelloResponse(
+                **{
+                    **hello.__dict__,
+                    "capabilities": tuple(
+                        sorted(REQUIRED_CAPABILITIES | {"firmware.identity-v1"})
+                    ),
+                }
+            ),
+            {
+                **info,
+                "firmware": {
+                    "version": "1.2.3+build.7",
+                    "source_revision": "b" * 40,
+                    "app_elf_sha256": "c" * 64,
+                    "build_profile": "freenove-fnk0085",
+                },
+            },
+        )
+        self.assertTrue(identity_result.compatible)
+        self.assertTrue(identity_result.identity_available)
+        self.assertIsNotNone(identity_result.firmware_identity)
+
+        missing_hello = HelloResponse(
+            **{
+                **hello.__dict__,
+                "capabilities": tuple(
+                    sorted(BASELINE_REQUIRED_CAPABILITIES - {"system.info-v1"})
+                ),
+            }
+        )
+        missing_result = evaluate_compatibility(missing_hello, info)
+        self.assertFalse(missing_result.compatible)
+        self.assertEqual(missing_result.missing_baseline_capabilities, ("system.info-v1",))
+
+        unsupported = evaluate_compatibility(
+            hello, {**info, "target": "esp32c6"}
+        )
+        self.assertFalse(unsupported.compatible)
+        self.assertFalse(unsupported.target_supported)
 
 
 if __name__ == "__main__":

@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-from .errors import ProtocolError
+from .errors import CompatibilityError, ProtocolError
 from .framing import FRAME_PREFIX, MAX_MACHINE_FRAME_BYTES
 
 
@@ -22,8 +22,19 @@ MAX_JSON_DEPTH = 8
 MAX_OBJECT_MEMBERS = 16
 MAX_ARRAY_MEMBERS = 16
 MAX_STRING_BYTES = 256
+MAX_FIRMWARE_VERSION_BYTES = 31
+MAX_SOURCE_REVISION_BYTES = 40
+MAX_APP_ELF_SHA256_BYTES = 64
+MAX_BUILD_PROFILE_BYTES = 31
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
-REQUIRED_CAPABILITIES = frozenset(
+SOURCE_REVISION_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_SOURCE_REVISION_BYTES}}}\Z")
+APP_ELF_SHA256_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_APP_ELF_SHA256_BYTES}}}\Z")
+BUILD_PROFILE_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+
+# The baseline is the minimum safe v1 control plane.  HID report commands are
+# optional because a peer can provide safe diagnostics and recovery without
+# allowing unsafe input injection.
+BASELINE_REQUIRED_CAPABILITIES = frozenset(
     {
         "protocol.hello-v1",
         "system.ping-v1",
@@ -31,10 +42,24 @@ REQUIRED_CAPABILITIES = frozenset(
         "usb.status-v1",
         "hid.lease-v1",
         "hid.release-all-v1",
-        "hid.keyboard-report-v1",
-        "hid.mouse-report-v1",
     }
 )
+OPTIONAL_CAPABILITIES = frozenset(
+    {
+        "hid.keyboard-report-v1",
+        "hid.mouse-report-v1",
+        "firmware.identity-v1",
+    }
+)
+KNOWN_OPTIONAL_CAPABILITIES = OPTIONAL_CAPABILITIES
+
+# Kept as a compatibility alias for callers that imported the pre-U6 name.
+# Validation now uses BASELINE_REQUIRED_CAPABILITIES and optional capabilities
+# independently.
+REQUIRED_CAPABILITIES = BASELINE_REQUIRED_CAPABILITIES | {
+    "hid.keyboard-report-v1",
+    "hid.mouse-report-v1",
+}
 
 
 @dataclass(frozen=True)
@@ -61,6 +86,47 @@ class HelloResponse:
     protocol_version: int
     capabilities: tuple[str, ...]
     lease_ms: int
+
+
+@dataclass(frozen=True)
+class FirmwareIdentity:
+    """Validated identity-v1 fields reported by a firmware image."""
+
+    version: str
+    source_revision: str | None
+    app_elf_sha256: str
+    build_profile: str
+
+
+@dataclass(frozen=True)
+class SystemInfo:
+    """Validated system.info data, including optional firmware identity."""
+
+    project: str
+    target: str
+    idf_version: str
+    protocol_version: int
+    firmware: FirmwareIdentity | None
+
+
+@dataclass(frozen=True)
+class CompatibilityResult:
+    """Pure compatibility assessment, not a USB or fixture health result."""
+
+    compatible: bool
+    missing_baseline_capabilities: tuple[str, ...]
+    advertised_optional_capabilities: tuple[str, ...]
+    identity_available: bool
+    firmware_identity: FirmwareIdentity | None
+    target_supported: bool
+
+
+_SEMVER_IDENTIFIER = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+_SEMVER_PATTERN = re.compile(
+    rf"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    rf"(?:-(?:{_SEMVER_IDENTIFIER})(?:\.{_SEMVER_IDENTIFIER})*)?"
+    rf"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -349,13 +415,13 @@ def validate_hello_response(
     nonce = _token(result["client_nonce"], "client_nonce", allow_null=False)
     if result_session != response.session or nonce != expected_nonce:
         raise ProtocolError("hello response correlation is invalid")
+    if not isinstance(result["project"], str) or type(result["protocol_version"]) is not int:
+        raise ProtocolError("hello response project/version types are invalid")
     if (
-        not isinstance(result["project"], str)
-        or result["project"] != "s3-hidbot"
-        or type(result["protocol_version"]) is not int
+        result["project"] != "s3-hidbot"
         or result["protocol_version"] != PROTOCOL_VERSION
     ):
-        raise ProtocolError("hello response identifies an incompatible project")
+        raise CompatibilityError("hello response identifies an incompatible project")
     capabilities = result["capabilities"]
     if (
         not isinstance(capabilities, list)
@@ -363,11 +429,14 @@ def validate_hello_response(
         or len(capabilities) > MAX_ARRAY_MEMBERS
         or len(set(capabilities)) != len(capabilities)
         or any(len(item.encode("utf-8")) > MAX_STRING_BYTES for item in capabilities)
-        or not REQUIRED_CAPABILITIES.issubset(capabilities)
     ):
         raise ProtocolError("hello response capabilities are incompatible")
-    if type(result["lease_ms"]) is not int or result["lease_ms"] != LEASE_MS:
-        raise ProtocolError("hello response lease is incompatible")
+    if not BASELINE_REQUIRED_CAPABILITIES.issubset(capabilities):
+        raise CompatibilityError("hello response is missing baseline capabilities")
+    if type(result["lease_ms"]) is not int:
+        raise ProtocolError("hello response lease type is invalid")
+    if result["lease_ms"] != LEASE_MS:
+        raise CompatibilityError("hello response lease is incompatible")
     return HelloResponse(
         session=response.session,
         boot_id=boot_id,
@@ -410,3 +479,173 @@ def validate_mouse_report_result(value: Any) -> MouseReportResult:
     if state not in {"already_set", "submitted"}:
         raise ProtocolError("hid.mouse.report result state is invalid")
     return MouseReportResult(state=cast(Literal["already_set", "submitted"], state))
+
+
+def _bounded_ascii(value: Any, maximum: int) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return len(encoded) <= maximum
+
+
+def _parse_firmware_identity(value: Any) -> FirmwareIdentity:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "source_revision",
+        "app_elf_sha256",
+        "build_profile",
+    }:
+        raise ProtocolError("firmware identity fields are invalid")
+
+    version = value["version"]
+    if (
+        not _bounded_ascii(version, MAX_FIRMWARE_VERSION_BYTES)
+        or _SEMVER_PATTERN.fullmatch(version) is None
+    ):
+        raise ProtocolError("firmware identity version is invalid")
+
+    source_revision = value["source_revision"]
+    if source_revision is not None and (
+        not isinstance(source_revision, str)
+        or SOURCE_REVISION_PATTERN.fullmatch(source_revision) is None
+    ):
+        raise ProtocolError("firmware identity source revision is invalid")
+
+    app_elf_sha256 = value["app_elf_sha256"]
+    if (
+        not isinstance(app_elf_sha256, str)
+        or APP_ELF_SHA256_PATTERN.fullmatch(app_elf_sha256) is None
+    ):
+        raise ProtocolError("firmware identity ELF SHA256 is invalid")
+
+    build_profile = value["build_profile"]
+    if (
+        not _bounded_ascii(build_profile, MAX_BUILD_PROFILE_BYTES)
+        or BUILD_PROFILE_PATTERN.fullmatch(build_profile) is None
+    ):
+        raise ProtocolError("firmware identity build profile is invalid")
+
+    return FirmwareIdentity(
+        version=version,
+        source_revision=source_revision,
+        app_elf_sha256=app_elf_sha256,
+        build_profile=build_profile,
+    )
+
+
+def validate_system_info(
+    value: Any,
+    *,
+    capabilities: Collection[str],
+) -> SystemInfo:
+    """Validate legacy or identity-v1 ``system.info`` data without I/O."""
+
+    if isinstance(capabilities, (str, bytes, bytearray)) or not isinstance(
+        capabilities, Collection
+    ):
+        raise ProtocolError("system.info capabilities are invalid")
+    try:
+        if len(capabilities) > MAX_ARRAY_MEMBERS or len(set(capabilities)) != len(capabilities):
+            raise ProtocolError("system.info capabilities are invalid")
+        capability_set = set(capabilities)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("system.info capabilities are invalid") from exc
+    if not all(
+        isinstance(item, str)
+        and item
+        and len(item.encode("utf-8")) <= MAX_STRING_BYTES
+        for item in capability_set
+    ):
+        raise ProtocolError("system.info capabilities are invalid")
+    if not isinstance(value, dict):
+        raise ProtocolError("system.info result must be an object")
+
+    base_fields = {"project", "target", "idf_version", "protocol_version"}
+    identity_advertised = "firmware.identity-v1" in capability_set
+    expected_fields = base_fields | ({"firmware"} if identity_advertised else set())
+    if set(value) != expected_fields:
+        if identity_advertised:
+            raise CompatibilityError(
+                "firmware.identity-v1 requires the exact identity system.info shape"
+            )
+        raise CompatibilityError(
+            "legacy system.info cannot contain identity fields without firmware.identity-v1"
+        )
+
+    project = value["project"]
+    if not isinstance(project, str):
+        raise ProtocolError("system.info project has an invalid type")
+    if project != "s3-hidbot":
+        raise CompatibilityError("system.info identifies an incompatible project")
+
+    target = value["target"]
+    if not _bounded_ascii(target, MAX_STRING_BYTES):
+        raise ProtocolError("system.info target is invalid")
+
+    idf_version = value["idf_version"]
+    if not _bounded_ascii(idf_version, MAX_STRING_BYTES):
+        raise ProtocolError("system.info IDF version is invalid")
+
+    protocol_version = value["protocol_version"]
+    if type(protocol_version) is not int:
+        raise ProtocolError("system.info protocol version has an invalid type")
+    if protocol_version != PROTOCOL_VERSION:
+        raise CompatibilityError("system.info protocol version is incompatible")
+
+    firmware: FirmwareIdentity | None = None
+    if identity_advertised:
+        try:
+            firmware = _parse_firmware_identity(value["firmware"])
+        except ProtocolError as exc:
+            raise CompatibilityError(
+                "firmware.identity-v1 system.info identity is incompatible"
+            ) from exc
+    return SystemInfo(
+        project=project,
+        target=target,
+        idf_version=idf_version,
+        protocol_version=protocol_version,
+        firmware=firmware,
+    )
+
+
+def evaluate_compatibility(
+    hello: HelloResponse,
+    info: Any,
+) -> CompatibilityResult:
+    """Assess protocol compatibility, excluding USB and physical health."""
+
+    if not isinstance(hello, HelloResponse):
+        raise ProtocolError("compatibility hello value is invalid")
+    try:
+        capabilities = set(hello.capabilities)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("compatibility capabilities are invalid") from exc
+    missing = tuple(sorted(BASELINE_REQUIRED_CAPABILITIES - capabilities))
+    optional = tuple(sorted(OPTIONAL_CAPABILITIES & capabilities))
+    try:
+        system_info = validate_system_info(info, capabilities=hello.capabilities)
+    except CompatibilityError:
+        return CompatibilityResult(
+            compatible=False,
+            missing_baseline_capabilities=missing,
+            advertised_optional_capabilities=optional,
+            identity_available=False,
+            firmware_identity=None,
+            target_supported=False,
+        )
+    target_supported = system_info.target == "esp32s3"
+    protocol_compatible = (
+        hello.project == "s3-hidbot" and hello.protocol_version == PROTOCOL_VERSION
+    )
+    return CompatibilityResult(
+        compatible=not missing and protocol_compatible and target_supported,
+        missing_baseline_capabilities=missing,
+        advertised_optional_capabilities=optional,
+        identity_available=system_info.firmware is not None,
+        firmware_identity=system_info.firmware,
+        target_supported=target_supported,
+    )
