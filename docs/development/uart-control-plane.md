@@ -161,7 +161,7 @@ initial capability list:
 ```text
   protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
   hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
-  hid.mouse-report-v1
+  hid.mouse-report-v1, firmware.identity-v1
 ```
 
 For a successful hello, top-level `session` equals `result.session`. Both are
@@ -171,7 +171,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
@@ -182,6 +182,11 @@ hosts must use the advertised capability list. The safety release, absolute
 keyboard-report, and relative mouse-report capabilities are advertised without
 changing `v`. All normal requests require the exact current session; USB mount
 does not automatically create one.
+
+The `firmware.identity-v1` capability is additive and does not change protocol
+version `v` or the hello result fields. When advertised, `system.info` includes
+the exact nested `firmware` object described below. `app_elf_sha256` is the
+SHA-256 of the running linked ELF, not a flash BIN or package artifact digest.
 
 The response `session` field is a correlation/epoch identity, not an
 authentication credential. A `session:null` response cannot be trusted as
@@ -276,8 +281,34 @@ safety boundary.
 
 - `system.ping` returns `{ "pong": true }`.
 - `system.info` returns bounded static project, target, ESP-IDF version, and
-  protocol version. It must not include a user name, host path, serial
+  protocol version. The current identity-v1 firmware additionally returns a
+  nested `firmware` object containing the validated descriptor version,
+  optional configured source revision (`null` when unset), linked ELF SHA-256,
+  and build profile. It must not include a user name, host path, serial
   identifier, or build-host information.
+
+The identity-v1 `system.info` result has exactly these fields:
+
+```json
+{
+  "project": "s3-hidbot",
+  "target": "esp32s3",
+  "idf_version": "v5.5.4",
+  "protocol_version": 1,
+  "firmware": {
+    "version": "0.1.0-dev",
+    "source_revision": null,
+    "app_elf_sha256": "<64 lowercase hex>",
+    "build_profile": "freenove-fnk0085"
+  }
+}
+```
+
+`source_revision` is either JSON `null` for an unset build input or the full
+40-character lowercase hexadecimal `S3_HIDBOT_SOURCE_REVISION` value. It is
+never an inferred Git value. Hosts must validate the descriptor fields and
+must not treat `boot_id` or the control session as firmware identity.
+
 - `usb.status` returns current TinyUSB `mounted`, `suspended`,
   `keyboard_ready`, and `mouse_ready` booleans. It queries status only and
   never submits a HID report.
@@ -373,9 +404,9 @@ fresh hello) in the generic host core.
 callers. External consumers that need typed compatibility inspection may use
 the pure host validators `validate_system_info()` and
 `evaluate_compatibility()`. Without `firmware.identity-v1`, `system.info`
-must have its legacy four-field shape. The host reserves the strict nested
-identity-v1 shape for a future producer; the current firmware does not
-advertise or produce that capability.
+must have its legacy four-field shape. With the capability, the current
+firmware produces the strict nested identity-v1 shape above. New hosts accept
+both forms, so old firmware remains compatible with identity unavailable.
 
 The v1 wire hardening keeps protocol `v` at `1` and uses the advertised
 capability list. The nonce identifies a hello attempt, the boot ID identifies

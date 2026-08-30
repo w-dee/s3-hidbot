@@ -66,6 +66,11 @@ def main() -> int:
     assert "hid.keyboard-report-v1" in protocol
     assert 'command == "hid.mouse.report"' in protocol
     assert "hid.mouse-report-v1" in protocol
+    assert "firmware.identity-v1" in protocol
+    assert "kIdentityCapabilityJson" in protocol
+    assert "kMaximumInfoResponseBytes" in protocol
+    assert "is_valid_identity" in protocol
+    assert "firmware_identity::Identity" in protocol_header
     assert "keyboard_report_provider" in protocol_header
     assert "mouse_report_provider" in protocol_header
     assert "tud_hid_n_keyboard_report" not in main_source

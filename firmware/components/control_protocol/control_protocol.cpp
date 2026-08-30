@@ -1,5 +1,6 @@
 #include "control_protocol/control_protocol.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -20,8 +21,10 @@ constexpr std::size_t kMaxJsonArrayMembers = 8;
 constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
-constexpr char kCapabilityJson[] =
+constexpr char kLegacyCapabilityJson[] =
     "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\"]";
+constexpr char kIdentityCapabilityJson[] =
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -30,15 +33,25 @@ struct ResponseSession {
 constexpr ResponseSession kUncorrelatableSession{false, {}};
 constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
 
-// Every formatter below writes to ResponseFrame::bytes. This conservative
-// bound covers the largest U2 response: protocol.hello with bounded project
+// Every formatter below writes to ResponseFrame::bytes. These conservative
+// bounds cover the largest identity-v1 protocol.hello and system.info responses
 // metadata, four 32-hex values (top-level session, result session, boot ID,
-// and client nonce), capability list, maximum int32 id, framing, and LF.
+// and client nonce), nine capabilities, maximum int32 id, framing, and LF.
 // vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
-    control_session::kTokenHexLength * 4 + (sizeof(kCapabilityJson) - 1) + 32 + 10 + 1;
+    control_session::kTokenHexLength * 4 + (sizeof(kIdentityCapabilityJson) - 1) + 32 + 10 + 1;
 static_assert(kMaximumHelloResponseBytes <= control_session::kMaxResponseBytes);
+
+// Conservative bound for identity-v1 system.info. It includes the frame
+// prefix/envelope, maximum int32 id and session token, three bounded legacy
+// metadata strings, the maximum C1 identity fields, JSON punctuation, and LF.
+constexpr std::size_t kMaximumInfoResponseBytes =
+    kPrefixLength + 320 + 10 + control_session::kTokenHexLength +
+    kMaxMetadataBytes * 3 + firmware_identity::kVersionMaxBytes +
+    firmware_identity::kSourceRevisionChars + firmware_identity::kAppElfSha256HexChars +
+    firmware_identity::kBuildProfileMaxBytes + 1;
+static_assert(kMaximumInfoResponseBytes <= control_session::kMaxResponseBytes);
 constexpr std::size_t kMaximumReleaseAllResponseBytes =
     kPrefixLength + 150 + control_session::kTokenHexLength + 1;
 static_assert(kMaximumReleaseAllResponseBytes <= control_session::kMaxResponseBytes);
@@ -61,6 +74,58 @@ bool is_safe_metadata_string(const char *value) {
         if (*character < 0x20 || *character == '"' || *character == '\\') {
             return false;
         }
+    }
+    return true;
+}
+
+template <typename Array>
+bool bounded_array_string(const Array &value,
+                          std::size_t maximum_length,
+                          std::string_view *result) {
+    const auto terminator = std::find(value.begin(), value.end(), '\0');
+    if (terminator == value.end()) {
+        return false;
+    }
+    const std::size_t length = static_cast<std::size_t>(terminator - value.begin());
+    if (length > maximum_length || result == nullptr) {
+        return false;
+    }
+    *result = std::string_view(value.data(), length);
+    return true;
+}
+
+bool is_nonzero_hex(std::string_view value) {
+    return std::any_of(value.begin(), value.end(), [](char character) {
+        return character != '0';
+    });
+}
+
+bool is_valid_identity(const firmware_identity::Identity *identity) {
+    if (identity == nullptr) {
+        return false;
+    }
+
+    std::string_view version;
+    std::string_view source_revision;
+    std::string_view app_elf_sha256;
+    std::string_view build_profile;
+    if (!bounded_array_string(identity->version, firmware_identity::kVersionMaxBytes, &version) ||
+        !bounded_array_string(identity->source_revision, firmware_identity::kSourceRevisionChars,
+                              &source_revision) ||
+        !bounded_array_string(identity->app_elf_sha256,
+                              firmware_identity::kAppElfSha256HexChars, &app_elf_sha256) ||
+        !bounded_array_string(identity->build_profile, firmware_identity::kBuildProfileMaxBytes,
+                              &build_profile)) {
+        return false;
+    }
+    if (!firmware_identity::is_valid_version(version) ||
+        !firmware_identity::is_valid_source_revision(
+            firmware_identity::SourceRevisionInput{identity->source_revision_present,
+                                                   source_revision}) ||
+        !firmware_identity::is_valid_app_elf_sha256(app_elf_sha256) ||
+        !is_nonzero_hex(app_elf_sha256) ||
+        !firmware_identity::is_valid_build_profile(build_profile)) {
+        return false;
     }
     return true;
 }
@@ -257,16 +322,56 @@ bool make_info(control_session::ResponseFrame *frame,
         frame->length = 0;
         return false;
     }
+    if (metadata.firmware_identity == nullptr) {
+        return format_frame(frame,
+                            "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                            "\"session\":%s,\"ok\":true,\"result\":{"
+                            "\"project\":\"%s\",\"target\":\"%s\",\"idf_version\":\"%s\","
+                            "\"protocol_version\":1}}\n",
+                            static_cast<long>(id),
+                            session_field,
+                            metadata.project,
+                            metadata.target,
+                            metadata.idf_version);
+    }
+    if (!is_valid_identity(metadata.firmware_identity)) {
+        frame->length = 0;
+        return false;
+    }
+    const firmware_identity::Identity &identity = *metadata.firmware_identity;
+    if (!identity.source_revision_present) {
+        return format_frame(frame,
+                            "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                            "\"session\":%s,\"ok\":true,\"result\":{"
+                            "\"project\":\"%s\",\"target\":\"%s\",\"idf_version\":\"%s\","
+                            "\"protocol_version\":1,\"firmware\":{"
+                            "\"version\":\"%s\",\"source_revision\":null,"
+                            "\"app_elf_sha256\":\"%s\",\"build_profile\":\"%s\"}}}\n",
+                            static_cast<long>(id),
+                            session_field,
+                            metadata.project,
+                            metadata.target,
+                            metadata.idf_version,
+                            identity.version.data(),
+                            identity.app_elf_sha256.data(),
+                            identity.build_profile.data());
+    }
     return format_frame(frame,
                         "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
                         "\"session\":%s,\"ok\":true,\"result\":{"
                         "\"project\":\"%s\",\"target\":\"%s\",\"idf_version\":\"%s\","
-                        "\"protocol_version\":1}}\n",
+                        "\"protocol_version\":1,\"firmware\":{"
+                        "\"version\":\"%s\",\"source_revision\":\"%s\","
+                        "\"app_elf_sha256\":\"%s\",\"build_profile\":\"%s\"}}}\n",
                         static_cast<long>(id),
                         session_field,
                         metadata.project,
                         metadata.target,
-                        metadata.idf_version);
+                        metadata.idf_version,
+                        identity.version.data(),
+                        identity.source_revision.data(),
+                        identity.app_elf_sha256.data(),
+                        identity.build_profile.data());
 }
 
 const char *json_bool(bool value) {
@@ -327,7 +432,8 @@ bool make_hello(control_session::ResponseFrame *frame,
     if (!format_session_field(session_field, session) ||
         !is_lower_hex_token_cstr(client_nonce) ||
         !is_lower_hex_token_cstr(boot_id) ||
-        !is_lower_hex_token_cstr(result_session)) {
+        !is_lower_hex_token_cstr(result_session) ||
+        (metadata.firmware_identity != nullptr && !is_valid_identity(metadata.firmware_identity))) {
         frame->length = 0;
         return false;
     }
@@ -344,7 +450,8 @@ bool make_hello(control_session::ResponseFrame *frame,
                         boot_id,
                         result_session,
                         static_cast<unsigned long>(control_session::kLeaseMilliseconds),
-                        kCapabilityJson);
+                        metadata.firmware_identity != nullptr ? kIdentityCapabilityJson
+                                                               : kLegacyCapabilityJson);
 }
 
 bool validate_no_params(const cJSON *params) {
@@ -529,7 +636,9 @@ bool Protocol::initialize(const Config &config,
         config.authority_epoch_provider == nullptr || random_fill == nullptr ||
         !is_safe_metadata_string(config.metadata.project) ||
         !is_safe_metadata_string(config.metadata.target) ||
-        !is_safe_metadata_string(config.metadata.idf_version)) {
+        !is_safe_metadata_string(config.metadata.idf_version) ||
+        (config.metadata.firmware_identity != nullptr &&
+         !is_valid_identity(config.metadata.firmware_identity))) {
         return false;
     }
     config_ = config;

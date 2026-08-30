@@ -7,15 +7,20 @@
 
 #include "control_framing/control_framing.hpp"
 #include "control_session/control_session.hpp"
+#include "firmware_identity/firmware_identity.hpp"
 
 namespace control_protocol {
 
 inline constexpr std::uint32_t kProtocolVersion = 1;
 
 struct Metadata {
-    const char *project;
-    const char *target;
-    const char *idf_version;
+    const char *project = nullptr;
+    const char *target = nullptr;
+    const char *idf_version = nullptr;
+    // A null identity keeps the protocol core able to exercise legacy
+    // metadata in native tests. The running C2 firmware always supplies a
+    // validated, stable identity before starting the control plane.
+    const firmware_identity::Identity *firmware_identity = nullptr;
 };
 
 struct UsbStatus {

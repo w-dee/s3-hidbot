@@ -1,4 +1,6 @@
 #include <cassert>
+#include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -7,12 +9,38 @@
 
 #include "control_framing/control_framing.hpp"
 #include "control_protocol/control_protocol.hpp"
+#include "firmware_identity/firmware_identity.hpp"
 
 namespace {
 
 constexpr char kNonceA[] = "0123456789abcdef0123456789abcdef";
 constexpr char kNonceB[] = "fedcba9876543210fedcba9876543210";
 constexpr std::size_t kMaxLogicalMachineFrameBytes = 1023;
+
+firmware_identity::Identity make_test_identity() {
+    std::array<std::uint8_t, firmware_identity::kAppElfSha256Bytes> digest{};
+    for (std::size_t index = 0; index < digest.size(); ++index) {
+        digest[index] = static_cast<std::uint8_t>(index + 1);
+    }
+    firmware_identity::Identity identity{};
+    assert(firmware_identity::build_identity(
+        &identity,
+        "0.1.0-dev",
+        firmware_identity::SourceRevisionInput{},
+        digest,
+        firmware_identity::kBuildProfile));
+    return identity;
+}
+
+std::size_t count_occurrences(const std::string &value, std::string_view needle) {
+    std::size_t count = 0;
+    std::size_t position = 0;
+    while ((position = value.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += needle.size();
+    }
+    return count;
+}
 
 struct Sink {
     std::vector<std::string> frames;
@@ -207,12 +235,27 @@ struct Fixture {
     ReleaseSource release;
     KeyboardSource keyboard;
     MouseSource mouse;
+    firmware_identity::Identity identity{};
+    bool identity_enabled = false;
     control_protocol::Protocol protocol;
 
-    explicit Fixture(std::uint8_t random_seed = 0) {
+    explicit Fixture(std::uint8_t random_seed = 0, bool with_identity = false)
+        : identity_enabled(with_identity) {
         random.next = random_seed;
-        const control_protocol::Config config{
-            .metadata = {"s3-hidbot", "esp32s3", "v5.5.4"},
+        if (identity_enabled) {
+            identity = make_test_identity();
+        }
+        assert(protocol.initialize(configuration(), RandomSource::fill, &random));
+    }
+
+    control_protocol::Config configuration() {
+        return control_protocol::Config{
+            .metadata = {
+                .project = "s3-hidbot",
+                .target = "esp32s3",
+                .idf_version = "v5.5.4",
+                .firmware_identity = identity_enabled ? &identity : nullptr,
+            },
             .usb_status_provider = StatusSource::get,
             .usb_status_context = &status,
             .authority_epoch_provider = AuthoritySource::get,
@@ -234,7 +277,6 @@ struct Fixture {
             .mouse_report_provider = MouseSource::get,
             .mouse_report_context = &mouse,
         };
-        assert(protocol.initialize(config, RandomSource::fill, &random));
     }
 
     void payload(std::string_view json) {
@@ -544,6 +586,86 @@ void test_request_cache_and_commands() {
     }
 }
 
+void test_identity_hello_and_info_shapes() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string hello = fixture.sink.last();
+    const std::string session = extract_string(hello, "session");
+
+    for (std::string_view capability : {
+             "protocol.hello-v1", "system.ping-v1", "system.info-v1",
+             "usb.status-v1", "hid.lease-v1", "hid.release-all-v1",
+             "hid.keyboard-report-v1", "hid.mouse-report-v1", "firmware.identity-v1",
+         }) {
+        assert(count_occurrences(hello, std::string("\"") + std::string(capability) + "\"") == 1);
+    }
+    assert(hello.find("\"firmware\":") == std::string::npos);
+    assert(count_occurrences(hello, "\"result\":") == 1);
+
+    fixture.payload(request(2, session, "system.info"));
+    const std::string null_revision_info = fixture.sink.last();
+    require_contains(null_revision_info,
+                     "\"firmware\":{\"version\":\"0.1.0-dev\",\"source_revision\":null,");
+    require_contains(null_revision_info,
+                     "\"app_elf_sha256\":\"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\"");
+    require_contains(null_revision_info, "\"build_profile\":\"freenove-fnk0085\"}");
+    assert(null_revision_info.size() <= kMaxLogicalMachineFrameBytes);
+
+    constexpr char kFullRevision[] =
+        "0123456789abcdef0123456789abcdef01234567";
+    std::array<std::uint8_t, firmware_identity::kAppElfSha256Bytes> full_digest{};
+    full_digest.fill(0xabU);
+    assert(firmware_identity::build_identity(
+        &fixture.identity,
+        "1.2.3+build",
+        firmware_identity::SourceRevisionInput{true, kFullRevision},
+        full_digest,
+        firmware_identity::kBuildProfile));
+    fixture.payload(request(3, session, "system.info"));
+    const std::string full_revision_info = fixture.sink.last();
+    require_contains(full_revision_info,
+                     "\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\"");
+    require_contains(full_revision_info, "\"version\":\"1.2.3+build\"");
+    assert(full_revision_info.size() <= kMaxLogicalMachineFrameBytes);
+
+    const std::string maximum_version = std::string(27, '1') + ".0.0";
+    const std::string maximum_profile(31, 'a');
+    std::array<std::uint8_t, firmware_identity::kAppElfSha256Bytes> maximum_digest{};
+    maximum_digest.fill(0x5aU);
+    assert(firmware_identity::build_identity(
+        &fixture.identity,
+        maximum_version,
+        firmware_identity::SourceRevisionInput{true, kFullRevision},
+        maximum_digest,
+        maximum_profile));
+    fixture.payload(request(4, session, "system.info"));
+    assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
+}
+
+void test_invalid_identity_rejected_at_protocol_initialization() {
+    auto expect_rejected = [](auto mutate) {
+        Fixture fixture(0, true);
+        mutate(fixture.identity);
+        control_protocol::Protocol rejected;
+        assert(!rejected.initialize(fixture.configuration(), RandomSource::fill, &fixture.random));
+    };
+
+    expect_rejected([](firmware_identity::Identity &identity) {
+        identity.version[0] = '\0';
+    });
+    expect_rejected([](firmware_identity::Identity &identity) {
+        identity.source_revision_present = true;
+        identity.source_revision[0] = 'G';
+    });
+    expect_rejected([](firmware_identity::Identity &identity) {
+        std::fill(identity.app_elf_sha256.begin(), identity.app_elf_sha256.end(), '0');
+        identity.app_elf_sha256.back() = '\0';
+    });
+    expect_rejected([](firmware_identity::Identity &identity) {
+        identity.build_profile[0] = 'F';
+    });
+}
+
 void test_response_scratch_reuse() {
     Fixture fixture;
 
@@ -840,5 +962,7 @@ int main() {
     test_release_all_result_cache_and_pending_error();
     test_keyboard_report_schema_result_and_cache();
     test_mouse_report_schema_result_and_cache();
+    test_identity_hello_and_info_shapes();
+    test_invalid_identity_rejected_at_protocol_initialization();
     return 0;
 }

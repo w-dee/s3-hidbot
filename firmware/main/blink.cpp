@@ -1,12 +1,15 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include <cstdlib>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "hid_runtime/hid_runtime.hpp"
 #include "uart_control_transport/uart_control_transport.hpp"
+#include "firmware_identity/firmware_identity.hpp"
+#include "firmware_identity_adapter.hpp"
 #include "class/hid/hid_device.h"
 #include "device/usbd.h"
 
@@ -32,6 +35,7 @@ constexpr uint8_t kKeyboardStringIndex = 4;
 constexpr uint8_t kMouseStringIndex = 5;
 
 hid_runtime::Runtime s_hid_runtime;
+firmware_identity::Identity s_firmware_identity;
 
 control_protocol::UsbStatus usb_status(void *) {
     const hid_runtime::StatusSnapshot status = s_hid_runtime.status_snapshot();
@@ -325,6 +329,10 @@ extern "C" void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 }
 
 extern "C" void app_main() {
+    if (!firmware_identity_adapter::build_runtime_identity(&s_firmware_identity)) {
+        ESP_LOGE(kLogTag, "firmware identity initialization failed");
+        std::abort();
+    }
     s_hid_runtime.initialize();
     const gpio_config_t configuration = {
         .pin_bit_mask = 1ULL << kOnboardLed,
@@ -361,6 +369,7 @@ extern "C" void app_main() {
             .project = "s3-hidbot",
             .target = CONFIG_IDF_TARGET,
             .idf_version = IDF_VER,
+            .firmware_identity = &s_firmware_identity,
         },
         .usb_status_provider = usb_status,
         .usb_status_context = nullptr,
