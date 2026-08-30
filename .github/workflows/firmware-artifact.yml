@@ -51,6 +51,10 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Run artifact static and privacy guards
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: ${{ github.workspace }}
         run: |
           set -euo pipefail
           ./tools/test-static.sh

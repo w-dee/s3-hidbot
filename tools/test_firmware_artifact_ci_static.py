@@ -58,6 +58,19 @@ def main() -> int:
     )
     if re.search(r"safe\.directory\s*=\s*\*|safe\.directory=/__w/|chown\s+-R|chmod\s+-R", text):
         raise AssertionError("workflow must not use wildcard or persistent ownership workarounds")
+    if re.search(r"git\s+config\s+--(?:global|system)|GIT_CONFIG_(?:GLOBAL|SYSTEM)", text):
+        raise AssertionError("workflow must not use persistent global/system Git configuration")
+    static_step = text.split(
+        "      - name: Run artifact static and privacy guards\n", 1
+    )[1].split("      - name: Build and verify two independent artifacts\n", 1)[0]
+    _required(static_step, r"GIT_CONFIG_COUNT:\s*[\"']?1[\"']?", "nested Git config count")
+    _required(static_step, r"GIT_CONFIG_KEY_0:\s*safe\.directory", "nested Git safe-directory key")
+    _required(static_step, r"GIT_CONFIG_VALUE_0:\s*\$\{\{\s*github\.workspace\s*\}\}", "trusted workspace value")
+    build_step = text.split(
+        "      - name: Build and verify two independent artifacts\n", 1
+    )[1]
+    if re.search(r"GIT_CONFIG_(?:COUNT|KEY_0|VALUE_0)", build_step):
+        raise AssertionError("nested Git safe-directory environment must not reach artifact builds")
     _required(text, r"SOURCE_DATE_EPOCH", "explicit SOURCE_DATE_EPOCH")
     _required(text, r"S3_HIDBOT_SOURCE_REVISION", "explicit source revision")
     _required(text, r"tools/privacy_lint\.py\s+--tracked", "repository privacy scan")
