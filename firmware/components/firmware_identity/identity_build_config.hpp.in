@@ -1,0 +1,8 @@
+#pragma once
+
+namespace firmware_identity::build {
+
+inline constexpr bool kSourceRevisionAvailable = @_source_revision_present@;
+inline constexpr char kSourceRevision[] = "@_source_revision@";
+
+}  // namespace firmware_identity::build

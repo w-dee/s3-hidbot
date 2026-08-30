@@ -64,7 +64,7 @@ Run these commands from the repository root:
 writer, documentation static guards, and the U5.4.1 read-only observer unit
 tests. `test-package.sh` is the release artifact validation entrypoint; it
 requires network access but no ESP-IDF.
-`test-native.sh` runs the three IDF-independent C++ suites.
+`test-native.sh` runs the four IDF-independent C++ suites.
 `test-control-protocol.sh` additionally compiles against the active ESP-IDF
 cJSON source and therefore requires the v5.5.4 environment.
 
