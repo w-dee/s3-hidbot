@@ -433,9 +433,10 @@ safe. Partial writes complete through a bounded deadline and serial I/O
 failures become `TransportError`; request deadline expiry remains
 `RequestTimeoutError` in the generic client.
 
-The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`, and
-`usb-status` through the diagnostic client methods, the safety recovery command
-`release-all` through `Client.release_all()`, and the explicit unsafe primitive
+The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`,
+`usb-status`, and the safe `self-test` control-plane diagnostic through the
+diagnostic client methods, the safety recovery command `release-all` through
+`Client.release_all()`, and the explicit unsafe primitive
 commands `keyboard-report` and `mouse-report` through the existing Client
 methods. All commands use `Client.connect()` first. `--port` overrides
 `S3_HIDBOT_SERIAL`; there is no tracked default port. `--baud` overrides
@@ -468,6 +469,16 @@ Invalid syntax or values fail before transport construction with argparse's
 normal exit 2. A valid primitive sends exactly one corresponding HID request
 after hello and never sends an automatic release-all. Use the safe
 `release-all` command explicitly when persistent state needs recovery.
+
+`hidbotctl self-test` is CLI-only orchestration over one connection and one
+session. It runs exactly `hello`, `system.ping`, `system.info`, `usb.status`,
+and `hid.release_all` in that order, returning one structured object with
+`hello`, `ping`, `info`, `usb_status`, and `release_all` members. It fails fast
+on the first exception and performs no cleanup request or reconnect. This
+proves only the UART/control-plane operations; it does not prove keyboard or
+mouse delivery, evdev events, or physical HID behavior. `hid.release_all` may
+submit all-up HID reports when safety state requires it, but the self-test does
+not intentionally inject a key, button, or movement.
 
 The characterization and this transport policy were established for the
 Freenove ESP32-S3 WROOM Board / FNK0085 CH343 path. The measured true/true

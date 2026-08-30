@@ -128,6 +128,10 @@ def _parser() -> argparse.ArgumentParser:
         ("info", "show device information"),
         ("usb-status", "show USB lifecycle and readiness state"),
         ("release-all", "perform the safe all-up recovery operation"),
+        (
+            "self-test",
+            "run hello/ping/info/usb-status/release-all safely; does not prove HID delivery",
+        ),
     ):
         command = commands.add_parser(name, help=help_text, description=help_text)
         _add_global_options(command, suppress_defaults=True)
@@ -295,6 +299,14 @@ def main(
                 result = client.usb_status()
             elif args.command == "release-all":
                 result = client.release_all()
+            elif args.command == "self-test":
+                result = {
+                    "hello": _hello_value(hello),
+                    "ping": client.ping(),
+                    "info": client.info(),
+                    "usb_status": client.usb_status(),
+                    "release_all": asdict(client.release_all()),
+                }
             elif args.command == "keyboard-report":
                 result = client.keyboard_report(args.modifiers, args.keys)
             else:

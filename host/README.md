@@ -23,16 +23,25 @@ not put a machine-specific device path in project files.
 
 ## Safe diagnostic and recovery commands
 
-The `hidbotctl` command exposes the four diagnostic commands `hello`, `ping`,
-`info`, and `usb-status`, plus the safety recovery command `release-all`. The
-first safe interactions with a device are `hello` and `usb-status`:
+The `hidbotctl` command exposes the five safe diagnostic commands `hello`,
+`ping`, `info`, `usb-status`, and `self-test`, plus the safety recovery command
+`release-all`. The first safe interactions with a device are `hello` and
+`usb-status`:
 
 ```bash
 export S3_HIDBOT_SERIAL="<serial-device>"
 hidbotctl hello
 hidbotctl usb-status
 hidbotctl release-all
+hidbotctl self-test
 ```
+
+`self-test` uses one connection and session to run `hello`, `ping`, `info`,
+`usb-status`, and `release-all` in order. It is a control-plane diagnostic,
+not proof of keyboard delivery, mouse delivery, evdev observation, or physical
+HID behavior. `release-all` is a safe recovery operation that may submit
+all-up HID reports when device state requires it; neither command intentionally
+injects a key, button, or movement.
 
 The package also exposes Python primitive APIs such as `Client`,
 `PySerialTransport`, `release_all()`, `keyboard_report()`, and

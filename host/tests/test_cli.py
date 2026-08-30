@@ -182,7 +182,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(kwargs["write_timeout"], 1.0)
 
     def test_env_fallback_and_commands(self) -> None:
-        for command in ("ping", "info", "usb-status", "release-all"):
+        for command in ("ping", "info", "usb-status", "release-all", "self-test"):
             code, output, errors, _ = self.run_cli(
                 [command],
                 {"S3_HIDBOT_SERIAL": "env-port", "S3_HIDBOT_BAUD": "115200"},
@@ -223,6 +223,102 @@ class CliTests(unittest.TestCase):
         self.assertEqual(errors, "")
         self.assertEqual(output, '{"keyboard":"already_up","mouse":"submitted"}\n')
 
+    def test_self_test_runs_one_safe_session_in_wire_order(self) -> None:
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "self-test"],
+            {"S3_HIDBOT_SERIAL": "env-port"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        value = json.loads(output)
+        self.assertEqual(value["hello"]["session"], TOKEN)
+        self.assertEqual(len(value["hello"]["client_nonce"]), 32)
+        self.assertTrue(all(char in "0123456789abcdef" for char in value["hello"]["client_nonce"]))
+        self.assertEqual(value["ping"], {"pong": True})
+        self.assertEqual(value["info"], {"project": "s3-hidbot"})
+        self.assertEqual(value["usb_status"], {"mounted": True})
+        self.assertEqual(
+            value["release_all"], {"keyboard": "already_up", "mouse": "submitted"}
+        )
+        commands = self.wire_commands(calls)
+        self.assertNotIn("hid.keyboard.report", commands)
+        self.assertNotIn("hid.mouse.report", commands)
+        self.assertEqual(
+            commands,
+            [
+                "protocol.hello",
+                "system.ping",
+                "system.info",
+                "usb.status",
+                "hid.release_all",
+            ],
+        )
+        self.assertEqual(sum(call[0] == "factory" for call in calls), 1)
+        self.assertEqual(sum(call[0] == "open" for call in calls), 1)
+        self.assertEqual(sum(call[0] == "close" for call in calls), 1)
+
+    def test_self_test_json_is_compact_and_contains_nested_results(self) -> None:
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "--json", "self-test"],
+            {"S3_HIDBOT_SERIAL": "env-port"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(output.count("\n"), 1)
+        self.assertNotIn("\n\n", output)
+        value = json.loads(output)
+        self.assertIn("hello", value)
+        self.assertIn("release_all", value)
+        self.assertEqual(self.wire_commands(calls)[1:], [
+            "system.ping",
+            "system.info",
+            "usb.status",
+            "hid.release_all",
+        ])
+
+    def test_self_test_fails_fast_without_later_steps_or_reconnect(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class PingErrorTransport(FakeTransport):
+            def write(self, data: bytes) -> None:
+                if data == TRANSPORT_SYNC:
+                    self.calls.append(("write", data))
+                    return
+                value = json.loads(data[len(FRAME_PREFIX) : -1])
+                if value["cmd"] == "protocol.hello":
+                    super().write(data)
+                    return
+                self.calls.append(("write", data))
+                if value["cmd"] == "system.ping":
+                    self.chunks.append(
+                        response(
+                            value["id"],
+                            TOKEN,
+                            error={"code": "UNKNOWN_COMMAND", "message": "ping failed"},
+                        )
+                    )
+
+        transport = PingErrorTransport(calls)
+        errors = io.StringIO()
+
+        def factory(*args: object, **kwargs: object) -> PingErrorTransport:
+            calls.append(("factory", args, kwargs))
+            return transport
+
+        code = main(
+            ["--port", "dummy-port", "self-test"],
+            transport_factory=factory,
+            output=io.StringIO(),
+            error_output=errors,
+        )
+        self.assertEqual(code, 5)
+        self.assertIn("UNKNOWN_COMMAND", errors.getvalue())
+        self.assertEqual(self.wire_commands(calls), ["protocol.hello", "system.ping"])
+        self.assertEqual(sum(call[0] == "factory" for call in calls), 1)
+        self.assertEqual(sum(call[0] == "construct" for call in calls), 1)
+        self.assertEqual(sum(call[0] == "open" for call in calls), 1)
+        self.assertEqual(sum(call[0] == "close" for call in calls), 1)
+
     def test_global_options_before_and_after_commands(self) -> None:
         for argv in (
             ["--json", "ping"],
@@ -251,6 +347,7 @@ class CliTests(unittest.TestCase):
             ["--unsafe-hid", "ping"],
             ["release-all", "--modifiers", "0"],
             ["info", "--x", "1"],
+            ["self-test", "--unsafe-hid"],
         ):
             code, errors, calls = self.run_parser_error(argv)
             self.assertEqual(code, 2, argv)
@@ -477,6 +574,7 @@ class CliTests(unittest.TestCase):
             (["keyboard-report", "--help"], "--unsafe-hid"),
             (["mouse-report", "--help"], "--pan"),
             (["release-all", "--help"], "safe all-up"),
+            (["self-test", "--help"], "release-all safely"),
         ):
             stdout = io.StringIO()
             stderr = io.StringIO()

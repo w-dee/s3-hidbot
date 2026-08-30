@@ -70,10 +70,13 @@ export S3_HIDBOT_SERIAL=/dev/serial/by-id/<s3-hidbot-uart>
 hidbotctl hello
 hidbotctl usb-status
 hidbotctl release-all
+hidbotctl self-test
 ```
 
 The first safe interactions are `hello` and `usb-status`; `release-all` is the
-explicit safety recovery operation. Primitive keyboard and mouse report
+explicit safety recovery operation. `self-test` runs the safe control-plane
+diagnostic sequence and is not proof that a keyboard or mouse event reached a
+host. Primitive keyboard and mouse report
 commands are also available, but require the command-local `--unsafe-hid`
 opt-in. They send one report through the existing Python API path; this is not
 a typing, clicking, dragging, or macro layer.
@@ -114,9 +117,11 @@ such claim is made yet.
 
 - `IMPLEMENTED`: Composite Keyboard + Mouse HID, UART control plane, session
   lease, authority/lifecycle safety, `hid.release_all` and its
-  `hidbotctl release-all` safety command, keyboard and mouse primitive APIs.
+  `hidbotctl release-all` safety command, `hidbotctl self-test` diagnostic,
+  keyboard and mouse primitive APIs.
 - `NATIVE VALIDATED`: framing, strict protocol parsing, session/cache/lease
-  behavior, HID safety state machine, host client, CLI, and firmware build.
+  behavior, HID safety state machine, host client, CLI, self-test orchestration,
+  and firmware build.
 - `HARDWARE VALIDATED`: composite HID enumeration, UART control reliability,
   `release_all`, the F24 keyboard sentinel path, and a small relative `REL_X`
   mouse movement path.
