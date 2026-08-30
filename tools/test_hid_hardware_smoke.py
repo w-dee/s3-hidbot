@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pure tests for the U5.4.1/U5.4.2 HID observer and F24 smoke layer."""
+"""Pure tests for the U5.4.1-U5.4.3 HID observer and smoke layers."""
 
 from __future__ import annotations
 
@@ -668,6 +668,308 @@ class KeyboardSmokeTests(unittest.TestCase):
         self.assertEqual(evidence["status"], "fail")
         self.assertIn("cleanup_error", evidence)
         self.assertEqual(actions.count("release_all"), 1)
+
+
+class MouseSmokeTests(unittest.TestCase):
+    candidate = smoke.InputCandidate(
+        Path("/dev/input/event1"),
+        "s3-hidbot mouse",
+        0x303A,
+        0x4008,
+        "s3-hidbot",
+        1,
+        ("rel",),
+    )
+
+    def make_fakes(
+        self,
+        *,
+        report_state: str = "submitted",
+        events: list[list[smoke.InputEvent]] | None = None,
+        release_error: Exception | None = None,
+    ) -> tuple[list[str], object, object, object, list[tuple[int, int, int, int, int]]]:
+        actions: list[str] = []
+        report_calls: list[tuple[int, int, int, int, int]] = []
+        event_batches = list(events or [
+            [
+                smoke.InputEvent(1, 1, smoke.EV_REL, smoke.REL_X, 1),
+                smoke.InputEvent(1, 2, smoke.EV_SYN, smoke.SYN_REPORT, 0),
+            ],
+            [],
+        ])
+
+        class FakeObserver:
+            def __init__(self, path: Path) -> None:
+                self.path = path
+
+            def open(self) -> None:
+                actions.append("observer_open")
+
+            def drain(self) -> int:
+                actions.append("drain")
+                return 0
+
+            def wait_events(self, timeout: float) -> list[smoke.InputEvent]:
+                del timeout
+                actions.append("observe")
+                return event_batches.pop(0) if event_batches else []
+
+            def close(self) -> None:
+                actions.append("observer_close")
+
+        class FakeTransport:
+            def open(self) -> None:
+                actions.append("transport_open")
+
+            def close(self) -> None:
+                actions.append("transport_close")
+
+        class FakeClient:
+            def __init__(self, transport: FakeTransport) -> None:
+                self.transport = transport
+
+            def connect(self) -> object:
+                actions.append("hello")
+                return SimpleNamespace(session="session")
+
+            def mouse_report(
+                self, buttons: int, x: int, y: int, wheel: int, pan: int
+            ) -> object:
+                report_calls.append((buttons, x, y, wheel, pan))
+                actions.append("mouse_report")
+                return SimpleNamespace(state=report_state)
+
+            def release_all(self) -> object:
+                actions.append("release_all")
+                if release_error is not None:
+                    raise release_error
+                return {"keyboard": "already_up", "mouse": "already_up"}
+
+            def close(self) -> None:
+                self.transport.close()
+
+        def transport_factory(port: str, baudrate: int, timeout: float) -> FakeTransport:
+            del port, baudrate, timeout
+            actions.append("transport_construct")
+            return FakeTransport()
+
+        def client_factory(transport: FakeTransport, timeout: float) -> FakeClient:
+            del timeout
+            actions.append("client_construct")
+            return FakeClient(transport)
+
+        return actions, FakeObserver, transport_factory, client_factory, report_calls
+
+    def execute(
+        self, **kwargs: object
+    ) -> tuple[int, dict[str, object], list[str], list[tuple[int, int, int, int, int]]]:
+        actions, observer_factory, transport_factory, client_factory, report_calls = self.make_fakes(
+            **kwargs
+        )
+        code, evidence = smoke.run_mouse_smoke(
+            self.candidate,
+            serial_port="fixture-port",
+            observer_factory=observer_factory,
+            transport_factory=transport_factory,
+            client_factory=client_factory,
+            clock=lambda: 1.0,
+        )
+        return code, evidence, actions, report_calls
+
+    def test_success_order_and_exact_relative_report(self) -> None:
+        code, evidence, actions, report_calls = self.execute()
+        self.assertEqual(code, 0)
+        self.assertEqual(evidence["status"], "pass")
+        self.assertEqual(
+            actions,
+            [
+                "observer_open",
+                "drain",
+                "transport_construct",
+                "transport_open",
+                "client_construct",
+                "hello",
+                "mouse_report",
+                "observe",
+                "observe",
+                "release_all",
+                "transport_close",
+                "observer_close",
+            ],
+        )
+        self.assertEqual(report_calls, [(0, 1, 0, 0, 0)])
+        self.assertEqual(evidence["submit"], "submitted")
+        self.assertTrue(evidence["movement_observed"])
+        self.assertTrue(evidence["packet_complete"])
+        self.assertEqual(evidence["event_evidence"][0]["classification"], "expected_rel_x")
+
+    def test_split_read_requires_later_syn_report(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_REL, smoke.REL_X, 1)],
+            [smoke.InputEvent(1, 2, smoke.EV_SYN, smoke.SYN_REPORT, 0)],
+            [],
+        ]
+        code, evidence, actions, _ = self.execute(events=events)
+        self.assertEqual(code, 0)
+        self.assertTrue(evidence["movement_observed"])
+        self.assertTrue(evidence["packet_complete"])
+        self.assertEqual(actions.count("mouse_report"), 1)
+
+    def test_pre_target_syn_report_does_not_prove_movement(self) -> None:
+        events = [
+            [smoke.InputEvent(1, 1, smoke.EV_SYN, smoke.SYN_REPORT, 0)],
+            [
+                smoke.InputEvent(1, 2, smoke.EV_REL, smoke.REL_X, 1),
+                smoke.InputEvent(1, 3, smoke.EV_SYN, smoke.SYN_REPORT, 0),
+            ],
+            [],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 0)
+        self.assertTrue(evidence["movement_observed"])
+        self.assertTrue(evidence["packet_complete"])
+
+    def test_target_packet_with_trailing_unexpected_event_fails(self) -> None:
+        events = [[
+            smoke.InputEvent(1, 1, smoke.EV_REL, smoke.REL_X, 1),
+            smoke.InputEvent(1, 2, smoke.EV_SYN, smoke.SYN_REPORT, 0),
+            smoke.InputEvent(1, 3, smoke.EV_REL, smoke.REL_X, 1),
+        ]]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertTrue(evidence["movement_observed"])
+        self.assertTrue(evidence["packet_complete"])
+        self.assertEqual(evidence["unexpected_event"]["code"], smoke.REL_X)
+        self.assertEqual(evidence["cleanup_attempted"], True)
+
+    def test_split_rel_without_syn_fails_but_preserves_movement_evidence(self) -> None:
+        code, evidence, _, _ = self.execute(
+            events=[[smoke.InputEvent(1, 1, smoke.EV_REL, smoke.REL_X, 1)], []]
+        )
+        self.assertEqual(code, 5)
+        self.assertTrue(evidence["movement_observed"])
+        self.assertFalse(evidence["packet_complete"])
+        self.assertIn("without SYN_REPORT", evidence["error"])
+
+    def test_wrong_rel_key_and_ev_key_fail_closed(self) -> None:
+        for event in (
+            smoke.InputEvent(1, 1, smoke.EV_REL, smoke.REL_Y, 1),
+            smoke.InputEvent(1, 1, smoke.EV_REL, smoke.REL_X, 2),
+            smoke.InputEvent(1, 1, smoke.EV_KEY, smoke.KEY_F24, 1),
+        ):
+            with self.subTest(event=event):
+                code, evidence, _, _ = self.execute(events=[[event]])
+                self.assertEqual(code, 5)
+                self.assertEqual(evidence["unexpected_event"]["type"], event.event_type)
+
+    def test_scan_metadata_is_allowed_but_other_msc_is_not(self) -> None:
+        allowed = [[
+            smoke.InputEvent(1, 1, smoke.EV_MSC, smoke.MSC_SCAN, 7),
+            smoke.InputEvent(1, 2, smoke.EV_REL, smoke.REL_X, 1),
+            smoke.InputEvent(1, 3, smoke.EV_SYN, smoke.SYN_REPORT, 0),
+        ], []]
+        code, evidence, _, _ = self.execute(events=allowed)
+        self.assertEqual(code, 0)
+        self.assertEqual(evidence["event_evidence"][0]["classification"], "metadata")
+        other = [[smoke.InputEvent(1, 1, smoke.EV_MSC, 5, 0)]]
+        code, evidence, _, _ = self.execute(events=other)
+        self.assertEqual(code, 5)
+        self.assertEqual(evidence["unexpected_event"]["type"], smoke.EV_MSC)
+
+    def test_syn_dropped_and_non_report_syn_fail(self) -> None:
+        for event in (
+            smoke.InputEvent(1, 1, smoke.EV_SYN, smoke.SYN_DROPPED, 0),
+            smoke.InputEvent(1, 1, smoke.EV_SYN, 1, 0),
+        ):
+            code, evidence, _, _ = self.execute(events=[[event]])
+            self.assertEqual(code, 5)
+            self.assertEqual(evidence["event_evidence"][0]["classification"],
+                             "syn_dropped" if event.code == smoke.SYN_DROPPED else "unexpected")
+
+    def test_quiet_tail_rejects_later_motion(self) -> None:
+        events = [
+            [
+                smoke.InputEvent(1, 1, smoke.EV_REL, smoke.REL_X, 1),
+                smoke.InputEvent(1, 2, smoke.EV_SYN, smoke.SYN_REPORT, 0),
+            ],
+            [smoke.InputEvent(1, 3, smoke.EV_REL, smoke.REL_X, 1)],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 5)
+        self.assertEqual(evidence["unexpected_event"]["phase"], "mouse_tail")
+
+    def test_mouse_event_evidence_is_bounded(self) -> None:
+        metadata = [
+            smoke.InputEvent(1, index, smoke.EV_MSC, smoke.MSC_SCAN, index)
+            for index in range(smoke.MAX_EVENT_EVIDENCE + 1)
+        ]
+        events = [
+            metadata
+            + [
+                smoke.InputEvent(1, 99, smoke.EV_REL, smoke.REL_X, 1),
+                smoke.InputEvent(1, 100, smoke.EV_SYN, smoke.SYN_REPORT, 0),
+            ],
+            [],
+        ]
+        code, evidence, _, _ = self.execute(events=events)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(evidence["event_evidence"]), smoke.MAX_EVENT_EVIDENCE)
+        self.assertTrue(evidence["event_evidence_truncated"])
+
+    def test_non_submitted_does_not_observe_or_retry(self) -> None:
+        code, evidence, actions, report_calls = self.execute(report_state="already_set")
+        self.assertEqual(code, 5)
+        self.assertEqual(report_calls, [(0, 1, 0, 0, 0)])
+        self.assertNotIn("observe", actions)
+        self.assertEqual(actions.count("release_all"), 1)
+
+    def test_cleanup_only_failure_has_distinct_code(self) -> None:
+        code, evidence, actions, _ = self.execute(release_error=RuntimeError("cleanup"))
+        self.assertEqual(code, 6)
+        self.assertEqual(evidence["status"], "fail")
+        self.assertEqual(actions.count("release_all"), 1)
+
+
+class MouseParserTests(unittest.TestCase):
+    def test_keyboard_and_mouse_modes_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            smoke._parser().parse_args(["--keyboard", "--mouse"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_mouse_mode_uses_mouse_only_discovery(self) -> None:
+        candidate = MouseSmokeTests.candidate
+        mouse_discovery = mock.Mock(return_value=candidate)
+        keyboard_discovery = mock.Mock(side_effect=AssertionError("keyboard discovery"))
+        helper = MouseSmokeTests()
+        _, observer_factory, transport_factory, client_factory, _ = helper.make_fakes()
+        result = smoke.main(
+            ["--hardware", "--mouse", "--port", "fixture-port", "--json"],
+            keyboard_discovery_fn=keyboard_discovery,
+            mouse_discovery_fn=mouse_discovery,
+            observer_factory=observer_factory,
+            transport_factory=transport_factory,
+            client_factory=client_factory,
+            clock=lambda: 1.0,
+            output=io.StringIO(),
+            errors=io.StringIO(),
+        )
+        self.assertEqual(result, 0)
+        mouse_discovery.assert_called_once()
+        self.assertEqual(mouse_discovery.call_args.kwargs["mouse_interface"], 1)
+        keyboard_discovery.assert_not_called()
+
+    def test_mouse_without_hardware_does_not_discover_or_construct(self) -> None:
+        discovery = mock.Mock(side_effect=AssertionError("must not discover"))
+        transport = mock.Mock(side_effect=AssertionError("must not construct"))
+        result = smoke.main(
+            ["--mouse"],
+            mouse_discovery_fn=discovery,
+            transport_factory=transport,
+            errors=io.StringIO(),
+        )
+        self.assertEqual(result, 2)
+        discovery.assert_not_called()
+        transport.assert_not_called()
 
 
 if __name__ == "__main__":

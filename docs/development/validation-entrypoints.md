@@ -19,8 +19,8 @@ contain a separate hidden test recipe.
   require an activated ESP-IDF v5.5.4 environment. Keep activation paths in
   local shell configuration; do not add them to this repository.
 - The ESP-IDF project root is `firmware/`.
-- `test-hardware-hid.sh` runs the U5.4.1/U5.4.2 Linux HID
-  observer/discovery and F24 orchestration unit tests without touching
+- `test-hardware-hid.sh` runs the U5.4.1-U5.4.3 Linux HID
+  observer/discovery and keyboard/mouse smoke orchestration unit tests without touching
   `/dev/input`, sysfs, serial, or USB. A physical observer/smoke run is a
   separate, explicit `./tools/run-hardware-hid.sh --hardware` operation and
   is never part of CI. The physical wrapper creates a temporary virtual
@@ -57,6 +57,7 @@ Run these commands from the repository root:
 ./tools/test-nonhardware.sh
 ./tools/test-hardware-hid.sh
 ./tools/run-hardware-hid.sh --hardware --keyboard --json
+./tools/run-hardware-hid.sh --hardware --mouse --json
 ```
 
 `test-static.sh` runs the protocol, default-HID-safety, HID-runtime, UART
@@ -80,7 +81,7 @@ and dependency source of truth; no `set-target` step is required for a fresh
 checkout. Build output remains ignored and must never be tracked.
 
 `test-hardware-hid.sh` is the no-hardware CI/unit-test entrypoint for the
-U5.4.1/U5.4.2 observer and F24 orchestration tests. With no arguments it
+U5.4.1-U5.4.3 observer and keyboard/mouse smoke orchestration tests. With no arguments it
 executes only the stdlib unit tests and remains hardware-free. The canonical
 physical entrypoint is `run-hardware-hid.sh`; it performs the Linux-only,
 read-only event-device discovery and bounded F24 transaction described in
@@ -89,15 +90,16 @@ execution requires a separate hardware review gate and is never a CI command.
 
 `run-hardware-hid.sh` is the canonical physical runner wrapper. It accepts the
 same arguments as `hid_hardware_smoke.py` without adding `--hardware`; the
-hardware opt-in therefore remains explicit. It installs `host/` into an
-ephemeral virtual environment before invoking the runner, forwards the local
-serial environment to the child process, and cleans up the environment on
-success or failure. Its pip cache, version-check state, and build temporaries
-are contained inside that temporary environment. It is not a CI command and
-must not be invoked with
-`--hardware` during no-hardware validation. Runner exit statuses are returned
-unchanged; wrapper setup uses exit `70` for virtual-environment creation
-failure and `71` for package-install failure.
+hardware opt-in therefore remains explicit. With `--hardware --keyboard` it
+runs the F24 keyboard smoke, and with `--hardware --mouse` it runs the one-shot
+relative `REL_X=+1` mouse smoke. It installs `host/` into an ephemeral virtual
+environment before invoking the runner, forwards the local serial environment
+to the child process, and cleans up the environment on success or failure. Its
+pip cache, version-check state, and build temporaries are contained inside
+that temporary environment. It is not a CI command and must not be invoked
+with `--hardware` during no-hardware validation. Runner exit statuses are
+returned unchanged; wrapper setup uses exit `70` for virtual-environment
+creation failure and `71` for package-install failure.
 
 `test-nonhardware.sh` is the complete A-D suite (static, privacy, host,
 package artifacts, IDF-independent native, and IDF-dependent protocol

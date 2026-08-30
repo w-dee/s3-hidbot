@@ -80,6 +80,7 @@ boards, operating systems, or future firmware.
 | `hid.release_all` | `HARDWARE VALIDATED` | Safety-only command, already-up/submitted outcomes, exact retry/cache behavior, lease refresh, and takeover behavior in the accepted gate. |
 | F24 keyboard report path | `HARDWARE VALIDATED` | F24/HID usage `0x73` sentinel report path with Linux evdev machine-observed `KEY_F24` value `1` (DOWN) and value `0` (UP), explicit release recovery, and no claim that F24 is globally side-effect-free. |
 | Relative `REL_X` mouse report path | `HARDWARE VALIDATED` | Small positive relative movement observed once per accepted report; no claim about pointer acceleration or exact screen pixels. |
+| U5.4.3 raw `REL_X` physical smoke | `NATIVE VALIDATED` | Dedicated mouse event observer and one-shot smoke path are implemented and tested without hardware; Linux evdev packet evidence remains a separate physical gate. |
 | Mouse buttons | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Wheel / pan | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Physical `report_failed` injection | `HARDWARE DEFERRED` | No accepted hardware injection or recovery evidence yet. |
@@ -166,6 +167,29 @@ F24 is HID usage `0x73` / Linux `KEY_F24` (`194`). It is a diagnostic sentinel,
 not guaranteed side-effect-free input. The accepted physical gate observed the
 required DOWN and UP events and no unexpected keyboard or mouse side effects;
 this remains a scoped fixture result, not a universal host-side guarantee.
+
+## U5.4.3 relative mouse smoke
+
+The dedicated `--hardware --mouse` runner path is **IMPLEMENTED / NATIVE
+VALIDATED** and has not yet received a physical gate. It discovers exactly one
+validated mouse interface (`interface=1`) with `REL_X` capability, opens and
+drains only that read-only event node, then constructs one control session and
+submits exactly one relative report: `buttons=0`, `x=1`, `y=0`, `wheel=0`, and
+`pan=0`. A fresh `submitted` result is required; `already_set` and any retry
+are failures. The path finishes with one `release_all` safety call and does
+not send an inverse movement or any keyboard report.
+
+The observer validates the logical Linux input packet rather than a read
+buffer boundary. It requires one `EV_REL/REL_X/+1` followed by
+`EV_SYN/SYN_REPORT`; `EV_MSC/MSC_SCAN` metadata is allowed. A split read is
+therefore valid, while duplicate or wrong relative events, key events,
+unsupported metadata, `SYN_DROPPED`, and other `EV_SYN` values fail closed.
+The bounded quiet tail remains strict and rejects any later input event.
+Evidence records movement observation separately from packet completion, so a
+`REL_X` seen without its `SYN_REPORT` is reported as observed-but-incomplete,
+not as proof that no movement occurred. This slice does not claim physical
+mouse validation; mouse buttons, wheel/pan, and longer hardware soak remain
+deferred.
 
 ## Low-interference sentinel policy
 
