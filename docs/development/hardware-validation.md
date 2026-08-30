@@ -116,8 +116,17 @@ print machine-local serial identifiers. An event override does not bypass the
 USB ancestry, identity, interface, or capability checks.
 
 The F24 smoke mode is explicitly selected with
-`./tools/test-hardware-hid.sh --hardware --keyboard` and requires the serial
-port from `--port` or `S3_HIDBOT_SERIAL`. Its bounded order is: discover the
+`./tools/run-hardware-hid.sh --hardware --keyboard` and requires the serial
+port from `--port` or `S3_HIDBOT_SERIAL`. The wrapper creates an ephemeral
+virtual environment, installs the repository's `host/` package as a normal
+distribution, and removes the environment on exit; dependency retrieval may
+require network access, but the caller's Python installation, pip cache, and
+pip build temporaries are not persistently modified.
+The previously attempted physical run stopped at this runner environment
+precondition because the host package was unavailable, before serial or HID
+activity. This is not an F24 functional failure; physical validation remains
+`NOT COMPLETED`.
+Its bounded order is: discover the
 validated keyboard, open and drain the read-only observer, construct/open one
 transport, connect one Client session, submit one F24-down report, observe
 `KEY_F24` value `1`, submit one explicit keyboard all-up report, observe value

@@ -22,8 +22,13 @@ contain a separate hidden test recipe.
 - `test-hardware-hid.sh` runs the U5.4.1/U5.4.2 Linux HID
   observer/discovery and F24 orchestration unit tests without touching
   `/dev/input`, sysfs, serial, or USB. A physical observer/smoke run is a
-  separate, explicit `./tools/test-hardware-hid.sh --hardware` operation and
-  is never part of CI.
+  separate, explicit `./tools/run-hardware-hid.sh --hardware` operation and
+  is never part of CI. The physical wrapper creates a temporary virtual
+  environment, installs `host/` as a normal package (including declared
+  dependencies), forwards machine-local environment variables unchanged, and
+  removes the environment on exit. Dependency retrieval may require network
+  access; the host Python environment, pip cache, and pip build temporaries
+  are not persistently modified.
 
 The host entrypoint creates a temporary virtual environment, stages the
 `host/` package in a temporary directory, installs it as a normal distribution
@@ -51,6 +56,7 @@ Run these commands from the repository root:
 ./tools/test-firmware.sh
 ./tools/test-nonhardware.sh
 ./tools/test-hardware-hid.sh
+./tools/run-hardware-hid.sh --hardware --keyboard --json
 ```
 
 `test-static.sh` runs the protocol, default-HID-safety, HID-runtime, UART
@@ -73,16 +79,25 @@ The existing `sdkconfig.defaults` and `dependencies.lock` provide the target
 and dependency source of truth; no `set-target` step is required for a fresh
 checkout. Build output remains ignored and must never be tracked.
 
-`test-hardware-hid.sh` is the canonical U5.4.1/U5.4.2 observer entrypoint.
-With no arguments it executes only the stdlib unit tests. The optional
-`--hardware` form performs Linux-only, read-only event-device discovery and an
-initial drain for the documented HID fixture; it does not open the UART,
-create a client session, or send a HID report. Adding `--keyboard` selects the
-separate bounded F24 down/observe/up smoke transaction, using the existing
-host `Client` and transport APIs after observer readiness. It requires
-`--port` or the machine-local `S3_HIDBOT_SERIAL` value and never prints that
-value. Both physical forms require a separate hardware review gate and are not
-CI commands; ordinary no-argument validation remains hardware-free.
+`test-hardware-hid.sh` is the no-hardware CI/unit-test entrypoint for the
+U5.4.1/U5.4.2 observer and F24 orchestration tests. With no arguments it
+executes only the stdlib unit tests and remains hardware-free. The canonical
+physical entrypoint is `run-hardware-hid.sh`; it performs the Linux-only,
+read-only event-device discovery and bounded F24 transaction described in
+`hardware-validation.md` after its temporary package installation. Physical
+execution requires a separate hardware review gate and is never a CI command.
+
+`run-hardware-hid.sh` is the canonical physical runner wrapper. It accepts the
+same arguments as `hid_hardware_smoke.py` without adding `--hardware`; the
+hardware opt-in therefore remains explicit. It installs `host/` into an
+ephemeral virtual environment before invoking the runner, forwards the local
+serial environment to the child process, and cleans up the environment on
+success or failure. Its pip cache, version-check state, and build temporaries
+are contained inside that temporary environment. It is not a CI command and
+must not be invoked with
+`--hardware` during no-hardware validation. Runner exit statuses are returned
+unchanged; wrapper setup uses exit `70` for virtual-environment creation
+failure and `71` for package-install failure.
 
 `test-nonhardware.sh` is the complete A-D suite (static, privacy, host,
 package artifacts, IDF-independent native, and IDF-dependent protocol
