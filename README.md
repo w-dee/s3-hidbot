@@ -73,15 +73,20 @@ hidbotctl release-all
 ```
 
 The first safe interactions are `hello` and `usb-status`; `release-all` is the
-explicit safety recovery operation. The CLI also exposes `release-all`, while
-keyboard and mouse report injection remain Python API only.
+explicit safety recovery operation. Primitive keyboard and mouse report
+commands are also available, but require the command-local `--unsafe-hid`
+opt-in. They send one report through the existing Python API path; this is not
+a typing, clicking, dragging, or macro layer.
 
 ## Python HID primitive API
 
 The public host surface includes `Client`, `PySerialTransport`,
 `Client.connect()`, `ping()`, `info()`, `usb_status()`, `release_all()`,
 `keyboard_report()`, and `mouse_report()`. These are explicit primitives,
-not high-level keyboard or pointer automation helpers. Signatures,
+not high-level keyboard or pointer automation helpers. The same keyboard and
+mouse primitives are available from `hidbotctl keyboard-report` and
+`hidbotctl mouse-report` only with explicit `--unsafe-hid`; nonzero mouse
+buttons can remain held, so use `hidbotctl release-all` for recovery. Signatures,
 validation, response states, and retry behavior are authoritative in
 [`uart-control-plane.md`](docs/development/uart-control-plane.md) and the
 actual host source.
@@ -144,8 +149,7 @@ HID, or physical lifecycle validation.
 
 ## Limitations
 
-There is no keyboard/mouse report CLI, raw JSON command mode,
-type/click/drag helper, VBUS monitor implementation, or hardware runner in
-this foundation. Review the hardware gate before connecting both USB paths or
-sending an unsafe HID primitive. Use `hidbotctl release-all` for explicit
-safety recovery.
+There is no raw JSON command mode, type/click/drag helper, macro, VBUS monitor
+implementation, or hardware runner in this foundation. Review the hardware
+gate before connecting both USB paths or sending an unsafe HID primitive. Use
+`hidbotctl release-all` for explicit safety recovery.

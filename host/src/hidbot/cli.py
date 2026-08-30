@@ -22,7 +22,13 @@ from .errors import (
     TransportError,
 )
 from .serial_transport import PySerialTransport
-from .protocol import ReleaseAllResult
+from .protocol import (
+    KeyboardReportResult,
+    MouseReportResult,
+    ReleaseAllResult,
+    validate_keyboard_report_inputs,
+    validate_mouse_report_inputs,
+)
 
 
 DEFAULT_BAUD = 115200
@@ -66,17 +72,121 @@ def _positive_float(value: str, field: str) -> float:
     return parsed
 
 
+def _raw_hid_integer(value: str) -> int:
+    """Parse a decimal or 0x-prefixed integer without introducing symbols."""
+
+    signless = value[1:] if value[:1] in {"+", "-"} else value
+    base = 16 if signless.lower().startswith("0x") else 10
+    try:
+        return int(value, base)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "must be a decimal integer or 0x-prefixed hexadecimal integer"
+        ) from exc
+
+
+def _add_global_options(
+    parser: argparse.ArgumentParser, *, suppress_defaults: bool = False
+) -> None:
+    default = argparse.SUPPRESS if suppress_defaults else None
+    parser.add_argument("--port", default=default, help="serial port; otherwise S3_HIDBOT_SERIAL")
+    parser.add_argument(
+        "--baud", default=default, help="baud rate; otherwise S3_HIDBOT_BAUD or 115200"
+    )
+    parser.add_argument(
+        "--timeout",
+        default=argparse.SUPPRESS if suppress_defaults else str(DEFAULT_TIMEOUT),
+        help="request timeout in seconds",
+    )
+    parser.add_argument(
+        "--attempts",
+        default=argparse.SUPPRESS if suppress_defaults else str(DEFAULT_ATTEMPTS),
+        help="maximum request attempts",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS if suppress_defaults else False,
+        help="emit one compact JSON result",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS if suppress_defaults else False,
+        help="reserved for diagnostic verbosity",
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hidbotctl", description=__doc__)
-    parser.add_argument("--port", help="serial port; otherwise S3_HIDBOT_SERIAL")
-    parser.add_argument("--baud", help="baud rate; otherwise S3_HIDBOT_BAUD or 115200")
-    parser.add_argument("--timeout", default=str(DEFAULT_TIMEOUT), help="request timeout in seconds")
-    parser.add_argument("--attempts", default=str(DEFAULT_ATTEMPTS), help="maximum request attempts")
-    parser.add_argument("--json", action="store_true", help="emit one compact JSON result")
-    parser.add_argument("--verbose", action="store_true", help="reserved for diagnostic verbosity")
-    parser.add_argument(
-        "command", choices=("hello", "ping", "info", "usb-status", "release-all")
+    _add_global_options(parser)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    for name, help_text in (
+        ("hello", "establish a session and show device capabilities"),
+        ("ping", "run the bounded diagnostic ping"),
+        ("info", "show device information"),
+        ("usb-status", "show USB lifecycle and readiness state"),
+        ("release-all", "perform the safe all-up recovery operation"),
+    ):
+        command = commands.add_parser(name, help=help_text, description=help_text)
+        _add_global_options(command, suppress_defaults=True)
+
+    keyboard = commands.add_parser(
+        "keyboard-report",
+        help="submit one explicit unsafe Boot keyboard report",
+        description="submit one explicit unsafe Boot keyboard report",
     )
+    _add_global_options(keyboard, suppress_defaults=True)
+    keyboard.add_argument(
+        "--unsafe-hid",
+        action="store_true",
+        required=True,
+        help="required opt-in for an unsafe HID report",
+    )
+    keyboard.add_argument(
+        "--modifiers",
+        type=_raw_hid_integer,
+        required=True,
+        metavar="N",
+        help="modifier bitmap (decimal or 0xNN)",
+    )
+    keyboard.add_argument(
+        "--key",
+        dest="keys",
+        type=_raw_hid_integer,
+        action="append",
+        default=[],
+        metavar="USAGE",
+        help="raw HID usage, repeatable up to six times (decimal or 0xNN)",
+    )
+
+    mouse = commands.add_parser(
+        "mouse-report",
+        help="submit one explicit unsafe Boot mouse report",
+        description="submit one explicit unsafe Boot mouse report",
+    )
+    _add_global_options(mouse, suppress_defaults=True)
+    mouse.add_argument(
+        "--unsafe-hid",
+        action="store_true",
+        required=True,
+        help="required opt-in for an unsafe HID report",
+    )
+    for name, help_text in (
+        ("buttons", "absolute persistent button bitmap (0..31)"),
+        ("x", "relative X delta (-127..127)"),
+        ("y", "relative Y delta (-127..127)"),
+        ("wheel", "relative vertical wheel delta (-127..127)"),
+        ("pan", "relative horizontal pan delta (-127..127)"),
+    ):
+        mouse.add_argument(
+            f"--{name}",
+            type=_raw_hid_integer,
+            required=True,
+            metavar="N",
+            help=f"{help_text}; decimal or 0xNN",
+        )
     return parser
 
 
@@ -93,7 +203,29 @@ def _result_value(command: str, result: object) -> object:
     if command == "release-all":
         assert isinstance(result, ReleaseAllResult)
         return asdict(result)
+    if command == "keyboard-report":
+        assert isinstance(result, KeyboardReportResult)
+        return asdict(result)
+    if command == "mouse-report":
+        assert isinstance(result, MouseReportResult)
+        return asdict(result)
     return result
+
+
+def _validate_hid_arguments(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    """Validate unsafe report inputs before any transport is constructed."""
+
+    try:
+        if args.command == "keyboard-report":
+            args.keys = validate_keyboard_report_inputs(args.modifiers, args.keys)
+        elif args.command == "mouse-report":
+            validate_mouse_report_inputs(
+                args.buttons, args.x, args.y, args.wheel, args.pan
+            )
+    except ProtocolError as exc:
+        parser.error(str(exc))
 
 
 def _print_result(command: str, result: object, *, as_json: bool, output: TextIO) -> None:
@@ -137,6 +269,7 @@ def main(
     parser = _parser()
     try:
         args = parser.parse_args(argv)
+        _validate_hid_arguments(args, parser)
         port = resolve_port(args.port, environ)
         baud = resolve_baud(args.baud, environ)
         timeout = _positive_float(args.timeout, "timeout")
@@ -160,8 +293,15 @@ def main(
                 result = client.info()
             elif args.command == "usb-status":
                 result = client.usb_status()
-            else:
+            elif args.command == "release-all":
                 result = client.release_all()
+            elif args.command == "keyboard-report":
+                result = client.keyboard_report(args.modifiers, args.keys)
+            else:
+                assert args.command == "mouse-report"
+                result = client.mouse_report(
+                    args.buttons, args.x, args.y, args.wheel, args.pan
+                )
             _print_result(args.command, result, as_json=args.json, output=output)
             return 0
         finally:

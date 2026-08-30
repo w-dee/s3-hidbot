@@ -220,6 +220,24 @@ PY
             exit 1
         fi
     done
+    for primitive in keyboard-report mouse-report; do
+        local -a primitive_args
+        if [[ "$primitive" == "keyboard-report" ]]; then
+            primitive_args=(keyboard-report --unsafe-hid --modifiers 0 --key 0x04)
+        else
+            primitive_args=(mouse-report --unsafe-hid --buttons 0 --x 1 --y 0 --wheel 0 --pan 0)
+        fi
+        set +e
+        env -u PYTHONPATH -u S3_HIDBOT_SERIAL -u S3_HIDBOT_BAUD \
+            "$venv_cli" "${primitive_args[@]}" >"$temporary_directory/cli-$primitive.log" 2>&1
+        status=$?
+        set -e
+        if [[ "$status" -ne 2 ]]; then
+            cat "$temporary_directory/cli-$primitive.log" >&2
+            echo "unexpected CLI smoke status for $primitive: $status" >&2
+            exit 1
+        fi
+    done
 }
 
 install_and_smoke "$wheel_one" "$temporary_directory/wheel-venv"

@@ -36,9 +36,21 @@ hidbotctl release-all
 
 The package also exposes Python primitive APIs such as `Client`,
 `PySerialTransport`, `release_all()`, `keyboard_report()`, and
-`mouse_report()`. These are bounded protocol primitives, not a high-level
-typing, clicking, dragging, or pointer-automation layer; keyboard and mouse
-report CLI commands are not yet provided. Review the
+`mouse_report()`. The equivalent CLI primitives require an explicit
+command-local `--unsafe-hid` opt-in:
+
+```bash
+hidbotctl keyboard-report --unsafe-hid --modifiers 0 --key 0x73
+hidbotctl mouse-report --unsafe-hid --buttons 0 --x 10 --y 0 --wheel 0 --pan 0
+```
+
+`--key` accepts raw decimal or `0xNN` usages; mouse buttons are absolute and
+can remain held, while x/y/wheel/pan are relative one-report values. Use
+`hidbotctl release-all` for explicit recovery. These are bounded protocol
+primitives, not a high-level typing, clicking, dragging, or pointer-automation
+layer. The CLI addition does not create new hardware evidence: mouse buttons,
+wheel, and pan are implemented and natively validated, but their hardware
+evidence remains deferred. Review the
 [project safety and protocol documentation](https://github.com/w-dee/s3-hidbot/blob/main/docs/development/uart-control-plane.md)
 before using an unsafe primitive. The package is distributed under the
 [MIT License](LICENSE).

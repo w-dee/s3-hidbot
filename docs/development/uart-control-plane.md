@@ -12,8 +12,9 @@ the public absolute `hid.keyboard.report` and relative `hid.mouse.report`
 commands. It implements
 `protocol.hello`, `system.ping`, `system.info`, `usb.status`,
 `hid.release_all`, `hid.keyboard.report`, and `hid.mouse.report`. There is
-still no keyboard helper, keyboard/mouse report CLI, asynchronous event, USB
-reconnect, GPIO action, or reset command.
+still no keyboard helper, high-level keyboard/mouse automation, asynchronous
+event, USB reconnect, GPIO action, or reset command. Primitive report CLI
+commands are documented below and remain explicitly unsafe.
 
 The configured ESP-IDF console UART is used without application hardcoding of
 its UART number, pins, or baud rate. The UART RX control task is the sole
@@ -433,15 +434,40 @@ failures become `TransportError`; request deadline expiry remains
 `RequestTimeoutError` in the generic client.
 
 The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`, and
-`usb-status` through the diagnostic client methods, plus the safety recovery
-command `release-all` through `Client.release_all()`. All commands use
-`Client.connect()` first. `--port` overrides `S3_HIDBOT_SERIAL`; there is no tracked default
-port. `--baud` overrides `S3_HIDBOT_BAUD`, then the current tested host default
-of 115200 is used. `--timeout`, `--attempts`, `--json`, and `--verbose` are
-available; DTR/RTS overrides and raw JSON/UART commands are intentionally not
-available. `--json` emits one compact result object on stdout; diagnostics and
-errors use stderr. Exit codes are 0 success, 2 configuration, 3 transport,
-4 protocol/compatibility/session, 5 remote command, and 6 timeout.
+`usb-status` through the diagnostic client methods, the safety recovery command
+`release-all` through `Client.release_all()`, and the explicit unsafe primitive
+commands `keyboard-report` and `mouse-report` through the existing Client
+methods. All commands use `Client.connect()` first. `--port` overrides
+`S3_HIDBOT_SERIAL`; there is no tracked default port. `--baud` overrides
+`S3_HIDBOT_BAUD`, then the current tested host default of 115200 is used.
+`--timeout`, `--attempts`, `--json`, and `--verbose` are available before or
+after the command; if an option is repeated, the later value wins. DTR/RTS
+overrides and raw JSON/UART commands are intentionally not available.
+`--json` emits one compact result object on stdout; diagnostics and errors use
+stderr. Exit codes are 0 success, 2 configuration, 3 transport, 4
+protocol/compatibility/session, 5 remote command, and 6 timeout.
+
+Primitive report CLI grammar is command-local and has no remembered or
+environment opt-in:
+
+```text
+hidbotctl [GLOBAL...] keyboard-report [GLOBAL...] --unsafe-hid \
+  --modifiers N [--key USAGE ...]
+hidbotctl [GLOBAL...] mouse-report [GLOBAL...] --unsafe-hid \
+  --buttons N --x N --y N --wheel N --pan N
+```
+
+`--unsafe-hid` is required. Keyboard modifiers are `0..255`; `--key` is
+repeatable for zero through six raw usages and accepts decimal or `0xNN`.
+Canonical keyboard validation enforces the allowed usage ranges, strict
+ascending order, and no duplicates. Mouse buttons are `0..31` and persistent;
+the four relative fields are each `-127..127`, with all five fields required.
+The buttons, wheel, and pan paths are implemented and natively validated, but
+their physical hardware evidence remains deferred.
+Invalid syntax or values fail before transport construction with argparse's
+normal exit 2. A valid primitive sends exactly one corresponding HID request
+after hello and never sends an automatic release-all. Use the safe
+`release-all` command explicitly when persistent state needs recovery.
 
 The characterization and this transport policy were established for the
 Freenove ESP32-S3 WROOM Board / FNK0085 CH343 path. The measured true/true
@@ -565,9 +591,8 @@ Exact retries (same ID and bytes) replay the cached success or pending error
 without restarting the operation. A new request ID reevaluates current state.
 The `hid.release-all-v1`, `hid.keyboard-report-v1`, and
 `hid.mouse-report-v1` capabilities advertise these commands. The public
-safety operation is also available as `hidbotctl release-all`; keyboard and
-mouse report CLI commands are not exposed. Host APIs are `Client.release_all()`,
-`Client.keyboard_report(modifiers, keys)`, and
+safety operation is also available as `hidbotctl release-all`. Host APIs are
+`Client.release_all()`, `Client.keyboard_report(modifiers, keys)`, and
 `Client.mouse_report(buttons, x, y, wheel, pan)`.
 
 ## Relative mouse reports
