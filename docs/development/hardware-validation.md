@@ -78,7 +78,7 @@ boards, operating systems, or future firmware.
 | Composite Keyboard + Mouse enumeration | `HARDWARE VALIDATED` | Freenove fixture with Linux host: one device, Boot Keyboard and Boot Mouse interfaces, expected endpoints, driver binding, and stable mount. |
 | UART control-plane reliability | `HARDWARE VALIDATED` | Fresh sessions, diagnostic commands, exact retries, sync recovery, bounded response checks, and repeated responses on the USB-UART path. |
 | `hid.release_all` | `HARDWARE VALIDATED` | Safety-only command, already-up/submitted outcomes, exact retry/cache behavior, lease refresh, and takeover behavior in the accepted gate. |
-| F24 keyboard report path | `HARDWARE VALIDATED` | F24/HID usage `0x73` sentinel report path with explicit release recovery; no claim that F24 is globally side-effect-free. |
+| F24 keyboard report path | `HARDWARE VALIDATED` | F24/HID usage `0x73` sentinel report path with Linux evdev machine-observed `KEY_F24` value `1` (DOWN) and value `0` (UP), explicit release recovery, and no claim that F24 is globally side-effect-free. |
 | Relative `REL_X` mouse report path | `HARDWARE VALIDATED` | Small positive relative movement observed once per accepted report; no claim about pointer acceleration or exact screen pixels. |
 | Mouse buttons | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Wheel / pan | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
@@ -92,13 +92,17 @@ semantics are authoritative in [`uart-control-plane.md`](uart-control-plane.md).
 
 ## U5.4 read-only event observer and F24 smoke
 
-The observer/discovery and F24 orchestration are implemented and native-tested,
-but this slice is **not** a new hardware claim. The historical F24 row in the
-evidence matrix records the separately accepted direct-report gate; the smoke
-runner itself remains `IMPLEMENTED / NO-HARDWARE VALIDATED` until a dedicated
-physical gate is approved. Run the no-hardware tests through
-`./tools/test-hardware-hid.sh`; they use fake sysfs, event records, transport,
-and Client objects and do not access a board.
+The observer/discovery and F24 orchestration are implemented and native-tested.
+The dedicated physical F24 smoke gate is now **HARDWARE VALIDATED** on the
+documented Freenove fixture: the canonical runner completed with exit `0`, and
+Linux evdev machine observation recorded `KEY_F24` value `1` (DOWN) followed by
+value `0` (UP). Both submissions were accepted, the successful run recorded
+`allowed_repeat_count=0` (the tolerance path was not exercised), the
+post-release quiet tail was clean, and final `release_all` cleanup succeeded.
+This proves the F24 DOWN/UP event path, not that F24 is globally
+side-effect-free. Mouse HID operation was not part of this run. Run the
+no-hardware tests through `./tools/test-hardware-hid.sh`; they use fake sysfs,
+event records, transport, and Client objects and do not access a board.
 
 In physical mode the observer enumerates `/dev/input/eventN`, validates the
 USB ancestor, VID/PID, product, interface number, and required capability,
@@ -122,24 +126,22 @@ virtual environment, installs the repository's `host/` package as a normal
 distribution, and removes the environment on exit; dependency retrieval may
 require network access, but the caller's Python installation, pip cache, and
 pip build temporaries are not persistently modified.
-The previously attempted physical run stopped at this runner environment
-precondition because the host package was unavailable, before serial or HID
-activity. This is not an F24 functional failure; physical validation remains
-`NOT COMPLETED`.
+An earlier physical attempt stopped at the runner environment precondition
+because the host package was unavailable, before serial or HID activity. A
+subsequent retry observed DOWN but failed while waiting for UP after an
+unexpected `EV_KEY`; that run did not preserve the unexpected event's type,
+code, or value, so it did not prove that the event was an autorepeat. The
+runner's bounded repeat handling and immediate-UP timing were then validated
+by the successful physical gate described above.
 
-The first physical F24 retry reached and observed the required `KEY_F24`
-value `1` (DOWN), then failed while waiting for the required value `0` (UP)
-after an unexpected `EV_KEY`. That run did not preserve the unexpected event's
-type, code, or value, so it does not prove that the event was an autorepeat.
-Autorepeat remains a plausible hypothesis only. The runner now shortens the
-held interval by submitting UP immediately after DOWN is observed. During the
-bounded UP wait it tolerates only pre-release `KEY_F24` value `2` events,
-records their count, and still requires a fresh value `0`. At most two such
-repeat events are tolerated; a third is an event-observation failure even if a
-release appears later in the same batch. Any other key, modifier, unexpected
-press/value, or `SYN_DROPPED` remains fail-closed. After the release is
-observed, the quiet tail remains strict: any `EV_KEY`, including a repeat,
-fails.
+The runner shortens the held interval by submitting UP immediately after DOWN
+is observed. During the bounded UP wait it tolerates only pre-release
+`KEY_F24` value `2` events, records their count, and still requires a fresh
+value `0`. At most two such repeat events are tolerated; a third is an
+event-observation failure even if a release appears later in the same batch.
+Any other key, modifier, unexpected press/value, or `SYN_DROPPED` remains
+fail-closed. After the release is observed, the quiet tail remains strict: any
+`EV_KEY`, including a repeat, fails.
 
 Its bounded order is: discover the validated keyboard, open and drain the
 read-only observer, construct/open one transport, connect one Client session,
@@ -156,13 +158,14 @@ position, timestamp, type, code, value, and classification. It separately
 reports the total observed pre-release repeat count and any repeat-limit event.
 The evidence has a small fixed limit and reports truncation rather than growing
 without bound.
-The runner remains `IMPLEMENTED / NO-HARDWARE VALIDATED`; the F24 UP event and
-full physical validation are still **NOT COMPLETED**.
+The observer and runner remain `IMPLEMENTED / NATIVE VALIDATED`, while the
+dedicated F24 DOWN/UP physical smoke is **HARDWARE VALIDATED**. Broader
+physical scopes remain deferred below.
 
 F24 is HID usage `0x73` / Linux `KEY_F24` (`194`). It is a diagnostic sentinel,
-not guaranteed side-effect-free input. This implementation is no-hardware
-validated only; a physical run requires a separate human gate and must verify
-the host-side effects before being classified as hardware evidence.
+not guaranteed side-effect-free input. The accepted physical gate observed the
+required DOWN and UP events and no unexpected keyboard or mouse side effects;
+this remains a scoped fixture result, not a universal host-side guarantee.
 
 ## Low-interference sentinel policy
 
