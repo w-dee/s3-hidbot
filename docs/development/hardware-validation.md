@@ -80,7 +80,7 @@ boards, operating systems, or future firmware.
 | `hid.release_all` | `HARDWARE VALIDATED` | Safety-only command, already-up/submitted outcomes, exact retry/cache behavior, lease refresh, and takeover behavior in the accepted gate. |
 | F24 keyboard report path | `HARDWARE VALIDATED` | F24/HID usage `0x73` sentinel report path with Linux evdev machine-observed `KEY_F24` value `1` (DOWN) and value `0` (UP), explicit release recovery, and no claim that F24 is globally side-effect-free. |
 | Relative `REL_X` mouse report path | `HARDWARE VALIDATED` | Small positive relative movement observed once per accepted report; no claim about pointer acceleration or exact screen pixels. |
-| U5.4.3 raw `REL_X` physical smoke | `NATIVE VALIDATED` | Dedicated mouse event observer and one-shot smoke path are implemented and tested without hardware; Linux evdev packet evidence remains a separate physical gate. |
+| U5.4.3 raw `REL_X` physical smoke | `HARDWARE VALIDATED` | Linux evdev machine-observed `EV_REL/REL_X/+1` followed by `EV_SYN/SYN_REPORT` after one submitted report; the one-shot path completed with no retry, inverse movement, or reconnect/resend. |
 | Mouse buttons | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Wheel / pan | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Physical `report_failed` injection | `HARDWARE DEFERRED` | No accepted hardware injection or recovery evidence yet. |
@@ -170,26 +170,38 @@ this remains a scoped fixture result, not a universal host-side guarantee.
 
 ## U5.4.3 relative mouse smoke
 
-The dedicated `--hardware --mouse` runner path is **IMPLEMENTED / NATIVE
-VALIDATED** and has not yet received a physical gate. It discovers exactly one
-validated mouse interface (`interface=1`) with `REL_X` capability, opens and
-drains only that read-only event node, then constructs one control session and
-submits exactly one relative report: `buttons=0`, `x=1`, `y=0`, `wheel=0`, and
-`pan=0`. A fresh `submitted` result is required; `already_set` and any retry
-are failures. The path finishes with one `release_all` safety call and does
-not send an inverse movement or any keyboard report.
+The dedicated `--hardware --mouse` runner path is now **HARDWARE VALIDATED** on
+the documented Freenove fixture. The canonical runner completed with exit `0`
+after discovering exactly one validated mouse interface (`interface=1`) with
+`REL_X` capability, opening and draining its read-only event node, and
+constructing one control session. It submitted exactly one relative report:
+`buttons=0`, `x=1`, `y=0`, `wheel=0`, and `pan=0`; the control result was
+`submitted`. Linux evdev machine observation recorded `EV_REL/REL_X/+1`
+followed by the corresponding `EV_SYN/SYN_REPORT`, so both
+`movement_observed=true` and `packet_complete=true` were established. The
+physical evidence is `REL_X +1` — **HARDWARE OBSERVED** — and logical
+`SYN_REPORT` packet completion — **HARDWARE OBSERVED**. This is distinct from
+the existing Relative `REL_X` mouse report path evidence in the matrix above:
+that row covers the accepted relative-report behavior, while this slice proves
+the raw Linux evdev packet. The successful run had a clean quiet tail and
+completed `release_all` cleanup with both devices already up. This physical
+proof is the evdev movement and packet observation, not merely the
+control-plane submission. The one-shot evidence
+also showed no retry, reconnect/resend, inverse movement, or keyboard report.
 
 The observer validates the logical Linux input packet rather than a read
 buffer boundary. It requires one `EV_REL/REL_X/+1` followed by
-`EV_SYN/SYN_REPORT`; `EV_MSC/MSC_SCAN` metadata is allowed. A split read is
-therefore valid, while duplicate or wrong relative events, key events,
-unsupported metadata, `SYN_DROPPED`, and other `EV_SYN` values fail closed.
+`EV_SYN/SYN_REPORT`; `EV_MSC/MSC_SCAN` metadata is allowed. The physical run
+did not encounter a split read; split-read handling remains covered by native
+tests. A split read is nevertheless valid, while duplicate or wrong relative
+events, key events, unsupported metadata, `SYN_DROPPED`, and other `EV_SYN`
+values fail closed.
 The bounded quiet tail remains strict and rejects any later input event.
 Evidence records movement observation separately from packet completion, so a
 `REL_X` seen without its `SYN_REPORT` is reported as observed-but-incomplete,
-not as proof that no movement occurred. This slice does not claim physical
-mouse validation; mouse buttons, wheel/pan, and longer hardware soak remain
-deferred.
+not as proof that no movement occurred. The raw evdev `REL_X` smoke is now
+hardware validated, while mouse buttons, wheel/pan, physical report failure,
+HID-not-ready races, suspend/resume or reconnect soak remain deferred.
 
 ## Low-interference sentinel policy
 
