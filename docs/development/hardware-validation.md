@@ -90,6 +90,27 @@ The corresponding native/CI coverage is authoritative in
 [`validation-entrypoints.md`](validation-entrypoints.md); protocol and safety
 semantics are authoritative in [`uart-control-plane.md`](uart-control-plane.md).
 
+## U5.4 read-only event observer
+
+The first physical-smoke slice is discovery only. Run the no-hardware tests
+through `./tools/test-hardware-hid.sh`; they use fake sysfs and event records
+and do not access a board. A physical run must be explicitly opted into with
+`./tools/test-hardware-hid.sh --hardware` on Linux after this gate is approved.
+
+In physical mode the observer enumerates `/dev/input/eventN`, validates the
+USB ancestor, VID/PID, product, interface number, and required capability,
+then opens exactly one keyboard and one mouse node with `O_RDONLY` and drains
+pending records before closing them. It never opens the USB-UART, creates a
+control session, sends a keyboard or mouse report, calls `EVIOCGRAB`, or
+changes host input state. Ambiguous or incomplete discovery fails closed.
+
+The default temporary bring-up identity is VID `0x303a`, PID `0x4008`, and
+product `s3-hidbot`; `--vid`, `--pid`, and `--product` are explicit overrides
+for a future identity. Output uses generic event-node paths and does not
+print machine-local serial identifiers. This observer slice does not prove
+that a HID report was delivered to evdev; F24 and relative-mouse event
+injection remain separate, explicitly approved U5.4.2/U5.4.3 gates.
+
 ## Low-interference sentinel policy
 
 For a separately approved smoke test, use the smallest useful signals:

@@ -19,6 +19,10 @@ contain a separate hidden test recipe.
   require an activated ESP-IDF v5.5.4 environment. Keep activation paths in
   local shell configuration; do not add them to this repository.
 - The ESP-IDF project root is `firmware/`.
+- `test-hardware-hid.sh` runs the U5.4.1 Linux HID observer/discovery unit
+  tests without touching `/dev/input`, sysfs, serial, or USB. A physical
+  observer run is a separate, explicit `./tools/test-hardware-hid.sh
+  --hardware` operation and is never part of CI.
 
 The host entrypoint creates a temporary virtual environment, stages the
 `host/` package in a temporary directory, installs it as a normal distribution
@@ -45,11 +49,13 @@ Run these commands from the repository root:
 ./tools/test-control-protocol.sh
 ./tools/test-firmware.sh
 ./tools/test-nonhardware.sh
+./tools/test-hardware-hid.sh
 ```
 
 `test-static.sh` runs the protocol, default-HID-safety, HID-runtime, UART
-writer, and documentation static guards. `test-package.sh` is the release
-artifact validation entrypoint; it requires network access but no ESP-IDF.
+writer, documentation static guards, and the U5.4.1 read-only observer unit
+tests. `test-package.sh` is the release artifact validation entrypoint; it
+requires network access but no ESP-IDF.
 `test-native.sh` runs the three IDF-independent C++ suites.
 `test-control-protocol.sh` additionally compiles against the active ESP-IDF
 cJSON source and therefore requires the v5.5.4 environment.
@@ -65,6 +71,13 @@ idf.py build
 The existing `sdkconfig.defaults` and `dependencies.lock` provide the target
 and dependency source of truth; no `set-target` step is required for a fresh
 checkout. Build output remains ignored and must never be tracked.
+
+`test-hardware-hid.sh` is the canonical U5.4.1 observer entrypoint. With no
+arguments it executes only the stdlib unit tests. The optional `--hardware`
+form performs Linux-only, read-only event-device discovery and an initial
+drain for the documented HID fixture; it does not open the UART, create a
+client session, or send a HID report. The physical form requires a separate
+hardware review gate and is not a CI command.
 
 `test-nonhardware.sh` is the complete A-D suite (static, privacy, host,
 package artifacts, IDF-independent native, and IDF-dependent protocol
