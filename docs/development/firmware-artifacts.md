@@ -104,9 +104,35 @@ the same explicit inputs, then compares the ELF, binaries, flash plan,
 manifest, checksums, and final archive byte-for-byte. Temporary build,
 staging, pip, and archive paths are removed after the test.
 
+## Dedicated CI artifact workflow
+
+U6.3B adds `.github/workflows/firmware-artifact.yml`. It starts from a clean
+checkout, derives the exact workflow revision from `github.sha`, and derives
+`SOURCE_DATE_EPOCH` from that commit's timestamp. The job runs in the verified
+immutable container
+`espressif/idf:v5.5.4@sha256:b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b`.
+The same container identity is passed to the canonical builder and recorded
+in each manifest.
+
+The workflow performs two independent clean builds with identical explicit
+inputs, runs the official verifier on both bundles, compares the final
+archives and every extracted payload byte-for-byte, and uploads exactly one
+canonical archive plus its outer SHA-256 file as a temporary Actions artifact
+with a 14-day retention period. The outer checksum covers the compressed
+archive for transport integrity; the bundle's internal `SHA256SUMS` continues
+to cover its manifest and payload files. Build or verification mismatch fails
+the job before upload. No serial, flash, hardware runner, tag, GitHub Release,
+or public package publication is involved. The archive is a development CI
+artifact for version `0.1.0-dev`, not a released firmware download.
+
 ## Scope boundary
 
-U6.3A does not publish artifacts, add a GitHub Actions artifact workflow, add a
-flash helper, compare artifacts with runtime UART identity, create attestations
-or SBOMs, or change firmware versioning. Container-backed CI and public release
-policy are subsequent slices; a release version and tag are deferred to U6.6.
+U6.3A does not publish public artifacts, add a flash helper, compare artifacts
+with runtime UART identity, create attestations or SBOMs, or change firmware
+versioning. U6.3B uploads only temporary CI evidence; it does not create a
+public release. Attestation remains unimplemented. A release version and tag
+are deferred to U6.6.
+
+The local artifact contract remains valid when `build.container_image` is
+`null`; only the dedicated CI workflow supplies immutable container
+provenance. Runtime bundle-vs-device verification remains deferred to U6.3C.

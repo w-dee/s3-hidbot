@@ -1,0 +1,119 @@
+name: Firmware artifact
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the container identity in one YAML value. The anchor is reused by
+  # the job container, while the environment value is passed into the bundle
+  # manifest by the canonical builder.
+  ESP_IDF_CONTAINER_IMAGE: &esp_idf_container_image espressif/idf:v5.5.4@sha256:b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b
+  ARTIFACT_NAME: s3-hidbot-firmware-0.1.0-dev-esp32s3-freenove-fnk0085.tar.gz
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  artifact:
+    name: Firmware artifact reproducibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: *esp_idf_container_image
+    steps:
+      - name: Checkout exact workflow revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Verify checkout and derive explicit provenance
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          test "$actual_sha" = "$EXPECTED_SHA"
+          printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          source_date_epoch=$(git show -s --format=%ct "$EXPECTED_SHA")
+          test "$source_date_epoch" -ge 0
+          {
+            printf 'S3_HIDBOT_SOURCE_REVISION=%s\n' "$EXPECTED_SHA"
+            printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch"
+          } >> "$GITHUB_ENV"
+
+      - name: Run artifact static and privacy guards
+        run: |
+          set -euo pipefail
+          ./tools/test-static.sh
+          python3 tools/test_privacy_lint.py
+          python3 tools/privacy_lint.py --tracked
+          python3 tools/test_firmware_artifact.py
+
+      - name: Build and verify two independent artifacts
+        run: |
+          set -euo pipefail
+          source "$IDF_PATH/export.sh"
+          test "$(idf.py --version)" = "ESP-IDF v5.5.4"
+          artifact_root="$RUNNER_TEMP/s3-hidbot-firmware-artifact"
+          rm -rf -- "$artifact_root"
+          mkdir -p "$artifact_root/a" "$artifact_root/b" "$artifact_root/canonical"
+          printf 'ARTIFACT_CI_DIR=%s\n' "$artifact_root" >> "$GITHUB_ENV"
+
+          build_one() {
+            local output="$1"
+            python3 tools/build_firmware_artifact.py \
+              --output "$output" \
+              --source-root "$GITHUB_WORKSPACE" \
+              --source-revision "$S3_HIDBOT_SOURCE_REVISION" \
+              --source-date-epoch "$SOURCE_DATE_EPOCH" \
+              --container-image "$ESP_IDF_CONTAINER_IMAGE"
+          }
+
+          build_one "$artifact_root/a/$ARTIFACT_NAME"
+          build_one "$artifact_root/b/$ARTIFACT_NAME"
+
+          python3 tools/verify_firmware_artifact.py "$artifact_root/a/$ARTIFACT_NAME"
+          python3 tools/verify_firmware_artifact.py "$artifact_root/b/$ARTIFACT_NAME"
+
+          test "$(sha256sum "$artifact_root/a/$ARTIFACT_NAME" | cut -d ' ' -f1)" \
+            = "$(sha256sum "$artifact_root/b/$ARTIFACT_NAME" | cut -d ' ' -f1)"
+          cmp "$artifact_root/a/$ARTIFACT_NAME" "$artifact_root/b/$ARTIFACT_NAME"
+
+          mkdir -p "$artifact_root/extract-a" "$artifact_root/extract-b"
+          tar -xzf "$artifact_root/a/$ARTIFACT_NAME" -C "$artifact_root/extract-a"
+          tar -xzf "$artifact_root/b/$ARTIFACT_NAME" -C "$artifact_root/extract-b"
+          find "$artifact_root/extract-a" -type f -printf '%P\n' | sort > "$artifact_root/files-a"
+          find "$artifact_root/extract-b" -type f -printf '%P\n' | sort > "$artifact_root/files-b"
+          diff -u "$artifact_root/files-a" "$artifact_root/files-b"
+          while IFS= read -r relative; do
+            cmp "$artifact_root/extract-a/$relative" "$artifact_root/extract-b/$relative"
+          done < "$artifact_root/files-a"
+
+          cp "$artifact_root/a/$ARTIFACT_NAME" "$artifact_root/canonical/$ARTIFACT_NAME"
+          sha256sum "$artifact_root/canonical/$ARTIFACT_NAME" \
+            > "$artifact_root/canonical/$ARTIFACT_NAME.sha256"
+
+      - name: Upload one canonical development artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: firmware-artifact
+          path: |
+            ${{ env.ARTIFACT_CI_DIR }}/canonical/${{ env.ARTIFACT_NAME }}
+            ${{ env.ARTIFACT_CI_DIR }}/canonical/${{ env.ARTIFACT_NAME }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove temporary artifact workspace
+        if: always()
+        run: |
+          if [[ -n "${ARTIFACT_CI_DIR:-}" ]]; then
+            rm -rf -- "$ARTIFACT_CI_DIR"
+          fi

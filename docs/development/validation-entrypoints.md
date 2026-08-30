@@ -127,14 +127,22 @@ of duplicating their test logic.
 - Tier C (`nonhardware.yml`, firmware job): the IDF-dependent protocol test
   and ESP-IDF v5.5.4 firmware build in the official
   `espressif/idf:v5.5.4` container.
+- Dedicated firmware artifact workflow (`firmware-artifact.yml`, U6.3B): a
+  clean ESP-IDF v5.5.4 `esp32s3` container build with an immutable image
+  digest, explicit source revision and `SOURCE_DATE_EPOCH`, two independent
+  artifact builds, official verification, byte-identical comparison, privacy
+  checks, and one temporary Actions artifact upload. It does not flash
+  hardware or publish a GitHub Release.
 
-The workflows run on pushes to every branch and on pull requests. They cancel
+The workflows run on pushes to every branch and on pull requests. The artifact
+workflow also supports manual `workflow_dispatch` runs. They cancel
 an older run for the same ref. Push refs (`refs/heads/*`) and pull-request refs
 (`refs/pull/*`) produce distinct concurrency groups, so a push cannot cancel a
-required pull-request run. No hardware workflow or artifact publishing is
-part of this slice. The official IDF container is pinned by release tag; a
-large mutable toolchain cache is intentionally deferred until its cache key
-and invalidation policy can be tested against `dependencies.lock`.
+required pull-request run. No hardware workflow is part of this slice. The
+dedicated artifact workflow pins its official IDF container by immutable image
+digest and uploads temporary CI evidence only; public artifact publication is
+not enabled. A large mutable toolchain cache is intentionally deferred until
+its cache key and invalidation policy can be tested against `dependencies.lock`.
 
 ## CI guarantees and limits
 
