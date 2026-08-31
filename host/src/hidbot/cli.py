@@ -9,8 +9,10 @@ import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from .artifact import ArtifactError, verify_bundle_archive, verify_bundle_directory
 from .client import Client, HelloResult
 from .errors import (
     CompatibilityError,
@@ -28,6 +30,13 @@ from .protocol import (
     ReleaseAllResult,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
+    validate_system_info,
+)
+from .firmware_verification import (
+    ArtifactFirmwareIdentity,
+    FirmwareVerificationResult,
+    artifact_identity_from_verified_manifest,
+    compare_firmware_identity,
 )
 
 
@@ -132,9 +141,19 @@ def _parser() -> argparse.ArgumentParser:
             "self-test",
             "run hello/ping/info/usb-status/release-all safely; does not prove HID delivery",
         ),
+        (
+            "verify-firmware",
+            "compare a verified firmware artifact with the connected device identity",
+        ),
     ):
         command = commands.add_parser(name, help=help_text, description=help_text)
         _add_global_options(command, suppress_defaults=True)
+        if name == "verify-firmware":
+            command.add_argument(
+                "artifact",
+                metavar="ARTIFACT",
+                help="verified firmware bundle archive or extracted bundle directory",
+            )
 
     keyboard = commands.add_parser(
         "keyboard-report",
@@ -216,6 +235,62 @@ def _result_value(command: str, result: object) -> object:
     return result
 
 
+def _verified_artifact_identity(value: str) -> ArtifactFirmwareIdentity:
+    """Verify an artifact before serial setup, then extract its identity once."""
+
+    path = Path(value)
+    if path.is_dir():
+        manifest = verify_bundle_directory(path)
+    elif path.is_file():
+        manifest = verify_bundle_archive(path)
+    else:
+        raise ArtifactError("artifact path must be an existing bundle directory or archive file")
+    return artifact_identity_from_verified_manifest(manifest)
+
+
+def _artifact_identity_value(value: ArtifactFirmwareIdentity) -> dict[str, object]:
+    return {
+        "project": value.project,
+        "target": value.target,
+        "protocol_version": value.protocol_version,
+        "version": value.version,
+        "source_revision": value.source_revision,
+        "app_elf_sha256": value.app_elf_sha256,
+        "build_profile": value.build_profile,
+        "idf_version": value.idf_version,
+    }
+
+
+def _device_identity_value(result: FirmwareVerificationResult) -> dict[str, object | None]:
+    firmware = result.device.firmware
+    return {
+        "project": result.device.project,
+        "target": result.device.target,
+        "protocol_version": result.device.protocol_version,
+        "version": None if firmware is None else firmware.version,
+        "source_revision": None if firmware is None else firmware.source_revision,
+        "app_elf_sha256": None if firmware is None else firmware.app_elf_sha256,
+        "build_profile": None if firmware is None else firmware.build_profile,
+        "idf_version": result.device.idf_version,
+    }
+
+
+def _firmware_verification_value(result: FirmwareVerificationResult) -> dict[str, object]:
+    """Render one stable CLI schema without exposing manifest or wire payloads."""
+
+    return {
+        "ok": True,
+        "match": result.match,
+        "classification": result.classification.value,
+        "artifact": _artifact_identity_value(result.artifact),
+        "device": _device_identity_value(result),
+        "mismatches": [mismatch.value for mismatch in result.mismatches],
+        "unavailable_reason": (
+            None if result.unavailable_reason is None else result.unavailable_reason.value
+        ),
+    }
+
+
 def _validate_hid_arguments(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
@@ -233,6 +308,24 @@ def _validate_hid_arguments(
 
 
 def _print_result(command: str, result: object, *, as_json: bool, output: TextIO) -> None:
+    if command == "verify-firmware":
+        assert isinstance(result, FirmwareVerificationResult)
+        value = _firmware_verification_value(result)
+        if as_json:
+            print(json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True), file=output)
+            return
+        print(f"firmware identity: {value['classification']}", file=output)
+        if value["classification"] == "MATCH":
+            return
+        print("artifact:", file=output)
+        print(json.dumps(value["artifact"], ensure_ascii=True, indent=2, sort_keys=True), file=output)
+        print("device:", file=output)
+        print(json.dumps(value["device"], ensure_ascii=True, indent=2, sort_keys=True), file=output)
+        if value["unavailable_reason"] is not None:
+            print(f"unavailable_reason: {value['unavailable_reason']}", file=output)
+        for mismatch in value["mismatches"]:
+            print(f"mismatch: {mismatch}", file=output)
+        return
     value = _result_value(command, result)
     if as_json:
         print(json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True), file=output)
@@ -274,6 +367,11 @@ def main(
     try:
         args = parser.parse_args(argv)
         _validate_hid_arguments(args, parser)
+        artifact_identity = (
+            _verified_artifact_identity(args.artifact)
+            if args.command == "verify-firmware"
+            else None
+        )
         port = resolve_port(args.port, environ)
         baud = resolve_baud(args.baud, environ)
         timeout = _positive_float(args.timeout, "timeout")
@@ -307,6 +405,10 @@ def main(
                     "usb_status": client.usb_status(),
                     "release_all": asdict(client.release_all()),
                 }
+            elif args.command == "verify-firmware":
+                assert artifact_identity is not None
+                info = validate_system_info(client.info(), capabilities=hello.capabilities)
+                result = compare_firmware_identity(artifact_identity, hello.capabilities, info)
             elif args.command == "keyboard-report":
                 result = client.keyboard_report(args.modifiers, args.keys)
             else:
@@ -315,12 +417,18 @@ def main(
                     args.buttons, args.x, args.y, args.wheel, args.pan
                 )
             _print_result(args.command, result, as_json=args.json, output=output)
+            if args.command == "verify-firmware":
+                assert isinstance(result, FirmwareVerificationResult)
+                return 0 if result.match else 7
             return 0
         finally:
             if client is not None:
                 client.close()
             else:
                 transport.close()
+    except ArtifactError as exc:
+        print(f"artifact error: {exc}", file=error_output)
+        return 2
     except ValueError as exc:
         print(f"configuration error: {exc}", file=error_output)
         return 2

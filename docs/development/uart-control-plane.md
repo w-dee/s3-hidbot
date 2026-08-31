@@ -486,7 +486,8 @@ failures become `TransportError`; request deadline expiry remains
 The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`,
 `usb-status`, and the safe `self-test` control-plane diagnostic through the
 diagnostic client methods, the safety recovery command `release-all` through
-`Client.release_all()`, and the explicit unsafe primitive
+`Client.release_all()`, verified artifact-to-runtime identity comparison via
+`verify-firmware ARTIFACT`, and the explicit unsafe primitive
 commands `keyboard-report` and `mouse-report` through the existing Client
 methods. All commands use `Client.connect()` first. `--port` overrides
 `S3_HIDBOT_SERIAL`; there is no tracked default port. `--baud` overrides
@@ -495,8 +496,23 @@ methods. All commands use `Client.connect()` first. `--port` overrides
 after the command; if an option is repeated, the later value wins. DTR/RTS
 overrides and raw JSON/UART commands are intentionally not available.
 `--json` emits one compact result object on stdout; diagnostics and errors use
-stderr. Exit codes are 0 success, 2 configuration, 3 transport, 4
-protocol/compatibility/session, 5 remote command, and 6 timeout.
+stderr. Exit codes are 0 success, 2 configuration/input, 3 transport, 4
+protocol/compatibility/session, 5 remote command, 6 timeout, and 7 for a
+completed `verify-firmware` comparison that is a mismatch or has unavailable
+identity.
+
+`hidbotctl verify-firmware ARTIFACT` verifies an archive file or extracted
+bundle directory before it constructs or opens a serial transport. It then
+runs exactly `protocol.hello` and `system.info`, validates the returned
+identity shape against hello capabilities, and compares the verified artifact
+identity with the runtime identity. It does not call `usb.status`,
+`hid.release_all`, or any HID report command. Hello and info still create and
+refresh the normal control-session lease. `--json` returns one compact object
+with `ok`, `match`, `classification`, `artifact`, `device`, `mismatches`, and
+`unavailable_reason`; `ok` means the comparison operation completed, not that
+the identities matched. The comparison is provenance evidence only, not
+physical device authentication, peer authentication, secure boot, or proof of
+signed firmware authenticity.
 
 Primitive report CLI grammar is command-local and has no remembered or
 environment opt-in:

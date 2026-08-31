@@ -227,6 +227,17 @@ PY
             exit 1
         fi
     done
+    set +e
+    env -u PYTHONPATH -u S3_HIDBOT_SERIAL -u S3_HIDBOT_BAUD \
+        "$venv_cli" verify-firmware "$temporary_directory/missing-artifact" \
+        >"$temporary_directory/cli-verify-firmware.log" 2>&1
+    status=$?
+    set -e
+    if [[ "$status" -ne 2 ]]; then
+        cat "$temporary_directory/cli-verify-firmware.log" >&2
+        echo "unexpected CLI smoke status for verify-firmware: $status" >&2
+        exit 1
+    fi
     for primitive in keyboard-report mouse-report; do
         local -a primitive_args
         if [[ "$primitive" == "keyboard-report" ]]; then

@@ -148,7 +148,23 @@ are deferred to U6.6.
 
 The local artifact contract remains valid when `build.container_image` is
 `null`; only the dedicated CI workflow supplies immutable container
-provenance. U6.3C1 provides pure bundle-vs-device identity comparison only;
-UART orchestration and a `hidbotctl verify-firmware` command remain deferred.
-Identity equality is provenance evidence, not device authentication,
-cryptographic attestation, or UART peer authentication.
+provenance.
+
+## Runtime identity comparison
+
+`hidbotctl verify-firmware ARTIFACT` is the canonical host-side comparison
+entrypoint. It accepts either an ordinary bundle archive or an extracted bundle
+directory. Before constructing a serial transport, it uses the canonical
+artifact verifier and extracts `ArtifactFirmwareIdentity` only from the
+verified manifest. It then uses one control connection and sends exactly
+`protocol.hello` followed by `system.info`, validating the latter against the
+advertised capabilities before calling the pure comparator.
+
+The comparison reports `MATCH`, `MISMATCH`, or `IDENTITY_UNAVAILABLE` with a
+fixed mismatch ordering. Match exits 0; a completed mismatch or unavailable
+identity exits 7. Invalid artifact input exits 2 before any serial operation.
+This command sends no HID report, does not query `usb.status`, and does not
+call `hid.release_all`; the normal hello/info control-session lease is still
+created and refreshed. Identity equality is provenance evidence, not device
+authentication, cryptographic attestation, UART peer authentication, secure
+boot, or signed firmware authenticity.
