@@ -88,11 +88,24 @@ path order, with each lowercase SHA-256 digest written in the fixed
 
 ## Verification and reproducibility
 
-`tools/verify_firmware_artifact.py` is stdlib-only and verifies either an
-extracted bundle or its archive. It strictly validates schema fields, hashes,
-provenance links, flash-plan mappings, path safety, archive traversal safety,
-and binary-safe privacy markers (developer paths, serial configuration,
-`.envrc`, and obvious secret markers).
+The canonical stdlib-only artifact implementation is the installable
+`hidbot.artifact` module. It verifies either an extracted bundle or its
+archive, strictly validating schema fields, hashes, provenance links,
+flash-plan mappings, path safety, archive traversal safety, and binary-safe
+privacy markers (developer paths, serial configuration, `.envrc`, and obvious
+secret markers). `tools/firmware_artifact.py` is only a source-tree adapter:
+it directly loads that canonical module without importing `hidbot.__init__`,
+so the existing standalone tools remain independent of pyserial and an
+installed host package.
+
+`verify_bundle_directory()` and `verify_bundle_archive()` return a deep copy
+of the validated manifest mapping. `hidbot.firmware_verification` consumes
+only that verified-manifest output to extract the runtime-comparable artifact
+identity and compare it with validated `SystemInfo`. It does not repeat bundle
+schema, hash, archive, or privacy validation and performs no serial I/O.
+Comparison returns one of `MATCH`, `MISMATCH`, or `IDENTITY_UNAVAILABLE`.
+The latter is used when the device does not advertise `firmware.identity-v1`
+or reports a null source revision; a null revision is never a wildcard.
 
 During a local build, the builder additionally checks the invocation's source
 root, working directory, `HOME`, and `S3_HIDBOT_SERIAL` values in memory. These
@@ -135,4 +148,7 @@ are deferred to U6.6.
 
 The local artifact contract remains valid when `build.container_image` is
 `null`; only the dedicated CI workflow supplies immutable container
-provenance. Runtime bundle-vs-device verification remains deferred to U6.3C.
+provenance. U6.3C1 provides pure bundle-vs-device identity comparison only;
+UART orchestration and a `hidbotctl verify-firmware` command remain deferred.
+Identity equality is provenance evidence, not device authentication,
+cryptographic attestation, or UART peer authentication.

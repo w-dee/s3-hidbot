@@ -99,9 +99,11 @@ assert all(sdist[name] == sdist_repeat[name] for name in sdist), "sdist payloads
 
 package_files = {
     "hidbot/__init__.py",
+    "hidbot/artifact.py",
     "hidbot/cli.py",
     "hidbot/client.py",
     "hidbot/errors.py",
+    "hidbot/firmware_verification.py",
     "hidbot/framing.py",
     "hidbot/protocol.py",
     "hidbot/serial_transport.py",
@@ -150,6 +152,7 @@ expected_tests = {
     "tests/__init__.py",
     "tests/test_cli.py",
     "tests/test_client.py",
+    "tests/test_firmware_verification.py",
     "tests/test_framing.py",
     "tests/test_protocol.py",
     "tests/test_serial_transport.py",
@@ -201,10 +204,14 @@ from pathlib import Path
 
 artifact = sys.argv[1]
 import hidbot
+from hidbot.artifact import verify_bundle_archive
+from hidbot.firmware_verification import compare_firmware_identity
 
 assert version("s3-hidbot-host") == "0.1.0"
 assert not hasattr(hidbot, "__version__")
 assert "site-packages" in Path(hidbot.__file__).parts
+assert callable(verify_bundle_archive)
+assert callable(compare_firmware_identity)
 print(f"PASS: installed import/version check for {Path(artifact).name}")
 PY
     env -u PYTHONPATH "$venv_cli" --help >/dev/null

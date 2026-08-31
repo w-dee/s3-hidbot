@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "tools/build_firmware_artifact.py"
 VERIFIER = ROOT / "tools/verify_firmware_artifact.py"
 LIBRARY = ROOT / "tools/firmware_artifact.py"
+CANONICAL_LIBRARY = ROOT / "host/src/hidbot/artifact.py"
 FOCUSED = ROOT / "tools/test-firmware-artifact.sh"
 DEFAULTS = ROOT / "firmware/sdkconfig.artifact.defaults"
 
@@ -16,7 +17,8 @@ DEFAULTS = ROOT / "firmware/sdkconfig.artifact.defaults"
 def main() -> int:
     builder = BUILDER.read_text(encoding="utf-8")
     verifier = VERIFIER.read_text(encoding="utf-8")
-    library = LIBRARY.read_text(encoding="utf-8")
+    adapter = LIBRARY.read_text(encoding="utf-8")
+    library = CANONICAL_LIBRARY.read_text(encoding="utf-8")
     focused = FOCUSED.read_text(encoding="utf-8")
     defaults = DEFAULTS.read_text(encoding="utf-8")
 
@@ -44,6 +46,14 @@ def main() -> int:
     assert "serial" not in verifier.lower()
     assert "/dev/input" not in verifier
     assert "Client" not in verifier
+
+    assert CANONICAL_LIBRARY.is_file()
+    assert "spec_from_file_location" in adapter
+    assert "host" in adapter and "artifact.py" in adapter
+    assert "import hidbot" not in adapter
+    assert "def verify_bundle_directory" not in adapter
+    assert "def verify_bundle_archive" not in adapter
+    assert "def validate_hash" not in adapter
 
     assert "SHA256SUMS" in library
     assert "manifest.json" in library

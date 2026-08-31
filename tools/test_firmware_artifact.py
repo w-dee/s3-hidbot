@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
@@ -273,6 +276,53 @@ def _assert_tool_version_extraction() -> None:
             raise AssertionError(f"malformed tool output was accepted: {malformed!r}")
 
 
+def _assert_source_tree_verifier_adapter() -> None:
+    """Run the official verifier while rejecting normal hidbot/serial imports."""
+
+    root = Path(__file__).resolve().parents[1]
+    verifier = root / "tools" / "verify_firmware_artifact.py"
+    with tempfile.TemporaryDirectory(prefix="s3-hidbot-artifact-test-") as temporary:
+        bundle = _build_synthetic_bundle(Path(temporary))
+        program = f'''\
+import builtins
+import runpy
+import sys
+
+verifier = {str(verifier)!r}
+artifact = {str(bundle)!r}
+original_import = builtins.__import__
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "serial" or name == "hidbot" or name.startswith("hidbot."):
+        raise AssertionError(f"forbidden import: {{name}}")
+    return original_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = guarded_import
+sys.path.insert(0, {str(root / "tools")!r})
+sys.argv = [verifier, artifact]
+try:
+    runpy.run_path(verifier, run_name="__main__")
+except SystemExit as exc:
+    if exc.code != 0:
+        raise
+'''
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                "source-tree verifier imported a forbidden dependency or failed: "
+                f"{result.stderr}"
+            )
+        assert "PASS: firmware artifact" in result.stdout
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="s3-hidbot-artifact-test-") as temporary:
         bundle = _build_synthetic_bundle(Path(temporary))
@@ -280,6 +330,7 @@ def main() -> int:
     _assert_rejects()
     _assert_archive_safety_and_determinism()
     _assert_tool_version_extraction()
+    _assert_source_tree_verifier_adapter()
     print("PASS: firmware artifact verifier, privacy, path safety, and deterministic archive tests")
     return 0
 
