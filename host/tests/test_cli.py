@@ -981,15 +981,23 @@ class CliTests(unittest.TestCase):
     def test_verify_artifact_human_output_and_port_are_serial_independent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive, _ = self.build_verified_artifact_archive(Path(temporary))
-            code, output, errors, calls = self.run_artifact_only(
-                ["--port", "definitely-invalid", "verify-artifact", str(archive)]
-            )
-
-        self.assertEqual(code, 0)
-        self.assertEqual(errors, "")
-        self.assertEqual(calls, [])
-        self.assertTrue(output.startswith("firmware artifact: VALID\nartifact:\n"))
-        self.assertIn('"project": "s3-hidbot"', output)
+            for option, value in (
+                ("--port", "definitely-invalid"),
+                ("--baud", "230400"),
+                ("--timeout", "2"),
+                ("--attempts", "4"),
+            ):
+                for argv in (
+                    [option, value, "verify-artifact", str(archive)],
+                    ["verify-artifact", option, value, str(archive)],
+                ):
+                    with self.subTest(argv=argv):
+                        code, output, errors, calls = self.run_artifact_only(argv)
+                        self.assertEqual(code, 0)
+                        self.assertEqual(errors, "")
+                        self.assertEqual(calls, [])
+                        self.assertTrue(output.startswith("firmware artifact: VALID\nartifact:\n"))
+                        self.assertIn('"project": "s3-hidbot"', output)
 
     def test_verify_artifact_missing_malformed_and_invalid_fail_before_transport(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1560,7 +1568,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("HID_NOT_READY", errors.getvalue())
 
     def test_parser_help_is_command_specific(self) -> None:
-        root_help = ""
+        helps: dict[tuple[str, ...], str] = {}
         for argv, expected in (
             (["--help"], "keyboard-report"),
             (["keyboard-report", "--help"], "--unsafe-hid"),
@@ -1576,9 +1584,25 @@ class CliTests(unittest.TestCase):
                     main(argv, output=stdout, error_output=stderr)
             self.assertEqual(exited.exception.code, 0, argv)
             self.assertIn(expected, stdout.getvalue(), argv)
-            if argv == ["--help"]:
-                root_help = stdout.getvalue()
-        self.assertNotIn("--unsafe-hid", root_help)
+            helps[tuple(argv)] = stdout.getvalue()
+
+        self.assertNotIn("--unsafe-hid", helps[("--help",)])
+        flash_help = helps[("verify-firmware", "--help")]
+        self.assertIn("--baud", flash_help)
+
+        for argv in (("flash-firmware", "--help"), ("verify-artifact", "--help")):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as exited:
+                    main(list(argv), output=stdout, error_output=stderr)
+            self.assertEqual(exited.exception.code, 0, argv)
+            helps[argv] = stdout.getvalue()
+
+        for option in ("--baud", "--timeout", "--attempts"):
+            self.assertNotIn(option, helps[("flash-firmware", "--help")])
+        for option in ("--port", "--baud", "--timeout", "--attempts"):
+            self.assertNotIn(option, helps[("verify-artifact", "--help")])
 
     def test_missing_port_and_malformed_baud_are_config_errors(self) -> None:
         code, _, errors, _ = self.run_cli(["hello"], {})

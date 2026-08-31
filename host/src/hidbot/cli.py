@@ -7,7 +7,7 @@ import json
 import math
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -118,27 +118,49 @@ def _raw_hid_integer(value: str) -> int:
 
 
 def _add_global_options(
-    parser: argparse.ArgumentParser, *, suppress_defaults: bool = False
+    parser: argparse.ArgumentParser,
+    *,
+    suppress_defaults: bool = False,
+    hidden_help: Collection[str] = (),
 ) -> None:
+    """Register global options while allowing command-specific help curation.
+
+    Hidden actions remain fully parse-compatible.  This is intentionally a
+    presentation-only mechanism for commands whose generic options are
+    ignored or explicitly rejected by their execution policy.
+    """
+
     default = argparse.SUPPRESS if suppress_defaults else None
-    parser.add_argument("--port", default=default, help="serial port; otherwise S3_HIDBOT_SERIAL")
+    parser.add_argument(
+        "--port",
+        default=default,
+        help=(
+            argparse.SUPPRESS
+            if "--port" in hidden_help
+            else "serial port; otherwise S3_HIDBOT_SERIAL"
+        ),
+    )
     parser.add_argument(
         "--baud",
         action=_ExplicitValueAction,
         default=default,
-        help="baud rate; otherwise S3_HIDBOT_BAUD or 115200",
+        help=(
+            argparse.SUPPRESS
+            if "--baud" in hidden_help
+            else "baud rate; otherwise S3_HIDBOT_BAUD or 115200"
+        ),
     )
     parser.add_argument(
         "--timeout",
         action=_ExplicitValueAction,
         default=argparse.SUPPRESS if suppress_defaults else str(DEFAULT_TIMEOUT),
-        help="request timeout in seconds",
+        help=(argparse.SUPPRESS if "--timeout" in hidden_help else "request timeout in seconds"),
     )
     parser.add_argument(
         "--attempts",
         action=_ExplicitValueAction,
         default=argparse.SUPPRESS if suppress_defaults else str(DEFAULT_ATTEMPTS),
-        help="maximum request attempts",
+        help=(argparse.SUPPRESS if "--attempts" in hidden_help else "maximum request attempts"),
     )
     parser.add_argument(
         "--json",
@@ -183,7 +205,16 @@ def _parser() -> argparse.ArgumentParser:
         ),
     ):
         command = commands.add_parser(name, help=help_text, description=help_text)
-        _add_global_options(command, suppress_defaults=True)
+        hidden_help: Collection[str] = ()
+        if name == "flash-firmware":
+            hidden_help = {"--baud", "--timeout", "--attempts"}
+        elif name == "verify-artifact":
+            hidden_help = {"--port", "--baud", "--timeout", "--attempts"}
+        _add_global_options(
+            command,
+            suppress_defaults=True,
+            hidden_help=hidden_help,
+        )
         if name in {"verify-artifact", "verify-firmware", "flash-firmware"}:
             command.add_argument(
                 "artifact",
