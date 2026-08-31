@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MAIN = ROOT / "firmware/main/blink.cpp"
+MAIN = ROOT / "firmware/main/main.cpp"
 KCONFIG = ROOT / "firmware/main/Kconfig.projbuild"
 
 

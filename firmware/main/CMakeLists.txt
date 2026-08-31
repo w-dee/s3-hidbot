@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "blink.cpp" "firmware_identity_adapter.cpp"
+    SRCS "main.cpp" "firmware_identity_adapter.cpp"
     INCLUDE_DIRS "."
     REQUIRES uart_control_transport hid_runtime firmware_identity esp_app_format
 )

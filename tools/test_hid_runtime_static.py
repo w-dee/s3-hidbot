@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "firmware/components/hid_runtime/hid_runtime.cpp"
 RUNTIME_HEADER = ROOT / "firmware/components/hid_runtime/include/hid_runtime/hid_runtime.hpp"
-MAIN = ROOT / "firmware/main/blink.cpp"
+MAIN = ROOT / "firmware/main/main.cpp"
 PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
 TRANSPORT = ROOT / "firmware/components/uart_control_transport/uart_control_transport.cpp"
 SDKCONFIG = ROOT / "firmware/sdkconfig.defaults"

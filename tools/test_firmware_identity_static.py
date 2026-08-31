@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "firmware/main/firmware_identity_adapter.cpp"
 ADAPTER_HEADER = ROOT / "firmware/main/firmware_identity_adapter.hpp"
-MAIN = ROOT / "firmware/main/blink.cpp"
+MAIN = ROOT / "firmware/main/main.cpp"
 MAIN_CMAKE = ROOT / "firmware/main/CMakeLists.txt"
 PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
 PROTOCOL_HEADER = ROOT / "firmware/components/control_protocol/include/control_protocol/control_protocol.hpp"

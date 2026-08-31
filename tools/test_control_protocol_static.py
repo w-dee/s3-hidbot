@@ -9,7 +9,7 @@ PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
 PROTOCOL_HEADER = ROOT / "firmware/components/control_protocol/include/control_protocol/control_protocol.hpp"
 SESSION = ROOT / "firmware/components/control_session/control_session.cpp"
 TRANSPORT = ROOT / "firmware/components/uart_control_transport/uart_control_transport.cpp"
-MAIN = ROOT / "firmware/main/blink.cpp"
+MAIN = ROOT / "firmware/main/main.cpp"
 
 
 def main() -> int:
