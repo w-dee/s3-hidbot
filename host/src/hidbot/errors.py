@@ -13,6 +13,23 @@ class TransportError(HidbotError):
     """The byte transport could not read, write, or close successfully."""
 
 
+class FlashExecutionError(HidbotError):
+    """The bounded esptool programming attempts all failed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+        timed_out: bool = False,
+        diagnostic_tail: bytes = b"",
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.timed_out = timed_out
+        self.diagnostic_tail = diagnostic_tail
+
+
 class RequestTimeoutError(HidbotError):
     """A bounded request deadline expired without a correlated response."""
 

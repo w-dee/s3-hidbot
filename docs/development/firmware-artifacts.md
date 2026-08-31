@@ -210,3 +210,34 @@ call `hid.release_all`; the normal hello/info control-session lease is still
 created and refreshed. Identity equality is provenance evidence, not device
 authentication, cryptographic attestation, UART peer authentication, secure
 boot, or signed firmware authenticity.
+
+## U6.4B2b safe esptool execution
+
+`hidbotctl flash-firmware ARTIFACT` is the explicit destructive programming
+entrypoint for a verified archive or extracted bundle. It accepts only the
+supported FNK0085 / ESP32-S3 / DIO / 4 MiB / 80 MHz provisioning plan produced
+by `stage_and_verify_firmware_bundle()` and the unchanged
+`plan_esptool_v4_args()` tuple. Staging and payload-integrity verification
+happen before any process or serial access, and the staged payloads are
+reverified immediately before each attempt. There is no confirmation prompt or
+public dry-run/plan option; the command itself is the explicit programming
+intent.
+
+The host package keeps esptool optional (`s3-hidbot-host[flash]`, constrained to
+`>=4.12,<5`); the base package imports and runs without it. The executor invokes
+only `sys.executable -m esptool` with `shell=False`, a private working
+directory, and absolute private staged image paths. Every inherited
+`ESPTOOL_*` variable is removed and `ESPTOOL_CFGFILE` points to a temporary
+configuration containing only an empty `[esptool]` section. The explicit port
+still takes precedence over `S3_HIDBOT_SERIAL`; `S3_HIDBOT_BAUD` is ignored.
+
+Nonzero and timeout results retry the identical operation at most three total
+times, with a fixed 300-second timeout per attempt. There is no erase, baud
+change, parameter fallback, rebuild, reconnect, or automatic verification.
+Normal mode passes esptool diagnostics through and prints a concise summary;
+JSON mode keeps tool output off stdout and emits one compact success object.
+Missing/incompatible esptool is a usage failure (exit 2); exhausted programming
+attempts are reported as exit 8 with a bounded diagnostic tail. A successful
+flash is programming evidence only, not runtime identity verification. U6.4B2c
+explicitly runs `hidbotctl verify-firmware ARTIFACT` as the separate identity
+check and is not part of this slice.

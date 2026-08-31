@@ -7,12 +7,15 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import patch
 
 from hidbot.artifact import create_deterministic_tar_gz, sha256_file, write_deterministic_json
 from hidbot.cli import main
-from hidbot.errors import TransportError
+from hidbot.errors import FlashExecutionError, TransportError
+from hidbot.flashing import FlashExecutionResult
+from hidbot.firmware_verification import ArtifactFirmwareIdentity
 from hidbot.framing import FRAME_PREFIX, TRANSPORT_SYNC
 from hidbot.protocol import FirmwareIdentity, SystemInfo
 
@@ -217,6 +220,48 @@ class CliTests(unittest.TestCase):
         )
         return code, output.getvalue(), errors.getvalue(), calls
 
+    def run_flash_cli(
+        self,
+        argv: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        executor: Callable[..., FlashExecutionResult] | None = None,
+    ) -> tuple[int, str, str, list[tuple[object, ...]]]:
+        calls: list[tuple[object, ...]] = []
+        identity = ArtifactFirmwareIdentity(
+            project="s3-hidbot",
+            target="esp32s3",
+            protocol_version=1,
+            version="0.1.0-dev",
+            source_revision="a" * 40,
+            app_elf_sha256="b" * 64,
+            build_profile="freenove-fnk0085",
+            idf_version="v5.5.4",
+        )
+        bundle = SimpleNamespace(artifact_identity=identity)
+
+        def transport_factory(*args: object, **kwargs: object) -> object:
+            calls.append(("transport", args, kwargs))
+            raise AssertionError("flash-firmware must not construct a serial transport")
+
+        if executor is None:
+            def executor(bundle_value: object, port: str, **kwargs: object) -> FlashExecutionResult:
+                calls.append(("flash", bundle_value, port, kwargs))
+                return FlashExecutionResult(attempts=1, chip="esp32s3", image_count=3)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with patch("hidbot.cli.stage_and_verify_firmware_bundle", return_value=contextlib.nullcontext(bundle)):
+            code = main(
+                argv,
+                environ={} if env is None else env,
+                transport_factory=transport_factory,
+                flash_executor=executor,
+                output=output,
+                error_output=errors,
+            )
+        return code, output.getvalue(), errors.getvalue(), calls
+
     @staticmethod
     def wire_commands(calls: list[tuple[object, ...]]) -> list[str]:
         return [
@@ -411,6 +456,76 @@ class CliTests(unittest.TestCase):
         self.assertEqual(errors, "")
         factory_call = next(call for call in calls if call[0] == "factory")
         self.assertEqual(factory_call[1], ("last-port", 115200))
+
+    def test_flash_firmware_json_uses_private_executor_and_env_port(self) -> None:
+        code, output, errors, calls = self.run_flash_cli(
+            ["--json", "flash-firmware", "bundle-dir"],
+            env={"S3_HIDBOT_SERIAL": "env-port", "S3_HIDBOT_BAUD": "not-used"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(
+            output,
+            '{"artifact":{"app_elf_sha256":"%s","build_profile":"freenove-fnk0085",'
+            '"idf_version":"v5.5.4","project":"s3-hidbot","protocol_version":1,'
+            '"source_revision":"%s","target":"esp32s3","version":"0.1.0-dev"},'
+            '"classification":"FLASHED","flash":{"attempts":1,"chip":"esp32s3",'
+            '"image_count":3},"ok":true}\n' % ("b" * 64, "a" * 40),
+        )
+        self.assertEqual(sum(call[0] == "transport" for call in calls), 0)
+        flash_call = next(call for call in calls if call[0] == "flash")
+        self.assertEqual(flash_call[2], "env-port")
+        self.assertTrue(flash_call[3]["json_mode"])
+
+    def test_flash_firmware_normal_output_and_explicit_programming_options_are_rejected(self) -> None:
+        code, output, errors, calls = self.run_flash_cli(
+            ["--port", "flash-port", "flash-firmware", "bundle-dir"],
+            env={"S3_HIDBOT_SERIAL": "env-port", "S3_HIDBOT_BAUD": "invalid"},
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("firmware flash: FLASHED", output)
+        self.assertIn("chip: esp32s3", output)
+        self.assertEqual(errors, "")
+        self.assertEqual(sum(call[0] == "transport" for call in calls), 0)
+
+        for option, value in (("--baud", "9600"), ("--timeout", "4"), ("--attempts", "1")):
+            for placement in (
+                [option, value, "flash-firmware", "bundle-dir"],
+                ["flash-firmware", option, value, "bundle-dir"],
+            ):
+                with self.subTest(option=option, placement=placement):
+                    calls: list[tuple[object, ...]] = []
+                    with patch("hidbot.cli.stage_and_verify_firmware_bundle") as stage:
+                        with patch("hidbot.cli.resolve_port", side_effect=AssertionError("port resolved")):
+                            with self.assertRaises(SystemExit) as raised:
+                                main(
+                                    placement,
+                                    environ={"S3_HIDBOT_SERIAL": "env-port"},
+                                    transport_factory=lambda *args, **kwargs: calls.append((args, kwargs)),
+                                    output=io.StringIO(),
+                                    error_output=io.StringIO(),
+                                )
+                    self.assertEqual(raised.exception.code, 2)
+                    stage.assert_not_called()
+                    self.assertEqual(calls, [])
+
+    def test_flash_execution_failure_maps_to_exit_eight_without_stdout(self) -> None:
+        def fail(*args: object, **kwargs: object) -> FlashExecutionResult:
+            del args, kwargs
+            raise FlashExecutionError(
+                "esptool failed after 3 attempts",
+                attempts=3,
+                diagnostic_tail=b"bounded esptool diagnostic",
+            )
+
+        code, output, errors, calls = self.run_flash_cli(
+            ["--port", "flash-port", "--json", "flash-firmware", "bundle-dir"],
+            executor=fail,
+        )
+        self.assertEqual(code, 8)
+        self.assertEqual(output, "")
+        self.assertIn("bounded esptool diagnostic", errors)
+        self.assertEqual(sum(call[0] == "transport" for call in calls), 0)
 
     @staticmethod
     def verified_manifest() -> dict[str, object]:

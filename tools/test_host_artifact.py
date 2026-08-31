@@ -33,7 +33,9 @@ def _write_valid_artifact(directory: Path) -> Path:
             "Name: s3-hidbot-host\n"
             "Version: 0.1.0\n"
             "Requires-Python: >=3.11\n"
-            "Requires-Dist: pyserial<4,>=3.5\n",
+            "Requires-Dist: pyserial<4,>=3.5\n"
+            "Provides-Extra: flash\n"
+            "Requires-Dist: esptool<5,>=4.12; extra == \"flash\"\n",
         )
         archive.writestr(
             f"{DIST_INFO}/WHEEL",

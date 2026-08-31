@@ -22,6 +22,7 @@ REQUIRED_MODULES = frozenset(
         "hidbot/client.py",
         "hidbot/errors.py",
         "hidbot/firmware_verification.py",
+        "hidbot/flashing.py",
         "hidbot/framing.py",
         "hidbot/protocol.py",
         "hidbot/provisioning.py",
@@ -131,6 +132,10 @@ def _validate_wheel(wheel: Path) -> None:
         raise HostArtifactError("wheel Requires-Python metadata does not match")
     if "Requires-Dist: pyserial<4,>=3.5" not in decoded_metadata:
         raise HostArtifactError("wheel runtime dependency metadata does not match")
+    if "Provides-Extra: flash" not in decoded_metadata:
+        raise HostArtifactError("wheel flash extra metadata is missing")
+    if "Requires-Dist: esptool<5,>=4.12; extra == \"flash\"" not in decoded_metadata:
+        raise HostArtifactError("wheel flash dependency metadata does not match")
     decoded_wheel = wheel_metadata.decode("utf-8")
     if "Root-Is-Purelib: true" not in decoded_wheel or "Tag: py3-none-any" not in decoded_wheel:
         raise HostArtifactError("wheel tag is not py3-none-any pure Python")

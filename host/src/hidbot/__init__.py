@@ -13,6 +13,7 @@ from .protocol import (
 )
 from .errors import (
     CompatibilityError,
+    FlashExecutionError,
     HidbotError,
     ProtocolError,
     RemoteError,
@@ -20,6 +21,7 @@ from .errors import (
     SessionLostError,
     TransportError,
 )
+from .flashing import FlashExecutionResult
 from .serial_transport import PySerialTransport
 
 __all__ = [
@@ -34,6 +36,8 @@ __all__ = [
     "evaluate_compatibility",
     "validate_system_info",
     "CompatibilityError",
+    "FlashExecutionError",
+    "FlashExecutionResult",
     "HidbotError",
     "ProtocolError",
     "RemoteError",

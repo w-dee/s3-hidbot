@@ -107,6 +107,7 @@ package_files = {
     "hidbot/client.py",
     "hidbot/errors.py",
     "hidbot/firmware_verification.py",
+    "hidbot/flashing.py",
     "hidbot/framing.py",
     "hidbot/protocol.py",
     "hidbot/provisioning.py",
@@ -126,6 +127,8 @@ assert "Name: s3-hidbot-host\n" in metadata
 assert "Version: 0.1.0\n" in metadata
 assert "Requires-Python: >=3.11\n" in metadata
 assert "Requires-Dist: pyserial<4,>=3.5\n" in metadata
+assert "Provides-Extra: flash\n" in metadata
+assert 'Requires-Dist: esptool<5,>=4.12; extra == "flash"\n' in metadata
 assert any(line.startswith("License: MIT") for line in metadata.splitlines())
 assert "Description-Content-Type: text/markdown\n" in metadata
 entry_points_name = next(name for name in wheel if name.endswith(".dist-info/entry_points.txt"))
@@ -157,6 +160,7 @@ expected_tests = {
     "tests/test_cli.py",
     "tests/test_client.py",
     "tests/test_firmware_verification.py",
+    "tests/test_flashing.py",
     "tests/test_framing.py",
     "tests/test_protocol.py",
     "tests/test_provisioning.py",
@@ -220,6 +224,7 @@ assert callable(compare_firmware_identity)
 print(f"PASS: installed import/version check for {Path(artifact).name}")
 PY
     env -u PYTHONPATH "$venv_cli" --help >/dev/null
+    env -u PYTHONPATH "$venv_cli" flash-firmware --help >/dev/null
     for command in hello ping info usb-status release-all self-test; do
         set +e
         env -u PYTHONPATH -u S3_HIDBOT_SERIAL -u S3_HIDBOT_BAUD \
@@ -272,9 +277,53 @@ PY
             exit 1
         fi
     done
+    flash_bundle_parent="$temporary_directory/flash-missing-extra-bundle"
+    flash_bundle=$(env -u PYTHONPATH "$venv_python" - "$repository_root" "$flash_bundle_parent" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "host" / "tests"))
+from test_provisioning import _make_bundle
+
+print(_make_bundle(Path(sys.argv[2])))
+PY
+    )
+    set +e
+    env -u PYTHONPATH -u S3_HIDBOT_SERIAL -u S3_HIDBOT_BAUD \
+        "$venv_cli" --port missing-port flash-firmware "$flash_bundle" \
+        >"$temporary_directory/cli-flash-firmware.log" 2>&1
+    status=$?
+    set -e
+    if [[ "$status" -ne 2 ]] || ! grep -q 's3-hidbot-host\[flash\]' "$temporary_directory/cli-flash-firmware.log"; then
+        cat "$temporary_directory/cli-flash-firmware.log" >&2
+        echo "base wheel flash-firmware missing-extra smoke failed" >&2
+        exit 1
+    fi
+    env -u PYTHONPATH "$venv_python" -c 'import importlib.util; assert importlib.util.find_spec("esptool") is None'
+}
+
+install_flash_extra_and_smoke() {
+    local artifact=$1
+    local venv_directory=$2
+    local venv_python="$venv_directory/bin/python"
+    local venv_cli="$venv_directory/bin/hidbotctl"
+    "$python_bin" -m venv "$venv_directory"
+    "$venv_python" -m pip install --disable-pip-version-check --no-input "${artifact}[flash]"
+    "$venv_python" -m pip check
+    env -u PYTHONPATH "$venv_python" -m esptool version >/dev/null
+    env -u PYTHONPATH "$venv_cli" flash-firmware --help >/dev/null
+    env -u PYTHONPATH "$venv_python" - <<'PY'
+from importlib.metadata import version
+
+value = version("esptool")
+parts = tuple(int(part) for part in value.split(".")[:2])
+assert parts >= (4, 12) and parts < (5, 0), value
+print(f"PASS: installed flash extra esptool {value}")
+PY
 }
 
 install_and_smoke "$wheel_one" "$temporary_directory/wheel-venv"
+install_flash_extra_and_smoke "$wheel_one" "$temporary_directory/flash-wheel-venv"
 
 sdist_extract_directory="$temporary_directory/sdist-extracted"
 mkdir -p "$sdist_extract_directory"

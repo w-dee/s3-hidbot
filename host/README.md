@@ -17,6 +17,13 @@ PyPI; install it from a checkout with pip:
 python3 -m pip install ./host
 ```
 
+The optional flash extra installs the constrained esptool distribution only
+when firmware programming is explicitly required:
+
+```bash
+python3 -m pip install './host[flash]'
+```
+
 The serial device is selected through the machine-local
 `S3_HIDBOT_SERIAL` environment variable or an explicit `--port` argument; do
 not put a machine-specific device path in project files.
@@ -105,3 +112,39 @@ The command sends no HID report, does not query USB status, and does not run
 normal control-session lease. This is provenance evidence, not physical device
 authentication, UART peer authentication, secure boot, or proof of signed
 firmware authenticity.
+
+## Safe firmware flashing
+
+`hidbotctl flash-firmware ARTIFACT` is the explicit programming command for a
+verified `.tar.gz` bundle or extracted bundle directory. It is intentionally
+separate from the normal control-plane commands and constructs no UART
+transport, protocol session, or HID request:
+
+```bash
+hidbotctl --port "$S3_HIDBOT_SERIAL" flash-firmware ./s3-hidbot-firmware.tar.gz
+hidbotctl --json flash-firmware ./extracted-firmware-bundle
+```
+
+Install the optional `flash` extra before using it. The command accepts the
+explicit `--port` (otherwise `S3_HIDBOT_SERIAL`) plus `--json` and `--verbose`;
+`--baud`, `--timeout`, and `--attempts` are rejected as usage errors, and
+`S3_HIDBOT_BAUD` is ignored. Artifact verification and the supported
+FNK0085/ESP32-S3 4 MiB DIO flash plan complete before esptool is started.
+There is no confirmation prompt or public dry-run/plan mode; invoking this
+command is the explicit programming intent.
+
+The runner invokes only the installed esptool module with absolute paths from
+a private staged snapshot. It removes inherited `ESPTOOL_*` settings, uses a
+private empty esptool configuration and working directory, and retries an
+unchanged nonzero or timed-out operation at most three times with a fixed
+five-minute timeout. It never erases, changes baud, falls back to another
+plan, rebuilds, reconnects, or automatically runs `verify-firmware`.
+
+Base package installation remains esptool-free; a missing or unsupported
+optional dependency exits 2 with installation guidance before any subprocess
+or serial access. Programming failure after the bounded attempts exits 8.
+JSON mode emits one compact success object and keeps esptool diagnostics out of
+stdout; normal mode passes diagnostics through. A successful flash proves only
+that esptool completed the selected programming operation. It is not runtime
+identity verification; run `hidbotctl verify-firmware ARTIFACT` separately
+when identity comparison is required.

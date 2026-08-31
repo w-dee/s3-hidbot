@@ -26,6 +26,7 @@ def main() -> int:
     text = WORKFLOW.read_text(encoding="utf-8")
     producer = job_block(text, "host-package-producer", "host-package-consumer")
     consumer = job_block(text, "host-package-consumer", "host-package")
+    flash_consumer = job_block(text, "host-package-flash-consumer", "native")
     if "matrix:" in producer:
         raise AssertionError("host artifact producer must not be matrixed")
     required(producer, r"python-version:\s*[\"']3\.12[\"']", "fixed producer Python 3.12")
@@ -56,6 +57,27 @@ def main() -> int:
     install_position = consumer.index('"$consumer_python" -m pip install')
     if checksum_position >= install_position:
         raise AssertionError("artifact consumer must verify checksum before wheel installation")
+    required(flash_consumer, r"needs:\s*host-package-producer", "flash consumer depends on producer")
+    required(
+        flash_consumer,
+        r"python-version:\s*\[\"3\.11\",\s*\"3\.12\"\]",
+        "flash consumer Python matrix",
+    )
+    required(flash_consumer, r"actions/download-artifact@v4", "flash consumer artifact download")
+    required(flash_consumer, r"sha256sum\s+--check\s+--strict", "flash consumer checksum verification")
+    required(flash_consumer, r'pip\s+install[^\n]*\$\{wheel\}\[flash\]', "flash extra install")
+    required(flash_consumer, r"consumer_python.*-m\s+esptool\s+version", "esptool version smoke")
+    required(flash_consumer, r"flash-firmware\s+--help", "flash CLI help smoke")
+    if "actions/checkout@" in flash_consumer:
+        raise AssertionError("flash artifact consumer must not checkout repository source")
+    if "tools/" in flash_consumer:
+        raise AssertionError("flash artifact consumer must not invoke repository helpers")
+    if "--hardware" in flash_consumer:
+        raise AssertionError("flash artifact consumer must not enable physical hardware execution")
+    checksum_position = flash_consumer.index("sha256sum --check --strict")
+    install_position = flash_consumer.index('"$consumer_python" -m pip install')
+    if checksum_position >= install_position:
+        raise AssertionError("flash consumer must verify checksum before wheel installation")
     print("PASS: non-hardware canonical host artifact CI static contract")
     return 0
 

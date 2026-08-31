@@ -19,6 +19,9 @@ classifiers = [
     "Topic :: System :: Hardware",
 ]
 
+[project.optional-dependencies]
+flash = ["esptool>=4.12,<5"]
+
 [project.urls]
 Homepage = "https://github.com/w-dee/s3-hidbot"
 Repository = "https://github.com/w-dee/s3-hidbot"

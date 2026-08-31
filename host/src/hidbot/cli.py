@@ -16,6 +16,7 @@ from .artifact import ArtifactError, verify_bundle_archive, verify_bundle_direct
 from .client import Client, HelloResult
 from .errors import (
     CompatibilityError,
+    FlashExecutionError,
     HidbotError,
     ProtocolError,
     RemoteError,
@@ -23,7 +24,9 @@ from .errors import (
     SessionLostError,
     TransportError,
 )
+from .flashing import FlashExecutionResult, execute_flash
 from .serial_transport import PySerialTransport
+from .provisioning import stage_and_verify_firmware_bundle
 from .protocol import (
     KeyboardReportResult,
     MouseReportResult,
@@ -43,6 +46,21 @@ from .firmware_verification import (
 DEFAULT_BAUD = 115200
 DEFAULT_TIMEOUT = 1.0
 DEFAULT_ATTEMPTS = 3
+
+
+class _ExplicitValueAction(argparse.Action):
+    """Record whether a value option was explicitly supplied by the caller."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, option_string
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_explicit", True)
 
 
 def resolve_port(cli_port: str | None, environ: Mapping[str, str] | None = None) -> str:
@@ -100,15 +118,20 @@ def _add_global_options(
     default = argparse.SUPPRESS if suppress_defaults else None
     parser.add_argument("--port", default=default, help="serial port; otherwise S3_HIDBOT_SERIAL")
     parser.add_argument(
-        "--baud", default=default, help="baud rate; otherwise S3_HIDBOT_BAUD or 115200"
+        "--baud",
+        action=_ExplicitValueAction,
+        default=default,
+        help="baud rate; otherwise S3_HIDBOT_BAUD or 115200",
     )
     parser.add_argument(
         "--timeout",
+        action=_ExplicitValueAction,
         default=argparse.SUPPRESS if suppress_defaults else str(DEFAULT_TIMEOUT),
         help="request timeout in seconds",
     )
     parser.add_argument(
         "--attempts",
+        action=_ExplicitValueAction,
         default=argparse.SUPPRESS if suppress_defaults else str(DEFAULT_ATTEMPTS),
         help="maximum request attempts",
     )
@@ -149,16 +172,19 @@ def _parser() -> argparse.ArgumentParser:
             "verify-artifact",
             "verify a firmware artifact locally without connecting to a device",
         ),
+        (
+            "flash-firmware",
+            "flash a verified firmware artifact using the supported provisioning policy",
+        ),
     ):
         command = commands.add_parser(name, help=help_text, description=help_text)
         _add_global_options(command, suppress_defaults=True)
-        if name in {"verify-artifact", "verify-firmware"}:
+        if name in {"verify-artifact", "verify-firmware", "flash-firmware"}:
             command.add_argument(
                 "artifact",
                 metavar="ARTIFACT",
                 help="verified firmware bundle archive or extracted bundle directory",
             )
-
     keyboard = commands.add_parser(
         "keyboard-report",
         help="submit one explicit unsafe Boot keyboard report",
@@ -305,6 +331,21 @@ def _artifact_validation_value(result: ArtifactFirmwareIdentity) -> dict[str, ob
     }
 
 
+def _flash_value(
+    identity: ArtifactFirmwareIdentity, result: FlashExecutionResult
+) -> dict[str, object]:
+    return {
+        "ok": True,
+        "classification": "FLASHED",
+        "artifact": _artifact_identity_value(identity),
+        "flash": {
+            "chip": result.chip,
+            "image_count": result.image_count,
+            "attempts": result.attempts,
+        },
+    }
+
+
 def _validate_hid_arguments(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
@@ -319,6 +360,26 @@ def _validate_hid_arguments(
             )
     except ProtocolError as exc:
         parser.error(str(exc))
+
+
+def _validate_flash_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.command != "flash-firmware":
+        return
+    rejected = [
+        option
+        for option, destination in (
+            ("--baud", "baud"),
+            ("--timeout", "timeout"),
+            ("--attempts", "attempts"),
+        )
+        if getattr(args, f"_{destination}_explicit", False)
+    ]
+    if rejected:
+        parser.error(
+            "flash-firmware does not accept "
+            + ", ".join(rejected)
+            + "; flashing uses fixed programming settings"
+        )
 
 
 def _print_result(command: str, result: object, *, as_json: bool, output: TextIO) -> None:
@@ -368,6 +429,8 @@ def _print_result(command: str, result: object, *, as_json: bool, output: TextIO
 def _exit_code(error: HidbotError) -> int:
     if isinstance(error, RequestTimeoutError):
         return 6
+    if isinstance(error, FlashExecutionError):
+        return 8
     if isinstance(error, RemoteError):
         return 5
     if isinstance(error, TransportError):
@@ -382,6 +445,7 @@ def main(
     *,
     environ: Mapping[str, str] | None = None,
     transport_factory: Callable[..., PySerialTransport] = PySerialTransport,
+    flash_executor: Callable[..., FlashExecutionResult] = execute_flash,
     output: TextIO | None = None,
     error_output: TextIO | None = None,
 ) -> int:
@@ -391,6 +455,7 @@ def main(
     try:
         args = parser.parse_args(argv)
         _validate_hid_arguments(args, parser)
+        _validate_flash_arguments(args, parser)
         artifact_identity = (
             _verified_artifact_identity(args.artifact)
             if args.command in {"verify-artifact", "verify-firmware"}
@@ -399,6 +464,28 @@ def main(
         if args.command == "verify-artifact":
             assert artifact_identity is not None
             _print_result(args.command, artifact_identity, as_json=args.json, output=output)
+            return 0
+        if args.command == "flash-firmware":
+            port = resolve_port(args.port, environ)
+            with stage_and_verify_firmware_bundle(args.artifact) as bundle:
+                result = flash_executor(
+                    bundle,
+                    port,
+                    json_mode=args.json,
+                    on_retry=lambda message: print(message, file=error_output),
+                )
+                value = _flash_value(bundle.artifact_identity, result)
+                if args.json:
+                    print(
+                        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                        file=output,
+                    )
+                else:
+                    print("firmware flash: FLASHED", file=output)
+                    print(json.dumps(value["artifact"], ensure_ascii=True, indent=2, sort_keys=True), file=output)
+                    print(f"chip: {result.chip}", file=output)
+                    print(f"images: {result.image_count}", file=output)
+                    print(f"attempts: {result.attempts}", file=output)
             return 0
         port = resolve_port(args.port, environ)
         baud = resolve_baud(args.baud, environ)
@@ -462,7 +549,11 @@ def main(
         return 2
     except HidbotError as exc:
         print(f"error: {exc}", file=error_output)
+        if isinstance(exc, FlashExecutionError) and exc.diagnostic_tail:
+            print(exc.diagnostic_tail.decode("utf-8", errors="replace").rstrip("\n"), file=error_output)
         return _exit_code(exc)
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":
