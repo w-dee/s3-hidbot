@@ -10,14 +10,14 @@ normative control-plane contract are documented in the project repository.
 
 ## Requirements and installation
 
-Python 3.11 or newer is required. Install the package with pip:
+Python 3.11 or newer is required. This package is not currently published on
+PyPI; install it from a checkout with pip:
 
 ```bash
-python3 -m pip install s3-hidbot-host
+python3 -m pip install ./host
 ```
 
-For a checkout-based installation, run `python3 -m pip install ./host` from
-the repository root. The serial device is selected through the machine-local
+The serial device is selected through the machine-local
 `S3_HIDBOT_SERIAL` environment variable or an explicit `--port` argument; do
 not put a machine-specific device path in project files.
 

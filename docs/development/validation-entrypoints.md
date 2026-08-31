@@ -9,7 +9,7 @@ contain a separate hidden test recipe.
 ## Prerequisites
 
 - Bash, Python 3.11 or newer, and a C/C++ toolchain providing `cc` and `c++`.
-- `test-static.sh`, `test-host.sh`, `test-package.sh`, and `test-native.sh` do
+- `test-static.sh`, `test-host.sh`, `test-package.sh`, `test-host-artifact.sh`, and `test-native.sh` do
   not require an activated ESP-IDF environment. `test-host.sh` requires
   network access to install the declared PyPI dependencies into its temporary
   venv. `test-package.sh` additionally downloads the temporary `build` and
@@ -88,6 +88,12 @@ artifact builds to verify byte-for-byte reproducibility. It does not use or
 modify the ordinary `firmware/build` directory and removes all temporary
 outputs when it exits.
 
+`test-host-artifact.sh` is the focused U6.4A canonical host-wheel producer
+test. It builds a single pure-Python wheel from a temporary staging copy of
+`host/`, writes a matching project-owned SHA-256 file, and validates the exact
+two-file output. It does not publish an artifact or modify repository package
+build directories.
+
 `test-hardware-hid.sh` is the no-hardware CI/unit-test entrypoint for the
 U5.4.1-U5.4.3 observer and keyboard/mouse smoke orchestration tests. With no arguments it
 executes only the stdlib unit tests and remains hardware-free. The canonical
@@ -124,6 +130,17 @@ of duplicating their test logic.
 - Tier A (`privacy-lint.yml`): static guards and privacy unit/tracked scans.
 - Tier B (`nonhardware.yml`): clean host install/package validation on Python
   3.11 and 3.12, plus one IDF-independent native C++ job.
+- U6.4A adds a non-matrix Python 3.12 producer to that workflow. It uploads a
+  temporary `host-package` Actions artifact containing only the canonical
+  wheel and its project-owned SHA-256 checksum, retained for 14 days. A
+  checkout-free Python 3.11/3.12 consumer matrix verifies that checksum before
+  installing the downloaded wheel in a fresh virtual environment. The wheel is
+  source-checkout-independent; the sdist remains validated by `test-package.sh`
+  but is not uploaded. This is neither PyPI publication, a GitHub Release, a
+  permanent release asset, nor signed provenance. The checksum establishes
+  matching wheel bytes alongside the download; it is not a signature or an
+  independent authentication mechanism. Public release and distribution are
+  reserved for U6.6.
 - Tier C (`nonhardware.yml`, firmware job): the IDF-dependent protocol test
   and ESP-IDF v5.5.4 firmware build in the official
   `espressif/idf:v5.5.4` container.

@@ -12,6 +12,86 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  host-package-producer:
+    name: U6.4A - canonical host wheel producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and validate canonical host wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input build
+          artifact_directory="$RUNNER_TEMP/host-package"
+          python tools/build_host_artifact.py "$artifact_directory"
+          python tools/test_host_artifact.py "$artifact_directory"
+      - name: Upload canonical host wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-package
+          path: ${{ runner.temp }}/host-package/*
+          if-no-files-found: error
+          retention-days: 14
+
+  host-package-consumer:
+    name: U6.4A - canonical host wheel consumer (Python ${{ matrix.python-version }})
+    needs: host-package-producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Download canonical host wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: host-package
+          path: ${{ runner.temp }}/host-package
+      - name: Verify, install, and smoke canonical host wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_directory="$RUNNER_TEMP/host-package"
+          mapfile -t files < <(find "$artifact_directory" -maxdepth 1 -type f -printf '%f\n' | sort)
+          expected_wheel="s3_hidbot_host-0.1.0-py3-none-any.whl"
+          expected_checksum="${expected_wheel}.sha256"
+          if [[ "${#files[@]}" -ne 2 || "${files[0]}" != "$expected_wheel" || "${files[1]}" != "$expected_checksum" ]]; then
+            echo "downloaded host artifact does not contain exactly wheel plus matching checksum" >&2
+            exit 1
+          fi
+          wheel="$artifact_directory/${files[0]}"
+          checksum="$artifact_directory/${files[1]}"
+          [[ ! -e "$GITHUB_WORKSPACE/host" ]]
+          [[ $(wc -c <"$checksum") -eq $((67 + ${#expected_wheel})) ]]
+          grep -Eq '^[0-9a-f]{64}  s3_hidbot_host-0.1.0-py3-none-any\.whl$' "$checksum"
+          (
+            cd "$artifact_directory"
+            sha256sum --check --strict "${files[1]}"
+          )
+          consumer_directory="$RUNNER_TEMP/host-package-consumer"
+          python -m venv "$consumer_directory"
+          consumer_python="$consumer_directory/bin/python"
+          consumer_cli="$consumer_directory/bin/hidbotctl"
+          "$consumer_python" -m pip install --disable-pip-version-check --no-input "$wheel"
+          "$consumer_python" -m pip check
+          env -u PYTHONPATH "$consumer_python" -c 'from importlib.metadata import version; from pathlib import Path; import hidbot; assert version("s3-hidbot-host") == "0.1.0"; assert "site-packages" in Path(hidbot.__file__).parts'
+          env -u PYTHONPATH "$consumer_cli" --help >/dev/null
+          set +e
+          env -u PYTHONPATH -u S3_HIDBOT_SERIAL -u S3_HIDBOT_BAUD "$consumer_cli" hello >/dev/null 2>&1
+          status=$?
+          set -e
+          [[ "$status" -eq 2 ]]
+
   host-package:
     name: Tier B - host and package (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

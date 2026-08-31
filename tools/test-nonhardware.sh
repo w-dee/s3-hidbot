@@ -14,6 +14,7 @@ fi
 "$python_bin" "$repository_root/tools/privacy_lint.py" --tracked
 "$repository_root/tools/test-host.sh"
 "$repository_root/tools/test-package.sh"
+"$repository_root/tools/test-host-artifact.sh"
 "$repository_root/tools/test-native.sh"
 "$repository_root/tools/test-control-protocol.sh"
 git -C "$repository_root" diff --check
