@@ -109,6 +109,7 @@ package_files = {
     "hidbot/firmware_verification.py",
     "hidbot/framing.py",
     "hidbot/protocol.py",
+    "hidbot/provisioning.py",
     "hidbot/serial_transport.py",
 }
 assert package_files.issubset(wheel), "wheel is missing a host package module"
@@ -158,6 +159,7 @@ expected_tests = {
     "tests/test_firmware_verification.py",
     "tests/test_framing.py",
     "tests/test_protocol.py",
+    "tests/test_provisioning.py",
     "tests/test_serial_transport.py",
 }
 assert expected_tests.issubset(sdist), "sdist is missing a complete test suite"

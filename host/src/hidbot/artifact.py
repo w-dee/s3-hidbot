@@ -295,7 +295,15 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, tuple[str, str]
     return paths
 
 
-def _validate_flash_plan(bundle: Path, manifest: Mapping[str, Any], paths: Mapping[str, tuple[str, str]]) -> None:
+def _parse_validated_flash_plan(
+    bundle: Path, manifest: Mapping[str, Any], paths: Mapping[str, tuple[str, str]]
+) -> dict[str, Any]:
+    """Validate and normalize the canonical flasher plan once.
+
+    The returned mapping is private and must be converted to an immutable
+    provisioning model before it crosses the artifact/provisioning boundary.
+    """
+
     plan_path = bundle / manifest["flash_plan"]
     plan = load_json_bytes(plan_path.read_bytes(), "flasher_args.json")
     _require_keys(
@@ -372,6 +380,30 @@ def _validate_flash_plan(bundle: Path, manifest: Mapping[str, Any], paths: Mappi
         if encrypted not in {True, False, "true", "false"}:
             raise _error(f"flash plan {key} encryption value is invalid")
 
+    images = tuple(
+        {
+            "role": role,
+            "offset": int(plan[key]["offset"], 0),
+            "path": plan[key]["file"],
+            "encrypted": plan[key]["encrypted"],
+        }
+        for key, role in PLAN_ROLE_BY_KEY.items()
+    )
+    return {
+        "chip": extra["chip"],
+        "before": extra["before"],
+        "after": extra["after"],
+        "stub": extra["stub"],
+        "flash_mode": settings["flash_mode"],
+        "flash_size": settings["flash_size"],
+        "flash_freq": settings["flash_freq"],
+        "images": images,
+    }
+
+
+def _validate_flash_plan(bundle: Path, manifest: Mapping[str, Any], paths: Mapping[str, tuple[str, str]]) -> None:
+    _parse_validated_flash_plan(bundle, manifest, paths)
+
 
 def _iter_payload_files(bundle: Path) -> list[tuple[str, Path]]:
     if bundle.is_symlink() or not bundle.is_dir():
@@ -428,7 +460,9 @@ def check_bundle_privacy(bundle: Path, extra_markers: tuple[bytes, ...] = ()) ->
             raise _error(f"machine-local or secret marker in payload: {relative}")
 
 
-def verify_bundle_directory(bundle: Path) -> dict[str, Any]:
+def _verify_bundle_directory_with_plan(
+    bundle: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     manifest_path = bundle / "manifest.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise _error("manifest.json is missing")
@@ -446,12 +480,17 @@ def verify_bundle_directory(bundle: Path) -> dict[str, Any]:
     if "CONFIG_APP_REPRODUCIBLE_BUILD=y" not in sdkconfig_lines:
         raise _error("effective sdkconfig does not enable reproducible builds")
     _validate_sha256sums(bundle, paths)
-    _validate_flash_plan(bundle, manifest, paths)
+    flash_plan = _parse_validated_flash_plan(bundle, manifest, paths)
     check_bundle_privacy(bundle)
     license_path = next(path for path, (_, role) in paths.items() if role == "license")
     if b"MIT License" not in (bundle / license_path).read_bytes():
         raise _error("license payload is not the expected MIT license")
-    return copy.deepcopy(manifest)
+    return copy.deepcopy(manifest), flash_plan
+
+
+def verify_bundle_directory(bundle: Path) -> dict[str, Any]:
+    manifest, _ = _verify_bundle_directory_with_plan(bundle)
+    return manifest
 
 
 def _safe_archive_member_name(name: str) -> str:
@@ -461,46 +500,59 @@ def _safe_archive_member_name(name: str) -> str:
     return validate_relative_path(normalized)
 
 
-def verify_bundle_archive(archive: Path) -> dict[str, Any]:
+def _extract_archive_to(archive: Path, extraction_root: Path) -> Path:
+    """Safely extract one archive into an already-private directory.
+
+    The caller owns ``extraction_root`` and its lifetime.  Keeping extraction
+    separate from verification lets provisioning verify and execute against
+    the same staged bytes without introducing a second tar security path.
+    """
+
     if archive.is_symlink() or not archive.is_file():
         raise _error("artifact archive is missing")
+    extraction_root.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(archive, mode="r:gz") as source:
+            members = source.getmembers()
+            if not members:
+                raise _error("artifact archive is empty")
+            top_level: str | None = None
+            names: set[str] = set()
+            for member in members:
+                name = _safe_archive_member_name(member.name)
+                if name in names:
+                    raise _error("duplicate archive member")
+                names.add(name)
+                first = name.split("/", 1)[0]
+                if top_level is None:
+                    top_level = first
+                elif first != top_level:
+                    raise _error("archive must contain one top-level directory")
+                if not (member.isdir() or member.isfile()):
+                    raise _error("archive symlink or special member is forbidden")
+                destination = extraction_root.joinpath(*name.split("/"))
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                extracted = source.extractfile(member)
+                if extracted is None:
+                    raise _error("archive member cannot be read")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with destination.open("wb") as output:
+                    shutil.copyfileobj(extracted, output)
+    except (tarfile.TarError, OSError) as exc:
+        if isinstance(exc, ArtifactError):
+            raise
+        raise _error("could not safely read artifact archive") from exc
+    if top_level is None:
+        raise _error("archive has no top-level directory")
+    return extraction_root / top_level
+
+
+def verify_bundle_archive(archive: Path) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="s3-hidbot-artifact-verify-") as temporary:
-        extraction_root = Path(temporary)
-        try:
-            with tarfile.open(archive, mode="r:gz") as source:
-                members = source.getmembers()
-                if not members:
-                    raise _error("artifact archive is empty")
-                top_level: str | None = None
-                names: set[str] = set()
-                for member in members:
-                    name = _safe_archive_member_name(member.name)
-                    if name in names:
-                        raise _error("duplicate archive member")
-                    names.add(name)
-                    first = name.split("/", 1)[0]
-                    if top_level is None:
-                        top_level = first
-                    elif first != top_level:
-                        raise _error("archive must contain one top-level directory")
-                    if not (member.isdir() or member.isfile()):
-                        raise _error("archive symlink or special member is forbidden")
-                    destination = extraction_root.joinpath(*name.split("/"))
-                    if member.isdir():
-                        destination.mkdir(parents=True, exist_ok=True)
-                        continue
-                    extracted = source.extractfile(member)
-                    if extracted is None:
-                        raise _error("archive member cannot be read")
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_bytes(extracted.read())
-        except (tarfile.TarError, OSError) as exc:
-            if isinstance(exc, ArtifactError):
-                raise
-            raise _error("could not safely read artifact archive") from exc
-        if top_level is None:
-            raise _error("archive has no top-level directory")
-        return verify_bundle_directory(extraction_root / top_level)
+        bundle = _extract_archive_to(archive, Path(temporary))
+        return verify_bundle_directory(bundle)
 
 
 def _tar_info(name: str, *, is_directory: bool, size: int, source_date_epoch: int) -> tarfile.TarInfo:
