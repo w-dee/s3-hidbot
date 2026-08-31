@@ -19,6 +19,27 @@ normal `firmware/sdkconfig.defaults` with
 `CONFIG_APP_REPRODUCIBLE_BUILD=y` only for artifact builds. An existing
 `firmware/build` directory is never an artifact input.
 
+## Memory envelope and fixture profile
+
+The firmware deliberately targets a conservative minimum envelope of **4 MiB
+flash** and **no required external PSRAM**. `firmware/sdkconfig.defaults`
+explicitly selects the ESP-IDF 4 MiB flash setting and disables external
+SPIRAM, so a canonical artifact intentionally records `--flash_size 4MB`.
+The current partition table ends well below that address-space limit; unused
+flash is not consumed by placeholder partitions.
+
+`build_profile=freenove-fnk0085` identifies the validated FNK0085 fixture and
+its board-integration assumptions. It is not a claim that the physical fixture
+has only the firmware minimum: the fixture may provide 8 MiB flash and 8 MiB
+PSRAM. That additional capacity is intentionally unused by the current
+firmware, which does not thereby claim compatibility with arbitrary
+ESP32-S3 boards whose USB, UART, or GPIO topology has not been validated.
+
+An artifact built before this explicit policy, with the inherited 2 MiB
+ESP-IDF flash default, remains structurally verifiable historical evidence but
+is not a positive target for the C4 flash gate. A new source revision and
+canonical artifact are required for that gate.
+
 ## Bundle layout
 
 The output is a deterministic `.tar.gz` with one top-level directory named:

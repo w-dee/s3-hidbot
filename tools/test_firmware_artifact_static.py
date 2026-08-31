@@ -11,7 +11,36 @@ VERIFIER = ROOT / "tools/verify_firmware_artifact.py"
 LIBRARY = ROOT / "tools/firmware_artifact.py"
 CANONICAL_LIBRARY = ROOT / "host/src/hidbot/artifact.py"
 FOCUSED = ROOT / "tools/test-firmware-artifact.sh"
+SDKCONFIG_DEFAULTS = ROOT / "firmware/sdkconfig.defaults"
 DEFAULTS = ROOT / "firmware/sdkconfig.artifact.defaults"
+
+
+_ASSIGNMENT = re.compile(r"(CONFIG_[A-Z0-9_]+)=(.+)")
+_DISABLED = re.compile(r"# (CONFIG_[A-Z0-9_]+) is not set")
+
+
+def _parse_sdkconfig_defaults(path: Path) -> dict[str, str | None]:
+    values: dict[str, str | None] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        disabled = _DISABLED.fullmatch(line)
+        assignment = _ASSIGNMENT.fullmatch(line)
+        if disabled is None and assignment is None:
+            assert line.startswith("#")
+            continue
+        name, value = (disabled.group(1), None) if disabled is not None else assignment.groups()
+        assert name not in values, f"duplicate sdkconfig default: {name}"
+        values[name] = value
+    return values
+
+
+def _effective_artifact_defaults() -> dict[str, str | None]:
+    # The artifact builder deliberately combines these in this order.
+    values = _parse_sdkconfig_defaults(SDKCONFIG_DEFAULTS)
+    values.update(_parse_sdkconfig_defaults(DEFAULTS))
+    return values
 
 
 def main() -> int:
@@ -21,8 +50,19 @@ def main() -> int:
     library = CANONICAL_LIBRARY.read_text(encoding="utf-8")
     focused = FOCUSED.read_text(encoding="utf-8")
     defaults = DEFAULTS.read_text(encoding="utf-8")
+    effective_defaults = _effective_artifact_defaults()
 
     assert "CONFIG_APP_REPRODUCIBLE_BUILD=y" in defaults
+    flash_size_choices = sorted(
+        name
+        for name, value in effective_defaults.items()
+        if name.startswith("CONFIG_ESPTOOLPY_FLASHSIZE_") and value == "y"
+    )
+    assert flash_size_choices == ["CONFIG_ESPTOOLPY_FLASHSIZE_4MB"]
+    assert effective_defaults.get("CONFIG_SPIRAM") is None
+    assert not any(
+        value == "y" for name, value in effective_defaults.items() if name.startswith("CONFIG_SPIRAM_")
+    )
     assert "TemporaryDirectory" in builder
     assert "SDKCONFIG_DEFAULTS" in builder
     assert "S3_HIDBOT_SOURCE_REVISION" in builder
