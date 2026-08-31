@@ -7,10 +7,8 @@ temporary_directory=$(mktemp -d)
 trap 'rm -rf "$temporary_directory"' EXIT
 
 find_repository_artifact() {
-    find "$repository_root/host" \
-        \( -type d \( -name build -o -name dist -o -name '*.egg-info' \) \
-        -o -type f -name '*.egg-info' \) \
-        -print -quit
+    git -C "$repository_root" ls-files --cached --others --exclude-standard -- host \
+        | awk '/(^|\/)(build|dist|[^/]+\.egg-info)(\/|$)/ { print; exit }'
 }
 
 if repository_artifact=$(find_repository_artifact) && [[ -n "$repository_artifact" ]]; then
@@ -23,11 +21,16 @@ tools_python="$temporary_directory/tools-venv/bin/python"
 "$tools_python" -m pip install --disable-pip-version-check --no-input build twine
 
 for build_number in 1 2; do
-    mkdir -p "$temporary_directory/stage-$build_number"
-    cp -R "$repository_root/host" "$temporary_directory/stage-$build_number/host"
+    stage_host="$temporary_directory/stage-$build_number/host"
+    mkdir -p "$stage_host/src"
+    cp "$repository_root/host/LICENSE" "$repository_root/host/MANIFEST.in" \
+        "$repository_root/host/README.md" "$repository_root/host/pyproject.toml" \
+        "$stage_host/"
+    cp -R "$repository_root/host/src/hidbot" "$stage_host/src/hidbot"
+    cp -R "$repository_root/host/tests" "$stage_host/tests"
     "$tools_python" -m build \
         --outdir "$temporary_directory/dist-$build_number" \
-        "$temporary_directory/stage-$build_number/host"
+        "$stage_host"
 done
 
 wheel_one=$(find "$temporary_directory/dist-1" -maxdepth 1 -type f -name '*.whl' -print -quit)
@@ -236,6 +239,17 @@ PY
     if [[ "$status" -ne 2 ]]; then
         cat "$temporary_directory/cli-verify-firmware.log" >&2
         echo "unexpected CLI smoke status for verify-firmware: $status" >&2
+        exit 1
+    fi
+    set +e
+    env -u PYTHONPATH -u S3_HIDBOT_SERIAL -u S3_HIDBOT_BAUD \
+        "$venv_cli" verify-artifact "$temporary_directory/missing-artifact" \
+        >"$temporary_directory/cli-verify-artifact.log" 2>&1
+    status=$?
+    set -e
+    if [[ "$status" -ne 2 ]] || ! grep -q '^artifact error:' "$temporary_directory/cli-verify-artifact.log"; then
+        cat "$temporary_directory/cli-verify-artifact.log" >&2
+        echo "verify-artifact installed-wheel smoke did not reach artifact validation" >&2
         exit 1
     fi
     for primitive in keyboard-report mouse-report; do

@@ -149,6 +149,28 @@ class CliTests(unittest.TestCase):
         )
         return code, output.getvalue(), errors.getvalue(), calls
 
+    def run_artifact_only(
+        self, argv: list[str], env: dict[str, str] | None = None
+    ) -> tuple[int, str, str, list[tuple[object, ...]]]:
+        """Run an artifact-only command with a transport factory that must not run."""
+
+        calls: list[tuple[object, ...]] = []
+
+        def factory(*args: object, **kwargs: object) -> object:
+            calls.append(("factory", args, kwargs))
+            raise AssertionError("artifact-only command constructed a transport")
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        code = main(
+            argv,
+            environ={} if env is None else env,
+            transport_factory=factory,
+            output=output,
+            error_output=errors,
+        )
+        return code, output.getvalue(), errors.getvalue(), calls
+
     def run_parser_error(
         self, argv: list[str], env: dict[str, str] | None = None
     ) -> tuple[int, str, list[tuple[object, ...]]]:
@@ -590,6 +612,86 @@ class CliTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "factory" for call in calls))
         self.assertFalse(any(call[0] == "construct" for call in calls))
         self.assertFalse(any(call[0] == "open" for call in calls))
+
+    def test_verify_artifact_valid_archive_and_directory_are_serial_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive, elf_sha256 = self.build_verified_artifact_archive(root)
+            directory = next(root.glob("s3-hidbot-firmware-*"))
+            archive_code, archive_output, archive_errors, archive_calls = self.run_artifact_only(
+                ["--json", "verify-artifact", str(archive)]
+            )
+            directory_code, directory_output, directory_errors, directory_calls = self.run_artifact_only(
+                ["--json", "verify-artifact", str(directory)]
+            )
+
+        self.assertEqual(archive_code, 0)
+        self.assertEqual(directory_code, 0)
+        self.assertEqual(archive_errors, "")
+        self.assertEqual(directory_errors, "")
+        self.assertEqual(archive_calls, [])
+        self.assertEqual(directory_calls, [])
+        self.assertEqual(archive_output.count("\n"), 1)
+        self.assertEqual(directory_output.count("\n"), 1)
+        archive_value = json.loads(archive_output)
+        directory_value = json.loads(directory_output)
+        self.assertEqual(archive_value, directory_value)
+        self.assertEqual(
+            archive_value,
+            {
+                "ok": True,
+                "classification": "VALID",
+                "artifact": {
+                    "project": "s3-hidbot",
+                    "target": "esp32s3",
+                    "protocol_version": 1,
+                    "version": "0.1.0-dev",
+                    "source_revision": "a" * 40,
+                    "app_elf_sha256": elf_sha256,
+                    "build_profile": "freenove-fnk0085",
+                    "idf_version": "v5.5.4",
+                },
+            },
+        )
+
+    def test_verify_artifact_human_output_and_port_are_serial_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive, _ = self.build_verified_artifact_archive(Path(temporary))
+            code, output, errors, calls = self.run_artifact_only(
+                ["--port", "definitely-invalid", "verify-artifact", str(archive)]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(calls, [])
+        self.assertTrue(output.startswith("firmware artifact: VALID\nartifact:\n"))
+        self.assertIn('"project": "s3-hidbot"', output)
+
+    def test_verify_artifact_missing_malformed_and_invalid_fail_before_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = root / "missing-artifact"
+            malformed = root / "malformed.tar.gz"
+            malformed.write_bytes(b"not a firmware artifact")
+            _, _ = self.build_verified_artifact_archive(root)
+            invalid_directory = next(root.glob("s3-hidbot-firmware-*"))
+            (invalid_directory / "manifest.json").write_text("{}\n", encoding="utf-8")
+            cases = {
+                "missing": str(missing),
+                "malformed": str(malformed),
+                "invalid": str(invalid_directory),
+            }
+            results = {
+                name: self.run_artifact_only(["verify-artifact", artifact])
+                for name, artifact in cases.items()
+            }
+
+        for name, (code, output, errors, calls) in results.items():
+            with self.subTest(name=name):
+                self.assertEqual(code, 2)
+                self.assertEqual(output, "")
+                self.assertIn("artifact error:", errors)
+                self.assertEqual(calls, [])
 
     def test_verify_firmware_real_archive_matches_fake_device_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

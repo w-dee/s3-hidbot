@@ -486,10 +486,11 @@ failures become `TransportError`; request deadline expiry remains
 The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`,
 `usb-status`, and the safe `self-test` control-plane diagnostic through the
 diagnostic client methods, the safety recovery command `release-all` through
-`Client.release_all()`, verified artifact-to-runtime identity comparison via
-`verify-firmware ARTIFACT`, and the explicit unsafe primitive
+`Client.release_all()`, artifact-only validation via `verify-artifact ARTIFACT`,
+verified artifact-to-runtime identity comparison via `verify-firmware ARTIFACT`, and the explicit unsafe primitive
 commands `keyboard-report` and `mouse-report` through the existing Client
-methods. All commands use `Client.connect()` first. `--port` overrides
+methods. Device commands use `Client.connect()` first; `verify-artifact` is
+artifact-only and returns before resolving serial configuration. `--port` overrides
 `S3_HIDBOT_SERIAL`; there is no tracked default port. `--baud` overrides
 `S3_HIDBOT_BAUD`, then the current tested host default of 115200 is used.
 `--timeout`, `--attempts`, `--json`, and `--verbose` are available before or
@@ -500,6 +501,16 @@ stderr. Exit codes are 0 success, 2 configuration/input, 3 transport, 4
 protocol/compatibility/session, 5 remote command, 6 timeout, and 7 for a
 completed `verify-firmware` comparison that is a mismatch or has unavailable
 identity.
+
+`hidbotctl verify-artifact ARTIFACT` validates either an archive or extracted
+bundle directory with the canonical artifact verifier, then renders the
+verified runtime-comparable artifact identity. It is non-destructive and
+serial-independent: it does not resolve a port, construct a transport, open a
+device, send a protocol command, or access HID. Valid input exits 0; missing,
+malformed, or unverifiable input exits 2. `--json` emits one compact object
+with `ok:true`, `classification:"VALID"`, and `artifact`; `VALID` describes
+internal artifact validation only, not a signature, authentication, secure
+boot, or attestation.
 
 `hidbotctl verify-firmware ARTIFACT` verifies an archive file or extracted
 bundle directory before it constructs or opens a serial transport. It then

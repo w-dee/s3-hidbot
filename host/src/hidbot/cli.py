@@ -145,10 +145,14 @@ def _parser() -> argparse.ArgumentParser:
             "verify-firmware",
             "compare a verified firmware artifact with the connected device identity",
         ),
+        (
+            "verify-artifact",
+            "verify a firmware artifact locally without connecting to a device",
+        ),
     ):
         command = commands.add_parser(name, help=help_text, description=help_text)
         _add_global_options(command, suppress_defaults=True)
-        if name == "verify-firmware":
+        if name in {"verify-artifact", "verify-firmware"}:
             command.add_argument(
                 "artifact",
                 metavar="ARTIFACT",
@@ -291,6 +295,16 @@ def _firmware_verification_value(result: FirmwareVerificationResult) -> dict[str
     }
 
 
+def _artifact_validation_value(result: ArtifactFirmwareIdentity) -> dict[str, object]:
+    """Render the stable artifact-only result without device or serial state."""
+
+    return {
+        "ok": True,
+        "classification": "VALID",
+        "artifact": _artifact_identity_value(result),
+    }
+
+
 def _validate_hid_arguments(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
@@ -308,6 +322,16 @@ def _validate_hid_arguments(
 
 
 def _print_result(command: str, result: object, *, as_json: bool, output: TextIO) -> None:
+    if command == "verify-artifact":
+        assert isinstance(result, ArtifactFirmwareIdentity)
+        value = _artifact_validation_value(result)
+        if as_json:
+            print(json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True), file=output)
+            return
+        print("firmware artifact: VALID", file=output)
+        print("artifact:", file=output)
+        print(json.dumps(value["artifact"], ensure_ascii=True, indent=2, sort_keys=True), file=output)
+        return
     if command == "verify-firmware":
         assert isinstance(result, FirmwareVerificationResult)
         value = _firmware_verification_value(result)
@@ -369,9 +393,13 @@ def main(
         _validate_hid_arguments(args, parser)
         artifact_identity = (
             _verified_artifact_identity(args.artifact)
-            if args.command == "verify-firmware"
+            if args.command in {"verify-artifact", "verify-firmware"}
             else None
         )
+        if args.command == "verify-artifact":
+            assert artifact_identity is not None
+            _print_result(args.command, artifact_identity, as_json=args.json, output=output)
+            return 0
         port = resolve_port(args.port, environ)
         baud = resolve_baud(args.baud, environ)
         timeout = _positive_float(args.timeout, "timeout")

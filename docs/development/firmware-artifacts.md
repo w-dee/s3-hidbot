@@ -171,6 +171,27 @@ The local artifact contract remains valid when `build.container_image` is
 `null`; only the dedicated CI workflow supplies immutable container
 provenance.
 
+## Artifact-only installed CLI verification
+
+`hidbotctl verify-artifact ARTIFACT` is the installed host-wheel interface for
+validating either a bundle archive or an extracted bundle directory before a
+device is provisioned. It reuses the canonical `hidbot.artifact` verifier and
+the verified-manifest identity conversion, so it performs no serial, USB, HID,
+BLE, ESP-IDF, or source-checkout operation. A valid artifact exits 0 and
+returns its runtime-comparable identity; missing, malformed, or unverifiable
+input exits 2. `--json` emits one compact result object:
+
+```text
+hidbotctl --json verify-artifact firmware.tar.gz
+```
+
+`VALID` means that the artifact schema, payload/checksum integrity, declared
+provenance relationships, flash-plan structure, and privacy/path contract are
+internally valid. It does not mean the artifact is signed, publisher
+authenticated, device authenticated, secure-boot trusted, or attested. This is
+the first direct installed-wheel-to-firmware-archive bridge; it does not by
+itself complete the broader U6.4 clean-room workflow.
+
 ## Runtime identity comparison
 
 `hidbotctl verify-firmware ARTIFACT` is the canonical host-side comparison

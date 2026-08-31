@@ -65,6 +65,25 @@ evidence remains deferred. Review the
 before using an unsafe primitive. The package is distributed under the
 [MIT License](LICENSE).
 
+## Artifact-only firmware verification
+
+`hidbotctl verify-artifact ARTIFACT` validates an ordinary artifact archive or
+an extracted artifact directory locally, without a serial port, connected
+fixture, repository checkout, ESP-IDF, or any hardware operation. This makes
+it suitable before provisioning a device when this package has been installed
+from its wheel:
+
+```bash
+hidbotctl verify-artifact ./s3-hidbot-firmware.tar.gz
+hidbotctl --json verify-artifact ./extracted-firmware-bundle
+```
+
+A valid artifact exits 0 and prints its compact runtime-comparable identity;
+missing, malformed, or unverifiable input exits 2. `VALID` means the artifact
+schema, checksums, payloads, flash plan, provenance relationships, and privacy
+rules are internally valid. It is not a signature, publisher authentication,
+device authentication, secure-boot result, or attestation.
+
 ## Firmware artifact identity comparison
 
 `hidbotctl verify-firmware ARTIFACT` first verifies an ordinary artifact archive
