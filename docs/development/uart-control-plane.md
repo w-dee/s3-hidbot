@@ -456,10 +456,12 @@ as unknown/session-lost.
 
 After `connect()`/hello, the host client exposes `ping()`, `info()`,
 `usb_status()`, the safety-only `Client.release_all()` API, and the explicit
-`Client.keyboard_report()` and `Client.mouse_report()` primitive APIs. No HID
-CLI or arbitrary raw command API exists; the hello result exposes read-only
-`lease_ms` metadata. Closing the client only closes the injected transport and
-invalidates local session state; it sends no UART command.
+`Client.keyboard_report()` and `Client.mouse_report()` primitive APIs. The CLI
+also exposes explicit `keyboard-report` and `mouse-report` commands, each with
+command-local `--unsafe-hid`; no arbitrary raw command API exists. The hello
+result exposes read-only `lease_ms` metadata. Closing the client only closes
+the injected transport and invalidates local session state; it sends no UART
+command.
 
 The current Freenove FNK0085 materials identify CH343 as the USB-UART bridge.
 Hardware characterization observed safe idle as DTR=true and RTS=true

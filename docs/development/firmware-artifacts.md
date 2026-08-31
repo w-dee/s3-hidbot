@@ -1,8 +1,10 @@
 # Firmware artifacts
 
 This document defines the U6.3A local firmware artifact contract. It is a
-development contract, not a release announcement: no public GitHub Release or
-published artifact exists yet.
+development contract, not a release announcement: no public GitHub Release,
+PyPI publication, or durable release artifact exists yet. The CI workflow does
+upload temporary Actions artifacts as documented below; they are development
+evidence rather than a stable public distribution channel.
 
 ## Builder inputs and isolation
 

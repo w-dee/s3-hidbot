@@ -1,160 +1,109 @@
 # s3-hidbot
 
-## What is s3-hidbot?
+`s3-hidbot` is an ESP32-S3 fixture that exposes two intentionally separate
+interfaces:
 
-`s3-hidbot` is an ESP32-S3 diagnostic HID bridge. It exposes a native USB
-Composite HID device (Boot Keyboard + Boot Mouse) and a separate bounded JSON
-control plane over the board's USB-UART console.
+- a bounded JSON UART control plane for diagnostics and provisioning; and
+- a native USB Composite HID device (Boot Keyboard + Boot Mouse).
 
-This is a low-level bring-up and control foundation. It does not provide a
-typing, clicking, dragging, or arbitrary HID automation layer.
+It is a low-level diagnostic fixture, not a typing, clicking, dragging, or
+macro-automation product.
 
-## Supported development hardware
+## Supported fixture
 
-The validated development fixture is the Freenove ESP32-S3 WROOM Board /
-FNK0085. The evidence below is scope-specific to that fixture and is not a
-claim that every ESP32-S3 board has the same wiring or power behavior.
+The validated fixture is the **Freenove ESP32-S3 WROOM Board / FNK0085**.
+Evidence applies to that board and the documented scope only; it is not a
+claim about arbitrary ESP32-S3 boards.
 
-## USB port roles
+With the board viewed from the front and the ESP32-S3 module at the top:
 
-Keep the two USB paths separate:
+- the **left USB-C**, below **EN/RST**, is the CH343 USB-UART connector for
+  programming and UART control;
+- the **right USB-C**, below **BOOT** and beside GPIO19/GPIO20, is the native
+  USB-OTG connector for HID.
+
+The official [board photograph](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board/blob/main/Board.jpg)
+and [pinout](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board/blob/main/ESP32S3_Pinout.png)
+are the physical-reference evidence. Provisioning and identity verification
+need only the left CH343 connector; native USB is not required.
+
+Keep the paths separate:
 
 ```text
-Host PC
+Host / controller
   |
-  +-- USB-UART -----------------> S3 console / control plane / flash / monitor
+  +-- left USB-C, CH343 ------> flash + UART control
   |
-  +-- native USB-OTG ------------> HID device path toward the DUT USB host
+  +-- right USB-C, USB-OTG --> native HID toward the DUT host
 ```
 
-The USB-UART path is used for diagnostics and control. The native USB-OTG
-path is the TinyUSB HID device path. Do not infer that one path is attached
-from the state of the other. Board-specific VBUS, backfeed, and detach-sense
-behavior is documented only where confirmed in
-[`hardware-validation.md`](docs/development/hardware-validation.md).
+VBUS sourcing, backfeed behavior, general dual-cable power safety, immediate
+detach sensing, and board-specific VBUS monitoring are **UNKNOWN**. Avoid
+dual-cable operation unless its topology has been deliberately validated.
 
-## Quick start
+## Safety boundary
 
-### Firmware
+`keyboard-report` and `mouse-report` can create real keyboard or mouse input.
+They require command-local `--unsafe-hid` and explicit human authorization.
+`release-all` is the explicit all-up recovery command. A report result of
+`submitted` means firmware accepted bytes; it does not prove that a host OS
+consumed the event.
 
-The firmware uses ESP-IDF v5.5.4 and keeps `firmware/` as the ESP-IDF project
-root. Activate the supported ESP-IDF environment in local shell
-configuration, then run:
+`flash-firmware` is destructive provisioning. It programs only a verified,
+supported plan and returns success only after an exact runtime identity match.
 
-```bash
-cd firmware
-idf.py build
-```
+## Current distribution status
 
-For physical flashing and monitoring, set the machine-local USB-UART device
-in your shell and follow the safety gate in
-[`hardware-validation.md`](docs/development/hardware-validation.md):
+This project is not published on PyPI and has no GitHub Release or public
+stable tag/release yet. Current development firmware and host wheels are
+temporary GitHub Actions artifacts retained for 14 days. U6.6 is expected to
+establish the durable release path.
 
-```bash
-cd firmware
-export S3_HIDBOT_SERIAL=/dev/serial/by-id/<s3-hidbot-uart>
-idf.py -p "$S3_HIDBOT_SERIAL" flash monitor
-```
+## Clean-room path
 
-Do not copy an actual serial identifier or ESP-IDF installation path into the
-repository.
+For a development fixture, start with the operator documentation:
 
-### Host package
+1. Select an exact source revision and successful Actions run.
+2. Download matching `firmware-artifact` and `host-package` artifacts.
+3. Verify their provided checksums and install the host wheel with `[flash]`.
+4. Connect only the CH343 USB-UART connector, verify the artifact, then run
+   `flash-firmware`.
+5. Require exit 0 and `FLASHED_AND_VERIFIED` / `MATCH` before treating the
+   fixture as provisioned.
 
-From the repository root (not `firmware/`), install the host package, which
-uses `pyserial`:
+The complete, Linux-first procedure is in
+[`docs/operator/quick-start.md`](docs/operator/quick-start.md).
 
-```bash
-python3 -m pip install ./host
-export S3_HIDBOT_SERIAL=/dev/serial/by-id/<s3-hidbot-uart>
-hidbotctl hello
-hidbotctl usb-status
-hidbotctl release-all
-hidbotctl self-test
-```
+## Documentation
 
-The first safe interactions are `hello` and `usb-status`; `release-all` is the
-explicit safety recovery operation. `self-test` runs the safe control-plane
-diagnostic sequence and is not proof that a keyboard or mouse event reached a
-host. Primitive keyboard and mouse report
-commands are also available, but require the command-local `--unsafe-hid`
-opt-in. They send one report through the existing Python API path; this is not
-a typing, clicking, dragging, or macro layer.
+External operators and agents should start at
+[`docs/operator/README.md`](docs/operator/README.md):
 
-## Python HID primitive API
+- [quick start](docs/operator/quick-start.md)
+- [CLI reference](docs/operator/cli-reference.md)
+- [safety and recovery](docs/operator/safety-and-recovery.md)
+- [automation contract](docs/operator/automation.md)
 
-The public host surface includes `Client`, `PySerialTransport`,
-`Client.connect()`, `ping()`, `info()`, `usb_status()`, `release_all()`,
-`keyboard_report()`, and `mouse_report()`. These are explicit primitives,
-not high-level keyboard or pointer automation helpers. The same keyboard and
-mouse primitives are available from `hidbotctl keyboard-report` and
-`hidbotctl mouse-report` only with explicit `--unsafe-hid`; nonzero mouse
-buttons can remain held, so use `hidbotctl release-all` for recovery. Signatures,
-validation, response states, and retry behavior are authoritative in
-[`uart-control-plane.md`](docs/development/uart-control-plane.md) and the
-actual host source.
+Contributors should use the development documentation instead:
 
-## Safety model
+- [development runbook](docs/development/codex-runbook.md)
+- [validation entrypoints](docs/development/validation-entrypoints.md)
+- [hardware evidence and limits](docs/development/hardware-validation.md)
+- [UART and HID protocol contract](docs/development/uart-control-plane.md)
+- [firmware artifact contract](docs/development/firmware-artifacts.md)
 
-- A successful `hello` creates a session with a 5000 ms lease.
-- Lease expiry and published USB lifecycle changes revoke authority and
-  require automatic all-up safety handling.
-- `release_all` is the public safety recovery operation.
-- `submitted` means that TinyUSB accepted report bytes; it does not mean the
-  host consumed them or produced an evdev event.
-- Suspend, unmount, attach-generation changes, and authority-epoch changes
-  prevent stale unsafe work from being replayed.
+## Validation status
 
-The cache, epoch, ticket, and lifecycle details are specified only in
-[`uart-control-plane.md`](docs/development/uart-control-plane.md).
+- `IMPLEMENTED`: UART control, Composite HID, safety lease/lifecycle handling,
+  artifact verification, identity comparison, and bounded provisioning.
+- `NATIVE VALIDATED`: host, protocol, safety state machine, CLI and firmware
+  build coverage.
+- `HARDWARE VALIDATED`: FNK0085 UART control, composite enumeration,
+  `release-all`, F24 keyboard sentinel, and one small relative mouse movement
+  on Linux.
+- `HARDWARE DEFERRED`: mouse buttons, wheel/pan, physical failure races,
+  long-duration soak, and board electrical conclusions.
 
-## Current status
-
-`IMPLEMENTED` means present in the repository. `NATIVE VALIDATED` means
-covered by host/native validation. `HARDWARE VALIDATED` means observed in the
-documented development fixture and test scope. `HARDWARE DEFERRED` means no
-such claim is made yet.
-
-- `IMPLEMENTED`: Composite Keyboard + Mouse HID, UART control plane, session
-  lease, authority/lifecycle safety, `hid.release_all` and its
-  `hidbotctl release-all` safety command, `hidbotctl self-test` diagnostic,
-  keyboard and mouse primitive APIs.
-- `NATIVE VALIDATED`: framing, strict protocol parsing, session/cache/lease
-  behavior, HID safety state machine, host client, CLI, self-test orchestration,
-  and firmware build.
-- `HARDWARE VALIDATED`: composite HID enumeration, UART control reliability,
-  `release_all`, the F24 keyboard sentinel path, and a small relative `REL_X`
-  mouse movement path.
-- `HARDWARE DEFERRED`: mouse buttons, wheel/pan, physical report-failure or
-  HID-not-ready races, long-duration soak, and board-specific VBUS/backfeed
-  conclusions.
-
-The detailed evidence matrix and sentinel policy are in
-[`hardware-validation.md`](docs/development/hardware-validation.md).
-
-## Validation
-
-Use the canonical commands and prerequisites in
-[`validation-entrypoints.md`](docs/development/validation-entrypoints.md).
-CI covers privacy/static checks, host tests, native tests, the IDF-dependent
-protocol test, and an ESP-IDF firmware build. CI does not replace real USB,
-HID, or physical lifecycle validation.
-
-## Documentation map
-
-- [`AGENTS.md`](AGENTS.md): stable repository and AI-agent invariants.
-- [`codex-runbook.md`](docs/development/codex-runbook.md): contributor
-  procedure and review gates.
-- [`validation-entrypoints.md`](docs/development/validation-entrypoints.md):
-  canonical local and CI validation.
-- [`hardware-validation.md`](docs/development/hardware-validation.md):
-  physical operation, safety, and evidence/deferred scope.
-- [`uart-control-plane.md`](docs/development/uart-control-plane.md): normative
-  protocol, runtime, host, and safety contract.
-
-## Limitations
-
-There is no raw JSON command mode, type/click/drag helper, macro, VBUS monitor
-implementation, or hardware runner in this foundation. Review the hardware
-gate before connecting both USB paths or sending an unsafe HID primitive. Use
-`hidbotctl release-all` for explicit safety recovery.
+The package is intended to be portable, but CI and accepted physical fixture
+validation are currently Linux-only. Platform-specific macOS and Windows
+operator instructions are not yet validated.
