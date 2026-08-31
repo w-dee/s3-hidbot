@@ -11,12 +11,23 @@ from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import patch
 
-from hidbot.artifact import create_deterministic_tar_gz, sha256_file, write_deterministic_json
+from hidbot.artifact import ArtifactError, create_deterministic_tar_gz, sha256_file, write_deterministic_json
 from hidbot.cli import main
 from hidbot.errors import FlashExecutionError, TransportError
 from hidbot.flashing import FlashExecutionResult
-from hidbot.firmware_verification import ArtifactFirmwareIdentity
+from hidbot.firmware_verification import (
+    ArtifactFirmwareIdentity,
+    FirmwareVerificationClassification,
+    FirmwareIdentityMismatch,
+    FirmwareVerificationResult,
+    IdentityUnavailableReason,
+)
 from hidbot.framing import FRAME_PREFIX, TRANSPORT_SYNC
+from hidbot.provisioning_workflow import (
+    ProvisioningWorkflowResult,
+    VerificationPhaseClassification,
+    VerificationPhaseResult,
+)
 from hidbot.protocol import FirmwareIdentity, SystemInfo
 
 
@@ -226,6 +237,7 @@ class CliTests(unittest.TestCase):
         *,
         env: dict[str, str] | None = None,
         executor: Callable[..., FlashExecutionResult] | None = None,
+        workflow_runner: Callable[..., ProvisioningWorkflowResult] | None = None,
     ) -> tuple[int, str, str, list[tuple[object, ...]]]:
         calls: list[tuple[object, ...]] = []
         identity = ArtifactFirmwareIdentity(
@@ -249,6 +261,41 @@ class CliTests(unittest.TestCase):
                 calls.append(("flash", bundle_value, port, kwargs))
                 return FlashExecutionResult(attempts=1, chip="esp32s3", image_count=3)
 
+        if workflow_runner is None:
+            def workflow_runner(bundle_value: object, port: str, **kwargs: object) -> ProvisioningWorkflowResult:
+                calls.append(("workflow", bundle_value, port, kwargs))
+                flash = kwargs["flash_executor"](bundle_value, port, json_mode=kwargs["json_mode"], on_retry=kwargs["on_retry"])
+                assert isinstance(flash, FlashExecutionResult)
+                device = SystemInfo(
+                    project="s3-hidbot",
+                    target="esp32s3",
+                    idf_version="v5.5.4",
+                    protocol_version=1,
+                    firmware=FirmwareIdentity(
+                        version="0.1.0-dev",
+                        source_revision="a" * 40,
+                        app_elf_sha256="b" * 64,
+                        build_profile="freenove-fnk0085",
+                    ),
+                )
+                comparison = FirmwareVerificationResult(
+                    match=True,
+                    classification=FirmwareVerificationClassification.MATCH,
+                    mismatches=(),
+                    unavailable_reason=None,
+                    artifact=identity,
+                    device=device,
+                )
+                return ProvisioningWorkflowResult(
+                    flash=flash,
+                    verification=VerificationPhaseResult(
+                        classification=VerificationPhaseClassification.MATCH,
+                        reconnect_attempts=1,
+                        boot_id=TOKEN,
+                        firmware_verification=comparison,
+                    ),
+                )
+
         output = io.StringIO()
         errors = io.StringIO()
         with patch("hidbot.cli.stage_and_verify_firmware_bundle", return_value=contextlib.nullcontext(bundle)):
@@ -257,10 +304,57 @@ class CliTests(unittest.TestCase):
                 environ={} if env is None else env,
                 transport_factory=transport_factory,
                 flash_executor=executor,
+                provisioning_workflow_runner=workflow_runner,
                 output=output,
                 error_output=errors,
             )
         return code, output.getvalue(), errors.getvalue(), calls
+
+    @staticmethod
+    def flash_workflow_result(
+        identity: ArtifactFirmwareIdentity,
+        classification: VerificationPhaseClassification,
+    ) -> ProvisioningWorkflowResult:
+        device = SystemInfo(
+            project="s3-hidbot",
+            target="esp32c6" if classification is VerificationPhaseClassification.MISMATCH else "esp32s3",
+            idf_version="v5.5.4",
+            protocol_version=1,
+            firmware=FirmwareIdentity(
+                version="0.1.0-dev",
+                source_revision="a" * 40,
+                app_elf_sha256="b" * 64,
+                build_profile="freenove-fnk0085",
+            ),
+        )
+        comparison: FirmwareVerificationResult | None = None
+        if classification is VerificationPhaseClassification.MISMATCH:
+            comparison = FirmwareVerificationResult(
+                match=False,
+                classification=FirmwareVerificationClassification.MISMATCH,
+                mismatches=(FirmwareIdentityMismatch.TARGET_MISMATCH,),
+                unavailable_reason=None,
+                artifact=identity,
+                device=device,
+            )
+        elif classification is VerificationPhaseClassification.IDENTITY_UNAVAILABLE:
+            comparison = FirmwareVerificationResult(
+                match=False,
+                classification=FirmwareVerificationClassification.IDENTITY_UNAVAILABLE,
+                mismatches=(),
+                unavailable_reason=IdentityUnavailableReason.SOURCE_REVISION_UNAVAILABLE,
+                artifact=identity,
+                device=device,
+            )
+        return ProvisioningWorkflowResult(
+            flash=FlashExecutionResult(attempts=1, chip="esp32s3", image_count=3),
+            verification=VerificationPhaseResult(
+                classification=classification,
+                reconnect_attempts=2,
+                boot_id=TOKEN if comparison is not None else None,
+                firmware_verification=comparison,
+            ),
+        )
 
     @staticmethod
     def wire_commands(calls: list[tuple[object, ...]]) -> list[str]:
@@ -464,14 +558,12 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(errors, "")
-        self.assertEqual(
-            output,
-            '{"artifact":{"app_elf_sha256":"%s","build_profile":"freenove-fnk0085",'
-            '"idf_version":"v5.5.4","project":"s3-hidbot","protocol_version":1,'
-            '"source_revision":"%s","target":"esp32s3","version":"0.1.0-dev"},'
-            '"classification":"FLASHED","flash":{"attempts":1,"chip":"esp32s3",'
-            '"image_count":3},"ok":true}\n' % ("b" * 64, "a" * 40),
-        )
+        value = json.loads(output)
+        self.assertTrue(value["ok"])
+        self.assertEqual(value["classification"], "FLASHED_AND_VERIFIED")
+        self.assertEqual(value["flash"]["classification"], "FLASHED")
+        self.assertEqual(value["verification"]["classification"], "MATCH")
+        self.assertEqual(value["verification"]["boot_id"], TOKEN)
         self.assertEqual(sum(call[0] == "transport" for call in calls), 0)
         flash_call = next(call for call in calls if call[0] == "flash")
         self.assertEqual(flash_call[2], "env-port")
@@ -484,6 +576,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("firmware flash: FLASHED", output)
+        self.assertIn("post-flash verification: MATCH", output)
         self.assertIn("chip: esp32s3", output)
         self.assertEqual(errors, "")
         self.assertEqual(sum(call[0] == "transport" for call in calls), 0)
@@ -526,6 +619,122 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertIn("bounded esptool diagnostic", errors)
         self.assertEqual(sum(call[0] == "transport" for call in calls), 0)
+
+    def test_flash_post_verification_failures_retain_flashed_phase_and_exit_mapping(self) -> None:
+        cases = (
+            (VerificationPhaseClassification.MISMATCH, 7),
+            (VerificationPhaseClassification.IDENTITY_UNAVAILABLE, 7),
+            (VerificationPhaseClassification.TRANSPORT_UNAVAILABLE, 3),
+            (VerificationPhaseClassification.TIMEOUT, 6),
+            (VerificationPhaseClassification.PROTOCOL_ERROR, 4),
+            (VerificationPhaseClassification.COMPATIBILITY_ERROR, 4),
+            (VerificationPhaseClassification.REMOTE_ERROR, 5),
+        )
+        for classification, expected_exit in cases:
+            with self.subTest(classification=classification):
+                def workflow_runner(bundle: object, port: str, **kwargs: object) -> ProvisioningWorkflowResult:
+                    flash = kwargs["flash_executor"](
+                        bundle,
+                        port,
+                        json_mode=kwargs["json_mode"],
+                        on_retry=kwargs["on_retry"],
+                    )
+                    result = self.flash_workflow_result(bundle.artifact_identity, classification)
+                    return ProvisioningWorkflowResult(flash=flash, verification=result.verification)
+
+                code, output, errors, calls = self.run_flash_cli(
+                    ["--json", "--port", "flash-port", "flash-firmware", "bundle-dir"],
+                    workflow_runner=workflow_runner,
+                )
+                self.assertEqual(code, expected_exit)
+                self.assertEqual(errors, "")
+                value = json.loads(output)
+                self.assertFalse(value["ok"])
+                self.assertEqual(value["classification"], "FLASHED_VERIFICATION_FAILED")
+                self.assertEqual(value["flash"]["classification"], "FLASHED")
+                self.assertEqual(value["verification"]["classification"], classification.value)
+                self.assertEqual(sum(call[0] == "flash" for call in calls), 1)
+                self.assertEqual(sum(call[0] == "transport" for call in calls), 0)
+
+    def test_flash_remote_error_human_output_retains_successful_programming(self) -> None:
+        def workflow_runner(bundle: object, port: str, **kwargs: object) -> ProvisioningWorkflowResult:
+            flash = kwargs["flash_executor"](
+                bundle,
+                port,
+                json_mode=kwargs["json_mode"],
+                on_retry=kwargs["on_retry"],
+            )
+            result = self.flash_workflow_result(
+                bundle.artifact_identity,
+                VerificationPhaseClassification.REMOTE_ERROR,
+            )
+            return ProvisioningWorkflowResult(flash=flash, verification=result.verification)
+
+        code, output, errors, calls = self.run_flash_cli(
+            ["--port", "flash-port", "flash-firmware", "bundle-dir"],
+            workflow_runner=workflow_runner,
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(errors, "")
+        self.assertIn("firmware flash: FLASHED", output)
+        self.assertIn("post-flash verification: REMOTE_ERROR", output)
+        self.assertEqual(sum(call[0] == "flash" for call in calls), 1)
+        self.assertEqual(sum(call[0] == "transport" for call in calls), 0)
+
+    def test_flash_mismatch_human_output_retains_successful_programming(self) -> None:
+        def workflow_runner(bundle: object, port: str, **kwargs: object) -> ProvisioningWorkflowResult:
+            flash = kwargs["flash_executor"](
+                bundle,
+                port,
+                json_mode=kwargs["json_mode"],
+                on_retry=kwargs["on_retry"],
+            )
+            result = self.flash_workflow_result(
+                bundle.artifact_identity,
+                VerificationPhaseClassification.MISMATCH,
+            )
+            return ProvisioningWorkflowResult(flash=flash, verification=result.verification)
+
+        code, output, errors, _ = self.run_flash_cli(
+            ["--port", "flash-port", "flash-firmware", "bundle-dir"],
+            workflow_runner=workflow_runner,
+        )
+        self.assertEqual(code, 7)
+        self.assertEqual(errors, "")
+        self.assertIn("firmware flash: FLASHED", output)
+        self.assertIn("post-flash verification: MISMATCH", output)
+        self.assertIn("mismatch: TARGET_MISMATCH", output)
+
+    def test_flash_artifact_failure_happens_before_programming_or_transport(self) -> None:
+        calls: list[object] = []
+
+        def executor(*args: object, **kwargs: object) -> FlashExecutionResult:
+            del args, kwargs
+            calls.append("flash")
+            raise AssertionError("artifact failure must prevent flashing")
+
+        def transport_factory(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            calls.append("transport")
+            raise AssertionError("artifact failure must prevent serial access")
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with patch(
+            "hidbot.cli.stage_and_verify_firmware_bundle",
+            side_effect=ArtifactError("invalid artifact"),
+        ):
+            code = main(
+                ["--port", "flash-port", "flash-firmware", "bundle-dir"],
+                transport_factory=transport_factory,
+                flash_executor=executor,
+                output=output,
+                error_output=errors,
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("artifact error: invalid artifact", errors.getvalue())
+        self.assertEqual(calls, [])
 
     @staticmethod
     def verified_manifest() -> dict[str, object]:

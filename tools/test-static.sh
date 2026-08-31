@@ -16,6 +16,7 @@ python_bin=${PYTHON_BIN:-python3}
 "$python_bin" "$repository_root/tools/test_firmware_artifact_ci_static.py"
 "$python_bin" "$repository_root/tools/test_host_artifact.py"
 "$python_bin" "$repository_root/tools/test_nonhardware_ci_static.py"
+"$python_bin" "$repository_root/tools/test_post_flash_provisioning_static.py"
 "$repository_root/tools/test-hardware-hid.sh"
 
 echo "PASS: static validation suite"

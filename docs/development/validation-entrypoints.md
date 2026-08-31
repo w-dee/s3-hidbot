@@ -143,11 +143,13 @@ of duplicating their test logic.
   matching wheel bytes alongside the download; it is not a signature or an
   independent authentication mechanism. Public release and distribution are
   reserved for U6.6.
-- U6.4B2b adds a checkout-free Python 3.11/3.12 flash-extra consumer to the
-  same workflow. Each job verifies the producer wheel checksum before
-  installing `s3-hidbot-host[flash]`, proves the installed package origin, and
-  runs only `python -m esptool version` plus `hidbotctl flash-firmware --help`.
-  The consumer never invokes a repository helper or enables `--hardware`.
+- U6.4B2b/B2c adds a checkout-free Python 3.11/3.12 flash-extra consumer to
+  the same workflow. Each job verifies the producer wheel checksum before
+  installing `s3-hidbot-host[flash]`, proves the installed package origin, runs
+  `python -m esptool version` and `hidbotctl flash-firmware --help`, then uses
+  injected fake programming, UART, and Client objects to prove the installed
+  post-flash orchestration reaches an identity `MATCH`. The consumer never
+  invokes a repository helper or enables `--hardware`.
 - Tier C (`nonhardware.yml`, firmware job): the IDF-dependent protocol test
   and ESP-IDF v5.5.4 firmware build in the official
   `espressif/idf:v5.5.4` container.

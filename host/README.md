@@ -116,9 +116,9 @@ firmware authenticity.
 ## Safe firmware flashing
 
 `hidbotctl flash-firmware ARTIFACT` is the explicit programming command for a
-verified `.tar.gz` bundle or extracted bundle directory. It is intentionally
-separate from the normal control-plane commands and constructs no UART
-transport, protocol session, or HID request:
+verified `.tar.gz` bundle or extracted bundle directory. It first programs the
+supported plan and then performs bounded post-reset runtime identity
+verification over the control UART:
 
 ```bash
 hidbotctl --port "$S3_HIDBOT_SERIAL" flash-firmware ./s3-hidbot-firmware.tar.gz
@@ -138,13 +138,30 @@ a private staged snapshot. It removes inherited `ESPTOOL_*` settings, uses a
 private empty esptool configuration and working directory, and retries an
 unchanged nonzero or timed-out operation at most three times with a fixed
 five-minute timeout. It never erases, changes baud, falls back to another
-plan, rebuilds, reconnects, or automatically runs `verify-firmware`.
+plan, or rebuilds.
 
 Base package installation remains esptool-free; a missing or unsupported
 optional dependency exits 2 with installation guidance before any subprocess
 or serial access. Programming failure after the bounded attempts exits 8.
 JSON mode emits one compact success object and keeps esptool diagnostics out of
-stdout; normal mode passes diagnostics through. A successful flash proves only
-that esptool completed the selected programming operation. It is not runtime
-identity verification; run `hidbotctl verify-firmware ARTIFACT` separately
-when identity comparison is required.
+stdout; normal mode passes diagnostics through.
+
+After esptool succeeds, programming is permanently complete for that command
+invocation: readiness retries never reflash. The host uses the fixed 115200
+control UART policy, with a controlled 20-second readiness deadline, at most
+four fresh connections, and a bounded raw receive drain (0.5 seconds or 8192
+bytes) followed by a 0.1-second quiet boundary. The discarded bytes are not
+framed or interpreted. Only then does a fresh Client perform its normal framing
+reset, device parser sync, nonce/session-correlated `protocol.hello`, and
+`system.info`; the existing artifact-to-runtime comparator must return `MATCH`.
+No HID request, USB status query, or native USB connection is required.
+
+Therefore `flash-firmware` exits 0 only for **FLASHED_AND_VERIFIED**: esptool
+succeeded, the firmware became reachable, and runtime identity matched the
+verified artifact. A successful programming phase can still produce a
+phase-aware post-flash verification failure: mismatch or unavailable identity
+exits 7, transport unavailability exits 3, and bounded startup/request timeout
+exits 6. Protocol, compatibility, and session-semantic failures exit 4; a
+correlated remote error response exits 5. The standalone `verify-firmware`
+command remains available for a separate later comparison, but it is not an
+automatic fallback or reflash authority for this command.

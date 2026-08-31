@@ -25,6 +25,11 @@ from .errors import (
     TransportError,
 )
 from .flashing import FlashExecutionResult, execute_flash
+from .provisioning_workflow import (
+    ProvisioningWorkflowResult,
+    VerificationPhaseClassification,
+    run_post_flash_provisioning,
+)
 from .serial_transport import PySerialTransport
 from .provisioning import stage_and_verify_firmware_bundle
 from .protocol import (
@@ -332,18 +337,76 @@ def _artifact_validation_value(result: ArtifactFirmwareIdentity) -> dict[str, ob
 
 
 def _flash_value(
-    identity: ArtifactFirmwareIdentity, result: FlashExecutionResult
+    identity: ArtifactFirmwareIdentity, result: ProvisioningWorkflowResult
 ) -> dict[str, object]:
+    verification = result.verification
+    comparison = verification.firmware_verification
     return {
-        "ok": True,
-        "classification": "FLASHED",
+        "ok": result.ok,
+        "classification": result.classification.value,
         "artifact": _artifact_identity_value(identity),
         "flash": {
-            "chip": result.chip,
-            "image_count": result.image_count,
-            "attempts": result.attempts,
+            "classification": result.flash_classification.value,
+            "chip": result.flash.chip,
+            "image_count": result.flash.image_count,
+            "attempts": result.flash.attempts,
+        },
+        "verification": {
+            "classification": verification.classification.value,
+            "match": verification.match,
+            "boot_id": verification.boot_id,
+            "reconnect_attempts": verification.reconnect_attempts,
+            "device": None if comparison is None else _device_identity_value(comparison),
+            "mismatches": (
+                [] if comparison is None else [mismatch.value for mismatch in comparison.mismatches]
+            ),
+            "unavailable_reason": (
+                None
+                if comparison is None or comparison.unavailable_reason is None
+                else comparison.unavailable_reason.value
+            ),
         },
     }
+
+
+def _flash_exit_code(result: ProvisioningWorkflowResult) -> int:
+    classification = result.verification.classification
+    if classification is VerificationPhaseClassification.MATCH:
+        return 0
+    if classification in {
+        VerificationPhaseClassification.MISMATCH,
+        VerificationPhaseClassification.IDENTITY_UNAVAILABLE,
+    }:
+        return 7
+    if classification is VerificationPhaseClassification.TRANSPORT_UNAVAILABLE:
+        return 3
+    if classification is VerificationPhaseClassification.REMOTE_ERROR:
+        return 5
+    if classification is VerificationPhaseClassification.TIMEOUT:
+        return 6
+    return 4
+
+
+def _print_flash_result(value: dict[str, object], *, as_json: bool, output: TextIO) -> None:
+    if as_json:
+        print(json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True), file=output)
+        return
+    flash = value["flash"]
+    verification = value["verification"]
+    assert isinstance(flash, dict)
+    assert isinstance(verification, dict)
+    print("firmware flash: FLASHED", file=output)
+    print(f"chip: {flash['chip']}", file=output)
+    print(f"images: {flash['image_count']}", file=output)
+    print(f"flash attempts: {flash['attempts']}", file=output)
+    print(f"post-flash verification: {verification['classification']}", file=output)
+    print(f"reconnect attempts: {verification['reconnect_attempts']}", file=output)
+    if verification["boot_id"] is not None:
+        print(f"boot_id: {verification['boot_id']}", file=output)
+    for mismatch in verification["mismatches"]:
+        print(f"mismatch: {mismatch}", file=output)
+    if verification["unavailable_reason"] is not None:
+        print(f"unavailable_reason: {verification['unavailable_reason']}", file=output)
 
 
 def _validate_hid_arguments(
@@ -446,6 +509,7 @@ def main(
     environ: Mapping[str, str] | None = None,
     transport_factory: Callable[..., PySerialTransport] = PySerialTransport,
     flash_executor: Callable[..., FlashExecutionResult] = execute_flash,
+    provisioning_workflow_runner: Callable[..., ProvisioningWorkflowResult] = run_post_flash_provisioning,
     output: TextIO | None = None,
     error_output: TextIO | None = None,
 ) -> int:
@@ -468,25 +532,17 @@ def main(
         if args.command == "flash-firmware":
             port = resolve_port(args.port, environ)
             with stage_and_verify_firmware_bundle(args.artifact) as bundle:
-                result = flash_executor(
+                result = provisioning_workflow_runner(
                     bundle,
                     port,
+                    flash_executor=flash_executor,
+                    transport_factory=transport_factory,
                     json_mode=args.json,
                     on_retry=lambda message: print(message, file=error_output),
                 )
                 value = _flash_value(bundle.artifact_identity, result)
-                if args.json:
-                    print(
-                        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
-                        file=output,
-                    )
-                else:
-                    print("firmware flash: FLASHED", file=output)
-                    print(json.dumps(value["artifact"], ensure_ascii=True, indent=2, sort_keys=True), file=output)
-                    print(f"chip: {result.chip}", file=output)
-                    print(f"images: {result.image_count}", file=output)
-                    print(f"attempts: {result.attempts}", file=output)
-            return 0
+                _print_flash_result(value, as_json=args.json, output=output)
+            return _flash_exit_code(result)
         port = resolve_port(args.port, environ)
         baud = resolve_baud(args.baud, environ)
         timeout = _positive_float(args.timeout, "timeout")

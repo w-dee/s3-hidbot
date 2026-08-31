@@ -68,6 +68,13 @@ def main() -> int:
     required(flash_consumer, r'pip\s+install[^\n]*\$\{wheel\}\[flash\]', "flash extra install")
     required(flash_consumer, r"consumer_python.*-m\s+esptool\s+version", "esptool version smoke")
     required(flash_consumer, r"flash-firmware\s+--help", "flash CLI help smoke")
+    required(
+        flash_consumer,
+        r"run_post_flash_provisioning",
+        "checkout-free post-flash provisioning orchestration smoke",
+    )
+    required(flash_consumer, r"FlashExecutionResult", "injected programming success")
+    required(flash_consumer, r"firmware\.identity-v1", "identity capability smoke")
     if "actions/checkout@" in flash_consumer:
         raise AssertionError("flash artifact consumer must not checkout repository source")
     if "tools/" in flash_consumer:

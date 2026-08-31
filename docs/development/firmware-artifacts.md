@@ -211,7 +211,7 @@ created and refreshed. Identity equality is provenance evidence, not device
 authentication, cryptographic attestation, UART peer authentication, secure
 boot, or signed firmware authenticity.
 
-## U6.4B2b safe esptool execution
+## U6.4B2b/B2c safe flash and post-flash verification
 
 `hidbotctl flash-firmware ARTIFACT` is the explicit destructive programming
 entrypoint for a verified archive or extracted bundle. It accepts only the
@@ -231,13 +231,37 @@ directory, and absolute private staged image paths. Every inherited
 configuration containing only an empty `[esptool]` section. The explicit port
 still takes precedence over `S3_HIDBOT_SERIAL`; `S3_HIDBOT_BAUD` is ignored.
 
-Nonzero and timeout results retry the identical operation at most three total
-times, with a fixed 300-second timeout per attempt. There is no erase, baud
-change, parameter fallback, rebuild, reconnect, or automatic verification.
-Normal mode passes esptool diagnostics through and prints a concise summary;
-JSON mode keeps tool output off stdout and emits one compact success object.
-Missing/incompatible esptool is a usage failure (exit 2); exhausted programming
-attempts are reported as exit 8 with a bounded diagnostic tail. A successful
-flash is programming evidence only, not runtime identity verification. U6.4B2c
-explicitly runs `hidbotctl verify-firmware ARTIFACT` as the separate identity
-check and is not part of this slice.
+Nonzero and timeout results retry the identical programming operation at most
+three total times, with a fixed 300-second timeout per attempt. There is no
+erase, baud change, parameter fallback, or rebuild. Once programming succeeds,
+it is permanently complete for that invocation: later runtime/readiness
+failures can never re-enter esptool.
+
+U6.4B2c then runs a fixed, bounded post-reset readiness procedure over the
+control UART at 115200. It permits at most four fresh connections within a
+controlled 20-second application-level deadline. Each open connection discards
+at most 8192 raw bytes for up to 0.5 seconds and requires 0.1 seconds of RX
+quiet before it creates a fresh Client. This is lexical post-reset alignment,
+not a newline, framing, or response-validation mechanism: drained boot text,
+NUL bytes, partial prefixes, and stale queued frames are neither logged as
+protocol output nor fed to the Framer. The deadline covers waits controlled by
+the application; it does not claim an independent OS tty-open timeout.
+
+After the quiet boundary, normal Client responsibilities remain unchanged:
+Framer reset, `TRANSPORT_SYNC` for the device parser, a fresh hello request ID,
+fresh nonce, and fresh session correlation. The post-flash path sends only
+`protocol.hello` and `system.info`, validates the latter, and reuses the
+existing `compare_firmware_identity()` authority. Exact `MATCH` is required for
+exit 0. It does not require native USB/HID, query `usb.status`, or send any HID
+command.
+
+Normal mode reports programming and verification phases separately; JSON mode
+emits one phase-aware object. A successful flash followed by `MISMATCH` or
+`IDENTITY_UNAVAILABLE` exits 7, `TRANSPORT_UNAVAILABLE` exits 3, and a bounded
+readiness/request `TIMEOUT` exits 6. Definite protocol, compatibility, or
+session-semantic failures exit 4; a correlated remote error response exits 5.
+Missing/incompatible esptool remains a usage failure (exit 2), while exhausted
+programming attempts remain exit 8 with a bounded diagnostic tail. The
+standalone `verify-firmware` command is unchanged and remains useful for an
+explicit later comparison; it is not an automatic fallback or reflash authority
+for `flash-firmware`.

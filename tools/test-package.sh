@@ -111,6 +111,7 @@ package_files = {
     "hidbot/framing.py",
     "hidbot/protocol.py",
     "hidbot/provisioning.py",
+    "hidbot/provisioning_workflow.py",
     "hidbot/serial_transport.py",
 }
 assert package_files.issubset(wheel), "wheel is missing a host package module"
@@ -164,6 +165,7 @@ expected_tests = {
     "tests/test_framing.py",
     "tests/test_protocol.py",
     "tests/test_provisioning.py",
+    "tests/test_provisioning_workflow.py",
     "tests/test_serial_transport.py",
 }
 assert expected_tests.issubset(sdist), "sdist is missing a complete test suite"
@@ -319,6 +321,111 @@ value = version("esptool")
 parts = tuple(int(part) for part in value.split(".")[:2])
 assert parts >= (4, 12) and parts < (5, 0), value
 print(f"PASS: installed flash extra esptool {value}")
+PY
+    env -u PYTHONPATH "$venv_python" - <<'PY'
+from __future__ import annotations
+
+from collections import deque
+from types import SimpleNamespace
+
+from hidbot.client import HelloResult
+from hidbot.firmware_verification import ArtifactFirmwareIdentity
+from hidbot.flashing import FlashExecutionResult
+from hidbot.provisioning_workflow import run_post_flash_provisioning
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def sleep(self, duration: float) -> None:
+        self.value += duration
+
+
+class Transport:
+    def __init__(self) -> None:
+        self.chunks = deque((b"\x00boot-noise",))
+        self.closed = False
+
+    def open(self) -> None:
+        pass
+
+    def read(self, max_bytes: int, timeout: float) -> bytes:
+        del max_bytes, timeout
+        return self.chunks.popleft() if self.chunks else b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class Client:
+    def __init__(self, transport: Transport) -> None:
+        self.transport = transport
+
+    def connect(self) -> HelloResult:
+        return HelloResult(
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+            ("firmware.identity-v1",),
+            5000,
+        )
+
+    def info(self) -> object:
+        return {
+            "project": "s3-hidbot",
+            "target": "esp32s3",
+            "idf_version": "v5.5.4",
+            "protocol_version": 1,
+            "firmware": {
+                "version": "0.1.0-dev",
+                "source_revision": "a" * 40,
+                "app_elf_sha256": "b" * 64,
+                "build_profile": "freenove-fnk0085",
+            },
+        }
+
+    def close(self) -> None:
+        self.transport.close()
+
+
+identity = ArtifactFirmwareIdentity(
+    project="s3-hidbot",
+    target="esp32s3",
+    protocol_version=1,
+    version="0.1.0-dev",
+    source_revision="a" * 40,
+    app_elf_sha256="b" * 64,
+    build_profile="freenove-fnk0085",
+    idf_version="v5.5.4",
+)
+clock = Clock()
+transport = Transport()
+flash_calls: list[object] = []
+
+
+def flash(bundle: object, port: str, **kwargs: object) -> FlashExecutionResult:
+    del bundle, port, kwargs
+    flash_calls.append("flash")
+    return FlashExecutionResult(attempts=1, chip="esp32s3", image_count=3)
+
+
+result = run_post_flash_provisioning(
+    SimpleNamespace(artifact_identity=identity),
+    "no-device",
+    flash_executor=flash,
+    transport_factory=lambda *args, **kwargs: transport,
+    client_factory=lambda opened, timeout, attempts: Client(opened),
+    clock=clock,
+    sleeper=clock.sleep,
+)
+assert result.ok
+assert len(flash_calls) == 1
+assert transport.closed
+print("PASS: installed flash-extra post-flash provisioning smoke")
 PY
 }
 

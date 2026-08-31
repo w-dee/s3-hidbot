@@ -157,6 +157,114 @@ jobs:
           env -u PYTHONPATH "$consumer_python" -c 'from importlib.metadata import version; from pathlib import Path; import hidbot; assert version("s3-hidbot-host") == "0.1.0"; assert "site-packages" in Path(hidbot.__file__).parts'
           env -u PYTHONPATH "$consumer_python" -m esptool version
           env -u PYTHONPATH "$consumer_cli" flash-firmware --help >/dev/null
+          env -u PYTHONPATH "$consumer_python" - <<'PY'
+          from __future__ import annotations
+
+          from types import SimpleNamespace
+
+          from hidbot.client import HelloResult
+          from hidbot.firmware_verification import ArtifactFirmwareIdentity
+          from hidbot.flashing import FlashExecutionResult
+          from hidbot.provisioning_workflow import run_post_flash_provisioning
+
+
+          class Clock:
+              def __init__(self) -> None:
+                  self.value = 0.0
+
+              def __call__(self) -> float:
+                  return self.value
+
+              def sleep(self, duration: float) -> None:
+                  self.value += duration
+
+
+          class Transport:
+              def __init__(self) -> None:
+                  self.opened = False
+                  self.closed = False
+                  self.noisy = True
+
+              def open(self) -> None:
+                  self.opened = True
+
+              def read(self, max_bytes: int, timeout: float) -> bytes:
+                  del max_bytes, timeout
+                  if self.opened and self.noisy:
+                      self.noisy = False
+                      return b"\x00boot-noise"
+                  return b""
+
+              def close(self) -> None:
+                  self.closed = True
+
+
+          class Client:
+              def __init__(self, transport: Transport) -> None:
+                  self.transport = transport
+                  self.closed = False
+
+              def connect(self) -> HelloResult:
+                  return HelloResult(
+                      "0123456789abcdef0123456789abcdef",
+                      "0123456789abcdef0123456789abcdef",
+                      "fedcba9876543210fedcba9876543210",
+                      ("firmware.identity-v1",),
+                      5000,
+                  )
+
+              def info(self) -> object:
+                  return {
+                      "project": "s3-hidbot",
+                      "target": "esp32s3",
+                      "idf_version": "v5.5.4",
+                      "protocol_version": 1,
+                      "firmware": {
+                          "version": "0.1.0-dev",
+                          "source_revision": "a" * 40,
+                          "app_elf_sha256": "b" * 64,
+                          "build_profile": "freenove-fnk0085",
+                      },
+                  }
+
+              def close(self) -> None:
+                  self.closed = True
+                  self.transport.close()
+
+
+          identity = ArtifactFirmwareIdentity(
+              project="s3-hidbot",
+              target="esp32s3",
+              protocol_version=1,
+              version="0.1.0-dev",
+              source_revision="a" * 40,
+              app_elf_sha256="b" * 64,
+              build_profile="freenove-fnk0085",
+              idf_version="v5.5.4",
+          )
+          clock = Clock()
+          transport = Transport()
+          flash_calls: list[object] = []
+
+          def flash(bundle: object, port: str, **kwargs: object) -> FlashExecutionResult:
+              del bundle, port, kwargs
+              flash_calls.append("flash")
+              return FlashExecutionResult(attempts=1, chip="esp32s3", image_count=3)
+
+          result = run_post_flash_provisioning(
+              SimpleNamespace(artifact_identity=identity),
+              "no-device",
+              flash_executor=flash,
+              transport_factory=lambda *args, **kwargs: transport,
+              client_factory=lambda opened, timeout, attempts: Client(opened),
+              clock=clock,
+              sleeper=clock.sleep,
+          )
+          assert result.ok
+          assert len(flash_calls) == 1
+          assert transport.closed
+          print("PASS: installed post-flash provisioning orchestration smoke")
+          PY
           set +e
           env -u PYTHONPATH -u S3_HIDBOT_SERIAL -u S3_HIDBOT_BAUD \
             "$consumer_cli" --port no-device flash-firmware "$RUNNER_TEMP/missing-artifact" \
