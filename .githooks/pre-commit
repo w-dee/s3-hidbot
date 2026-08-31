@@ -1,3 +1,6 @@
 #!/bin/sh
 
+set -eu
+
+python3 tools/repository_hygiene.py --staged
 exec python3 tools/privacy_lint.py --staged

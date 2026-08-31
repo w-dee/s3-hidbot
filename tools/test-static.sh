@@ -4,6 +4,8 @@ set -euo pipefail
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 python_bin=${PYTHON_BIN:-python3}
 
+"$python_bin" "$repository_root/tools/test_repository_hygiene.py"
+"$python_bin" "$repository_root/tools/repository_hygiene.py" --tracked
 "$python_bin" "$repository_root/tools/test_control_protocol_static.py"
 "$python_bin" "$repository_root/tools/test_firmware_identity_static.py"
 "$python_bin" "$repository_root/tools/test_default_hid_safety.py"

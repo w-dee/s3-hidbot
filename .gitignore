@@ -1,12 +1,17 @@
+# Machine-local configuration
+/.envrc
+
+# Python-generated cache
 *.pyc
-.*
-!.github/
-!.github/workflows/
-!.github/workflows/*.yml
+__pycache__/
+
+# ESP-IDF generated/local state
 /firmware/build/
 /firmware/artifacts/
 /firmware/sdkconfig
 /firmware/managed_components/
+
+# Host packaging outputs
 /host/build/
 /host/dist/
 /host/src/*.egg-info/
