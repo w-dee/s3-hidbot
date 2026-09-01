@@ -4,12 +4,28 @@
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 OPERATOR = ROOT / "docs/operator"
 CLI_SOURCE = ROOT / "host/src/hidbot/cli.py"
+README = ROOT / "README.md"
+RELEASE_NOTES = ROOT / "docs/development/release-notes-v0.1.0.md"
+RELEASE_NOTES_RENDERER = ROOT / "tools/render_release_notes.py"
+IDENTIFIER_QUALIFICATION_MARKERS = (
+    "project-specific USB-IF VID/PID assignment",
+    "project-specific Bluetooth SIG Company Identifier",
+    "Bluetooth product qualification or listing",
+    "v0.1.0 does not implement BLE HID",
+    "development and interoperability testing",
+    "production or commercial identifier allocation",
+    "Anyone incorporating, redistributing, manufacturing, selling, or otherwise using",
+    "existing MIT License does not add a non-commercial-use restriction",
+)
 
 
 def _command_names() -> set[str]:
@@ -57,6 +73,34 @@ def _require(text: str, value: str, description: str) -> None:
         raise AssertionError(f"missing operator documentation: {description}")
 
 
+def _require_semantic_marker(text: str, value: str, description: str) -> None:
+    if " ".join(value.split()) not in " ".join(text.split()):
+        raise AssertionError(f"missing operator documentation: {description}")
+
+
+def _render_release_notes() -> str:
+    with tempfile.TemporaryDirectory() as temporary:
+        output = Path(temporary) / "release-notes.md"
+        subprocess.run(
+            [
+                sys.executable,
+                str(RELEASE_NOTES_RENDERER),
+                "--template",
+                str(RELEASE_NOTES),
+                "--output",
+                str(output),
+                "--tag",
+                "v0.1.0",
+                "--version",
+                "0.1.0",
+                "--source-revision",
+                "a" * 40,
+            ],
+            check=True,
+        )
+        return output.read_text(encoding="utf-8")
+
+
 def main() -> int:
     required_paths = {
         "README.md",
@@ -77,6 +121,8 @@ def main() -> int:
     quick_start = documents["quick-start.md"]
     safety = documents["safety-and-recovery.md"]
     automation = documents["automation.md"]
+    readme = README.read_text(encoding="utf-8")
+    release_notes = RELEASE_NOTES.read_text(encoding="utf-8")
 
     for command in _command_names():
         _require(cli, f"`{command}", f"public command {command!r} in CLI reference")
@@ -126,6 +172,21 @@ def main() -> int:
     _require(automation, "FLASHED_VERIFICATION_FAILED", "phase-aware flash failure")
     _require(automation, "Never automatically erase flash", "agent flash prohibition")
     _require(automation, "Never commit", "agent machine-local configuration prohibition")
+
+    _require(
+        documents["README.md"],
+        "safety-and-recovery.md#external-identifiers-qualification-and-distribution-responsibility",
+        "operator link to identifier and qualification statement",
+    )
+    for document_name, text in {
+        "repository README": readme,
+        "operator safety documentation": safety,
+        "release-note template": release_notes,
+        "rendered release notes": _render_release_notes(),
+    }.items():
+        for marker in IDENTIFIER_QUALIFICATION_MARKERS:
+            _require_semantic_marker(text, marker, f"{document_name} marker {marker!r}")
+
     print(f"PASS: operator documentation guard ({len(_command_names())} public commands)")
     return 0
 

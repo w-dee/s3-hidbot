@@ -20,6 +20,31 @@ fixture lease/session/lifecycle mechanisms invalidate unsafe authority and
 drive internal safety handling, but they do not prove immediate release of
 state a host OS may already believe is pressed.
 
+## External identifiers, qualification, and distribution responsibility
+
+s3-hidbot has not obtained a project-specific USB-IF VID/PID assignment or a
+project-specific Bluetooth SIG Company Identifier. It has not completed
+Bluetooth product qualification or listing for this project. v0.1.0 does not
+implement BLE HID.
+
+Any USB identifiers present in development firmware are solely for development
+and interoperability testing. They do not represent a project-owned USB-IF
+allocation or certification, a production or commercial identifier allocation,
+or identifiers suitable for a user's product or redistribution. If future
+Bluetooth functionality appears in the source, that alone does not represent
+Bluetooth SIG qualification or listing, trademark authorization, or assignment
+of a project-specific Company Identifier.
+
+The existing MIT License does not add a non-commercial-use restriction.
+Open-source copyright permission is separate from external identifier,
+qualification, listing, regulatory, trademark, membership, and other
+authorization obligations. Anyone incorporating, redistributing, manufacturing,
+selling, or otherwise using this software or firmware is responsible for
+determining and obtaining the authorizations required for their intended use.
+Requirements depend on intended use, product configuration, jurisdiction,
+distribution model, and applicable rules. Publishing this firmware does not
+provide those approvals. This statement is not legal advice.
+
 ## Destructive provisioning policy
 
 `flash-firmware ARTIFACT` is destructive provisioning. It accepts only the

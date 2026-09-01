@@ -8,6 +8,11 @@ published-release and development-artifact paths, checksum verification,
 host-wheel install, CH343 serial selection, verified provisioning, and the
 evidence to retain.
 
+Before incorporating, redistributing, manufacturing, or selling a fixture,
+read the [external identifiers, qualification, and distribution
+responsibility](safety-and-recovery.md#external-identifiers-qualification-and-distribution-responsibility)
+statement.
+
 Then use:
 
 - [CLI reference](cli-reference.md) for command syntax, environment variables,
