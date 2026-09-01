@@ -469,6 +469,18 @@ void StateMachine::set_before_submit_hook_for_test(TestHook hook) {
 void StateMachine::set_before_release_reconciliation_hook_for_test(TestHook hook) {
     before_release_reconciliation_hook_ = hook;
 }
+
+void StateMachine::publish_release_request_only_for_test() {
+    publish_release_request();
+}
+
+bool StateMachine::release_requested_for_test() const {
+    return release_requested_.load(std::memory_order_acquire);
+}
+
+std::uint32_t StateMachine::release_request_epoch_for_test() const {
+    return release_request_epoch_.load(std::memory_order_acquire);
+}
 #endif
 
 bool StateMachine::mounted_and_active(Interface interface) const {
@@ -524,6 +536,18 @@ bool StateMachine::any_safety_required() const {
            interfaces_[1].safety_required.load(std::memory_order_acquire);
 }
 
+bool StateMachine::active_release_request_is_current(UsbGeneration generation,
+                                                     AuthorityEpoch authority_epoch,
+                                                     std::uint32_t release_epoch) const {
+    return release_requested_.load(std::memory_order_acquire) &&
+           release_request_generation_.load(std::memory_order_acquire) == generation &&
+           release_request_authority_epoch_.load(std::memory_order_acquire) == authority_epoch &&
+           release_request_epoch_.load(std::memory_order_acquire) == release_epoch &&
+           attach_generation() == generation &&
+           this->authority_epoch() == authority_epoch &&
+           release_epoch_.load(std::memory_order_acquire) == release_epoch;
+}
+
 bool StateMachine::release_request_is_current(UsbGeneration generation,
                                               AuthorityEpoch authority_epoch,
                                               std::uint32_t release_epoch) const {
@@ -531,15 +555,31 @@ bool StateMachine::release_request_is_current(UsbGeneration generation,
            release_request_generation_.load(std::memory_order_acquire) == generation &&
            release_request_authority_epoch_.load(std::memory_order_acquire) == authority_epoch &&
            release_request_epoch_.load(std::memory_order_acquire) == release_epoch &&
+           attach_generation() == generation &&
+           this->authority_epoch() == authority_epoch &&
            release_epoch_.load(std::memory_order_acquire) == release_epoch;
+}
+
+bool StateMachine::unavailable_usb_transport_is_clean() const {
+    const StatusSnapshot runtime = status();
+    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
+    const bool unavailable =
+        lifecycle.observed == usb_lifecycle::ObservedState::kDriverNotInstalled ||
+        lifecycle.observed == usb_lifecycle::ObservedState::kDisconnected;
+    return unavailable && !runtime.mounted && !runtime.suspended &&
+           !lifecycle.recovery_required && !lifecycle.host_release_uncertain &&
+           known_all_up(Interface::kKeyboard) && known_all_up(Interface::kMouse);
 }
 
 void StateMachine::reconcile_zero_work_release(UsbGeneration generation,
                                                AuthorityEpoch authority_epoch,
-                                               std::uint32_t release_epoch) {
+                                               std::uint32_t release_epoch,
+                                               bool require_unavailable_transport) {
     if (!release_request_is_current(generation, authority_epoch, release_epoch) ||
         !known_all_up(Interface::kKeyboard) || !known_all_up(Interface::kMouse) ||
-        usb_lifecycle_.snapshot().host_release_uncertain) {
+        usb_lifecycle_.snapshot().host_release_uncertain ||
+        usb_lifecycle_.snapshot().recovery_required ||
+        (require_unavailable_transport && !unavailable_usb_transport_is_clean())) {
         return;
     }
 #ifdef HID_RUNTIME_NATIVE_TEST
@@ -547,15 +587,75 @@ void StateMachine::reconcile_zero_work_release(UsbGeneration generation,
         before_release_reconciliation_hook_(this);
     }
 #endif
-    if (!release_request_is_current(generation, authority_epoch, release_epoch)) {
+    if (!release_request_is_current(generation, authority_epoch, release_epoch) ||
+        !known_all_up(Interface::kKeyboard) || !known_all_up(Interface::kMouse) ||
+        usb_lifecycle_.snapshot().host_release_uncertain ||
+        usb_lifecycle_.snapshot().recovery_required ||
+        (require_unavailable_transport && !unavailable_usb_transport_is_clean())) {
         return;
     }
     (void)usb_lifecycle_.clear_release_pending_if_not_uncertain();
     // A newer producer may have published after the pre-clear identity check.
     // Reassert its barrier rather than letting an older zero-work pass erase it.
-    if (!release_request_is_current(generation, authority_epoch, release_epoch)) {
+    const usb_lifecycle::Snapshot after_clear = usb_lifecycle_.snapshot();
+    if (release_requested_.load(std::memory_order_acquire) ||
+        !known_all_up(Interface::kKeyboard) || !known_all_up(Interface::kMouse) ||
+        after_clear.host_release_uncertain || after_clear.recovery_required) {
         usb_lifecycle_.mark_release_pending();
     }
+}
+
+void StateMachine::reconcile_unavailable_zero_work_release() {
+    bool expected = false;
+    if (!unavailable_release_reconciler_active_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+
+    do {
+        while (release_requested_.load(std::memory_order_acquire) &&
+               unavailable_usb_transport_is_clean()) {
+            const UsbGeneration generation =
+                release_request_generation_.load(std::memory_order_acquire);
+            const AuthorityEpoch request_authority_epoch =
+                release_request_authority_epoch_.load(std::memory_order_acquire);
+            const std::uint32_t request_release_epoch =
+                release_request_epoch_.load(std::memory_order_acquire);
+            if (!active_release_request_is_current(
+                    generation, request_authority_epoch, request_release_epoch)) {
+                break;
+            }
+
+            release_requested_.store(false, std::memory_order_release);
+            if (!release_request_is_current(
+                    generation, request_authority_epoch, request_release_epoch)) {
+                const UsbGeneration current_generation = attach_generation();
+                const AuthorityEpoch current_authority_epoch = authority_epoch();
+                const std::uint32_t current_release_epoch =
+                    release_epoch_.load(std::memory_order_acquire);
+                if (release_request_generation_.load(std::memory_order_acquire) ==
+                        current_generation &&
+                    release_request_authority_epoch_.load(std::memory_order_acquire) ==
+                        current_authority_epoch &&
+                    release_request_epoch_.load(std::memory_order_acquire) ==
+                        current_release_epoch) {
+                    release_requested_.store(true, std::memory_order_release);
+                    usb_lifecycle_.mark_release_pending();
+                }
+                continue;
+            }
+            reconcile_zero_work_release(
+                generation, request_authority_epoch, request_release_epoch, true);
+        }
+
+        unavailable_release_reconciler_active_.store(false, std::memory_order_release);
+        if (!release_requested_.load(std::memory_order_acquire) ||
+            !unavailable_usb_transport_is_clean()) {
+            return;
+        }
+        expected = false;
+    } while (unavailable_release_reconciler_active_.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel, std::memory_order_acquire));
 }
 
 bool StateMachine::queue_report(Interface interface, ReportKind kind,
@@ -936,7 +1036,7 @@ bool StateMachine::queue_safety(Interface interface) {
     return true;
 }
 
-void StateMachine::request_release_all() {
+void StateMachine::publish_release_request() {
     // Producers only publish a request.  Logical state, mailbox contents, and
     // safety decisions are owned by the TinyUSB executor task.
     release_request_generation_.store(attach_generation(), std::memory_order_release);
@@ -946,8 +1046,15 @@ void StateMachine::request_release_all() {
     release_request_epoch_.store(request_epoch, std::memory_order_release);
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kSafetyPending);
     cancel_mouse_ticket(MouseReportTicketOutcome::kSafetyPending);
-    release_requested_.store(true, std::memory_order_release);
     usb_lifecycle_.mark_release_pending();
+    // The active flag is the publication commit. An acquire observation of
+    // true therefore sees both the complete identity and its safety barrier.
+    release_requested_.store(true, std::memory_order_release);
+}
+
+void StateMachine::request_release_all() {
+    publish_release_request();
+    reconcile_unavailable_zero_work_release();
 }
 
 LifecycleSafetyResult StateMachine::begin_lifecycle_detach_safety() {
@@ -1521,7 +1628,7 @@ void StateMachine::execute(SubmitFn submit, void *context) {
     }
     if (release_requested_for_current_attach) {
         reconcile_zero_work_release(current_generation, current_authority_epoch,
-                                    request_release_epoch);
+                                    request_release_epoch, false);
     }
 }
 

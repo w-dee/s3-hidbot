@@ -249,11 +249,13 @@ void test_zero_work_release_terminalizes_lifecycle_pending() {
     // This is the same producer-side primitive used by session takeover.
     state.request_release_all();
     assert(state.usb_lifecycle_snapshot().safety_pending);
+    assert(state.release_requested_for_test());
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 0);
     const auto reconciled = state.usb_lifecycle_snapshot();
     assert(!reconciled.safety_pending);
     assert(!reconciled.host_release_uncertain);
+    assert(!state.release_requested_for_test());
 
     // The public operation still reports the unchanged per-interface state.
     state.begin_release_all();
@@ -262,6 +264,120 @@ void test_zero_work_release_terminalizes_lifecycle_pending() {
     assert(release.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
     state.finalize_release_all();
     assert(!state.usb_lifecycle_snapshot().safety_pending);
+}
+
+void test_hidden_clean_release_terminalizes_without_executor() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+
+    const auto cold = state.usb_lifecycle_snapshot();
+    assert(cold.desired == usb_lifecycle::DesiredExposure::kHidden);
+    assert(cold.observed == usb_lifecycle::ObservedState::kDriverNotInstalled);
+    assert(cold.generation == 0);
+    assert(!cold.safety_pending && !cold.host_release_uncertain && !cold.recovery_required);
+
+    state.request_release_all();
+    const auto reconciled = state.usb_lifecycle_snapshot();
+    assert(reconciled.desired == usb_lifecycle::DesiredExposure::kHidden);
+    assert(reconciled.observed == usb_lifecycle::ObservedState::kDriverNotInstalled);
+    assert(reconciled.generation == 0);
+    assert(!reconciled.safety_pending && !reconciled.host_release_uncertain);
+    assert(!state.release_requested_for_test());
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+}
+
+void test_disconnected_clean_release_terminalizes_without_executor() {
+    hid_runtime::StateMachine state;
+    ImmediateLifecycleExecutor executor;
+    Sink sink;
+
+    assert(action(state.request_usb_attach(executor)) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    state.complete_usb_install_success();
+    const auto disconnected = state.usb_lifecycle_snapshot();
+    assert(disconnected.desired == usb_lifecycle::DesiredExposure::kExposed);
+    assert(disconnected.observed == usb_lifecycle::ObservedState::kDisconnected);
+    assert(!state.status().mounted);
+
+    state.request_release_all();
+    assert(!state.usb_lifecycle_snapshot().safety_pending);
+    assert(!state.release_requested_for_test());
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+}
+
+void publish_new_hidden_release_request(hid_runtime::StateMachine *state) {
+    state->set_before_release_reconciliation_hook_for_test(nullptr);
+    const std::uint32_t previous_epoch = state->release_request_epoch_for_test();
+    state->publish_release_request_only_for_test();
+    assert(state->release_requested_for_test());
+    assert(state->release_request_epoch_for_test() == previous_epoch + 1);
+    assert(state->usb_lifecycle_snapshot().safety_pending);
+}
+
+void test_new_hidden_request_survives_old_reconciliation() {
+    hid_runtime::StateMachine state;
+    state.set_before_release_reconciliation_hook_for_test(
+        publish_new_hidden_release_request);
+
+    state.request_release_all();
+    assert(state.release_request_epoch_for_test() == 2);
+    assert(!state.release_requested_for_test());
+    assert(!state.usb_lifecycle_snapshot().safety_pending);
+}
+
+void attach_and_publish_new_release(hid_runtime::StateMachine *state) {
+    state->set_before_release_reconciliation_hook_for_test(nullptr);
+    ImmediateLifecycleExecutor executor;
+    assert(action(state->request_usb_attach(executor)) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    state->publish_release_request_only_for_test();
+    assert(state->release_requested_for_test());
+    assert(state->usb_lifecycle_snapshot().safety_pending);
+}
+
+void test_attach_boundary_blocks_stale_hidden_reconciliation() {
+    hid_runtime::StateMachine state;
+    state.set_before_release_reconciliation_hook_for_test(attach_and_publish_new_release);
+
+    state.request_release_all();
+    const auto attaching = state.usb_lifecycle_snapshot();
+    assert(attaching.desired == usb_lifecycle::DesiredExposure::kExposed);
+    assert(attaching.observed == usb_lifecycle::ObservedState::kAttaching);
+    assert(attaching.generation == 1);
+    assert(state.authority_epoch() == 1);
+    assert(state.release_requested_for_test());
+    assert(attaching.safety_pending);
+
+    state.complete_usb_install_success();
+    state.on_mount();
+    assert(!state.release_requested_for_test());
+    assert(!state.usb_lifecycle_snapshot().safety_pending);
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(state.route_snapshot().route == hid_route::OutputRoute::kUsb);
+}
+
+void test_later_attach_after_clean_hidden_release_has_no_stale_work() {
+    hid_runtime::StateMachine state;
+    ImmediateLifecycleExecutor executor;
+    Sink sink;
+
+    state.request_release_all();
+    assert(!state.release_requested_for_test());
+    assert(!state.usb_lifecycle_snapshot().safety_pending);
+    assert(action(state.request_usb_attach(executor)) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    state.complete_usb_install_success();
+    state.on_mount();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    assert(!state.release_requested_for_test());
+    assert(!state.usb_lifecycle_snapshot().safety_pending);
+    assert(state.route_snapshot().route == hid_route::OutputRoute::kUsb);
 }
 
 void test_uncertainty_is_not_zero_work_terminalized() {
@@ -981,6 +1097,39 @@ void test_internal_detach_preserves_uncertainty_until_explicit_recovery() {
     assert(clean.queue_mouse_report(0, 1, 0, 0, 0));
 }
 
+void test_hidden_uncertainty_is_never_zero_work_terminalized() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    FakeLifecycleExecutor executor;
+    ready(state);
+    const std::array<std::uint8_t, 6> f24 = {115, 0, 0, 0, 0, 0};
+    assert(state.queue_keyboard_report(0, f24));
+    state.execute(Sink::submit, &sink);
+    assert(state.report_complete(0));
+    state.on_unmount();
+    assert(state.usb_lifecycle_snapshot().host_release_uncertain);
+
+    assert(action(state.request_usb_detach(executor)) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    const auto old_generation = state.attach_generation();
+    state.mark_lifecycle_detach_uncertain(old_generation);
+    assert(state.begin_usb_uninstall() == old_generation + 1);
+    state.on_driver_uninstalled();
+    state.complete_usb_uninstall_success();
+    const auto hidden_uncertain = state.usb_lifecycle_snapshot();
+    assert(hidden_uncertain.desired == usb_lifecycle::DesiredExposure::kHidden);
+    assert(hidden_uncertain.observed ==
+           usb_lifecycle::ObservedState::kDriverNotInstalled);
+    assert(hidden_uncertain.host_release_uncertain);
+
+    state.request_release_all();
+    const auto pending = state.usb_lifecycle_snapshot();
+    assert(pending.safety_pending);
+    assert(pending.host_release_uncertain);
+    assert(state.release_requested_for_test());
+    assert(sink.calls == 1);
+}
+
 void test_detach_invalidates_route_only_after_old_route_safety() {
     hid_runtime::StateMachine state;
     Sink sink;
@@ -1019,6 +1168,11 @@ int main() {
     test_success_failure_and_release();
     test_partial_release_and_no_delayed_unsafe_replay();
     test_zero_work_release_terminalizes_lifecycle_pending();
+    test_hidden_clean_release_terminalizes_without_executor();
+    test_disconnected_clean_release_terminalizes_without_executor();
+    test_new_hidden_request_survives_old_reconciliation();
+    test_attach_boundary_blocks_stale_hidden_reconciliation();
+    test_later_attach_after_clean_hidden_release_has_no_stale_work();
     test_uncertainty_is_not_zero_work_terminalized();
     test_held_keyboard_release_requires_safety_completion();
     test_new_release_request_survives_zero_work_reconciliation_race();
@@ -1041,6 +1195,7 @@ int main() {
     test_late_tokenized_callbacks_cannot_affect_new_generation();
     test_relative_and_safety_work_do_not_cross_usb_generation();
     test_internal_detach_preserves_uncertainty_until_explicit_recovery();
+    test_hidden_uncertainty_is_never_zero_work_terminalized();
     test_detach_invalidates_route_only_after_old_route_safety();
     return 0;
 }

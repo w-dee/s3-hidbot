@@ -10,6 +10,7 @@
 #include "control_framing/control_framing.hpp"
 #include "control_protocol/control_protocol.hpp"
 #include "firmware_identity/firmware_identity.hpp"
+#include "hid_runtime/hid_runtime.hpp"
 
 namespace {
 
@@ -268,28 +269,69 @@ struct LeaseFixture {
     int expired_callbacks = 0;
     int takeover_callbacks = 0;
     int hid_failure_callbacks = 0;
+    hid_runtime::StateMachine runtime;
     control_protocol::Protocol protocol;
 
+    static control_protocol::UsbStatus usb_status(void *context) {
+        const auto status = static_cast<LeaseFixture *>(context)->runtime.status();
+        return control_protocol::UsbStatus{
+            status.mounted,
+            status.suspended,
+            status.keyboard_ready,
+            status.mouse_ready,
+        };
+    }
+
+    static control_protocol::UsbExposureStatus exposure_status(void *context) {
+        auto *fixture = static_cast<LeaseFixture *>(context);
+        const auto lifecycle = fixture->runtime.usb_lifecycle_snapshot();
+        const auto status = fixture->runtime.status();
+        return control_protocol::UsbExposureStatus{
+            .desired = static_cast<control_protocol::UsbExposureDesired>(lifecycle.desired),
+            .observed = static_cast<control_protocol::UsbExposureObserved>(lifecycle.observed),
+            .generation = lifecycle.generation,
+            .mounted = status.mounted,
+            .suspended = status.suspended,
+            .keyboard_ready = status.keyboard_ready,
+            .mouse_ready = status.mouse_ready,
+            .safety_pending = lifecycle.safety_pending,
+            .host_release_uncertain = lifecycle.host_release_uncertain,
+            .recovery_required = lifecycle.recovery_required,
+            .last_error = {
+                .present = lifecycle.last_error.present,
+                .operation = static_cast<control_protocol::UsbExposureOperation>(
+                    lifecycle.last_error.operation),
+                .code = lifecycle.last_error.code,
+            },
+        };
+    }
+
     static void expired(void *context) {
-        ++static_cast<LeaseFixture *>(context)->expired_callbacks;
+        auto *fixture = static_cast<LeaseFixture *>(context);
+        ++fixture->expired_callbacks;
+        fixture->runtime.request_release_all();
     }
 
     static void takeover(void *context) {
-        ++static_cast<LeaseFixture *>(context)->takeover_callbacks;
+        auto *fixture = static_cast<LeaseFixture *>(context);
+        ++fixture->takeover_callbacks;
+        fixture->runtime.request_release_all();
     }
 
     static void hid_failure(void *context) {
-        ++static_cast<LeaseFixture *>(context)->hid_failure_callbacks;
+        auto *fixture = static_cast<LeaseFixture *>(context);
+        ++fixture->hid_failure_callbacks;
+        fixture->runtime.request_release_all();
     }
 
     LeaseFixture() {
         exposure.authority = &authority;
         const control_protocol::Config config{
             .metadata = {"s3-hidbot", "esp32s3", "v5.5.4"},
-            .usb_status_provider = StatusSource::get,
-            .usb_status_context = nullptr,
-            .usb_exposure_status_provider = ExposureSource::get,
-            .usb_exposure_status_context = &exposure,
+            .usb_status_provider = LeaseFixture::usb_status,
+            .usb_status_context = this,
+            .usb_exposure_status_provider = LeaseFixture::exposure_status,
+            .usb_exposure_status_context = this,
             .usb_attach_provider = ExposureSource::attach,
             .usb_attach_context = &exposure,
             .usb_detach_provider = ExposureSource::detach,
@@ -967,6 +1009,10 @@ void test_usb_exposure_transition_response_is_frozen_before_provider_progress() 
 void test_lease_refresh_expiry_and_takeover() {
     LeaseFixture fixture;
     fixture.payload(hello_request(1, kNonceA));
+    assert(fixture.expired_callbacks == 0);
+    assert(fixture.takeover_callbacks == 0);
+    assert(!fixture.runtime.release_requested_for_test());
+    assert(!fixture.runtime.usb_lifecycle_snapshot().safety_pending);
     const std::string first = fixture.sink.last();
     const std::string first_session = extract_string(first, "session");
     require_contains(first, "\"lease_ms\":5000");
@@ -984,6 +1030,9 @@ void test_lease_refresh_expiry_and_takeover() {
     fixture.clock.value += 1;
     fixture.protocol.service();
     assert(fixture.expired_callbacks == 1);
+    assert(!fixture.runtime.release_requested_for_test());
+    assert(!fixture.runtime.usb_lifecycle_snapshot().safety_pending);
+    assert(!fixture.runtime.usb_lifecycle_snapshot().host_release_uncertain);
     fixture.payload(request(3, first_session, "system.ping"));
     require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
 
@@ -993,10 +1042,55 @@ void test_lease_refresh_expiry_and_takeover() {
     assert(second_session != first_session);
     fixture.payload(hello_request(5, kNonceA));
     assert(fixture.takeover_callbacks == 1);
+    assert(!fixture.runtime.release_requested_for_test());
+    const auto after_takeover = fixture.runtime.usb_lifecycle_snapshot();
+    assert(after_takeover.desired == usb_lifecycle::DesiredExposure::kHidden);
+    assert(after_takeover.observed == usb_lifecycle::ObservedState::kDriverNotInstalled);
+    assert(after_takeover.generation == 0);
+    assert(!after_takeover.safety_pending && !after_takeover.host_release_uncertain);
     const std::string third = fixture.sink.last();
     fixture.payload(hello_request(5, kNonceA));
     assert(fixture.sink.last() == third);
     assert(fixture.takeover_callbacks == 1);
+}
+
+void test_hidden_provisioning_like_two_client_sessions_stay_clean() {
+    {
+        LeaseFixture fixture;
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string session = extract_string(fixture.sink.last(), "session");
+        fixture.payload(request(2, session, "system.info"));
+        fixture.payload(hello_request(3, kNonceB));
+        assert(fixture.takeover_callbacks == 1);
+        assert(fixture.expired_callbacks == 0);
+        assert(!fixture.runtime.release_requested_for_test());
+        assert(!fixture.runtime.usb_lifecycle_snapshot().safety_pending);
+        const std::string new_session = extract_string(fixture.sink.last(), "session");
+        fixture.payload(request(4, new_session, "usb.exposure.status"));
+        require_contains(fixture.sink.last(),
+                         "\"desired\":\"hidden\",\"observed\":\"driver_not_installed\"");
+        require_contains(fixture.sink.last(), "\"safety_pending\":false");
+    }
+
+    {
+        LeaseFixture fixture;
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string session = extract_string(fixture.sink.last(), "session");
+        fixture.payload(request(2, session, "system.info"));
+        fixture.clock.value = control_session::kLeaseMicroseconds;
+        fixture.protocol.service();
+        assert(fixture.expired_callbacks == 1);
+        assert(!fixture.runtime.release_requested_for_test());
+        assert(!fixture.runtime.usb_lifecycle_snapshot().safety_pending);
+
+        fixture.payload(hello_request(3, kNonceB));
+        assert(fixture.takeover_callbacks == 0);
+        assert(fixture.sink.last().find("\"ok\":true") != std::string::npos);
+        assert(!fixture.runtime.usb_lifecycle_snapshot().safety_pending);
+        const std::string new_session = extract_string(fixture.sink.last(), "session");
+        fixture.payload(request(4, new_session, "usb.exposure.status"));
+        require_contains(fixture.sink.last(), "\"safety_pending\":false");
+    }
 }
 
 void test_hid_failure_revokes_authority() {
@@ -1218,6 +1312,7 @@ int main() {
     test_usb_exposure_transition_response_is_frozen_before_provider_progress();
     test_stale_response_correlation();
     test_lease_refresh_expiry_and_takeover();
+    test_hidden_provisioning_like_two_client_sessions_stay_clean();
     test_hid_failure_revokes_authority();
     test_authority_epoch_barrier_and_retry_scoping();
     test_same_rx_batch_observes_published_epoch();

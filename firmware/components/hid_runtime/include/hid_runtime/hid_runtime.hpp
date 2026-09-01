@@ -336,6 +336,9 @@ class StateMachine {
     void set_before_ticket_publish_hook_for_test(TestHook hook);
     void set_before_submit_hook_for_test(TestHook hook);
     void set_before_release_reconciliation_hook_for_test(TestHook hook);
+    void publish_release_request_only_for_test();
+    bool release_requested_for_test() const;
+    std::uint32_t release_request_epoch_for_test() const;
 #endif
 
   private:
@@ -393,12 +396,19 @@ class StateMachine {
     bool unsafe_route_active(RouteGeneration generation, HidTransport transport) const;
     bool safety_transport_active(Interface interface) const;
     bool any_safety_required() const;
+    void publish_release_request();
+    void reconcile_unavailable_zero_work_release();
+    bool unavailable_usb_transport_is_clean() const;
+    bool active_release_request_is_current(UsbGeneration generation,
+                                           AuthorityEpoch authority_epoch,
+                                           std::uint32_t release_epoch) const;
     bool release_request_is_current(UsbGeneration generation,
                                     AuthorityEpoch authority_epoch,
                                     std::uint32_t release_epoch) const;
     void reconcile_zero_work_release(UsbGeneration generation,
                                      AuthorityEpoch authority_epoch,
-                                     std::uint32_t release_epoch);
+                                     std::uint32_t release_epoch,
+                                     bool require_unavailable_transport);
     bool queue_safety(Interface interface);
     bool queue_report(Interface interface, ReportKind kind,
                       const std::uint8_t *report, std::uint8_t length);
@@ -462,6 +472,7 @@ class StateMachine {
     std::atomic<std::uint32_t> release_request_epoch_{0};
     std::atomic<std::uint8_t> status_bits_{0};  // mounted, suspended, kbd-ready, mouse-ready
     std::atomic_bool release_requested_{false};
+    std::atomic_bool unavailable_release_reconciler_active_{false};
     InterfaceState interfaces_[2]{};
     ReleaseAllTicket release_ticket_{};
     KeyboardReportTicket keyboard_ticket_{};
