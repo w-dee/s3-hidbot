@@ -624,6 +624,147 @@ void test_mouse_release_all_during_in_flight() {
     assert(!state.safety_required(hid_runtime::Interface::kMouse));
 }
 
+void invalidate_at_ticket_publish(hid_runtime::StateMachine *state) {
+    state->on_unmount();
+}
+
+void invalidate_before_submit(hid_runtime::StateMachine *state) {
+    state->on_unmount();
+}
+
+struct FakeLifecycleExecutor final : usb_lifecycle::Executor {
+    void schedule(usb_lifecycle::ExecutorAction action,
+                  usb_lifecycle::Snapshot snapshot) override {
+        calls += 1;
+        last_action = action;
+        last_snapshot = snapshot;
+    }
+
+    int calls = 0;
+    usb_lifecycle::ExecutorAction last_action = usb_lifecycle::ExecutorAction::kConnect;
+    usb_lifecycle::Snapshot last_snapshot{};
+};
+
+void test_writing_and_claimed_lifecycle_races_are_fail_closed() {
+    const std::array<std::uint8_t, 6> keys = {4, 0, 0, 0, 0, 0};
+    {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        state.set_before_ticket_publish_hook_for_test(invalidate_at_ticket_publish);
+        assert(state.begin_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kAuthorityLost);
+        state.set_before_ticket_publish_hook_for_test(nullptr);
+        state.execute(Sink::submit, &sink);
+        assert(sink.calls == 0);
+    }
+    {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        assert(state.queue_mouse_report(0, 1, 0, 0, 0));
+        state.set_before_submit_hook_for_test(invalidate_before_submit);
+        state.execute(Sink::submit, &sink);
+        state.set_before_submit_hook_for_test(nullptr);
+        assert(sink.calls == 0);
+    }
+}
+
+void test_late_tokenized_callbacks_cannot_affect_new_generation() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    const hid_runtime::HidWorkToken old_token =
+        state.in_flight_token(hid_runtime::Interface::kMouse);
+    state.on_unmount();
+    state.on_mount();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    const hid_runtime::HidWorkToken new_token =
+        state.in_flight_token(hid_runtime::Interface::kMouse);
+    assert(old_token.usb_generation != new_token.usb_generation);
+    assert(!state.report_complete_for_token(1, old_token));
+    assert(!state.report_failed_for_token(1, old_token));
+    assert(state.report_in_flight(hid_runtime::Interface::kMouse));
+    assert(!state.safety_required(hid_runtime::Interface::kMouse));
+    assert(state.report_complete_for_token(1, new_token));
+}
+
+void test_relative_and_safety_work_do_not_cross_usb_generation() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+
+    // A queued relative delta cannot become a post-reattach movement.
+    assert(state.queue_mouse_report(0, 7, 0, 0, 0));
+    state.on_unmount();
+    state.on_mount();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+
+    // An old all-up retry is likewise canceled rather than applied to the
+    // fresh attachment.
+    assert(state.queue_mouse_report(1, 0, 0, 0, 0));
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1);
+    state.report_complete(1);
+    state.request_release_all();
+    state.on_unmount();
+    state.on_mount();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1);
+}
+
+void test_internal_detach_preserves_uncertainty_until_explicit_recovery() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    FakeLifecycleExecutor executor;
+    ready(state);
+    assert(state.queue_mouse_report(1, 0, 0, 0, 0));
+    state.execute(Sink::submit, &sink);
+    assert(state.report_in_flight(hid_runtime::Interface::kMouse));
+
+    state.request_usb_detach(executor);
+    const auto detached = state.usb_lifecycle_snapshot();
+    assert(executor.calls == 1);
+    assert(detached.desired == usb_lifecycle::DesiredExposure::kHidden);
+    assert(detached.observed == usb_lifecycle::ObservedState::kDetaching);
+    assert(detached.safety_pending);
+    assert(detached.host_release_uncertain);
+    assert(!state.queue_mouse_report(0, 1, 0, 0, 0));
+
+    // A fresh lifecycle does not turn an unproven host release into a clean
+    // state. It remains fail-closed until a future explicit recovery policy.
+    state.request_usb_attach(executor);
+    state.on_mount();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(!state.queue_mouse_report(0, 1, 0, 0, 0));
+
+    // A clean lifecycle can, after a fresh generation and fresh authority,
+    // accept new work normally.
+    hid_runtime::StateMachine clean;
+    ready(clean);
+    clean.request_usb_detach(executor);
+    clean.request_usb_attach(executor);
+    clean.on_mount();
+    clean.set_ready(hid_runtime::Interface::kKeyboard, true);
+    clean.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(clean.queue_mouse_report(0, 1, 0, 0, 0));
+}
+
 }  // namespace
 
 int main() {
@@ -647,5 +788,9 @@ int main() {
     test_mouse_report_ticket_relative_and_confirmed_state();
     test_mouse_report_ticket_cancellation_and_failure();
     test_mouse_release_all_during_in_flight();
+    test_writing_and_claimed_lifecycle_races_are_fail_closed();
+    test_late_tokenized_callbacks_cannot_affect_new_generation();
+    test_relative_and_safety_work_do_not_cross_usb_generation();
+    test_internal_detach_preserves_uncertainty_until_explicit_recovery();
     return 0;
 }

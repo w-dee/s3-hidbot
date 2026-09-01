@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "usb_lifecycle/usb_lifecycle.hpp"
+
 namespace hid_runtime {
 
 enum class Interface : std::uint8_t {
@@ -141,10 +143,20 @@ struct MouseReportResult {
     MouseReportFailure failure = MouseReportFailure::kNotReady;
 };
 
-// This is deliberately separate from attach_generation.  It is a lock-free
+// This is deliberately separate from USB lifecycle generation. It is a lock-free
 // lifecycle publication token that defines HID-control authority boundaries.
 // Unsigned wrap is well-defined; practical lifecycle frequency cannot reach it.
 using AuthorityEpoch = std::uint32_t;
+using UsbGeneration = usb_lifecycle::Generation;
+using HidTicketId = std::uint32_t;
+
+// Every queued or in-flight HID item is tied to both control authority and
+// one USB lifecycle.  Route generation is deliberately deferred to U7.2.
+struct HidWorkToken {
+    UsbGeneration usb_generation = 0;
+    AuthorityEpoch authority_epoch = 0;
+    HidTicketId ticket_id = 0;
+};
 
 using SubmitFn = bool (*)(void *context, std::uint8_t instance,
                           const std::uint8_t *report, std::uint16_t length);
@@ -161,7 +173,7 @@ enum class ReleaseAllInterfaceState : std::uint8_t {
 // TinyUSB SOF executor. Interface outcomes are historical: kSubmitted means
 // tud_hid_n_report() accepted the all-up report, not that the host completed it.
 struct ReleaseAllTicket {
-    std::atomic<std::uint32_t> attach_generation{0};
+    std::atomic<UsbGeneration> attach_generation{0};
     std::atomic<AuthorityEpoch> authority_epoch{0};
     std::atomic<ReleaseAllInterfaceState> keyboard{ReleaseAllInterfaceState::kUnresolved};
     std::atomic<ReleaseAllInterfaceState> mouse{ReleaseAllInterfaceState::kUnresolved};
@@ -172,7 +184,7 @@ struct ReleaseAllTicket {
 };
 
 struct ReleaseAllSnapshot {
-    std::uint32_t attach_generation = 0;
+    UsbGeneration attach_generation = 0;
     AuthorityEpoch authority_epoch = 0;
     ReleaseAllInterfaceState keyboard = ReleaseAllInterfaceState::kUnresolved;
     ReleaseAllInterfaceState mouse = ReleaseAllInterfaceState::kUnresolved;
@@ -202,8 +214,15 @@ class StateMachine {
     void on_resume();
     void set_ready(Interface interface, bool ready);
 
+    // U7.1A internal-only future lifecycle boundary. It does not issue USB
+    // hardware calls; U7.1B will connect it to the executor implementation.
+    void request_usb_attach(usb_lifecycle::Executor &executor);
+    void request_usb_detach(usb_lifecycle::Executor &executor);
+    usb_lifecycle::Snapshot usb_lifecycle_snapshot() const;
+
     StatusSnapshot status() const;
-    std::uint32_t attach_generation() const;
+    UsbGeneration attach_generation() const;
+    HidWorkToken in_flight_token(Interface interface) const;
     AuthorityEpoch authority_epoch() const;
 
     // Unsafe reports are accepted only while mounted, ready, and safety-clear.
@@ -249,6 +268,12 @@ class StateMachine {
     bool report_failed(std::uint8_t instance,
                        const std::uint8_t *report = nullptr,
                        std::uint16_t length = 0);
+    bool report_complete_for_token(std::uint8_t instance, HidWorkToken token,
+                                   const std::uint8_t *report = nullptr,
+                                   std::uint16_t length = 0);
+    bool report_failed_for_token(std::uint8_t instance, HidWorkToken token,
+                                 const std::uint8_t *report = nullptr,
+                                 std::uint16_t length = 0);
 
     KeyboardState keyboard_state() const;
     MouseState mouse_state() const;
@@ -256,19 +281,27 @@ class StateMachine {
     bool host_state_uncertain(Interface interface) const;
     bool report_in_flight(Interface interface) const;
 
+#ifdef HID_RUNTIME_NATIVE_TEST
+    using TestHook = void (*)(StateMachine *);
+    void set_before_ticket_publish_hook_for_test(TestHook hook);
+    void set_before_submit_hook_for_test(TestHook hook);
+#endif
+
   private:
     struct InterfaceState {
         std::atomic<std::uint8_t> slot_state{0};  // empty, writing, ready, executing
-        std::uint32_t slot_generation = 0;
+        UsbGeneration slot_generation = 0;
         AuthorityEpoch slot_authority_epoch = 0;
+        HidTicketId slot_ticket_id = 0;
         std::uint32_t slot_release_epoch = 0;
         ReportKind slot_kind = ReportKind::kUnsafeKeyboard;
         std::uint8_t slot_length = 0;
         std::uint8_t slot_report[8]{};
 
         std::atomic_bool in_flight{false};
-        std::uint32_t in_flight_generation = 0;
+        UsbGeneration in_flight_generation = 0;
         AuthorityEpoch in_flight_authority_epoch = 0;
+        HidTicketId in_flight_ticket_id = 0;
         ReportKind in_flight_kind = ReportKind::kUnsafeKeyboard;
         std::uint8_t in_flight_length = 0;
         std::uint8_t in_flight_report[8]{};
@@ -316,16 +349,17 @@ class StateMachine {
     void write_confirmed_mouse(std::uint8_t buttons);
     std::uint8_t read_confirmed_mouse() const;
     bool process_keyboard_ticket(SubmitFn submit, void *context,
-                                 std::uint32_t current_generation,
+                                 UsbGeneration current_generation,
                                  AuthorityEpoch current_authority_epoch);
     bool process_mouse_ticket(SubmitFn submit, void *context,
-                              std::uint32_t current_generation,
+                              UsbGeneration current_generation,
                               AuthorityEpoch current_authority_epoch);
 
     struct KeyboardReportTicket {
         std::atomic<KeyboardReportTicketState> state{KeyboardReportTicketState::kFree};
-        std::atomic<std::uint32_t> attach_generation{0};
+        std::atomic<UsbGeneration> attach_generation{0};
         std::atomic<AuthorityEpoch> authority_epoch{0};
+        std::atomic<HidTicketId> ticket_id{0};
         std::atomic<std::uint32_t> release_epoch{0};
         std::atomic<KeyboardReportTicketOutcome> outcome{KeyboardReportTicketOutcome::kNone};
         std::uint8_t report[8]{};
@@ -333,8 +367,9 @@ class StateMachine {
 
     struct MouseReportTicket {
         std::atomic<MouseReportTicketState> state{MouseReportTicketState::kFree};
-        std::atomic<std::uint32_t> attach_generation{0};
+        std::atomic<UsbGeneration> attach_generation{0};
         std::atomic<AuthorityEpoch> authority_epoch{0};
+        std::atomic<HidTicketId> ticket_id{0};
         std::atomic<std::uint32_t> release_epoch{0};
         std::atomic<MouseReportTicketOutcome> outcome{MouseReportTicketOutcome::kNone};
         std::uint8_t report[5]{};
@@ -344,8 +379,10 @@ class StateMachine {
     // publication token independent from attach generation so the lifecycle
     // callback never needs to wait for the UART/control task.
     static_assert(std::atomic<AuthorityEpoch>::is_always_lock_free);
-    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
-    std::atomic<std::uint32_t> generation_{0};
+    static_assert(std::atomic<UsbGeneration>::is_always_lock_free);
+    static_assert(std::atomic<HidTicketId>::is_always_lock_free);
+    usb_lifecycle::StateMachine usb_lifecycle_{};
+    std::atomic<HidTicketId> next_ticket_id_{1};
     std::atomic<AuthorityEpoch> authority_epoch_{0};
     std::atomic<std::uint32_t> release_epoch_{0};
     std::atomic<std::uint32_t> release_request_generation_{0};
@@ -356,6 +393,10 @@ class StateMachine {
     ReleaseAllTicket release_ticket_{};
     KeyboardReportTicket keyboard_ticket_{};
     MouseReportTicket mouse_ticket_{};
+#ifdef HID_RUNTIME_NATIVE_TEST
+    TestHook before_ticket_publish_hook_ = nullptr;
+    TestHook before_submit_hook_ = nullptr;
+#endif
 };
 
 // Hardware adapter. All tud_hid_* calls are confined to service_sof(), which

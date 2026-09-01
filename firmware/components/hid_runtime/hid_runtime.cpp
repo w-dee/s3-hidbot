@@ -232,11 +232,13 @@ void StateMachine::preserve_suspend_safety(InterfaceState &interface_state) {
 }
 
 void StateMachine::on_mount() {
+    if (!usb_lifecycle_.observe_mount()) {
+        return;
+    }
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    generation_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
     clear_interface(interfaces_[0]);
     clear_interface(interfaces_[1]);
@@ -244,26 +246,56 @@ void StateMachine::on_mount() {
     release_request_authority_epoch_.store(0, std::memory_order_release);
     release_requested_.store(false, std::memory_order_release);
     status_bits_.store(kMountedBit, std::memory_order_release);
+    if (!usb_lifecycle_.snapshot().host_release_uncertain) {
+        usb_lifecycle_.mark_release_confirmed();
+    }
 }
 
 void StateMachine::on_unmount() {
+    if (!usb_lifecycle_.observe_unmount()) {
+        return;
+    }
+    const bool preserve_uncertainty =
+        usb_lifecycle_.snapshot().desired == usb_lifecycle::DesiredExposure::kHidden;
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     // Invalidate first: work from an older attach or authority epoch can never
     // be accepted by a later executor pass, even if it races this callback.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    generation_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
     status_bits_.store(0, std::memory_order_release);
-    clear_interface(interfaces_[0]);
-    clear_interface(interfaces_[1]);
+    if (!preserve_uncertainty) {
+        clear_interface(interfaces_[0]);
+        clear_interface(interfaces_[1]);
+    } else {
+        bool uncertainty = false;
+        for (InterfaceState &interface_state : interfaces_) {
+            const bool needs_safety =
+                interface_state.logical_state_held.load(std::memory_order_acquire) ||
+                interface_state.in_flight.load(std::memory_order_acquire) ||
+                interface_state.host_state_uncertain.load(std::memory_order_acquire);
+            interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
+            interface_state.in_flight.store(false, std::memory_order_release);
+            if (needs_safety) {
+                uncertainty = true;
+                interface_state.safety_required.store(true, std::memory_order_release);
+                interface_state.host_state_uncertain.store(true, std::memory_order_release);
+            }
+        }
+        if (uncertainty && !usb_lifecycle_.snapshot().host_release_uncertain) {
+            usb_lifecycle_.mark_release_uncertain();
+        }
+    }
     release_request_generation_.store(0, std::memory_order_release);
     release_request_authority_epoch_.store(0, std::memory_order_release);
     release_requested_.store(false, std::memory_order_release);
 }
 
 void StateMachine::on_suspend() {
+    if (!usb_lifecycle_.observe_suspend()) {
+        return;
+    }
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -287,6 +319,9 @@ void StateMachine::on_suspend() {
 }
 
 void StateMachine::on_resume() {
+    if (!usb_lifecycle_.observe_resume()) {
+        return;
+    }
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -316,18 +351,78 @@ StatusSnapshot StateMachine::status() const {
     };
 }
 
-std::uint32_t StateMachine::attach_generation() const {
-    return generation_.load(std::memory_order_acquire);
+void StateMachine::request_usb_attach(usb_lifecycle::Executor &executor) {
+    usb_lifecycle_.request_attach(executor);
+    // Request intent is the fail-closed authority boundary. U7.1A does not
+    // invoke an executor in firmware, so this has no current USB behavior.
+    cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
+    authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    status_bits_.store(0, std::memory_order_release);
+}
+
+void StateMachine::request_usb_detach(usb_lifecycle::Executor &executor) {
+    const UsbGeneration retired_generation = attach_generation();
+    usb_lifecycle_.request_detach(executor);
+    cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
+    authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    status_bits_.store(0, std::memory_order_release);
+    // Do not clear uncertainty: a hidden transport is not proof the host saw
+    // all-up. Existing current-main unmount behavior remains unchanged.
+    bool uncertainty = false;
+    for (InterfaceState &interface_state : interfaces_) {
+        if (interface_state.logical_state_held.load(std::memory_order_acquire) ||
+            interface_state.in_flight.load(std::memory_order_acquire) ||
+            interface_state.host_state_uncertain.load(std::memory_order_acquire)) {
+            uncertainty = true;
+            interface_state.safety_required.store(true, std::memory_order_release);
+            interface_state.host_state_uncertain.store(true, std::memory_order_release);
+        }
+        std::uint8_t expected = kSlotReady;
+        interface_state.slot_state.compare_exchange_strong(
+            expected, kSlotCanceled, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    if (uncertainty) {
+        usb_lifecycle_.mark_release_uncertain_for_generation(retired_generation);
+    } else {
+        // Internal all-up was already known before this future detach request.
+        usb_lifecycle_.mark_release_confirmed();
+    }
+}
+
+usb_lifecycle::Snapshot StateMachine::usb_lifecycle_snapshot() const {
+    return usb_lifecycle_.snapshot();
+}
+
+UsbGeneration StateMachine::attach_generation() const {
+    return usb_lifecycle_.generation();
 }
 
 AuthorityEpoch StateMachine::authority_epoch() const {
     return authority_epoch_.load(std::memory_order_acquire);
 }
 
+#ifdef HID_RUNTIME_NATIVE_TEST
+void StateMachine::set_before_ticket_publish_hook_for_test(TestHook hook) {
+    before_ticket_publish_hook_ = hook;
+}
+
+void StateMachine::set_before_submit_hook_for_test(TestHook hook) {
+    before_submit_hook_ = hook;
+}
+#endif
+
 bool StateMachine::mounted_and_active(Interface interface) const {
     const StatusSnapshot snapshot = status();
-    return snapshot.mounted && !snapshot.suspended &&
-           (interface == Interface::kKeyboard ? snapshot.keyboard_ready : snapshot.mouse_ready);
+    return !usb_lifecycle_.has_unresolved_prior_generation() &&
+           usb_lifecycle_.accepts_hid(
+        snapshot.mounted && !snapshot.suspended &&
+        (interface == Interface::kKeyboard ? snapshot.keyboard_ready : snapshot.mouse_ready));
 }
 
 bool StateMachine::any_safety_required() const {
@@ -341,7 +436,7 @@ bool StateMachine::queue_report(Interface interface, ReportKind kind,
         !mounted_and_active(interface)) {
         return false;
     }
-    const std::uint32_t queue_generation = attach_generation();
+    const UsbGeneration queue_generation = attach_generation();
     const AuthorityEpoch queue_authority_epoch = authority_epoch();
     InterfaceState &interface_state = state(interface);
     const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
@@ -360,6 +455,7 @@ bool StateMachine::queue_report(Interface interface, ReportKind kind,
     }
     interface_state.slot_generation = queue_generation;
     interface_state.slot_authority_epoch = queue_authority_epoch;
+    interface_state.slot_ticket_id = next_ticket_id_.fetch_add(1, std::memory_order_acq_rel);
     interface_state.slot_release_epoch = release_epoch;
     interface_state.slot_kind = kind;
     interface_state.slot_length = length;
@@ -434,14 +530,22 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
             std::memory_order_acq_rel, std::memory_order_acquire)) {
         return KeyboardReportBeginResult::kBusy;
     }
-    const std::uint32_t generation = attach_generation();
+    const UsbGeneration generation = attach_generation();
     const AuthorityEpoch epoch = authority_epoch();
     const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
     keyboard_ticket_.attach_generation.store(generation, std::memory_order_relaxed);
     keyboard_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
+    keyboard_ticket_.ticket_id.store(next_ticket_id_.fetch_add(1, std::memory_order_acq_rel),
+                                     std::memory_order_relaxed);
     keyboard_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
     std::memcpy(keyboard_ticket_.report, report, sizeof(report));
     keyboard_ticket_.outcome.store(KeyboardReportTicketOutcome::kNone, std::memory_order_relaxed);
+
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (before_ticket_publish_hook_ != nullptr) {
+        before_ticket_publish_hook_(this);
+    }
+#endif
 
     if (generation != attach_generation() || epoch != authority_epoch() ||
         release_epoch != release_epoch_.load(std::memory_order_acquire) ||
@@ -554,11 +658,13 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
             std::memory_order_acq_rel, std::memory_order_acquire)) {
         return MouseReportBeginResult::kBusy;
     }
-    const std::uint32_t generation = attach_generation();
+    const UsbGeneration generation = attach_generation();
     const AuthorityEpoch epoch = authority_epoch();
     const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
     mouse_ticket_.attach_generation.store(generation, std::memory_order_relaxed);
     mouse_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
+    mouse_ticket_.ticket_id.store(next_ticket_id_.fetch_add(1, std::memory_order_acq_rel),
+                                  std::memory_order_relaxed);
     mouse_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
     mouse_ticket_.report[0] = static_cast<std::uint8_t>(buttons & 0x1fU);
     mouse_ticket_.report[1] = static_cast<std::uint8_t>(x);
@@ -566,6 +672,12 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     mouse_ticket_.report[3] = static_cast<std::uint8_t>(vertical);
     mouse_ticket_.report[4] = static_cast<std::uint8_t>(horizontal);
     mouse_ticket_.outcome.store(MouseReportTicketOutcome::kNone, std::memory_order_relaxed);
+
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (before_ticket_publish_hook_ != nullptr) {
+        before_ticket_publish_hook_(this);
+    }
+#endif
 
     if (generation != attach_generation() || epoch != authority_epoch() ||
         release_epoch != release_epoch_.load(std::memory_order_acquire) ||
@@ -649,10 +761,11 @@ bool StateMachine::queue_safety(Interface interface) {
             expected, kSlotWriting, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return false;
     }
-    const std::uint32_t queue_generation = attach_generation();
+    const UsbGeneration queue_generation = attach_generation();
     const AuthorityEpoch queue_authority_epoch = authority_epoch();
     interface_state.slot_generation = queue_generation;
     interface_state.slot_authority_epoch = queue_authority_epoch;
+    interface_state.slot_ticket_id = next_ticket_id_.fetch_add(1, std::memory_order_acq_rel);
     interface_state.slot_release_epoch = release_epoch_.load(std::memory_order_acquire);
     interface_state.slot_kind = interface == Interface::kKeyboard
                                     ? ReportKind::kSafetyKeyboard
@@ -685,6 +798,7 @@ void StateMachine::request_release_all() {
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kSafetyPending);
     cancel_mouse_ticket(MouseReportTicketOutcome::kSafetyPending);
     release_requested_.store(true, std::memory_order_release);
+    usb_lifecycle_.mark_release_pending();
 }
 
 void StateMachine::begin_release_all() {
@@ -763,7 +877,7 @@ void StateMachine::cancel_queued(Interface interface) {
 }
 
 bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
-                                            std::uint32_t current_generation,
+                                            UsbGeneration current_generation,
                                             AuthorityEpoch current_authority_epoch) {
     KeyboardReportTicketState expected = KeyboardReportTicketState::kPublished;
     if (!keyboard_ticket_.state.compare_exchange_strong(
@@ -772,8 +886,9 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
         return false;
     }
 
-    const std::uint32_t ticket_generation =
+    const UsbGeneration ticket_generation =
         keyboard_ticket_.attach_generation.load(std::memory_order_relaxed);
+    const HidTicketId ticket_id = keyboard_ticket_.ticket_id.load(std::memory_order_relaxed);
     const AuthorityEpoch ticket_epoch =
         keyboard_ticket_.authority_epoch.load(std::memory_order_relaxed);
     const std::uint32_t ticket_release_epoch =
@@ -802,6 +917,11 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
     // Keep the final pre-submit window explicit. Lifecycle callbacks publish
     // their epoch before control/session cleanup, so a callback observed here
     // invalidates the claimed ticket without allowing a stale key report.
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (before_submit_hook_ != nullptr) {
+        before_submit_hook_(this);
+    }
+#endif
     if (ticket_generation != attach_generation() ||
         ticket_epoch != authority_epoch() ||
         ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
@@ -829,6 +949,7 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
 
     keyboard.in_flight_generation = current_generation;
     keyboard.in_flight_authority_epoch = current_authority_epoch;
+    keyboard.in_flight_ticket_id = ticket_id;
     keyboard.in_flight_kind = ReportKind::kUnsafeKeyboard;
     keyboard.in_flight_length = sizeof(keyboard_ticket_.report);
     std::memcpy(keyboard.in_flight_report, keyboard_ticket_.report,
@@ -851,7 +972,7 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
 }
 
 bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
-                                         std::uint32_t current_generation,
+                                         UsbGeneration current_generation,
                                          AuthorityEpoch current_authority_epoch) {
     MouseReportTicketState expected = MouseReportTicketState::kPublished;
     if (!mouse_ticket_.state.compare_exchange_strong(
@@ -860,8 +981,9 @@ bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
         return false;
     }
 
-    const std::uint32_t ticket_generation =
+    const UsbGeneration ticket_generation =
         mouse_ticket_.attach_generation.load(std::memory_order_relaxed);
+    const HidTicketId ticket_id = mouse_ticket_.ticket_id.load(std::memory_order_relaxed);
     const AuthorityEpoch ticket_epoch =
         mouse_ticket_.authority_epoch.load(std::memory_order_relaxed);
     const std::uint32_t ticket_release_epoch =
@@ -887,6 +1009,11 @@ bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
         return false;
     }
 
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (before_submit_hook_ != nullptr) {
+        before_submit_hook_(this);
+    }
+#endif
     if (ticket_generation != attach_generation() ||
         ticket_epoch != authority_epoch() ||
         ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
@@ -915,6 +1042,7 @@ bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
 
     mouse.in_flight_generation = current_generation;
     mouse.in_flight_authority_epoch = current_authority_epoch;
+    mouse.in_flight_ticket_id = ticket_id;
     mouse.in_flight_kind = ReportKind::kUnsafeMouse;
     mouse.in_flight_length = sizeof(mouse_ticket_.report);
     std::memcpy(mouse.in_flight_report, mouse_ticket_.report,
@@ -941,7 +1069,7 @@ void StateMachine::execute(SubmitFn submit, void *context) {
     if (!snapshot.mounted || snapshot.suspended) {
         return;
     }
-    const std::uint32_t current_generation = attach_generation();
+    const UsbGeneration current_generation = attach_generation();
     const AuthorityEpoch current_authority_epoch = authority_epoch();
     const std::uint32_t request_generation =
         release_request_generation_.load(std::memory_order_acquire);
@@ -1012,7 +1140,8 @@ void StateMachine::execute(SubmitFn submit, void *context) {
             continue;
         }
         const ReportKind kind = interface_state.slot_kind;
-        const std::uint32_t slot_generation = interface_state.slot_generation;
+        const UsbGeneration slot_generation = interface_state.slot_generation;
+        const HidTicketId slot_ticket_id = interface_state.slot_ticket_id;
         const AuthorityEpoch slot_authority_epoch = interface_state.slot_authority_epoch;
         const std::uint32_t slot_release_epoch = interface_state.slot_release_epoch;
         const std::uint8_t length = interface_state.slot_length;
@@ -1037,6 +1166,20 @@ void StateMachine::execute(SubmitFn submit, void *context) {
             interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
             continue;
         }
+        // The hook deterministically models a lifecycle callback winning the
+        // final claimed-to-submit boundary. Production builds have no hook.
+#ifdef HID_RUNTIME_NATIVE_TEST
+        if (before_submit_hook_ != nullptr) {
+            before_submit_hook_(this);
+        }
+#endif
+        if (slot_generation != attach_generation() ||
+            slot_authority_epoch != authority_epoch() ||
+            !mounted_and_active(interface) ||
+            interface_state.slot_state.load(std::memory_order_acquire) != kSlotExecuting) {
+            interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
+            continue;
+        }
         const bool accepted = submit(context, static_cast<std::uint8_t>(interface),
                                      interface_state.slot_report, length);
         if (!accepted) {
@@ -1053,6 +1196,7 @@ void StateMachine::execute(SubmitFn submit, void *context) {
         }
         interface_state.in_flight_generation = current_generation;
         interface_state.in_flight_authority_epoch = current_authority_epoch;
+        interface_state.in_flight_ticket_id = slot_ticket_id;
         interface_state.in_flight_kind = kind;
         interface_state.in_flight_length = length;
         std::memcpy(interface_state.in_flight_report, interface_state.slot_report, length);
@@ -1094,16 +1238,39 @@ void StateMachine::execute(SubmitFn submit, void *context) {
     }
 }
 
+HidWorkToken StateMachine::in_flight_token(Interface interface) const {
+    const InterfaceState &interface_state = state(interface);
+    return HidWorkToken{
+        .usb_generation = interface_state.in_flight_generation,
+        .authority_epoch = interface_state.in_flight_authority_epoch,
+        .ticket_id = interface_state.in_flight_ticket_id,
+    };
+}
+
 bool StateMachine::report_complete(std::uint8_t instance,
-                                    const std::uint8_t *report,
-                                    std::uint16_t length) {
+                                   const std::uint8_t *report,
+                                   std::uint16_t length) {
+    if (instance > static_cast<std::uint8_t>(Interface::kMouse)) {
+        return false;
+    }
+    return report_complete_for_token(instance,
+                                     in_flight_token(static_cast<Interface>(instance)),
+                                     report, length);
+}
+
+bool StateMachine::report_complete_for_token(std::uint8_t instance, HidWorkToken token,
+                                             const std::uint8_t *report,
+                                             std::uint16_t length) {
     if (instance > static_cast<std::uint8_t>(Interface::kMouse)) {
         return false;
     }
     InterfaceState &interface_state = interfaces_[instance];
     if (!interface_state.in_flight.load(std::memory_order_acquire) ||
         interface_state.in_flight_generation != attach_generation() ||
-        interface_state.in_flight_authority_epoch != authority_epoch()) {
+        interface_state.in_flight_authority_epoch != authority_epoch() ||
+        interface_state.in_flight_generation != token.usb_generation ||
+        interface_state.in_flight_authority_epoch != token.authority_epoch ||
+        interface_state.in_flight_ticket_id != token.ticket_id) {
         return false;
     }
     if (report != nullptr && length != interface_state.in_flight_length) {
@@ -1142,6 +1309,10 @@ bool StateMachine::report_complete(std::uint8_t instance,
     // in-flight bit. A producer that observes !in_flight must never see the
     // previous confirmed payload and submit a duplicate same-state report.
     interface_state.in_flight.store(false, std::memory_order_release);
+    if ((kind == ReportKind::kSafetyKeyboard || kind == ReportKind::kSafetyMouse) &&
+        !any_safety_required()) {
+        usb_lifecycle_.mark_release_confirmed();
+    }
     return true;
 }
 
@@ -1151,10 +1322,24 @@ bool StateMachine::report_failed(std::uint8_t instance,
     if (instance > static_cast<std::uint8_t>(Interface::kMouse)) {
         return false;
     }
+    return report_failed_for_token(instance,
+                                   in_flight_token(static_cast<Interface>(instance)),
+                                   report, length);
+}
+
+bool StateMachine::report_failed_for_token(std::uint8_t instance, HidWorkToken token,
+                                           const std::uint8_t *report,
+                                           std::uint16_t length) {
+    if (instance > static_cast<std::uint8_t>(Interface::kMouse)) {
+        return false;
+    }
     InterfaceState &interface_state = interfaces_[instance];
     if (!interface_state.in_flight.load(std::memory_order_acquire) ||
         interface_state.in_flight_generation != attach_generation() ||
-        interface_state.in_flight_authority_epoch != authority_epoch()) {
+        interface_state.in_flight_authority_epoch != authority_epoch() ||
+        interface_state.in_flight_generation != token.usb_generation ||
+        interface_state.in_flight_authority_epoch != token.authority_epoch ||
+        interface_state.in_flight_ticket_id != token.ticket_id) {
         return false;
     }
     // TinyUSB reports transferred bytes for a failed input transfer; a short
@@ -1165,6 +1350,7 @@ bool StateMachine::report_failed(std::uint8_t instance,
     }
     interface_state.host_state_uncertain.store(true, std::memory_order_release);
     interface_state.safety_required.store(true, std::memory_order_release);
+    usb_lifecycle_.mark_release_uncertain();
     if (release_ticket_.active.load(std::memory_order_acquire) &&
         release_ticket_.attach_generation.load(std::memory_order_acquire) ==
             interface_state.in_flight_generation &&
