@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing annotated release tag, for example v0.1.0
+        description: Existing annotated release tag, exactly v0.1.0
         required: true
         type: string
       release_build_run_id:
-        description: Exact successful tag-build workflow run ID
+        description: Exact successful recovered Release build whose assets will be published
         required: true
         type: string
       candidate_release_build_run_id:
@@ -20,73 +20,108 @@ permissions:
   contents: write
   actions: read
 
+env:
+  RELEASE_VERSION: 0.1.0
+  EXPECTED_TAG: v0.1.0
+  EXPECTED_TAG_OBJECT_SHA: 0180ab16241814b6b7d8cbd45878cf3ae5ddfeee
+  EXPECTED_RELEASE_SOURCE: 9f80ace9e1f7112b8b12a3984a21522c9d4fa1a5
+  RECOVERY_WORKFLOW_COMMIT: f01bcded0fe3851ce53d10462714afc03cfa0871
+  EXPECTED_FIRMWARE_SHA256: 861e2ead3673e620526ebfaea82a987da6ecfb3777613af9e9df46e70530dbde
+  EXPECTED_APP_ELF_SHA256: fdd9277138c8aacf62a517b9823f58d3a4f0ebc4668caf7941b1ea675024f4f8
+
 defaults:
   run:
     shell: bash
 
 jobs:
   draft:
-    name: Create one unpublished release draft from a proven tag build
+    name: Create one unpublished release draft from proven recovery evidence
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout the requested tag with tag objects
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-
-      - name: Resolve and validate the annotated tag commit
+      - name: Require the exact main control ref and v0.1.0 request
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          contract=$(python3 tools/release_contract.py \
-            --source-root "$GITHUB_WORKSPACE" \
-            --repository "$GITHUB_WORKSPACE" \
-            --tag "$RELEASE_TAG")
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$INPUT_TAG" = "$EXPECTED_TAG"
+
+      - name: Checkout exact draft control revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+
+      - name: Checkout immutable release source with tag objects
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve independent control and annotated tag authorities
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: ${{ github.workspace }}/release-source
+        run: |
+          set -euo pipefail
+          control_root="$GITHUB_WORKSPACE/control"
+          source_root="$GITHUB_WORKSPACE/release-source"
+          control_head=$(git -c "safe.directory=$control_root" -C "$control_root" rev-parse HEAD)
+          test "$control_head" = "$GITHUB_SHA"
+          contract=$(python3 "$control_root/tools/release_contract.py" \
+            --source-root "$source_root" \
+            --repository "$source_root" \
+            --tag "$EXPECTED_TAG")
+          version=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["version"])' <<<"$contract")
           commit=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["source_revision"])' <<<"$contract")
-          actual=$(git -c "safe.directory=$GITHUB_WORKSPACE" rev-parse HEAD)
-          test "$actual" = "$commit"
+          tag_object=$(git -c "safe.directory=$source_root" -C "$source_root" rev-parse --verify "refs/tags/$EXPECTED_TAG")
+          source_head=$(git -c "safe.directory=$source_root" -C "$source_root" rev-parse HEAD)
+          test "$version" = "$RELEASE_VERSION"
+          test "$tag_object" = "$EXPECTED_TAG_OBJECT_SHA"
+          test "$commit" = "$EXPECTED_RELEASE_SOURCE"
+          test "$source_head" = "$EXPECTED_RELEASE_SOURCE"
           printf 'RELEASE_COMMIT=%s\n' "$commit" >> "$GITHUB_ENV"
 
-      - name: Prove selected Actions run is the successful immutable tag build
+      - name: Prove selected recovery and candidate Actions runs
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_RUN_ID: ${{ inputs.release_build_run_id }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_release_build_run_id }}
         run: |
           set -euo pipefail
+          control_root="$GITHUB_WORKSPACE/control"
           printf '%s' "$RELEASE_RUN_ID" | grep -Eq '^[1-9][0-9]*$'
           printf '%s' "$CANDIDATE_RUN_ID" | grep -Eq '^[1-9][0-9]*$'
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" >"$RUNNER_TEMP/release-build-run.json"
-          python3 tools/validate_release_build_run.py \
-            --document "$RUNNER_TEMP/release-build-run.json" \
-            --kind tag \
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" >"$RUNNER_TEMP/recovery-build-run.json"
+          python3 "$control_root/tools/validate_release_build_run.py" \
+            --document "$RUNNER_TEMP/recovery-build-run.json" \
+            --kind recovery \
             --repository "$GITHUB_REPOSITORY" \
-            --tag "$RELEASE_TAG" \
-            --version 0.1.0 \
-            --commit "$RELEASE_COMMIT" \
+            --workflow-commit "$RECOVERY_WORKFLOW_COMMIT" \
             --run-id "$RELEASE_RUN_ID"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" >"$RUNNER_TEMP/candidate-build-run.json"
-          python3 tools/validate_release_build_run.py \
+          python3 "$control_root/tools/validate_release_build_run.py" \
             --document "$RUNNER_TEMP/candidate-build-run.json" \
             --kind candidate \
             --repository "$GITHUB_REPOSITORY" \
-            --commit "$RELEASE_COMMIT" \
+            --commit "$EXPECTED_RELEASE_SOURCE" \
             --run-id "$CANDIDATE_RUN_ID"
 
-      - name: Download the exact selected tag-build artifact
+      - name: Download exact recovered release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: release-assets
-          path: ${{ runner.temp }}/tag-release-assets
+          path: ${{ runner.temp }}/recovery-release-assets
           repository: ${{ github.repository }}
           run-id: ${{ inputs.release_build_run_id }}
           github-token: ${{ github.token }}
 
-      - name: Download the exact physically validated candidate artifact
+      - name: Download exact physically validated candidate assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: release-assets
@@ -95,45 +130,99 @@ jobs:
           run-id: ${{ inputs.candidate_release_build_run_id }}
           github-token: ${{ github.token }}
 
-      - name: Reverify exact assets, require candidate/tag byte equality, and reject existing releases
+      - name: Reverify tagged source, legal assets, and exact physical firmware identity
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: ${{ github.workspace }}/release-source
         run: |
           set -euo pipefail
-          python3 tools/verify_release_assets.py \
-            "$RUNNER_TEMP/tag-release-assets" \
-            --source-root "$GITHUB_WORKSPACE" \
-            --source-revision "$RELEASE_COMMIT"
-          python3 tools/verify_release_assets.py \
-            "$RUNNER_TEMP/candidate-release-assets" \
-            --source-root "$GITHUB_WORKSPACE" \
-            --source-revision "$RELEASE_COMMIT"
+          control_root="$GITHUB_WORKSPACE/control"
+          source_root="$GITHUB_WORKSPACE/release-source"
+          recovery_assets="$RUNNER_TEMP/recovery-release-assets"
+          candidate_assets="$RUNNER_TEMP/candidate-release-assets"
           firmware="s3-hidbot-firmware-0.1.0-esp32s3-freenove-fnk0085.tar.gz"
-          python3 tools/compare_release_firmware.py \
-            "$RUNNER_TEMP/candidate-release-assets/$firmware" \
-            "$RUNNER_TEMP/tag-release-assets/$firmware"
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "a release or draft already exists for $RELEASE_TAG; refusing to overwrite it" >&2
+          recovery_firmware="$recovery_assets/$firmware"
+          candidate_firmware="$candidate_assets/$firmware"
+          python3 "$control_root/tools/verify_release_assets.py" \
+            "$recovery_assets" \
+            --source-root "$source_root" \
+            --source-revision "$EXPECTED_RELEASE_SOURCE"
+          python3 "$control_root/tools/verify_release_assets.py" \
+            "$candidate_assets" \
+            --source-root "$source_root" \
+            --source-revision "$EXPECTED_RELEASE_SOURCE"
+          test "$(sha256sum "$recovery_firmware" | cut -d' ' -f1)" = "$EXPECTED_FIRMWARE_SHA256"
+          test "$(sha256sum "$candidate_firmware" | cut -d' ' -f1)" = "$EXPECTED_FIRMWARE_SHA256"
+          PYTHONPATH="$control_root/tools" python3 - \
+            "$candidate_firmware" "$recovery_firmware" \
+            "$EXPECTED_APP_ELF_SHA256" "$RELEASE_VERSION" "$EXPECTED_RELEASE_SOURCE" <<'PY'
+          import sys
+          from pathlib import Path
+
+          from firmware_artifact import verify_bundle_archive
+
+          candidate, recovery, expected_elf, version, revision = sys.argv[1:]
+          expected = {
+              "version": version,
+              "source_revision": revision,
+              "target": "esp32s3",
+              "build_profile": "freenove-fnk0085",
+              "idf_version": "v5.5.4",
+              "protocol_version": 1,
+              "app_elf_sha256": expected_elf,
+          }
+          for archive in (candidate, recovery):
+              manifest = verify_bundle_archive(Path(archive))
+              firmware = manifest["firmware"]
+              actual = {
+                  "version": firmware["version"],
+                  "source_revision": firmware["source_revision"],
+                  "target": firmware["target"],
+                  "build_profile": firmware["build_profile"],
+                  "idf_version": firmware["idf_version"],
+                  "protocol_version": firmware["protocol_version"],
+                  "app_elf_sha256": manifest["runtime_identity"]["app_elf_sha256"],
+              }
+              if actual != expected:
+                  raise SystemExit(f"firmware identity mismatch: {archive}")
+          PY
+          python3 "$control_root/tools/compare_release_firmware.py" \
+            "$candidate_firmware" "$recovery_firmware"
+          cmp -- "$recovery_assets/LICENSE" "$source_root/LICENSE"
+          cmp -- "$recovery_assets/THIRD_PARTY_NOTICES.md" "$source_root/THIRD_PARTY_NOTICES.md"
+          (
+            cd "$source_root"
+            python3 "$control_root/tools/privacy_lint.py" --tracked
+          )
+
+      - name: Render tagged-source notes and reject any existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          control_root="$GITHUB_WORKSPACE/control"
+          source_root="$GITHUB_WORKSPACE/release-source"
+          python3 "$control_root/tools/render_release_notes.py" \
+            --template "$source_root/docs/development/release-notes-v0.1.0.md" \
+            --output "$RUNNER_TEMP/release-notes.md" \
+            --tag "$EXPECTED_TAG" \
+            --version "$RELEASE_VERSION" \
+            --source-revision "$EXPECTED_RELEASE_SOURCE"
+          if gh release view "$EXPECTED_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "a release or draft already exists for $EXPECTED_TAG; refusing to overwrite it" >&2
             exit 1
           fi
 
       - name: Create one GitHub draft release, never publish it
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          python3 tools/render_release_notes.py \
-            --template docs/development/release-notes-v0.1.0.md \
-            --output "$RUNNER_TEMP/release-notes.md" \
-            --tag "$RELEASE_TAG" \
-            --version 0.1.0 \
-            --source-revision "$RELEASE_COMMIT"
-          gh release create "$RELEASE_TAG" \
-            "$RUNNER_TEMP/tag-release-assets/"* \
+          gh release create "$EXPECTED_TAG" \
+            "$RUNNER_TEMP/recovery-release-assets/"* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "s3-hidbot $RELEASE_TAG" \
+            --title "s3-hidbot $EXPECTED_TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --draft \
             --verify-tag

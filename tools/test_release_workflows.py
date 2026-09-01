@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ from validate_release_build_run import (
     ReleaseBuildRunError,
     validate_release_build_run,
     validate_release_candidate_run,
+    validate_release_recovery_run,
 )
 
 
@@ -20,6 +22,37 @@ BUILD = ROOT / ".github" / "workflows" / "release-build.yml"
 DRAFT = ROOT / ".github" / "workflows" / "release-draft.yml"
 NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
 PIN = re.compile(r"uses:\s+actions/[A-Za-z0-9_.-]+@([0-9a-f]{40})")
+WORKFLOW_PATH = ".github/workflows/release-build.yml"
+
+
+def run_document(
+    *,
+    run_id: int,
+    event: str,
+    head_sha: str,
+    head_branch: str = "main",
+    conclusion: str = "success",
+) -> dict:
+    """Return a realistic subset of a GitHub REST workflow-run document."""
+
+    return {
+        "id": run_id,
+        "name": "Release build",
+        "event": event,
+        "head_branch": head_branch,
+        "head_sha": head_sha,
+        "status": "completed",
+        "conclusion": conclusion,
+        "path": WORKFLOW_PATH,
+        "repository": {
+            "id": 123456,
+            "node_id": "R_fixture",
+            "name": "s3-hidbot",
+            "full_name": "w-dee/s3-hidbot",
+            "private": False,
+            "html_url": "https://github.com/w-dee/s3-hidbot",
+        },
+    }
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
@@ -109,17 +142,54 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertRegex(self.draft, r"permissions:\n\s+contents: write\n\s+actions: read\n")
         self.assertIn("release_build_run_id:", self.draft)
         self.assertIn("candidate_release_build_run_id:", self.draft)
-        self.assertIn("tools/validate_release_build_run.py", self.draft)
-        self.assertIn("tools/compare_release_firmware.py", self.draft)
-        self.assertIn("--kind tag", self.draft)
+        self.assertNotIn("recovery_workflow_commit:", self.draft)
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/main"', self.draft)
+        self.assertIn("ref: ${{ github.sha }}", self.draft)
+        self.assertIn("ref: refs/tags/${{ inputs.tag }}", self.draft)
+        self.assertIn("path: control", self.draft)
+        self.assertIn("path: release-source", self.draft)
+        self.assertGreaterEqual(self.draft.count("persist-credentials: false"), 2)
+        self.assertIn('test "$control_head" = "$GITHUB_SHA"', self.draft)
+        self.assertIn('"$control_root/tools/validate_release_build_run.py"', self.draft)
+        self.assertIn('"$control_root/tools/verify_release_assets.py"', self.draft)
+        self.assertIn('"$control_root/tools/compare_release_firmware.py"', self.draft)
+        self.assertIn('"$control_root/tools/render_release_notes.py"', self.draft)
+        self.assertIn('--source-root "$source_root"', self.draft)
+        self.assertIn('"$source_root/docs/development/release-notes-v0.1.0.md"', self.draft)
+        self.assertIn("EXPECTED_TAG_OBJECT_SHA: 0180ab16241814b6b7d8cbd45878cf3ae5ddfeee", self.draft)
+        self.assertIn("EXPECTED_RELEASE_SOURCE: 9f80ace9e1f7112b8b12a3984a21522c9d4fa1a5", self.draft)
+        self.assertIn("RECOVERY_WORKFLOW_COMMIT: f01bcded0fe3851ce53d10462714afc03cfa0871", self.draft)
+        self.assertIn("EXPECTED_FIRMWARE_SHA256: 861e2ead3673e620526ebfaea82a987da6ecfb3777613af9e9df46e70530dbde", self.draft)
+        self.assertIn("EXPECTED_APP_ELF_SHA256: fdd9277138c8aacf62a517b9823f58d3a4f0ebc4668caf7941b1ea675024f4f8", self.draft)
+        self.assertIn('test "$tag_object" = "$EXPECTED_TAG_OBJECT_SHA"', self.draft)
+        self.assertIn('test "$commit" = "$EXPECTED_RELEASE_SOURCE"', self.draft)
+        self.assertIn('--workflow-commit "$RECOVERY_WORKFLOW_COMMIT"', self.draft)
+        self.assertIn('sha256sum "$recovery_firmware"', self.draft)
+        self.assertIn('sha256sum "$candidate_firmware"', self.draft)
+        self.assertIn('"$EXPECTED_APP_ELF_SHA256"', self.draft)
+        self.assertIn("--kind recovery", self.draft)
         self.assertIn("--kind candidate", self.draft)
         self.assertIn("run-id:", self.draft)
+        self.assertIn('cmp -- "$recovery_assets/LICENSE" "$source_root/LICENSE"', self.draft)
+        self.assertIn('cmp -- "$recovery_assets/THIRD_PARTY_NOTICES.md"', self.draft)
+        self.assertIn('cd "$source_root"', self.draft)
+        self.assertIn('"$control_root/tools/privacy_lint.py" --tracked', self.draft)
+        self.assertNotIn("safe.directory=*", self.draft)
+        self.assertNotIn("safe.directory: *", self.draft)
         self.assertIn("gh release view", self.draft)
         self.assertIn("refusing to overwrite", self.draft)
         self.assertIn("gh release create", self.draft)
+        self.assertLess(self.draft.index("gh release view"), self.draft.index("gh release create"))
+        create_step = self.draft.split(
+            "      - name: Create one GitHub draft release, never publish it\n", 1
+        )[1]
+        self.assertNotIn("\n      - name:", create_step)
+        self.assertIn('"$RUNNER_TEMP/recovery-release-assets/"*', create_step)
+        self.assertNotIn("candidate-release-assets", create_step)
         self.assertIn("--draft", self.draft)
         self.assertNotIn("--latest", self.draft)
         self.assertNotIn("--prerelease", self.draft)
+        self.assertNotIn("pypi", self.draft.lower())
 
     def test_release_actions_are_full_sha_pinned(self) -> None:
         for workflow in (self.build, self.draft):
@@ -129,16 +199,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_selected_tag_build_metadata_must_match_every_immutable_field(self) -> None:
         contract = read_release_contract(ROOT)
-        document = {
-            "id": 123,
-            "name": "Release build",
-            "event": "push",
-            "head_branch": "v0.1.0",
-            "head_sha": "a" * 40,
-            "status": "completed",
-            "conclusion": "success",
-            "repository": {"full_name": "w-dee/s3-hidbot"},
-        }
+        document = run_document(
+            run_id=123,
+            event="push",
+            head_branch="v0.1.0",
+            head_sha="a" * 40,
+        )
         validate_release_build_run(
             document,
             repository="w-dee/s3-hidbot",
@@ -159,15 +225,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             )
 
     def test_selected_candidate_build_must_match_the_tagged_commit(self) -> None:
-        document = {
-            "id": 456,
-            "name": "Release build",
-            "event": "workflow_dispatch",
-            "head_sha": "a" * 40,
-            "status": "completed",
-            "conclusion": "success",
-            "repository": {"full_name": "w-dee/s3-hidbot"},
-        }
+        document = run_document(run_id=456, event="workflow_dispatch", head_sha="a" * 40)
         validate_release_candidate_run(
             document,
             repository="w-dee/s3-hidbot",
@@ -182,6 +240,84 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 commit="a" * 40,
                 run_id="456",
             )
+
+    def test_candidate_rejects_wrong_source_and_workflow_path(self) -> None:
+        baseline = run_document(run_id=456, event="workflow_dispatch", head_sha="a" * 40)
+        for field, value in (("head_sha", "b" * 40), ("path", ".github/workflows/other.yml")):
+            with self.subTest(field=field):
+                document = copy.deepcopy(baseline)
+                document[field] = value
+                with self.assertRaises(ReleaseBuildRunError):
+                    validate_release_candidate_run(
+                        document,
+                        repository="w-dee/s3-hidbot",
+                        commit="a" * 40,
+                        run_id="456",
+                    )
+
+    def test_repository_full_name_is_required_inside_a_realistic_object(self) -> None:
+        baseline = run_document(run_id=456, event="workflow_dispatch", head_sha="a" * 40)
+        validate_release_candidate_run(
+            baseline,
+            repository="w-dee/s3-hidbot",
+            commit="a" * 40,
+            run_id="456",
+        )
+        invalid_repositories = (
+            None,
+            "w-dee/s3-hidbot",
+            {},
+            {"full_name": "w-dee/not-s3-hidbot", "id": 123456},
+        )
+        for repository_document in invalid_repositories:
+            with self.subTest(repository=repository_document):
+                document = copy.deepcopy(baseline)
+                if repository_document is None:
+                    document.pop("repository")
+                else:
+                    document["repository"] = repository_document
+                with self.assertRaises(ReleaseBuildRunError):
+                    validate_release_candidate_run(
+                        document,
+                        repository="w-dee/s3-hidbot",
+                        commit="a" * 40,
+                        run_id="456",
+                    )
+
+    def test_selected_recovery_run_uses_exact_reviewed_workflow(self) -> None:
+        workflow_commit = "f" * 40
+        baseline = run_document(
+            run_id=789,
+            event="workflow_dispatch",
+            head_branch="main",
+            head_sha=workflow_commit,
+        )
+        validate_release_recovery_run(
+            baseline,
+            repository="w-dee/s3-hidbot",
+            workflow_commit=workflow_commit,
+            run_id="789",
+        )
+        mutations = (
+            ("event", "push"),
+            ("head_branch", "feature/not-main"),
+            ("head_sha", "e" * 40),
+            ("path", ".github/workflows/other.yml"),
+            ("status", "in_progress"),
+            ("conclusion", "failure"),
+            ("repository", {"full_name": "w-dee/not-s3-hidbot", "id": 123456}),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                document = copy.deepcopy(baseline)
+                document[field] = value
+                with self.assertRaises(ReleaseBuildRunError):
+                    validate_release_recovery_run(
+                        document,
+                        repository="w-dee/s3-hidbot",
+                        workflow_commit=workflow_commit,
+                        run_id="789",
+                    )
 
     def test_release_docs_and_third_party_outcome_are_explicit(self) -> None:
         documents = {
