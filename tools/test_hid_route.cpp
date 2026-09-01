@@ -5,6 +5,12 @@
 
 namespace {
 
+bool nested_invalidation_result = true;
+
+void invalidate_after_generation_publish(hid_route::StateMachine &state) {
+    nested_invalidation_result = state.invalidate();
+}
+
 void test_cold_boot_is_none_generation_zero() {
     hid_route::StateMachine state;
     const hid_route::Snapshot snapshot = state.snapshot();
@@ -56,6 +62,34 @@ void test_generation_wrap_uses_exact_match_not_ordering() {
     assert(state.snapshot().generation == 1);
 }
 
+void verify_pre_publish_invalidation_abort(hid_route::Generation initial,
+                                           hid_route::Generation expected) {
+    hid_route::StateMachine state;
+    state.set_generation_for_test(initial);
+    state.set_generation_published_hook_for_test(invalidate_after_generation_publish);
+    nested_invalidation_result = true;
+
+    assert(!state.commit_usb_if_none());
+    assert(!nested_invalidation_result);
+    const hid_route::Snapshot final = state.snapshot();
+    assert(final.route == hid_route::OutputRoute::kNone);
+    assert(final.generation == expected);
+    assert(!final.invalidation_pending);
+    assert(!state.matches(hid_route::OutputRoute::kUsb, initial));
+    assert(!state.matches(hid_route::OutputRoute::kUsb, expected));
+}
+
+void test_pre_publish_invalidation_aborts_but_consumes_authority_epoch() {
+    // snapshot() is an atomic-field observation, so none plus the newly
+    // advanced authority epoch is a valid transient and final fail-closed
+    // result. The aborted transition must not roll back or increment twice.
+    verify_pre_publish_invalidation_abort(41, 42);
+}
+
+void test_pre_publish_invalidation_abort_wraps_modulo_uint32() {
+    verify_pre_publish_invalidation_abort(UINT32_MAX, 0);
+}
+
 }  // namespace
 
 int main() {
@@ -63,4 +97,6 @@ int main() {
     test_commit_and_invalidation_change_generation_exactly_once();
     test_exact_identity_rejects_stale_invalidation();
     test_generation_wrap_uses_exact_match_not_ordering();
+    test_pre_publish_invalidation_aborts_but_consumes_authority_epoch();
+    test_pre_publish_invalidation_abort_wraps_modulo_uint32();
 }

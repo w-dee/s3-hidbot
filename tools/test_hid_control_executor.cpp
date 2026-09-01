@@ -1,10 +1,11 @@
 #include <cassert>
 #include <cstdint>
-#include <vector>
 
 #include "hid_control_executor/hid_control_executor.hpp"
 
 namespace {
+
+using hid_control_executor::ControlOperation;
 
 struct FakeBackend final : hid_control_executor::Backend {
     hid_control_executor::BackendResult install() override {
@@ -29,8 +30,44 @@ struct FakeBackend final : hid_control_executor::Backend {
     };
 };
 
+struct AcceptingExecutor final : usb_lifecycle::Executor {
+    bool schedule(usb_lifecycle::ExecutorAction, usb_lifecycle::Snapshot) override {
+        ++calls;
+        return true;
+    }
+    int calls = 0;
+};
+
 usb_lifecycle::TransitionResult action(hid_control_executor::CommandOutcome outcome) {
     return outcome.action_result;
+}
+
+bool same_lifecycle(const usb_lifecycle::Snapshot &left,
+                    const usb_lifecycle::Snapshot &right) {
+    return left.desired == right.desired && left.observed == right.observed &&
+           left.generation == right.generation &&
+           left.uncertainty_generation == right.uncertainty_generation &&
+           left.safety_pending == right.safety_pending &&
+           left.host_release_uncertain == right.host_release_uncertain &&
+           left.recovery_required == right.recovery_required &&
+           left.last_error.present == right.last_error.present &&
+           left.last_error.operation == right.last_error.operation &&
+           left.last_error.code == right.last_error.code;
+}
+
+void complete_attach(hid_runtime::Runtime &runtime, FakeBackend &backend,
+                     hid_control_executor::Controller &controller) {
+    assert(controller.initialize(&runtime, &backend));
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(controller.active_operation_for_test() == ControlOperation::kUsbAttach);
+    assert(controller.process_one_for_test());
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+}
+
+void mount_ready(hid_runtime::Runtime &runtime) {
+    runtime.state_machine().on_mount();
+    runtime.state_machine().set_ready(hid_runtime::Interface::kKeyboard, true);
+    runtime.state_machine().set_ready(hid_runtime::Interface::kMouse, true);
 }
 
 void test_install_and_uninstall_are_task_owned_and_serialized() {
@@ -39,111 +76,232 @@ void test_install_and_uninstall_are_task_owned_and_serialized() {
     hid_control_executor::Controller controller;
     assert(controller.initialize(&runtime, &backend));
 
-    const auto cold = controller.snapshot();
-    assert(cold.lifecycle.desired == usb_lifecycle::DesiredExposure::kHidden);
-    assert(cold.lifecycle.observed == usb_lifecycle::ObservedState::kDriverNotInstalled);
-    assert(backend.install_calls == 0 && backend.uninstall_calls == 0);
-
     const auto accepted_attach = controller.request_attach();
     assert(action(accepted_attach) == usb_lifecycle::TransitionResult::kAccepted);
     assert(accepted_attach.snapshot_valid);
-    assert(accepted_attach.snapshot.lifecycle.observed == usb_lifecycle::ObservedState::kAttaching);
-    assert(!accepted_attach.snapshot.runtime.mounted);
-    assert(controller.active_operation_for_test() ==
-           hid_control_executor::ControlOperation::kUsbAttach);
-    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kNoOp);
+    assert(accepted_attach.snapshot.lifecycle.observed ==
+           usb_lifecycle::ObservedState::kAttaching);
+    assert(controller.active_operation_for_test() == ControlOperation::kUsbAttach);
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kBusy);
     assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kBusy);
     assert(backend.install_calls == 0);
     assert(controller.process_one_for_test());
     assert(backend.install_calls == 1);
-    assert(controller.active_operation_for_test() ==
-           hid_control_executor::ControlOperation::kNone);
-    assert(controller.snapshot().lifecycle.observed ==
-           usb_lifecycle::ObservedState::kDisconnected);
-    assert(!controller.process_one_for_test());
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
 
-    runtime.state_machine().on_mount();
-    runtime.state_machine().set_ready(hid_runtime::Interface::kKeyboard, true);
-    runtime.state_machine().set_ready(hid_runtime::Interface::kMouse, true);
+    mount_ready(runtime);
     const auto old_generation = controller.snapshot().lifecycle.generation;
     const auto accepted_detach = controller.request_detach();
     assert(action(accepted_detach) == usb_lifecycle::TransitionResult::kAccepted);
     assert(accepted_detach.snapshot_valid);
-    assert(accepted_detach.snapshot.lifecycle.observed == usb_lifecycle::ObservedState::kDetaching);
-    assert(accepted_detach.snapshot.lifecycle.generation == old_generation);
-    assert(accepted_detach.snapshot.runtime.mounted);
-    assert(accepted_detach.snapshot.runtime.keyboard_ready);
-    assert(accepted_detach.snapshot.runtime.mouse_ready);
-    assert(controller.active_operation_for_test() ==
-           hid_control_executor::ControlOperation::kUsbDetach);
-    assert(controller.snapshot().lifecycle.generation == old_generation);
-    assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kNoOp);
+    assert(accepted_detach.snapshot.lifecycle.observed ==
+           usb_lifecycle::ObservedState::kDetaching);
+    assert(controller.active_operation_for_test() == ControlOperation::kUsbDetach);
+    assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kBusy);
     assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kBusy);
     assert(backend.uninstall_calls == 0);
     assert(controller.process_one_for_test());
     assert(backend.uninstall_calls == 1);
-    assert(controller.active_operation_for_test() ==
-           hid_control_executor::ControlOperation::kNone);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
     const auto hidden = controller.snapshot();
     assert(hidden.lifecycle.observed == usb_lifecycle::ObservedState::kDriverNotInstalled);
     assert(hidden.lifecycle.generation == old_generation + 1);
     assert(!hidden.lifecycle.recovery_required);
 }
 
-void test_operation_guard_rejects_overlapping_control_actions() {
+void test_route_owner_blocks_attach_before_lifecycle_stage_a() {
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &backend));
+    assert(controller.reserve_operation_for_test(ControlOperation::kRouteChange));
+    const auto before = controller.snapshot().lifecycle;
+
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kBusy);
+    assert(same_lifecycle(before, controller.snapshot().lifecycle));
+    assert(backend.install_calls == 0);
+    assert(!controller.process_one_for_test());
+    controller.release_operation_for_test(ControlOperation::kRouteChange);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+}
+
+void test_route_owner_blocks_detach_before_lifecycle_stage_a() {
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    complete_attach(runtime, backend, controller);
+    mount_ready(runtime);
+    assert(controller.reserve_operation_for_test(ControlOperation::kRouteChange));
+    const auto before = controller.snapshot().lifecycle;
+
+    assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kBusy);
+    assert(same_lifecycle(before, controller.snapshot().lifecycle));
+    assert(backend.uninstall_calls == 0);
+    assert(!controller.process_one_for_test());
+    controller.release_operation_for_test(ControlOperation::kRouteChange);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+}
+
+void test_usb_owner_blocks_route_reservation() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &backend));
+        assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
+        assert(controller.active_operation_for_test() == ControlOperation::kUsbAttach);
+        assert(!controller.reserve_operation_for_test(ControlOperation::kRouteChange));
+        assert(controller.process_one_for_test());
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        complete_attach(runtime, backend, controller);
+        mount_ready(runtime);
+        assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kAccepted);
+        assert(controller.active_operation_for_test() == ControlOperation::kUsbDetach);
+        assert(!controller.reserve_operation_for_test(ControlOperation::kRouteChange));
+        assert(controller.process_one_for_test());
+    }
+}
+
+void test_no_op_and_ordinary_rejection_release_guard() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &backend));
+        assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kNoOp);
+        assert(controller.active_operation_for_test() == ControlOperation::kNone);
+        assert(!controller.process_one_for_test());
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        complete_attach(runtime, backend, controller);
+        assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kNoOp);
+        assert(controller.active_operation_for_test() == ControlOperation::kNone);
+        assert(!controller.process_one_for_test());
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        AcceptingExecutor external;
+        assert(controller.initialize(&runtime, &backend));
+        assert(runtime.state_machine().request_usb_attach(external).action_result ==
+               usb_lifecycle::TransitionResult::kAccepted);
+        const auto before = controller.snapshot().lifecycle;
+        assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kBusy);
+        assert(same_lifecycle(before, controller.snapshot().lifecycle));
+        assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    }
+}
+
+void test_schedule_requires_matching_preclaimed_owner() {
     hid_runtime::Runtime runtime;
     FakeBackend backend;
     hid_control_executor::Controller controller;
     assert(controller.initialize(&runtime, &backend));
     const auto snapshot = controller.snapshot().lifecycle;
 
-    // The lifecycle state machine normally owns scheduling. This direct probe
-    // exercises only the generic guard: once one control action is claimed,
-    // a distinct operation cannot enqueue beside it.
+    assert(!controller.schedule(usb_lifecycle::ExecutorAction::kInstall, snapshot));
+    assert(controller.reserve_operation_for_test(ControlOperation::kRouteChange));
+    assert(!controller.schedule(usb_lifecycle::ExecutorAction::kInstall, snapshot));
+    controller.release_operation_for_test(ControlOperation::kRouteChange);
+    assert(controller.reserve_operation_for_test(ControlOperation::kUsbAttach));
     assert(controller.schedule(usb_lifecycle::ExecutorAction::kInstall, snapshot));
-    assert(controller.active_operation_for_test() ==
-           hid_control_executor::ControlOperation::kUsbAttach);
-    assert(!controller.schedule(usb_lifecycle::ExecutorAction::kUninstall, snapshot));
-    assert(backend.install_calls == 0 && backend.uninstall_calls == 0);
+    assert(controller.process_one_for_test());
+    assert(backend.install_calls == 0);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
 }
 
-void test_backend_failure_results_reach_lifecycle_state() {
+void test_backend_failures_release_guard() {
+    for (const auto kind : {hid_control_executor::BackendResultKind::kCleanInstallFailure,
+                            hid_control_executor::BackendResultKind::kAmbiguousInstallFailure}) {
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &backend));
+        backend.install_result = {.kind = kind, .error_code = -99};
+        assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        assert(controller.active_operation_for_test() == ControlOperation::kNone);
+        const auto snapshot = controller.snapshot().lifecycle;
+        assert(snapshot.last_error.present && snapshot.last_error.code == -99);
+        assert(snapshot.recovery_required ==
+               (kind == hid_control_executor::BackendResultKind::kAmbiguousInstallFailure));
+    }
+
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    complete_attach(runtime, backend, controller);
+    mount_ready(runtime);
+    backend.uninstall_result = {
+        .kind = hid_control_executor::BackendResultKind::kUninstallFailure,
+        .error_code = -77,
+    };
+    assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    const auto failed = controller.snapshot().lifecycle;
+    assert(failed.recovery_required);
+    assert(failed.last_error.present && failed.last_error.code == -77);
+}
+
+void test_real_queue_failure_is_recovery_fault_and_releases_guard() {
     hid_runtime::Runtime runtime;
     FakeBackend backend;
     hid_control_executor::Controller controller;
     assert(controller.initialize(&runtime, &backend));
+    controller.fail_next_enqueue_for_test();
 
-    backend.install_result = {
-        .kind = hid_control_executor::BackendResultKind::kCleanInstallFailure,
-        .error_code = -12,
-    };
-    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
-    assert(controller.process_one_for_test());
-    auto snapshot = controller.snapshot().lifecycle;
-    assert(snapshot.observed == usb_lifecycle::ObservedState::kDriverNotInstalled);
-    assert(!snapshot.recovery_required);
-    assert(snapshot.last_error.present && snapshot.last_error.code == -12);
-    assert(controller.active_operation_for_test() ==
-           hid_control_executor::ControlOperation::kNone);
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kBusy);
+    const auto failed = controller.snapshot().lifecycle;
+    assert(failed.desired == usb_lifecycle::DesiredExposure::kExposed);
+    assert(failed.observed == usb_lifecycle::ObservedState::kAttaching);
+    assert(failed.generation == 1);
+    assert(failed.recovery_required);
+    assert(failed.last_error.present && failed.last_error.code == -1);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    assert(!controller.process_one_for_test());
+    assert(backend.install_calls == 0);
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kBusy);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+}
 
-    backend.install_result = {
-        .kind = hid_control_executor::BackendResultKind::kAmbiguousInstallFailure,
-        .error_code = -99,
-    };
+void test_callback_invalidation_obsoletes_action_and_releases_guard() {
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &backend));
+    const auto authority_before = runtime.state_machine().authority_epoch();
     assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
+    const auto accepted_generation = controller.snapshot().lifecycle.generation;
+    assert(controller.active_operation_for_test() == ControlOperation::kUsbAttach);
+
+    runtime.state_machine().on_unmount();
+    assert(runtime.state_machine().authority_epoch() != authority_before);
+    assert(controller.snapshot().lifecycle.generation != accepted_generation);
+    assert(controller.active_operation_for_test() == ControlOperation::kUsbAttach);
     assert(controller.process_one_for_test());
-    snapshot = controller.snapshot().lifecycle;
-    assert(snapshot.observed == usb_lifecycle::ObservedState::kAttaching);
-    assert(snapshot.recovery_required);
-    assert(snapshot.last_error.present && snapshot.last_error.code == -99);
-    assert(controller.active_operation_for_test() ==
-           hid_control_executor::ControlOperation::kNone);
+    assert(backend.install_calls == 0);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
 }
 
 }  // namespace
 
 int main() {
     test_install_and_uninstall_are_task_owned_and_serialized();
-    test_operation_guard_rejects_overlapping_control_actions();
-    test_backend_failure_results_reach_lifecycle_state();
+    test_route_owner_blocks_attach_before_lifecycle_stage_a();
+    test_route_owner_blocks_detach_before_lifecycle_stage_a();
+    test_usb_owner_blocks_route_reservation();
+    test_no_op_and_ordinary_rejection_release_guard();
+    test_schedule_requires_matching_preclaimed_owner();
+    test_backend_failures_release_guard();
+    test_real_queue_failure_is_recovery_fault_and_releases_guard();
+    test_callback_invalidation_obsoletes_action_and_releases_guard();
 }

@@ -77,6 +77,9 @@ class Controller final : public usb_lifecycle::Executor {
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     bool process_one_for_test();
     ControlOperation active_operation_for_test() const;
+    bool reserve_operation_for_test(ControlOperation operation);
+    void release_operation_for_test(ControlOperation operation);
+    void fail_next_enqueue_for_test();
 #endif
 
   private:
@@ -99,6 +102,7 @@ class Controller final : public usb_lifecycle::Executor {
     Action native_queue_[2]{};
     std::uint8_t native_head_ = 0;
     std::uint8_t native_count_ = 0;
+    bool fail_next_enqueue_ = false;
 #endif
 };
 

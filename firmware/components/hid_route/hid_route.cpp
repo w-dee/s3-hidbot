@@ -42,9 +42,16 @@ bool StateMachine::commit_usb_if_none() {
         leave_writer();
         return false;
     }
-    // Publish the new generation before usb becomes usable. The transient is
-    // fail-closed because the route remains none until this store.
+    // Publish the new authority epoch before usb becomes usable. The
+    // transient is fail-closed because the route remains none until this
+    // store. An invalidation that preempts publication intentionally retires
+    // this epoch even though no route change commits; never roll it back.
     generation_.fetch_add(1, std::memory_order_acq_rel);
+#ifdef HID_ROUTE_NATIVE_TEST
+    if (generation_published_hook_ != nullptr) {
+        generation_published_hook_(*this);
+    }
+#endif
     if (invalidation_pending_.load(std::memory_order_acquire)) {
         leave_writer();
         (void)invalidate();
@@ -104,6 +111,10 @@ bool StateMachine::invalidate_if_matches(Snapshot expected) {
 #ifdef HID_ROUTE_NATIVE_TEST
 void StateMachine::set_generation_for_test(Generation generation) {
     generation_.store(generation, std::memory_order_release);
+}
+
+void StateMachine::set_generation_published_hook_for_test(GenerationPublishedHook hook) {
+    generation_published_hook_ = hook;
 }
 #endif
 

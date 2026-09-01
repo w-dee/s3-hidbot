@@ -12,6 +12,8 @@ enum class OutputRoute : std::uint8_t {
     kBle,
 };
 
+// Opaque route-authority epoch. Consumers may compare only for exact equality
+// or inequality; this is not a route-change count or an ordering value.
 using Generation = std::uint32_t;
 
 struct Snapshot {
@@ -28,6 +30,11 @@ class StateMachine final {
     StateMachine();
 
     void initialize_cold_boot();
+    // Atomic-field observation for internal fail-closed checks. This is not a
+    // coherent transaction snapshot for a future public wire contract;
+    // transient combinations such as none plus a newly advanced epoch are
+    // valid. A future accepted route response must use its controller-owned
+    // immutable transaction snapshot, not a later live snapshot().
     Snapshot snapshot() const;
     bool matches(OutputRoute route, Generation generation) const;
 
@@ -41,7 +48,9 @@ class StateMachine final {
     bool invalidate_if_matches(Snapshot expected);
 
 #ifdef HID_ROUTE_NATIVE_TEST
+    using GenerationPublishedHook = void (*)(StateMachine &state);
     void set_generation_for_test(Generation generation);
+    void set_generation_published_hook_for_test(GenerationPublishedHook hook);
 #endif
 
   private:
@@ -56,6 +65,9 @@ class StateMachine final {
     std::atomic<std::uint8_t> route_{static_cast<std::uint8_t>(OutputRoute::kNone)};
     std::atomic_bool writer_active_{false};
     std::atomic_bool invalidation_pending_{false};
+#ifdef HID_ROUTE_NATIVE_TEST
+    GenerationPublishedHook generation_published_hook_ = nullptr;
+#endif
 };
 
 }  // namespace hid_route

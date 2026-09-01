@@ -68,11 +68,17 @@ void Controller::release_operation(ControlOperation operation) {
 }
 
 CommandOutcome Controller::request_attach() {
-    if (!initialized_) {
+    constexpr ControlOperation operation = ControlOperation::kUsbAttach;
+    if (!initialized_ || !claim_operation(operation)) {
         return {};
     }
     const hid_runtime::UsbTransitionOutcome outcome =
         runtime_->state_machine().request_usb_attach(*this);
+    if (outcome.action_result != usb_lifecycle::TransitionResult::kAccepted) {
+        // No asynchronous action exists for no-op, ordinary rejection, or a
+        // real post-Stage-A scheduling failure.
+        release_operation(operation);
+    }
     return CommandOutcome{
         .action_result = outcome.action_result,
         .snapshot_valid = outcome.snapshot_valid,
@@ -84,11 +90,16 @@ CommandOutcome Controller::request_attach() {
 }
 
 CommandOutcome Controller::request_detach() {
-    if (!initialized_) {
+    constexpr ControlOperation operation = ControlOperation::kUsbDetach;
+    if (!initialized_ || !claim_operation(operation)) {
         return {};
     }
     const hid_runtime::UsbTransitionOutcome outcome =
         runtime_->state_machine().request_usb_detach(*this);
+    if (outcome.action_result != usb_lifecycle::TransitionResult::kAccepted) {
+        // Accepted work retains ownership until process() terminalizes it.
+        release_operation(operation);
+    }
     return CommandOutcome{
         .action_result = outcome.action_result,
         .snapshot_valid = outcome.snapshot_valid,
@@ -112,7 +123,10 @@ ExposureSnapshot Controller::snapshot() const {
 bool Controller::schedule(usb_lifecycle::ExecutorAction action,
                           usb_lifecycle::Snapshot snapshot) {
     const ControlOperation operation = operation_for(action);
-    if (!initialized_ || !claim_operation(operation)) {
+    // The request entry point must own the cross-domain guard before USB
+    // lifecycle Stage-A. Scheduling only verifies inherited ownership.
+    if (!initialized_ ||
+        active_operation_.load(std::memory_order_acquire) != operation) {
         return false;
     }
     const Action item{.kind = action,
@@ -120,8 +134,11 @@ bool Controller::schedule(usb_lifecycle::ExecutorAction action,
                       .route = runtime_->state_machine().route_snapshot(),
                       .operation = operation};
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (fail_next_enqueue_) {
+        fail_next_enqueue_ = false;
+        return false;
+    }
     if (native_count_ == 2) {
-        release_operation(operation);
         return false;
     }
     native_queue_[(native_head_ + native_count_) % 2] = item;
@@ -131,7 +148,6 @@ bool Controller::schedule(usb_lifecycle::ExecutorAction action,
     if (xQueueSend(s_action_queue, &item, 0) == pdPASS) {
         return true;
     }
-    release_operation(operation);
     return false;
 #endif
 }
@@ -214,6 +230,16 @@ bool Controller::process_one_for_test() {
 ControlOperation Controller::active_operation_for_test() const {
     return active_operation_.load(std::memory_order_acquire);
 }
+
+bool Controller::reserve_operation_for_test(ControlOperation operation) {
+    return operation != ControlOperation::kNone && claim_operation(operation);
+}
+
+void Controller::release_operation_for_test(ControlOperation operation) {
+    release_operation(operation);
+}
+
+void Controller::fail_next_enqueue_for_test() { fail_next_enqueue_ = true; }
 #else
 void Controller::task_entry(void *context) {
     static_cast<Controller *>(context)->task_loop();
