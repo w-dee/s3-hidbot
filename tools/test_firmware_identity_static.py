@@ -50,7 +50,7 @@ def main() -> int:
     # U7.1B keeps native USB absent at boot: only the dedicated lifecycle
     # backend may contain the public install call, after UART startup setup.
     assert "tinyusb_driver_install" not in app_main
-    assert "usb_exposure_control" in main_cmake
+    assert "hid_control_executor" in main_cmake
     assert '"firmware_identity_adapter.cpp"' in main_cmake
     assert "esp_app_format" in main_cmake
 

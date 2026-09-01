@@ -1,7 +1,6 @@
 idf_component_register(
-    SRCS "hid_runtime.cpp"
+    SRCS "hid_route.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES esp_tinyusb usb_lifecycle hid_route
 )
 
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)

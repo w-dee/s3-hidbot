@@ -7,7 +7,7 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "hid_runtime/hid_runtime.hpp"
-#include "usb_exposure_control/usb_exposure_control.hpp"
+#include "hid_control_executor/hid_control_executor.hpp"
 #include "uart_control_transport/uart_control_transport.hpp"
 #include "firmware_identity/firmware_identity.hpp"
 #include "firmware_identity_adapter.hpp"
@@ -36,7 +36,7 @@ constexpr uint8_t kKeyboardStringIndex = 4;
 constexpr uint8_t kMouseStringIndex = 5;
 
 hid_runtime::Runtime s_hid_runtime;
-usb_exposure_control::Controller s_usb_exposure;
+hid_control_executor::Controller s_usb_exposure;
 firmware_identity::Identity s_firmware_identity;
 
 control_protocol::UsbStatus usb_status(void *) {
@@ -50,7 +50,7 @@ control_session::AuthorityEpoch hid_authority_epoch(void *) {
 }
 
 control_protocol::UsbExposureStatus make_usb_exposure_status(
-    const usb_exposure_control::ExposureSnapshot &snapshot) {
+    const hid_control_executor::ExposureSnapshot &snapshot) {
     const auto desired = [](usb_lifecycle::DesiredExposure value) {
         return value == usb_lifecycle::DesiredExposure::kExposed
                    ? control_protocol::UsbExposureDesired::kExposed
@@ -102,7 +102,7 @@ control_protocol::UsbExposureStatus usb_exposure_status(void *) {
 }
 
 control_protocol::UsbExposureActionOutcome usb_attach(void *) {
-    const usb_exposure_control::CommandOutcome outcome = s_usb_exposure.request_attach();
+    const hid_control_executor::CommandOutcome outcome = s_usb_exposure.request_attach();
     switch (outcome.action_result) {
         case usb_lifecycle::TransitionResult::kAccepted:
             return control_protocol::UsbExposureActionOutcome{
@@ -123,7 +123,7 @@ control_protocol::UsbExposureActionOutcome usb_attach(void *) {
 }
 
 control_protocol::UsbExposureActionOutcome usb_detach(void *) {
-    const usb_exposure_control::CommandOutcome outcome = s_usb_exposure.request_detach();
+    const hid_control_executor::CommandOutcome outcome = s_usb_exposure.request_detach();
     switch (outcome.action_result) {
         case usb_lifecycle::TransitionResult::kAccepted:
             return control_protocol::UsbExposureActionOutcome{
@@ -370,9 +370,9 @@ void usb_event_handler(tinyusb_event_t *event, void *argument) {
     }
 }
 
-class TinyUsbLifecycleBackend final : public usb_exposure_control::Backend {
+class TinyUsbLifecycleBackend final : public hid_control_executor::Backend {
   public:
-    usb_exposure_control::BackendResult install() override {
+    hid_control_executor::BackendResult install() override {
         // esp_tinyusb copies the callback and consumes descriptor setup during
         // install. The descriptors themselves remain static for the complete
         // duration of every fresh driver instance.
@@ -384,7 +384,7 @@ class TinyUsbLifecycleBackend final : public usb_exposure_control::Backend {
             sizeof(kHidStringDescriptors) / sizeof(kHidStringDescriptors[0]);
         const esp_err_t result = tinyusb_driver_install(&configuration);
         if (result == ESP_OK) {
-            return {.kind = usb_exposure_control::BackendResultKind::kSuccess,
+            return {.kind = hid_control_executor::BackendResultKind::kSuccess,
                     .error_code = 0};
         }
         ESP_LOGE(kLogTag, "native USB install failed: %ld", static_cast<long>(result));
@@ -393,19 +393,19 @@ class TinyUsbLifecycleBackend final : public usb_exposure_control::Backend {
         // followed by the component's PHY cleanup). All other outcomes may
         // have crossed a partial-start boundary and require manual recovery.
         const auto kind = result == ESP_ERR_INVALID_ARG || result == ESP_ERR_NOT_SUPPORTED
-                              ? usb_exposure_control::BackendResultKind::kCleanInstallFailure
-                              : usb_exposure_control::BackendResultKind::kAmbiguousInstallFailure;
+                              ? hid_control_executor::BackendResultKind::kCleanInstallFailure
+                              : hid_control_executor::BackendResultKind::kAmbiguousInstallFailure;
         return {.kind = kind, .error_code = static_cast<std::int32_t>(result)};
     }
 
-    usb_exposure_control::BackendResult uninstall() override {
+    hid_control_executor::BackendResult uninstall() override {
         const esp_err_t result = tinyusb_driver_uninstall();
         if (result == ESP_OK) {
-            return {.kind = usb_exposure_control::BackendResultKind::kSuccess,
+            return {.kind = hid_control_executor::BackendResultKind::kSuccess,
                     .error_code = 0};
         }
         ESP_LOGE(kLogTag, "native USB uninstall failed: %ld", static_cast<long>(result));
-        return {.kind = usb_exposure_control::BackendResultKind::kUninstallFailure,
+        return {.kind = hid_control_executor::BackendResultKind::kUninstallFailure,
                 .error_code = static_cast<std::int32_t>(result)};
     }
 };

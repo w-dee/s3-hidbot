@@ -3,19 +3,19 @@ set -euo pipefail
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 temporary_directory=$(mktemp -d)
-trap 'rm -f "$temporary_directory/test_hid_runtime"; rmdir "$temporary_directory" 2>/dev/null || true' EXIT
+trap 'rm -f "$temporary_directory/test_hid_control_executor"; rmdir "$temporary_directory" 2>/dev/null || true' EXIT
 
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -pedantic \
-  -DHID_RUNTIME_NATIVE_TEST \
-  -DUSB_LIFECYCLE_NATIVE_TEST \
-  -DHID_ROUTE_NATIVE_TEST \
+  -DHID_RUNTIME_NATIVE_TEST -DHID_CONTROL_EXECUTOR_NATIVE_TEST -DHID_ROUTE_NATIVE_TEST \
   -I"$repository_root/firmware/components/hid_runtime/include" \
+  -I"$repository_root/firmware/components/hid_control_executor/include" \
   -I"$repository_root/firmware/components/hid_route/include" \
   -I"$repository_root/firmware/components/usb_lifecycle/include" \
-  "$repository_root/tools/test_hid_runtime.cpp" \
+  "$repository_root/tools/test_hid_control_executor.cpp" \
+  "$repository_root/firmware/components/hid_control_executor/hid_control_executor.cpp" \
   "$repository_root/firmware/components/hid_runtime/hid_runtime.cpp" \
   "$repository_root/firmware/components/hid_route/hid_route.cpp" \
   "$repository_root/firmware/components/usb_lifecycle/usb_lifecycle.cpp" \
-  -o "$temporary_directory/test_hid_runtime"
-"$temporary_directory/test_hid_runtime"
-echo "PASS: HID runtime lifecycle/state/safety tests"
+  -o "$temporary_directory/test_hid_control_executor"
+"$temporary_directory/test_hid_control_executor"
+echo "PASS: HID control executor tests"

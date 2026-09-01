@@ -1,15 +1,15 @@
-#include "usb_exposure_control/usb_exposure_control.hpp"
+#include "hid_control_executor/hid_control_executor.hpp"
 
-#ifndef USB_EXPOSURE_CONTROL_NATIVE_TEST
+#ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #endif
 
-namespace usb_exposure_control {
+namespace hid_control_executor {
 namespace {
 
-#ifndef USB_EXPOSURE_CONTROL_NATIVE_TEST
+#ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
 constexpr std::size_t kActionQueueDepth = 2;
 constexpr std::uint32_t kLifecycleTaskStackBytes = 4096;
 constexpr std::size_t kLifecycleTaskStackDepth =
@@ -34,17 +34,37 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend) {
     }
     runtime_ = runtime;
     backend_ = backend;
-#ifndef USB_EXPOSURE_CONTROL_NATIVE_TEST
+#ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     s_action_queue = xQueueCreateStatic(kActionQueueDepth, sizeof(Action), s_queue_bytes,
                                         &s_queue_storage);
     if (s_action_queue == nullptr ||
-        xTaskCreateStatic(task_entry, "usb_lifecycle", kLifecycleTaskStackDepth,
+        xTaskCreateStatic(task_entry, "hid_control", kLifecycleTaskStackDepth,
                           this, kLifecycleTaskPriority, s_task_stack, &s_task_storage) == nullptr) {
         return false;
     }
 #endif
     initialized_ = true;
     return true;
+}
+
+ControlOperation Controller::operation_for(usb_lifecycle::ExecutorAction action) {
+    return action == usb_lifecycle::ExecutorAction::kInstall
+               ? ControlOperation::kUsbAttach
+               : ControlOperation::kUsbDetach;
+}
+
+bool Controller::claim_operation(ControlOperation operation) {
+    ControlOperation expected = ControlOperation::kNone;
+    return active_operation_.compare_exchange_strong(expected, operation,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire);
+}
+
+void Controller::release_operation(ControlOperation operation) {
+    ControlOperation expected = operation;
+    (void)active_operation_.compare_exchange_strong(expected, ControlOperation::kNone,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire);
 }
 
 CommandOutcome Controller::request_attach() {
@@ -91,27 +111,52 @@ ExposureSnapshot Controller::snapshot() const {
 
 bool Controller::schedule(usb_lifecycle::ExecutorAction action,
                           usb_lifecycle::Snapshot snapshot) {
-    if (!initialized_) {
+    const ControlOperation operation = operation_for(action);
+    if (!initialized_ || !claim_operation(operation)) {
         return false;
     }
-    const Action item{.kind = action, .snapshot = snapshot};
-#ifdef USB_EXPOSURE_CONTROL_NATIVE_TEST
+    const Action item{.kind = action,
+                      .snapshot = snapshot,
+                      .route = runtime_->state_machine().route_snapshot(),
+                      .operation = operation};
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     if (native_count_ == 2) {
+        release_operation(operation);
         return false;
     }
     native_queue_[(native_head_ + native_count_) % 2] = item;
     ++native_count_;
     return true;
 #else
-    return xQueueSend(s_action_queue, &item, 0) == pdPASS;
+    if (xQueueSend(s_action_queue, &item, 0) == pdPASS) {
+        return true;
+    }
+    release_operation(operation);
+    return false;
 #endif
 }
 
 void Controller::process(Action action) {
     if (runtime_ == nullptr || backend_ == nullptr) {
+        release_operation(action.operation);
         return;
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
+    const usb_lifecycle::Snapshot current = state.usb_lifecycle_snapshot();
+    const bool expected_lifecycle_state =
+        action.kind == usb_lifecycle::ExecutorAction::kInstall
+            ? current.desired == usb_lifecycle::DesiredExposure::kExposed &&
+                  current.observed == usb_lifecycle::ObservedState::kAttaching
+            : current.desired == usb_lifecycle::DesiredExposure::kHidden &&
+                  current.observed == usb_lifecycle::ObservedState::kDetaching;
+    if (active_operation_.load(std::memory_order_acquire) != action.operation ||
+        !expected_lifecycle_state ||
+        current.desired != action.snapshot.desired ||
+        current.observed != action.snapshot.observed ||
+        current.generation != action.snapshot.generation) {
+        release_operation(action.operation);
+        return;
+    }
     if (action.kind == usb_lifecycle::ExecutorAction::kInstall) {
         const BackendResult result = backend_->install();
         switch (result.kind) {
@@ -130,10 +175,11 @@ void Controller::process(Action action) {
                 state.complete_usb_install_ambiguous_failure(result.error_code);
                 break;
         }
+        release_operation(action.operation);
         return;
     }
 
-#ifdef USB_EXPOSURE_CONTROL_NATIVE_TEST
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     const hid_runtime::LifecycleSafetyResult safety = state.begin_lifecycle_detach_safety();
     if (safety != hid_runtime::LifecycleSafetyResult::kClean) {
         state.mark_lifecycle_detach_uncertain(action.snapshot.generation);
@@ -141,6 +187,7 @@ void Controller::process(Action action) {
 #else
     (void)runtime_->run_lifecycle_detach_safety();
 #endif
+    state.complete_usb_detach_route_invalidation(action.route);
     state.begin_usb_uninstall();
     const BackendResult result = backend_->uninstall();
     if (result.kind == BackendResultKind::kSuccess) {
@@ -149,9 +196,10 @@ void Controller::process(Action action) {
     } else {
         state.complete_usb_uninstall_failure(result.error_code);
     }
+    release_operation(action.operation);
 }
 
-#ifdef USB_EXPOSURE_CONTROL_NATIVE_TEST
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
 bool Controller::process_one_for_test() {
     if (native_count_ == 0) {
         return false;
@@ -161,6 +209,10 @@ bool Controller::process_one_for_test() {
     --native_count_;
     process(action);
     return true;
+}
+
+ControlOperation Controller::active_operation_for_test() const {
+    return active_operation_.load(std::memory_order_acquire);
 }
 #else
 void Controller::task_entry(void *context) {
@@ -177,4 +229,4 @@ void Controller::task_loop() {
 }
 #endif
 
-}  // namespace usb_exposure_control
+}  // namespace hid_control_executor

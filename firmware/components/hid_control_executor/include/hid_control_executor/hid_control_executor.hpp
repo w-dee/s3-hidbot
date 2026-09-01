@@ -1,11 +1,22 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
+#include "hid_route/hid_route.hpp"
 #include "hid_runtime/hid_runtime.hpp"
 #include "usb_lifecycle/usb_lifecycle.hpp"
 
-namespace usb_exposure_control {
+namespace hid_control_executor {
+
+enum class ControlOperation : std::uint8_t {
+    kNone,
+    kUsbAttach,
+    kUsbDetach,
+    // U7.2A foundation-only placeholders; they execute no route/BLE work.
+    kRouteChange,
+    kBleChange,
+};
 
 enum class BackendResultKind : std::uint8_t {
     kSuccess,
@@ -19,7 +30,7 @@ struct BackendResult {
     std::int32_t error_code = 0;
 };
 
-// Only Controller's dedicated lifecycle task invokes this backend. The
+// Only Controller's dedicated control task invokes this backend. The
 // concrete firmware backend owns the public esp_tinyusb calls; native tests
 // use a deterministic fake and never link TinyUSB.
 class Backend {
@@ -48,6 +59,8 @@ class Controller final : public usb_lifecycle::Executor {
     struct Action {
         usb_lifecycle::ExecutorAction kind = usb_lifecycle::ExecutorAction::kInstall;
         usb_lifecycle::Snapshot snapshot{};
+        hid_route::Snapshot route{};
+        ControlOperation operation = ControlOperation::kNone;
     };
 
     bool initialize(hid_runtime::Runtime *runtime, Backend *backend);
@@ -57,18 +70,22 @@ class Controller final : public usb_lifecycle::Executor {
     ExposureSnapshot snapshot() const;
 
     // usb_lifecycle::Executor. Calls originate in the UART/control task and
-    // are stored in a fixed, serialized action queue.
+    // are stored in the shared fixed control-action queue.
     bool schedule(usb_lifecycle::ExecutorAction action,
                   usb_lifecycle::Snapshot snapshot) override;
 
-#ifdef USB_EXPOSURE_CONTROL_NATIVE_TEST
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     bool process_one_for_test();
+    ControlOperation active_operation_for_test() const;
 #endif
 
   private:
     void process(Action action);
+    bool claim_operation(ControlOperation operation);
+    void release_operation(ControlOperation operation);
+    static ControlOperation operation_for(usb_lifecycle::ExecutorAction action);
 
-#ifndef USB_EXPOSURE_CONTROL_NATIVE_TEST
+#ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     static void task_entry(void *context);
     void task_loop();
 #endif
@@ -76,12 +93,13 @@ class Controller final : public usb_lifecycle::Executor {
     hid_runtime::Runtime *runtime_ = nullptr;
     Backend *backend_ = nullptr;
     bool initialized_ = false;
+    std::atomic<ControlOperation> active_operation_{ControlOperation::kNone};
 
-#ifdef USB_EXPOSURE_CONTROL_NATIVE_TEST
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     Action native_queue_[2]{};
     std::uint8_t native_head_ = 0;
     std::uint8_t native_count_ = 0;
 #endif
 };
 
-}  // namespace usb_exposure_control
+}  // namespace hid_control_executor

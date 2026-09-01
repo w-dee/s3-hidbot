@@ -7,6 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "firmware/components/hid_runtime/hid_runtime.cpp"
 RUNTIME_HEADER = ROOT / "firmware/components/hid_runtime/include/hid_runtime/hid_runtime.hpp"
+ROUTE = ROOT / "firmware/components/hid_route/hid_route.cpp"
+ROUTE_HEADER = ROOT / "firmware/components/hid_route/include/hid_route/hid_route.hpp"
 MAIN = ROOT / "firmware/main/main.cpp"
 PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
 TRANSPORT = ROOT / "firmware/components/uart_control_transport/uart_control_transport.cpp"
@@ -16,6 +18,8 @@ SDKCONFIG = ROOT / "firmware/sdkconfig.defaults"
 def main() -> int:
     runtime = RUNTIME.read_text(encoding="utf-8")
     header = RUNTIME_HEADER.read_text(encoding="utf-8")
+    route = ROUTE.read_text(encoding="utf-8")
+    route_header = ROUTE_HEADER.read_text(encoding="utf-8")
     main_source = MAIN.read_text(encoding="utf-8")
     protocol = PROTOCOL.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
@@ -62,7 +66,20 @@ def main() -> int:
     assert "in_flight_authority_epoch != authority_epoch()" in runtime
     assert "preserve_suspend_safety" in runtime
     assert "any_safety_required" in runtime
-    assert "generation" in header and "slot_generation" in header
+    assert "HidTransport" in header and "RouteGeneration" in header
+    assert "slot_transport_generation" in header
+    assert "slot_route_generation" in header
+    assert "in_flight_route_generation" in header
+    assert "route_generation" in header and "transport_generation" in header
+    assert "hid_route/hid_route.hpp" in header
+    assert "unsafe_route_active" in runtime
+    assert "route_.invalidate()" in runtime
+    assert "commit_usb_if_none" in runtime
+    assert "OutputRoute" in route_header
+    assert "kBle" in route_header
+    assert "std::uint32_t" in route_header
+    assert "commit_none_locked" in route
+    assert "invalidation_pending_" in route
     assert "request_release_all" in header
     assert "ReleaseAllTicket" in header
     assert "begin_release_all" in runtime

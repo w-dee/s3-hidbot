@@ -132,6 +132,35 @@ void test_readiness_refresh_after_reattach() {
     assert(snapshot.keyboard_ready && snapshot.mouse_ready);
 }
 
+void invalidate_route_before_submit(hid_runtime::StateMachine *state) {
+    state->on_suspend();
+}
+
+void test_route_generation_is_independent_and_gates_stale_unsafe_work() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    assert(state.route_snapshot().route == hid_route::OutputRoute::kNone);
+    assert(state.route_snapshot().generation == 0);
+
+    expose(state);
+    assert(state.route_snapshot().route == hid_route::OutputRoute::kNone);
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    const hid_route::Snapshot usb_route = state.route_snapshot();
+    assert(usb_route.route == hid_route::OutputRoute::kUsb);
+    assert(usb_route.generation == 1);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+
+    assert(state.queue_mouse_report(0, 1, 0, 0, 0));
+    state.set_before_submit_hook_for_test(invalidate_route_before_submit);
+    state.execute(Sink::submit, &sink);
+    state.set_before_submit_hook_for_test(nullptr);
+    assert(sink.calls == 0);
+    const hid_route::Snapshot invalidated = state.route_snapshot();
+    assert(invalidated.route == hid_route::OutputRoute::kNone);
+    assert(invalidated.generation == usb_route.generation + 1);
+    assert(!state.queue_mouse_report(0, 1, 0, 0, 0));
+}
+
 void test_usb_transition_outcomes_freeze_stage_a_runtime() {
     hid_runtime::StateMachine state;
     ImmediateLifecycleExecutor executor;
@@ -836,7 +865,18 @@ void test_late_tokenized_callbacks_cannot_affect_new_generation() {
     state.execute(Sink::submit, &sink);
     const hid_runtime::HidWorkToken new_token =
         state.in_flight_token(hid_runtime::Interface::kMouse);
-    assert(old_token.usb_generation != new_token.usb_generation);
+    assert(old_token.transport_generation != new_token.transport_generation);
+    assert(old_token.route_generation != new_token.route_generation);
+    assert(new_token.transport == hid_runtime::HidTransport::kUsb);
+    const hid_runtime::HidWorkToken stale_route = {
+        .authority_epoch = new_token.authority_epoch,
+        .route_generation = new_token.route_generation + 1,
+        .transport = new_token.transport,
+        .transport_generation = new_token.transport_generation,
+        .ticket_id = new_token.ticket_id,
+        .release_epoch = new_token.release_epoch,
+    };
+    assert(!state.report_complete_for_token(1, stale_route));
     assert(!state.report_complete_for_token(1, old_token));
     assert(!state.report_failed_for_token(1, old_token));
     assert(state.report_in_flight(hid_runtime::Interface::kMouse));
@@ -941,12 +981,40 @@ void test_internal_detach_preserves_uncertainty_until_explicit_recovery() {
     assert(clean.queue_mouse_report(0, 1, 0, 0, 0));
 }
 
+void test_detach_invalidates_route_only_after_old_route_safety() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    FakeLifecycleExecutor executor;
+    ready(state);
+    const hid_route::Snapshot old_route = state.route_snapshot();
+    const auto old_usb_generation = state.attach_generation();
+    const std::array<std::uint8_t, 6> f24 = {115, 0, 0, 0, 0, 0};
+    assert(state.queue_keyboard_report(0, f24));
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1 && sink.instance == 0 && sink.report[2] == 115);
+
+    assert(action(state.request_usb_detach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(state.route_snapshot().route == hid_route::OutputRoute::kUsb);
+    assert(state.begin_lifecycle_detach_safety() == hid_runtime::LifecycleSafetyResult::kPending);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2 && sink.instance == 0 && sink.report[0] == 0 && sink.report[2] == 0);
+    assert(state.report_complete(0));
+    assert(state.lifecycle_detach_safety_clean());
+
+    state.complete_usb_detach_route_invalidation(old_route);
+    const hid_route::Snapshot invalidated = state.route_snapshot();
+    assert(invalidated.route == hid_route::OutputRoute::kNone);
+    assert(invalidated.generation == old_route.generation + 1);
+    assert(state.begin_usb_uninstall() == old_usb_generation + 1);
+}
+
 }  // namespace
 
 int main() {
     test_lifecycle_and_generation_cancellation();
     test_readiness_refresh_after_mount_without_hid_work();
     test_readiness_refresh_after_reattach();
+    test_route_generation_is_independent_and_gates_stale_unsafe_work();
     test_usb_transition_outcomes_freeze_stage_a_runtime();
     test_success_failure_and_release();
     test_partial_release_and_no_delayed_unsafe_replay();
@@ -973,5 +1041,6 @@ int main() {
     test_late_tokenized_callbacks_cannot_affect_new_generation();
     test_relative_and_safety_work_do_not_cross_usb_generation();
     test_internal_detach_preserves_uncertainty_until_explicit_recovery();
+    test_detach_invalidates_route_only_after_old_route_safety();
     return 0;
 }

@@ -6,7 +6,8 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 "$repository_root/tools/test-control-framing.sh"
 "$repository_root/tools/test-control-session-lease.sh"
 "$repository_root/tools/test-usb-lifecycle.sh"
-"$repository_root/tools/test-usb-exposure-control.sh"
+"$repository_root/tools/test-hid-route.sh"
+"$repository_root/tools/test-hid-control-executor.sh"
 "$repository_root/tools/test-hid-runtime.sh"
 "$repository_root/tools/test-firmware-identity.sh"
 

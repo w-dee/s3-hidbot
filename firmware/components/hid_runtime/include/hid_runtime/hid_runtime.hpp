@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "hid_route/hid_route.hpp"
 #include "usb_lifecycle/usb_lifecycle.hpp"
 
 namespace hid_runtime {
@@ -19,6 +20,13 @@ enum class ReportKind : std::uint8_t {
     kUnsafeMouse,
     kSafetyKeyboard,
     kSafetyMouse,
+};
+
+// Future transports are identity values only in U7.2A. No BLE adapter or
+// execution path exists in this slice.
+enum class HidTransport : std::uint8_t {
+    kUsb,
+    kBle,
 };
 
 enum class LifecycleSafetyResult : std::uint8_t {
@@ -163,14 +171,18 @@ struct MouseReportResult {
 // Unsigned wrap is well-defined; practical lifecycle frequency cannot reach it.
 using AuthorityEpoch = std::uint32_t;
 using UsbGeneration = usb_lifecycle::Generation;
+using RouteGeneration = hid_route::Generation;
 using HidTicketId = std::uint32_t;
 
-// Every queued or in-flight HID item is tied to both control authority and
-// one USB lifecycle.  Route generation is deliberately deferred to U7.2.
+// Every queued or in-flight HID item is permanently bound to one output route
+// and transport. It is never rerouted or replayed under another identity.
 struct HidWorkToken {
-    UsbGeneration usb_generation = 0;
     AuthorityEpoch authority_epoch = 0;
+    RouteGeneration route_generation = 0;
+    HidTransport transport = HidTransport::kUsb;
+    UsbGeneration transport_generation = 0;
     HidTicketId ticket_id = 0;
+    std::uint32_t release_epoch = 0;
 };
 
 using SubmitFn = bool (*)(void *context, std::uint8_t instance,
@@ -188,8 +200,10 @@ enum class ReleaseAllInterfaceState : std::uint8_t {
 // TinyUSB SOF executor. Interface outcomes are historical: kSubmitted means
 // tud_hid_n_report() accepted the all-up report, not that the host completed it.
 struct ReleaseAllTicket {
-    std::atomic<UsbGeneration> attach_generation{0};
+    std::atomic<UsbGeneration> transport_generation{0};
     std::atomic<AuthorityEpoch> authority_epoch{0};
+    std::atomic<RouteGeneration> route_generation{0};
+    std::atomic<HidTransport> transport{HidTransport::kUsb};
     std::atomic<ReleaseAllInterfaceState> keyboard{ReleaseAllInterfaceState::kUnresolved};
     std::atomic<ReleaseAllInterfaceState> mouse{ReleaseAllInterfaceState::kUnresolved};
     std::atomic_bool active{false};
@@ -199,8 +213,10 @@ struct ReleaseAllTicket {
 };
 
 struct ReleaseAllSnapshot {
-    UsbGeneration attach_generation = 0;
+    UsbGeneration transport_generation = 0;
     AuthorityEpoch authority_epoch = 0;
+    RouteGeneration route_generation = 0;
+    HidTransport transport = HidTransport::kUsb;
     ReleaseAllInterfaceState keyboard = ReleaseAllInterfaceState::kUnresolved;
     ReleaseAllInterfaceState mouse = ReleaseAllInterfaceState::kUnresolved;
     bool active = false;
@@ -234,6 +250,7 @@ class StateMachine {
     UsbTransitionOutcome request_usb_attach(usb_lifecycle::Executor &executor);
     UsbTransitionOutcome request_usb_detach(usb_lifecycle::Executor &executor);
     usb_lifecycle::Snapshot usb_lifecycle_snapshot() const;
+    hid_route::Snapshot route_snapshot() const;
 
     // Project-owned, lifecycle-only safety operation. It intentionally does
     // not create a public hid.release_all cache identity. While detaching it
@@ -248,6 +265,10 @@ class StateMachine {
     UsbGeneration begin_usb_uninstall();
     void complete_usb_uninstall_success();
     void complete_usb_uninstall_failure(std::int32_t error_code);
+    // Called only by the shared control executor after old-route all-up work
+    // received its bounded opportunity and before USB teardown advances its
+    // independent generation.
+    void complete_usb_detach_route_invalidation(hid_route::Snapshot old_route);
 
     StatusSnapshot status() const;
     UsbGeneration attach_generation() const;
@@ -320,8 +341,10 @@ class StateMachine {
   private:
     struct InterfaceState {
         std::atomic<std::uint8_t> slot_state{0};  // empty, writing, ready, executing
-        UsbGeneration slot_generation = 0;
+        UsbGeneration slot_transport_generation = 0;
         AuthorityEpoch slot_authority_epoch = 0;
+        RouteGeneration slot_route_generation = 0;
+        HidTransport slot_transport = HidTransport::kUsb;
         HidTicketId slot_ticket_id = 0;
         std::uint32_t slot_release_epoch = 0;
         ReportKind slot_kind = ReportKind::kUnsafeKeyboard;
@@ -329,9 +352,12 @@ class StateMachine {
         std::uint8_t slot_report[8]{};
 
         std::atomic_bool in_flight{false};
-        UsbGeneration in_flight_generation = 0;
+        UsbGeneration in_flight_transport_generation = 0;
         AuthorityEpoch in_flight_authority_epoch = 0;
+        RouteGeneration in_flight_route_generation = 0;
+        HidTransport in_flight_transport = HidTransport::kUsb;
         HidTicketId in_flight_ticket_id = 0;
+        std::uint32_t in_flight_release_epoch = 0;
         ReportKind in_flight_kind = ReportKind::kUnsafeKeyboard;
         std::uint8_t in_flight_length = 0;
         std::uint8_t in_flight_report[8]{};
@@ -362,6 +388,9 @@ class StateMachine {
     InterfaceState &state(Interface interface);
     const InterfaceState &state(Interface interface) const;
     bool mounted_and_active(Interface interface) const;
+    bool compatibility_usb_route_can_select() const;
+    void apply_u7_1b_compatibility_route();
+    bool unsafe_route_active(RouteGeneration generation, HidTransport transport) const;
     bool safety_transport_active(Interface interface) const;
     bool any_safety_required() const;
     bool release_request_is_current(UsbGeneration generation,
@@ -394,8 +423,10 @@ class StateMachine {
 
     struct KeyboardReportTicket {
         std::atomic<KeyboardReportTicketState> state{KeyboardReportTicketState::kFree};
-        std::atomic<UsbGeneration> attach_generation{0};
+        std::atomic<UsbGeneration> transport_generation{0};
         std::atomic<AuthorityEpoch> authority_epoch{0};
+        std::atomic<RouteGeneration> route_generation{0};
+        std::atomic<HidTransport> transport{HidTransport::kUsb};
         std::atomic<HidTicketId> ticket_id{0};
         std::atomic<std::uint32_t> release_epoch{0};
         std::atomic<KeyboardReportTicketOutcome> outcome{KeyboardReportTicketOutcome::kNone};
@@ -404,8 +435,10 @@ class StateMachine {
 
     struct MouseReportTicket {
         std::atomic<MouseReportTicketState> state{MouseReportTicketState::kFree};
-        std::atomic<UsbGeneration> attach_generation{0};
+        std::atomic<UsbGeneration> transport_generation{0};
         std::atomic<AuthorityEpoch> authority_epoch{0};
+        std::atomic<RouteGeneration> route_generation{0};
+        std::atomic<HidTransport> transport{HidTransport::kUsb};
         std::atomic<HidTicketId> ticket_id{0};
         std::atomic<std::uint32_t> release_epoch{0};
         std::atomic<MouseReportTicketOutcome> outcome{MouseReportTicketOutcome::kNone};
@@ -417,8 +450,10 @@ class StateMachine {
     // callback never needs to wait for the UART/control task.
     static_assert(std::atomic<AuthorityEpoch>::is_always_lock_free);
     static_assert(std::atomic<UsbGeneration>::is_always_lock_free);
+    static_assert(std::atomic<RouteGeneration>::is_always_lock_free);
     static_assert(std::atomic<HidTicketId>::is_always_lock_free);
     usb_lifecycle::StateMachine usb_lifecycle_{};
+    hid_route::StateMachine route_{};
     std::atomic<HidTicketId> next_ticket_id_{1};
     std::atomic<AuthorityEpoch> authority_epoch_{0};
     std::atomic<std::uint32_t> release_epoch_{0};

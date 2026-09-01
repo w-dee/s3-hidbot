@@ -276,6 +276,9 @@ void StateMachine::on_unmount() {
         }
         return;
     }
+    // Callback-side invalidation never waits for the shared control executor.
+    // Its pending gate closes unsafe route work before later cleanup runs.
+    (void)route_.invalidate();
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -314,6 +317,7 @@ void StateMachine::on_suspend() {
     if (!usb_lifecycle_.observe_suspend()) {
         return;
     }
+    (void)route_.invalidate();
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -357,6 +361,7 @@ void StateMachine::set_ready(Interface interface, bool ready) {
     } else {
         status_bits_.fetch_and(static_cast<std::uint8_t>(~bit), std::memory_order_release);
     }
+    apply_u7_1b_compatibility_route();
 }
 
 StatusSnapshot StateMachine::status() const {
@@ -442,6 +447,8 @@ usb_lifecycle::Snapshot StateMachine::usb_lifecycle_snapshot() const {
     return usb_lifecycle_.snapshot();
 }
 
+hid_route::Snapshot StateMachine::route_snapshot() const { return route_.snapshot(); }
+
 UsbGeneration StateMachine::attach_generation() const {
     return usb_lifecycle_.generation();
 }
@@ -470,6 +477,32 @@ bool StateMachine::mounted_and_active(Interface interface) const {
            usb_lifecycle_.accepts_hid(
         snapshot.mounted && !snapshot.suspended &&
         (interface == Interface::kKeyboard ? snapshot.keyboard_ready : snapshot.mouse_ready));
+}
+
+bool StateMachine::unsafe_route_active(RouteGeneration generation,
+                                       HidTransport transport) const {
+    return transport == HidTransport::kUsb &&
+           route_.matches(hid_route::OutputRoute::kUsb, generation);
+}
+
+bool StateMachine::compatibility_usb_route_can_select() const {
+    const StatusSnapshot snapshot = status();
+    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
+    return snapshot.mounted && !snapshot.suspended &&
+           (snapshot.keyboard_ready || snapshot.mouse_ready) &&
+           !any_safety_required() && !lifecycle.safety_pending &&
+           !lifecycle.host_release_uncertain && !lifecycle.recovery_required &&
+           lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed &&
+           lifecycle.observed == usb_lifecycle::ObservedState::kMounted;
+}
+
+void StateMachine::apply_u7_1b_compatibility_route() {
+    // U7.2A-only policy: this is the one removable compatibility seam. Public
+    // Model B selection remains deferred, so attach never selects before a
+    // clean mounted/readiness state exists.
+    if (compatibility_usb_route_can_select()) {
+        (void)route_.commit_usb_if_none();
+    }
 }
 
 bool StateMachine::safety_transport_active(Interface interface) const {
@@ -533,10 +566,12 @@ bool StateMachine::queue_report(Interface interface, ReportKind kind,
     }
     const UsbGeneration queue_generation = attach_generation();
     const AuthorityEpoch queue_authority_epoch = authority_epoch();
+    const hid_route::Snapshot queue_route = route_.snapshot();
     InterfaceState &interface_state = state(interface);
     const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
     if (kind != ReportKind::kSafetyKeyboard && kind != ReportKind::kSafetyMouse &&
-        (release_requested_.load(std::memory_order_acquire) || any_safety_required())) {
+        (release_requested_.load(std::memory_order_acquire) || any_safety_required() ||
+         !unsafe_route_active(queue_route.generation, HidTransport::kUsb))) {
         return false;
     }
     if (interface_state.safety_required.load(std::memory_order_acquire) ||
@@ -548,8 +583,10 @@ bool StateMachine::queue_report(Interface interface, ReportKind kind,
             expected, kSlotWriting, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return false;
     }
-    interface_state.slot_generation = queue_generation;
+    interface_state.slot_transport_generation = queue_generation;
     interface_state.slot_authority_epoch = queue_authority_epoch;
+    interface_state.slot_route_generation = queue_route.generation;
+    interface_state.slot_transport = HidTransport::kUsb;
     interface_state.slot_ticket_id = next_ticket_id_.fetch_add(1, std::memory_order_acq_rel);
     interface_state.slot_release_epoch = release_epoch;
     interface_state.slot_kind = kind;
@@ -559,6 +596,8 @@ bool StateMachine::queue_report(Interface interface, ReportKind kind,
         release_epoch_.load(std::memory_order_acquire) != release_epoch ||
         attach_generation() != queue_generation ||
         authority_epoch() != queue_authority_epoch ||
+        (kind != ReportKind::kSafetyKeyboard && kind != ReportKind::kSafetyMouse &&
+         !unsafe_route_active(queue_route.generation, HidTransport::kUsb)) ||
         !mounted_and_active(interface)) {
         interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
         return false;
@@ -596,7 +635,9 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
     }
 
     const StatusSnapshot snapshot = status();
-    if (!snapshot.mounted || snapshot.suspended || !snapshot.keyboard_ready) {
+    const hid_route::Snapshot route = route_.snapshot();
+    if (!snapshot.mounted || snapshot.suspended || !snapshot.keyboard_ready ||
+        !unsafe_route_active(route.generation, HidTransport::kUsb)) {
         return KeyboardReportBeginResult::kNotReady;
     }
     if (release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
@@ -628,8 +669,10 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
     const UsbGeneration generation = attach_generation();
     const AuthorityEpoch epoch = authority_epoch();
     const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
-    keyboard_ticket_.attach_generation.store(generation, std::memory_order_relaxed);
+    keyboard_ticket_.transport_generation.store(generation, std::memory_order_relaxed);
     keyboard_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
+    keyboard_ticket_.route_generation.store(route.generation, std::memory_order_relaxed);
+    keyboard_ticket_.transport.store(HidTransport::kUsb, std::memory_order_relaxed);
     keyboard_ticket_.ticket_id.store(next_ticket_id_.fetch_add(1, std::memory_order_acq_rel),
                                      std::memory_order_relaxed);
     keyboard_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
@@ -644,6 +687,7 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
 
     if (generation != attach_generation() || epoch != authority_epoch() ||
         release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !unsafe_route_active(route.generation, HidTransport::kUsb) ||
         !mounted_and_active(Interface::kKeyboard) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required() ||
         keyboard.in_flight.load(std::memory_order_acquire) ||
@@ -727,7 +771,9 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     }
 
     const StatusSnapshot snapshot = status();
-    if (!snapshot.mounted || snapshot.suspended || !snapshot.mouse_ready) {
+    const hid_route::Snapshot route = route_.snapshot();
+    if (!snapshot.mounted || snapshot.suspended || !snapshot.mouse_ready ||
+        !unsafe_route_active(route.generation, HidTransport::kUsb)) {
         return MouseReportBeginResult::kNotReady;
     }
     if (release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
@@ -756,8 +802,10 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     const UsbGeneration generation = attach_generation();
     const AuthorityEpoch epoch = authority_epoch();
     const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
-    mouse_ticket_.attach_generation.store(generation, std::memory_order_relaxed);
+    mouse_ticket_.transport_generation.store(generation, std::memory_order_relaxed);
     mouse_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
+    mouse_ticket_.route_generation.store(route.generation, std::memory_order_relaxed);
+    mouse_ticket_.transport.store(HidTransport::kUsb, std::memory_order_relaxed);
     mouse_ticket_.ticket_id.store(next_ticket_id_.fetch_add(1, std::memory_order_acq_rel),
                                   std::memory_order_relaxed);
     mouse_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
@@ -776,6 +824,7 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
 
     if (generation != attach_generation() || epoch != authority_epoch() ||
         release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !unsafe_route_active(route.generation, HidTransport::kUsb) ||
         !mounted_and_active(Interface::kMouse) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required() ||
         mouse.in_flight.load(std::memory_order_acquire) ||
@@ -858,8 +907,11 @@ bool StateMachine::queue_safety(Interface interface) {
     }
     const UsbGeneration queue_generation = attach_generation();
     const AuthorityEpoch queue_authority_epoch = authority_epoch();
-    interface_state.slot_generation = queue_generation;
+    const hid_route::Snapshot queue_route = route_.snapshot();
+    interface_state.slot_transport_generation = queue_generation;
     interface_state.slot_authority_epoch = queue_authority_epoch;
+    interface_state.slot_route_generation = queue_route.generation;
+    interface_state.slot_transport = HidTransport::kUsb;
     interface_state.slot_ticket_id = next_ticket_id_.fetch_add(1, std::memory_order_acq_rel);
     interface_state.slot_release_epoch = release_epoch_.load(std::memory_order_acquire);
     interface_state.slot_kind = interface == Interface::kKeyboard
@@ -989,14 +1041,21 @@ void StateMachine::complete_usb_uninstall_failure(std::int32_t error_code) {
     usb_lifecycle_.complete_uninstall_failure(error_code);
 }
 
+void StateMachine::complete_usb_detach_route_invalidation(hid_route::Snapshot old_route) {
+    (void)route_.invalidate_if_matches(old_route);
+}
+
 void StateMachine::begin_release_all() {
     // Only the UART/control task starts a public operation. A second request
     // while one is being observed coalesces with the existing mailbox work.
     if (release_ticket_.active.load(std::memory_order_acquire)) {
         return;
     }
-    release_ticket_.attach_generation.store(attach_generation(), std::memory_order_release);
+    release_ticket_.transport_generation.store(attach_generation(), std::memory_order_release);
     release_ticket_.authority_epoch.store(authority_epoch(), std::memory_order_release);
+    const hid_route::Snapshot route = route_.snapshot();
+    release_ticket_.route_generation.store(route.generation, std::memory_order_release);
+    release_ticket_.transport.store(HidTransport::kUsb, std::memory_order_release);
     release_ticket_.keyboard.store(ReleaseAllInterfaceState::kUnresolved,
                                     std::memory_order_release);
     release_ticket_.mouse.store(ReleaseAllInterfaceState::kUnresolved,
@@ -1040,8 +1099,10 @@ void StateMachine::begin_release_all() {
 
 ReleaseAllSnapshot StateMachine::release_all_snapshot() const {
     return ReleaseAllSnapshot{
-        .attach_generation = release_ticket_.attach_generation.load(std::memory_order_acquire),
+        .transport_generation = release_ticket_.transport_generation.load(std::memory_order_acquire),
         .authority_epoch = release_ticket_.authority_epoch.load(std::memory_order_acquire),
+        .route_generation = release_ticket_.route_generation.load(std::memory_order_acquire),
+        .transport = release_ticket_.transport.load(std::memory_order_acquire),
         .keyboard = release_ticket_.keyboard.load(std::memory_order_acquire),
         .mouse = release_ticket_.mouse.load(std::memory_order_acquire),
         .active = release_ticket_.active.load(std::memory_order_acquire),
@@ -1075,10 +1136,14 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
     }
 
     const UsbGeneration ticket_generation =
-        keyboard_ticket_.attach_generation.load(std::memory_order_relaxed);
+        keyboard_ticket_.transport_generation.load(std::memory_order_relaxed);
     const HidTicketId ticket_id = keyboard_ticket_.ticket_id.load(std::memory_order_relaxed);
     const AuthorityEpoch ticket_epoch =
         keyboard_ticket_.authority_epoch.load(std::memory_order_relaxed);
+    const RouteGeneration ticket_route_generation =
+        keyboard_ticket_.route_generation.load(std::memory_order_relaxed);
+    const HidTransport ticket_transport =
+        keyboard_ticket_.transport.load(std::memory_order_relaxed);
     const std::uint32_t ticket_release_epoch =
         keyboard_ticket_.release_epoch.load(std::memory_order_relaxed);
     InterfaceState &keyboard = state(Interface::kKeyboard);
@@ -1087,7 +1152,8 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
     const bool safety_pending =
         ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required();
-    const bool not_ready = !mounted_and_active(Interface::kKeyboard);
+    const bool not_ready = !mounted_and_active(Interface::kKeyboard) ||
+                           !unsafe_route_active(ticket_route_generation, ticket_transport);
     const bool busy = keyboard.in_flight.load(std::memory_order_acquire) ||
                       keyboard.slot_state.load(std::memory_order_acquire) != kSlotEmpty;
     if (authority_lost || safety_pending || not_ready || busy) {
@@ -1113,6 +1179,7 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
     if (ticket_generation != attach_generation() ||
         ticket_epoch != authority_epoch() ||
         ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !unsafe_route_active(ticket_route_generation, ticket_transport) ||
         !mounted_and_active(Interface::kKeyboard) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
         keyboard_ticket_.outcome.store(
@@ -1135,9 +1202,12 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
         return false;
     }
 
-    keyboard.in_flight_generation = current_generation;
+    keyboard.in_flight_transport_generation = current_generation;
     keyboard.in_flight_authority_epoch = current_authority_epoch;
+    keyboard.in_flight_route_generation = ticket_route_generation;
+    keyboard.in_flight_transport = ticket_transport;
     keyboard.in_flight_ticket_id = ticket_id;
+    keyboard.in_flight_release_epoch = ticket_release_epoch;
     keyboard.in_flight_kind = ReportKind::kUnsafeKeyboard;
     keyboard.in_flight_length = sizeof(keyboard_ticket_.report);
     std::memcpy(keyboard.in_flight_report, keyboard_ticket_.report,
@@ -1170,10 +1240,14 @@ bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
     }
 
     const UsbGeneration ticket_generation =
-        mouse_ticket_.attach_generation.load(std::memory_order_relaxed);
+        mouse_ticket_.transport_generation.load(std::memory_order_relaxed);
     const HidTicketId ticket_id = mouse_ticket_.ticket_id.load(std::memory_order_relaxed);
     const AuthorityEpoch ticket_epoch =
         mouse_ticket_.authority_epoch.load(std::memory_order_relaxed);
+    const RouteGeneration ticket_route_generation =
+        mouse_ticket_.route_generation.load(std::memory_order_relaxed);
+    const HidTransport ticket_transport =
+        mouse_ticket_.transport.load(std::memory_order_relaxed);
     const std::uint32_t ticket_release_epoch =
         mouse_ticket_.release_epoch.load(std::memory_order_relaxed);
     InterfaceState &mouse = state(Interface::kMouse);
@@ -1182,7 +1256,8 @@ bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
     const bool safety_pending =
         ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required();
-    const bool not_ready = !mounted_and_active(Interface::kMouse);
+    const bool not_ready = !mounted_and_active(Interface::kMouse) ||
+                           !unsafe_route_active(ticket_route_generation, ticket_transport);
     const bool busy = mouse.in_flight.load(std::memory_order_acquire) ||
                       mouse.slot_state.load(std::memory_order_acquire) != kSlotEmpty;
     if (authority_lost || safety_pending || not_ready || busy) {
@@ -1205,6 +1280,7 @@ bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
     if (ticket_generation != attach_generation() ||
         ticket_epoch != authority_epoch() ||
         ticket_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !unsafe_route_active(ticket_route_generation, ticket_transport) ||
         !mounted_and_active(Interface::kMouse) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
         const bool current_authority = ticket_generation == attach_generation() &&
@@ -1228,9 +1304,12 @@ bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
         return false;
     }
 
-    mouse.in_flight_generation = current_generation;
+    mouse.in_flight_transport_generation = current_generation;
     mouse.in_flight_authority_epoch = current_authority_epoch;
+    mouse.in_flight_route_generation = ticket_route_generation;
+    mouse.in_flight_transport = ticket_transport;
     mouse.in_flight_ticket_id = ticket_id;
+    mouse.in_flight_release_epoch = ticket_release_epoch;
     mouse.in_flight_kind = ReportKind::kUnsafeMouse;
     mouse.in_flight_length = sizeof(mouse_ticket_.report);
     std::memcpy(mouse.in_flight_report, mouse_ticket_.report,
@@ -1337,20 +1416,23 @@ void StateMachine::execute(SubmitFn submit, void *context) {
             continue;
         }
         const ReportKind kind = interface_state.slot_kind;
-        const UsbGeneration slot_generation = interface_state.slot_generation;
+        const UsbGeneration slot_transport_generation = interface_state.slot_transport_generation;
         const HidTicketId slot_ticket_id = interface_state.slot_ticket_id;
         const AuthorityEpoch slot_authority_epoch = interface_state.slot_authority_epoch;
+        const RouteGeneration slot_route_generation = interface_state.slot_route_generation;
+        const HidTransport slot_transport = interface_state.slot_transport;
         const std::uint32_t slot_release_epoch = interface_state.slot_release_epoch;
         const std::uint8_t length = interface_state.slot_length;
         const bool safety_kind = kind == ReportKind::kSafetyKeyboard ||
                                  kind == ReportKind::kSafetyMouse;
         const bool stale_unsafe =
             !safety_kind &&
-            slot_release_epoch != release_epoch_.load(std::memory_order_acquire);
+            (slot_release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+             !unsafe_route_active(slot_route_generation, slot_transport));
         const bool safety_now = interface_state.safety_required.load(std::memory_order_acquire) ||
                                 release_requested_.load(std::memory_order_acquire);
         const bool any_safety_pending = any_safety_required();
-        if (slot_generation != current_generation ||
+        if (slot_transport_generation != current_generation ||
             slot_authority_epoch != current_authority_epoch ||
             !(safety_kind ? safety_transport_active(interface) : mounted_and_active(interface)) ||
             stale_unsafe || ((safety_now || any_safety_pending) && !safety_kind)) {
@@ -1370,8 +1452,9 @@ void StateMachine::execute(SubmitFn submit, void *context) {
             before_submit_hook_(this);
         }
 #endif
-        if (slot_generation != attach_generation() ||
+        if (slot_transport_generation != attach_generation() ||
             slot_authority_epoch != authority_epoch() ||
+            (!safety_kind && !unsafe_route_active(slot_route_generation, slot_transport)) ||
             !(safety_kind ? safety_transport_active(interface) : mounted_and_active(interface)) ||
             interface_state.slot_state.load(std::memory_order_acquire) != kSlotExecuting) {
             interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
@@ -1382,7 +1465,7 @@ void StateMachine::execute(SubmitFn submit, void *context) {
         if (!accepted) {
             interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
             if (safety_kind && release_ticket_.active.load(std::memory_order_acquire) &&
-                release_ticket_.attach_generation.load(std::memory_order_acquire) == current_generation &&
+                release_ticket_.transport_generation.load(std::memory_order_acquire) == current_generation &&
                 release_ticket_.authority_epoch.load(std::memory_order_acquire) == current_authority_epoch) {
                 set_release_outcome(interface, ReleaseAllInterfaceState::kPending);
                 release_ticket_.failed_before_finalization.store(true, std::memory_order_release);
@@ -1391,9 +1474,12 @@ void StateMachine::execute(SubmitFn submit, void *context) {
             // are retried only in the safe all-up direction.
             continue;
         }
-        interface_state.in_flight_generation = current_generation;
+        interface_state.in_flight_transport_generation = current_generation;
         interface_state.in_flight_authority_epoch = current_authority_epoch;
+        interface_state.in_flight_route_generation = slot_route_generation;
+        interface_state.in_flight_transport = slot_transport;
         interface_state.in_flight_ticket_id = slot_ticket_id;
+        interface_state.in_flight_release_epoch = slot_release_epoch;
         interface_state.in_flight_kind = kind;
         interface_state.in_flight_length = length;
         std::memcpy(interface_state.in_flight_report, interface_state.slot_report, length);
@@ -1421,7 +1507,7 @@ void StateMachine::execute(SubmitFn submit, void *context) {
             interface_state.logical_state_held.store(false, std::memory_order_release);
         }
         if (safety_kind && release_ticket_.active.load(std::memory_order_acquire) &&
-            release_ticket_.attach_generation.load(std::memory_order_acquire) == current_generation &&
+            release_ticket_.transport_generation.load(std::memory_order_acquire) == current_generation &&
             release_ticket_.authority_epoch.load(std::memory_order_acquire) == current_authority_epoch) {
             const auto current_outcome = interface == Interface::kKeyboard
                                              ? release_ticket_.keyboard.load(std::memory_order_acquire)
@@ -1442,9 +1528,12 @@ void StateMachine::execute(SubmitFn submit, void *context) {
 HidWorkToken StateMachine::in_flight_token(Interface interface) const {
     const InterfaceState &interface_state = state(interface);
     return HidWorkToken{
-        .usb_generation = interface_state.in_flight_generation,
         .authority_epoch = interface_state.in_flight_authority_epoch,
+        .route_generation = interface_state.in_flight_route_generation,
+        .transport = interface_state.in_flight_transport,
+        .transport_generation = interface_state.in_flight_transport_generation,
         .ticket_id = interface_state.in_flight_ticket_id,
+        .release_epoch = interface_state.in_flight_release_epoch,
     };
 }
 
@@ -1467,11 +1556,18 @@ bool StateMachine::report_complete_for_token(std::uint8_t instance, HidWorkToken
     }
     InterfaceState &interface_state = interfaces_[instance];
     if (!interface_state.in_flight.load(std::memory_order_acquire) ||
-        interface_state.in_flight_generation != attach_generation() ||
+        interface_state.in_flight_transport_generation != attach_generation() ||
         interface_state.in_flight_authority_epoch != authority_epoch() ||
-        interface_state.in_flight_generation != token.usb_generation ||
+        (interface_state.in_flight_kind != ReportKind::kSafetyKeyboard &&
+         interface_state.in_flight_kind != ReportKind::kSafetyMouse &&
+         !unsafe_route_active(interface_state.in_flight_route_generation,
+                              interface_state.in_flight_transport)) ||
+        interface_state.in_flight_transport_generation != token.transport_generation ||
         interface_state.in_flight_authority_epoch != token.authority_epoch ||
-        interface_state.in_flight_ticket_id != token.ticket_id) {
+        interface_state.in_flight_route_generation != token.route_generation ||
+        interface_state.in_flight_transport != token.transport ||
+        interface_state.in_flight_ticket_id != token.ticket_id ||
+        interface_state.in_flight_release_epoch != token.release_epoch) {
         return false;
     }
     if (report != nullptr && length != interface_state.in_flight_length) {
@@ -1513,6 +1609,7 @@ bool StateMachine::report_complete_for_token(std::uint8_t instance, HidWorkToken
     if ((kind == ReportKind::kSafetyKeyboard || kind == ReportKind::kSafetyMouse) &&
         !any_safety_required()) {
         usb_lifecycle_.mark_release_confirmed();
+        apply_u7_1b_compatibility_route();
     }
     return true;
 }
@@ -1536,11 +1633,18 @@ bool StateMachine::report_failed_for_token(std::uint8_t instance, HidWorkToken t
     }
     InterfaceState &interface_state = interfaces_[instance];
     if (!interface_state.in_flight.load(std::memory_order_acquire) ||
-        interface_state.in_flight_generation != attach_generation() ||
+        interface_state.in_flight_transport_generation != attach_generation() ||
         interface_state.in_flight_authority_epoch != authority_epoch() ||
-        interface_state.in_flight_generation != token.usb_generation ||
+        (interface_state.in_flight_kind != ReportKind::kSafetyKeyboard &&
+         interface_state.in_flight_kind != ReportKind::kSafetyMouse &&
+         !unsafe_route_active(interface_state.in_flight_route_generation,
+                              interface_state.in_flight_transport)) ||
+        interface_state.in_flight_transport_generation != token.transport_generation ||
         interface_state.in_flight_authority_epoch != token.authority_epoch ||
-        interface_state.in_flight_ticket_id != token.ticket_id) {
+        interface_state.in_flight_route_generation != token.route_generation ||
+        interface_state.in_flight_transport != token.transport ||
+        interface_state.in_flight_ticket_id != token.ticket_id ||
+        interface_state.in_flight_release_epoch != token.release_epoch) {
         return false;
     }
     // TinyUSB reports transferred bytes for a failed input transfer; a short
@@ -1553,8 +1657,8 @@ bool StateMachine::report_failed_for_token(std::uint8_t instance, HidWorkToken t
     interface_state.safety_required.store(true, std::memory_order_release);
     usb_lifecycle_.mark_release_uncertain();
     if (release_ticket_.active.load(std::memory_order_acquire) &&
-        release_ticket_.attach_generation.load(std::memory_order_acquire) ==
-            interface_state.in_flight_generation &&
+        release_ticket_.transport_generation.load(std::memory_order_acquire) ==
+            interface_state.in_flight_transport_generation &&
         release_ticket_.authority_epoch.load(std::memory_order_acquire) ==
             interface_state.in_flight_authority_epoch &&
         (interface_state.in_flight_kind == ReportKind::kSafetyKeyboard ||
@@ -1823,7 +1927,7 @@ ReleaseAllResult Runtime::release_all() {
         const AuthorityEpoch current_epoch = state_machine_.authority_epoch();
         const std::uint32_t current_generation = state_machine_.attach_generation();
         if (snapshot.canceled || snapshot.authority_epoch != current_epoch ||
-            snapshot.attach_generation != current_generation) {
+            snapshot.transport_generation != current_generation) {
             state_machine_.finalize_release_all();
             return ReleaseAllResult{.success = false, .authority_lost = true};
         }
