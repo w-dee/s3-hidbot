@@ -9,9 +9,10 @@ Python 3.11 or newer is required.
 
 ## Distribution and installation
 
-The package is not currently published on PyPI and there is no GitHub Release.
-For development, install either a checkout or the temporary `host-package`
-wheel from a matching GitHub Actions run (retained for 14 days):
+The package is not published on PyPI. When a published version is available,
+obtain its wheel and adjacent checksum from GitHub Releases. For development,
+install either a checkout or the temporary `host-package` wheel from a
+matching GitHub Actions run (retained for 14 days):
 
 ```bash
 python3 -m pip install ./host
@@ -20,7 +21,7 @@ python3 -m pip install './host[flash]'
 
 The optional `flash` extra installs supported `esptool >=4.12,<5`. A downloaded
 wheel can be installed equivalently with `'<wheel-path>[flash]'`. Verify its
-provided checksum before installation. The complete clean-room acquisition and
+adjacent checksum before installation. The complete clean-room acquisition and
 installation flow is in the project
 [operator quick start](../docs/operator/quick-start.md).
 

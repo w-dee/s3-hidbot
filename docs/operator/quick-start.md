@@ -17,19 +17,25 @@ The right USB-C below BOOT is native USB-OTG/HID and should remain disconnected
 for this provisioning path. VBUS/backfeed and general dual-cable behavior are
 **UNKNOWN**; do not add a second cable without a deliberately validated setup.
 
-## 1. Select matching development artifacts
+## 1. Select matching stable or development artifacts
 
-Choose an exact source revision and a successful Actions run for that revision.
-Download and unpack both artifacts from their matching runs:
+For a published version, start at GitHub Releases, choose the intended version,
+and download its firmware archive, host wheel, and adjacent checksum files.
+Also retain the attached `LICENSE` and `THIRD_PARTY_NOTICES.md`.
+
+For development or an unreleased commit, choose an exact source revision and a
+successful Actions run for that revision. Download and unpack both artifacts
+from their matching runs:
 
 - `firmware-artifact`: a versioned `s3-hidbot-firmware-*.tar.gz` and matching
   `.sha256` file;
 - `host-package`: a versioned `s3_hidbot_host-*.whl` and matching `.sha256`
   file.
 
-These artifacts expire after 14 days. They are not a GitHub Release and the
-host package is not on PyPI. Record the commit SHA and Actions run identifier
-before continuing.
+Development artifacts expire after 14 days. They are not GitHub Releases and
+the host package is not on PyPI. Record the commit SHA and Actions run
+identifier before continuing. For a published version, record the release tag
+and source revision supplied by `verify-artifact`.
 
 ## 2. Verify downloaded bytes
 
@@ -41,11 +47,11 @@ sha256sum --check s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0085.tar.gz.s
 sha256sum --check s3_hidbot_host-<version>-py3-none-any.whl.sha256
 ```
 
-The outer checksum compares downloaded bytes with the record produced beside
-that Actions artifact. It detects accidental corruption or substitution
-relative to that record. It is not a publisher signature, independent artifact
-authentication, or a replacement for choosing the intended repository, run,
-and source SHA.
+The outer checksum compares downloaded bytes with the adjacent published
+record. It detects accidental corruption or substitution relative to that
+record. It is not a publisher signature, independent artifact authentication,
+attestation, secure-boot proof, device authentication, or a replacement for
+choosing the intended repository, release/run, and source SHA.
 
 ## 3. Install the matching host wheel
 

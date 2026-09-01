@@ -1,10 +1,10 @@
 # Firmware artifacts
 
-This document defines the U6.3A local firmware artifact contract. It is a
-development contract, not a release announcement: no public GitHub Release,
-PyPI publication, or durable release artifact exists yet. The CI workflow does
-upload temporary Actions artifacts as documented below; they are development
-evidence rather than a stable public distribution channel.
+This document defines the firmware artifact contract and its development and
+release-preparation paths. Published versions, when available, are obtained
+from GitHub Releases; the host package remains unavailable on PyPI. Temporary
+Actions artifacts remain development evidence rather than a stable public
+distribution channel.
 
 ## Builder inputs and isolation
 
@@ -159,15 +159,42 @@ archive for transport integrity; the bundle's internal `SHA256SUMS` continues
 to cover its manifest and payload files. Build or verification mismatch fails
 the job before upload. No serial, flash, hardware runner, tag, GitHub Release,
 or public package publication is involved. The archive is a development CI
-artifact for version `0.1.0-dev`, not a released firmware download.
+artifact for the current firmware version, not a released firmware download.
 
 ## Scope boundary
 
-U6.3A does not publish public artifacts, add a flash helper, compare artifacts
-with runtime UART identity, create attestations or SBOMs, or change firmware
-versioning. U6.3B uploads only temporary CI evidence; it does not create a
-public release. Attestation remains unimplemented. A release version and tag
-are deferred to U6.6.
+The ordinary artifact workflow does not publish public artifacts, add a flash
+helper, create attestations or SBOMs, or create a tag. It uploads only
+temporary CI evidence. Attestation remains unimplemented.
+
+## Release preparation
+
+U6.6A keeps the artifact schema unchanged and adds a separate
+`release-build.yml`. A manual candidate supplies an exact 40-character commit
+SHA; a tag build accepts only an annotated `vX.Y.Z` tag, peels it to its commit,
+and verifies checkout HEAD, firmware version, host version, source revision,
+and commit timestamp. In either mode, `SOURCE_DATE_EPOCH` comes from that
+commit timestamp, never from tag or workflow creation time.
+
+The release-build workflow reuses `tools/build_firmware_artifact.py` for two
+isolated firmware builds and requires exact archive bytes. It then prepares
+one temporary `release-assets` artifact containing the firmware archive, wheel,
+sdist, adjacent SHA-256 sidecars, LICENSE, and THIRD_PARTY_NOTICES.md. Its
+checkout-free consumers verify sidecars, firmware structure, wheel/sdist
+metadata, installed CLI behavior, the flash extra, and `verify-artifact` on
+Python 3.11 and 3.12. The host package is checked semantically; no claim of
+cross-workflow byte-identical host archives is made.
+
+The candidate firmware becomes physical-release evidence only after a separate
+authorized hardware gate. A later tag build must compare its firmware archive
+with the physically validated candidate and require exact bytes before a draft
+can be created. The manual `release-draft.yml` requires both the exact
+successful pre-tag candidate run ID recorded at that hardware gate and the
+exact successful tag-build run ID. It independently proves that each run built
+the immutable tagged commit, rechecks both exact asset sets, and compares their
+firmware archives byte-for-byte before creating only a GitHub draft. It never
+publishes a Release. The human v0.1.0 procedure requires an annotated,
+unsigned `v0.1.0` tag; lightweight tags are rejected.
 
 The local artifact contract remains valid when `build.container_image` is
 `null`; only the dedicated CI workflow supplies immutable container

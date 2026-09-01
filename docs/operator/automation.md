@@ -70,9 +70,12 @@ For every provisioning, upgrade, or incident, retain:
 Do not put the exact machine-local serial path in shared project data or bug
 reports.
 
-## Future stable releases
+## Stable and development acquisition
 
-Current acquisition is commit SHA plus temporary Actions artifacts. U6.6 is
-expected to provide versioned tag/release artifacts and possibly package
-publication. Do not assume a stable release URL or PyPI package exists until
-that release explicitly publishes one.
+When a published version is available, acquire versioned assets from its
+GitHub Release and record the tag plus source revision. For development or an
+unreleased commit, acquire matching temporary Actions artifacts by exact
+commit SHA and run ID. The host package remains unavailable on PyPI. In either
+path, SHA-256 is byte-integrity comparison against the adjacent checksum; it
+is not a signature, independent publisher authentication, attestation,
+secure-boot proof, or device authentication.

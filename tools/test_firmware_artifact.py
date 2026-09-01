@@ -42,7 +42,7 @@ def _base_plan() -> dict[str, Any]:
 
 
 def _build_synthetic_bundle(root: Path) -> Path:
-    bundle = root / "s3-hidbot-firmware-0.1.0-dev-esp32s3-freenove-fnk0085"
+    bundle = root / "s3-hidbot-firmware-0.1.0-esp32s3-freenove-fnk0085"
     payloads = {
         "application.bin": b"application image\n",
         "application.elf": b"exact linked elf\n",
@@ -75,7 +75,7 @@ def _build_synthetic_bundle(root: Path) -> Path:
         "artifact_manifest_version": 1,
         "project": "s3-hidbot",
         "firmware": {
-            "version": "0.1.0-dev",
+            "version": "0.1.0",
             "protocol_version": 1,
             "source_revision": "a" * 40,
             "target": "esp32s3",

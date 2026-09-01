@@ -296,7 +296,7 @@ The identity-v1 `system.info` result has exactly these fields:
   "idf_version": "v5.5.4",
   "protocol_version": 1,
   "firmware": {
-    "version": "0.1.0-dev",
+    "version": "0.1.0",
     "source_revision": null,
     "app_elf_sha256": "<64 lowercase hex>",
     "build_profile": "freenove-fnk0085"

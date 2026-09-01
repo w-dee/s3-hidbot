@@ -4,8 +4,9 @@ This documentation is for someone operating an existing FNK0085 fixture or
 automating one. It does not require ESP-IDF knowledge or a source checkout.
 
 Start with the [Linux-first quick start](quick-start.md). It explains the
-current development-artifact path, checksum verification, host-wheel install,
-CH343 serial selection, verified provisioning, and the evidence to retain.
+published-release and development-artifact paths, checksum verification,
+host-wheel install, CH343 serial selection, verified provisioning, and the
+evidence to retain.
 
 Then use:
 
@@ -26,13 +27,15 @@ Do not infer electrical safety from this mapping. VBUS sourcing, backfeed,
 general dual-cable power safety, immediate detach sensing, and a board-specific
 VBUS monitor are **UNKNOWN**. Avoid dual-cable operation when it is not needed.
 
-## Current versus future distribution
+## Stable versus development distribution
 
-Current development artifacts come from a successful GitHub Actions run for an
-exact commit SHA. `firmware-artifact` and `host-package` are temporary,
-14-day artifacts. The host package is not published on PyPI, and there is no
-GitHub Release or public stable tag/release yet. U6.6 is intended to establish
-the durable release path.
+When a published version is available, use its GitHub Release page for the
+firmware archive, host wheel, adjacent checksums, `LICENSE`, and
+`THIRD_PARTY_NOTICES.md`. The host package remains unavailable on PyPI.
+
+Development artifacts come from a successful GitHub Actions run for an exact
+commit SHA. `firmware-artifact` and `host-package` are temporary, 14-day
+artifacts; they are not stable releases.
 
 For protocol internals, fixture evidence, artifact format, and maintainer
 validation, use the linked [development documentation](../development/codex-runbook.md).

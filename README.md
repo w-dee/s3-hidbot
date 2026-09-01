@@ -52,12 +52,15 @@ consumed the event.
 `flash-firmware` is destructive provisioning. It programs only a verified,
 supported plan and returns success only after an exact runtime identity match.
 
-## Current distribution status
+## Distribution status
 
-This project is not published on PyPI and has no GitHub Release or public
-stable tag/release yet. Current development firmware and host wheels are
-temporary GitHub Actions artifacts retained for 14 days. U6.6 is expected to
-establish the durable release path.
+When a published version is available, obtain its versioned firmware archive,
+host wheel, adjacent SHA-256 files, `LICENSE`, and `THIRD_PARTY_NOTICES.md`
+from the GitHub Releases page. The host package is not published on PyPI.
+
+For development or an unreleased commit, use matching temporary
+`firmware-artifact` and `host-package` GitHub Actions artifacts. They are
+retained for 14 days and are not stable releases.
 
 ## Clean-room path
 

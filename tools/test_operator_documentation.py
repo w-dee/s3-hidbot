@@ -101,11 +101,11 @@ def main() -> int:
     _require(cli, "ignores `S3_HIDBOT_BAUD`", "flash baud exception")
     _require(cli, "`ok:true` with `match:false`", "JSON ok-versus-match distinction")
 
-    _require(all_text, "not published on PyPI", "current PyPI status")
-    _require(
-        " ".join(all_text.lower().split()),
-        "no github release",
-        "current GitHub Release status",
+    _require(all_text, "PyPI", "PyPI deferral")
+    _require(all_text, "GitHub Releases", "stable release acquisition")
+    _require(all_text, "not stable releases", "development artifact distinction")
+    assert "v0.1.0 is published" not in all_text.lower(), (
+        "source documentation must not claim the pending version is already published"
     )
     _require(all_text, "14 days", "Actions retention")
     _require(quick_start, "<ch343-control-port>", "serial placeholder")
