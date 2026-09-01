@@ -212,6 +212,90 @@ void test_release_all_noop_for_known_all_up() {
     assert(!state.safety_required(hid_runtime::Interface::kMouse));
 }
 
+void test_zero_work_release_terminalizes_lifecycle_pending() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+
+    // This is the same producer-side primitive used by session takeover.
+    state.request_release_all();
+    assert(state.usb_lifecycle_snapshot().safety_pending);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    const auto reconciled = state.usb_lifecycle_snapshot();
+    assert(!reconciled.safety_pending);
+    assert(!reconciled.host_release_uncertain);
+
+    // The public operation still reports the unchanged per-interface state.
+    state.begin_release_all();
+    const auto release = state.release_all_snapshot();
+    assert(release.keyboard == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    assert(release.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    state.finalize_release_all();
+    assert(!state.usb_lifecycle_snapshot().safety_pending);
+}
+
+void test_uncertainty_is_not_zero_work_terminalized() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+
+    // A relative report is logically all-up, but a failed transfer makes host
+    // delivery genuinely uncertain and therefore requires a fresh safety report.
+    assert(state.queue_mouse_report(0, 1, 0, 0, 0));
+    state.execute(Sink::submit, &sink);
+    assert(state.report_in_flight(hid_runtime::Interface::kMouse));
+    assert(state.report_failed(1));
+    assert(state.usb_lifecycle_snapshot().host_release_uncertain);
+
+    state.request_release_all();
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2);
+    const auto pending = state.usb_lifecycle_snapshot();
+    assert(pending.safety_pending);
+    assert(pending.host_release_uncertain);
+}
+
+void test_held_keyboard_release_requires_safety_completion() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    const std::array<std::uint8_t, 6> f24 = {0x73, 0, 0, 0, 0, 0};
+
+    assert(state.queue_keyboard_report(0, f24));
+    state.execute(Sink::submit, &sink);
+    assert(state.report_complete(0));
+    state.request_release_all();
+    assert(state.usb_lifecycle_snapshot().safety_pending);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2);
+    assert(state.report_in_flight(hid_runtime::Interface::kKeyboard));
+    assert(state.usb_lifecycle_snapshot().safety_pending);
+    assert(state.report_complete(0));
+    assert(!state.safety_required(hid_runtime::Interface::kKeyboard));
+    assert(!state.usb_lifecycle_snapshot().safety_pending);
+}
+
+void publish_new_release_request(hid_runtime::StateMachine *state) {
+    state->request_release_all();
+}
+
+void test_new_release_request_survives_zero_work_reconciliation_race() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+
+    state.request_release_all();
+    state.set_before_release_reconciliation_hook_for_test(publish_new_release_request);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    assert(state.usb_lifecycle_snapshot().safety_pending);
+
+    state.set_before_release_reconciliation_hook_for_test(nullptr);
+    state.execute(Sink::submit, &sink);
+    assert(!state.usb_lifecycle_snapshot().safety_pending);
+}
+
 void test_partial_release_and_no_delayed_unsafe_replay() {
     hid_runtime::StateMachine state;
     Sink sink;
@@ -866,6 +950,10 @@ int main() {
     test_usb_transition_outcomes_freeze_stage_a_runtime();
     test_success_failure_and_release();
     test_partial_release_and_no_delayed_unsafe_replay();
+    test_zero_work_release_terminalizes_lifecycle_pending();
+    test_uncertainty_is_not_zero_work_terminalized();
+    test_held_keyboard_release_requires_safety_completion();
+    test_new_release_request_survives_zero_work_reconciliation_race();
     test_release_barrier_discards_queued_work();
     test_release_all_noop_for_known_all_up();
     test_executor_submission_bound();

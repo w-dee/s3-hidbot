@@ -257,6 +257,7 @@ void StateMachine::on_mount() {
     }
     release_request_generation_.store(0, std::memory_order_release);
     release_request_authority_epoch_.store(0, std::memory_order_release);
+    release_request_epoch_.store(0, std::memory_order_release);
     release_requested_.store(false, std::memory_order_release);
     status_bits_.store(kMountedBit, std::memory_order_release);
     if (!usb_lifecycle_.snapshot().host_release_uncertain) {
@@ -305,6 +306,7 @@ void StateMachine::on_unmount() {
     }
     release_request_generation_.store(0, std::memory_order_release);
     release_request_authority_epoch_.store(0, std::memory_order_release);
+    release_request_epoch_.store(0, std::memory_order_release);
     release_requested_.store(false, std::memory_order_release);
 }
 
@@ -456,6 +458,10 @@ void StateMachine::set_before_ticket_publish_hook_for_test(TestHook hook) {
 void StateMachine::set_before_submit_hook_for_test(TestHook hook) {
     before_submit_hook_ = hook;
 }
+
+void StateMachine::set_before_release_reconciliation_hook_for_test(TestHook hook) {
+    before_release_reconciliation_hook_ = hook;
+}
 #endif
 
 bool StateMachine::mounted_and_active(Interface interface) const {
@@ -483,6 +489,40 @@ bool StateMachine::safety_transport_active(Interface interface) const {
 bool StateMachine::any_safety_required() const {
     return interfaces_[0].safety_required.load(std::memory_order_acquire) ||
            interfaces_[1].safety_required.load(std::memory_order_acquire);
+}
+
+bool StateMachine::release_request_is_current(UsbGeneration generation,
+                                              AuthorityEpoch authority_epoch,
+                                              std::uint32_t release_epoch) const {
+    return !release_requested_.load(std::memory_order_acquire) &&
+           release_request_generation_.load(std::memory_order_acquire) == generation &&
+           release_request_authority_epoch_.load(std::memory_order_acquire) == authority_epoch &&
+           release_request_epoch_.load(std::memory_order_acquire) == release_epoch &&
+           release_epoch_.load(std::memory_order_acquire) == release_epoch;
+}
+
+void StateMachine::reconcile_zero_work_release(UsbGeneration generation,
+                                               AuthorityEpoch authority_epoch,
+                                               std::uint32_t release_epoch) {
+    if (!release_request_is_current(generation, authority_epoch, release_epoch) ||
+        !known_all_up(Interface::kKeyboard) || !known_all_up(Interface::kMouse) ||
+        usb_lifecycle_.snapshot().host_release_uncertain) {
+        return;
+    }
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (before_release_reconciliation_hook_ != nullptr) {
+        before_release_reconciliation_hook_(this);
+    }
+#endif
+    if (!release_request_is_current(generation, authority_epoch, release_epoch)) {
+        return;
+    }
+    (void)usb_lifecycle_.clear_release_pending_if_not_uncertain();
+    // A newer producer may have published after the pre-clear identity check.
+    // Reassert its barrier rather than letting an older zero-work pass erase it.
+    if (!release_request_is_current(generation, authority_epoch, release_epoch)) {
+        usb_lifecycle_.mark_release_pending();
+    }
 }
 
 bool StateMachine::queue_report(Interface interface, ReportKind kind,
@@ -849,7 +889,9 @@ void StateMachine::request_release_all() {
     // safety decisions are owned by the TinyUSB executor task.
     release_request_generation_.store(attach_generation(), std::memory_order_release);
     release_request_authority_epoch_.store(authority_epoch(), std::memory_order_release);
-    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    const std::uint32_t request_epoch =
+        release_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    release_request_epoch_.store(request_epoch, std::memory_order_release);
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kSafetyPending);
     cancel_mouse_ticket(MouseReportTicketOutcome::kSafetyPending);
     release_requested_.store(true, std::memory_order_release);
@@ -919,6 +961,7 @@ void StateMachine::on_driver_uninstalled() {
     }
     release_request_generation_.store(0, std::memory_order_release);
     release_request_authority_epoch_.store(0, std::memory_order_release);
+    release_request_epoch_.store(0, std::memory_order_release);
     release_requested_.store(false, std::memory_order_release);
 }
 
@@ -1216,15 +1259,24 @@ void StateMachine::execute(SubmitFn submit, void *context) {
     }
     const UsbGeneration current_generation = attach_generation();
     const AuthorityEpoch current_authority_epoch = authority_epoch();
-    const std::uint32_t request_generation =
-        release_request_generation_.load(std::memory_order_acquire);
-    const AuthorityEpoch request_authority_epoch =
-        release_request_authority_epoch_.load(std::memory_order_acquire);
     const bool release_requested =
         release_requested_.exchange(false, std::memory_order_acq_rel);
+    // Exchange first. A producer publishes its identity before setting this
+    // flag, so an acquire observation of true sees one complete request. A
+    // later producer leaves the flag true for the next SOF pass.
+    const std::uint32_t request_generation = release_requested
+        ? release_request_generation_.load(std::memory_order_acquire)
+        : 0;
+    const AuthorityEpoch request_authority_epoch = release_requested
+        ? release_request_authority_epoch_.load(std::memory_order_acquire)
+        : 0;
+    const std::uint32_t request_release_epoch = release_requested
+        ? release_request_epoch_.load(std::memory_order_acquire)
+        : 0;
     const bool release_requested_for_current_attach =
         release_requested && request_generation == current_generation &&
-        request_authority_epoch == current_authority_epoch;
+        request_authority_epoch == current_authority_epoch &&
+        request_release_epoch == release_epoch_.load(std::memory_order_acquire);
     // A public keyboard ticket has priority over ordinary mailboxes. It is a
     // single immediate TinyUSB call; a canceled/stale ticket never falls
     // through to a later SOF for replay.
@@ -1380,6 +1432,10 @@ void StateMachine::execute(SubmitFn submit, void *context) {
         }
         interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
         break;
+    }
+    if (release_requested_for_current_attach) {
+        reconcile_zero_work_release(current_generation, current_authority_epoch,
+                                    request_release_epoch);
     }
 }
 

@@ -263,6 +263,22 @@ void StateMachine::mark_release_pending() {
     state_.fetch_or(kSafetyPendingBit, std::memory_order_acq_rel);
 }
 
+bool StateMachine::clear_release_pending_if_not_uncertain() {
+    std::uint8_t current = state_.load(std::memory_order_acquire);
+    do {
+        if ((current & kUncertainBit) != 0) {
+            return false;
+        }
+        const std::uint8_t cleared = static_cast<std::uint8_t>(
+            current & static_cast<std::uint8_t>(~kSafetyPendingBit));
+        if (state_.compare_exchange_weak(current, cleared,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+            return true;
+        }
+    } while (true);
+}
+
 void StateMachine::mark_release_confirmed() {
     state_.fetch_and(static_cast<std::uint8_t>(~(kSafetyPendingBit | kUncertainBit)),
                      std::memory_order_acq_rel);

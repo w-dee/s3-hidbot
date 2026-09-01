@@ -177,6 +177,21 @@ void test_schedule_failure_returns_busy_without_accepted_snapshot() {
     assert(failed.last_error.code == -1);
 }
 
+void test_zero_work_clear_preserves_real_uncertainty() {
+    usb_lifecycle::StateMachine lifecycle;
+
+    lifecycle.mark_release_pending();
+    assert(lifecycle.clear_release_pending_if_not_uncertain());
+    assert(!lifecycle.snapshot().safety_pending);
+    assert(!lifecycle.snapshot().host_release_uncertain);
+
+    lifecycle.mark_release_uncertain();
+    assert(!lifecycle.clear_release_pending_if_not_uncertain());
+    const auto uncertain = lifecycle.snapshot();
+    assert(uncertain.safety_pending);
+    assert(uncertain.host_release_uncertain);
+}
+
 void test_external_unmount_advances_once_and_later_mount_reuses_generation() {
     usb_lifecycle::StateMachine lifecycle;
     FakeExecutor executor;
@@ -210,6 +225,7 @@ int main() {
     test_failure_classification_and_new_retry();
     test_uninstall_failure_is_explicit_recovery_state();
     test_schedule_failure_returns_busy_without_accepted_snapshot();
+    test_zero_work_clear_preserves_real_uncertainty();
     test_external_unmount_advances_once_and_later_mount_reuses_generation();
     test_noops_conflicts_and_wrap_boundary();
 }

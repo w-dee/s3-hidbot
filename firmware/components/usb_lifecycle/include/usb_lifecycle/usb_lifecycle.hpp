@@ -112,6 +112,10 @@ class StateMachine {
 
     // Future detach safety accounting. Hidden never implies this proof.
     void mark_release_pending();
+    // Zero-work reconciliation may prove there is no current safety work, but
+    // it must never erase a prior uncertain host delivery. Returns false when
+    // uncertainty is present and leaves the fail-closed state unchanged.
+    bool clear_release_pending_if_not_uncertain();
     void mark_release_confirmed();
     void mark_release_uncertain();
     void mark_release_uncertain_for_generation(Generation generation);
