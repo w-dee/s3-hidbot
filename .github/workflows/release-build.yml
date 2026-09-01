@@ -7,6 +7,11 @@ on:
         description: Exact 40-character commit SHA to build as a pre-tag candidate
         required: true
         type: string
+      expected_tag:
+        description: Optional existing annotated vX.Y.Z tag to recover at expected_commit
+        required: false
+        default: ""
+        type: string
   push:
     tags:
       - "v*"
@@ -29,33 +34,74 @@ jobs:
     container:
       image: *esp_idf_container_image
     steps:
+      - name: Select exact immutable checkout ref and release mode
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          INPUT_COMMIT: ${{ inputs.expected_commit }}
+          INPUT_TAG: ${{ inputs.expected_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            printf '%s' "$INPUT_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+            if [[ -z "$INPUT_TAG" ]]; then
+              mode="candidate"
+              checkout_ref="$INPUT_COMMIT"
+            else
+              printf '%s' "$INPUT_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+              mode="existing-tag-recovery"
+              checkout_ref="refs/tags/$INPUT_TAG"
+            fi
+          else
+            mode="tag-push"
+            checkout_ref="$EVENT_REF"
+          fi
+          {
+            printf 'mode=%s\n' "$mode"
+            printf 'checkout_ref=%s\n' "$checkout_ref"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout selected immutable revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_commit || github.ref }}
+          ref: ${{ steps.select.outputs.checkout_ref }}
           fetch-depth: 0
 
       - name: Resolve exact candidate or annotated tag commit
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+          RELEASE_MODE: ${{ steps.select.outputs.mode }}
           INPUT_COMMIT: ${{ inputs.expected_commit }}
+          INPUT_TAG: ${{ inputs.expected_tag }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+          if [[ "$RELEASE_MODE" == "candidate" ]]; then
             expected_sha="$INPUT_COMMIT"
             printf '%s' "$expected_sha" | grep -Eq '^[0-9a-f]{40}$'
-            actual_sha=$(git -c "safe.directory=$GITHUB_WORKSPACE" rev-parse HEAD)
-            test "$actual_sha" = "$expected_sha"
           else
-            python3 tools/release_contract.py \
-              --source-root "$GITHUB_WORKSPACE" \
-              --repository "$GITHUB_WORKSPACE" \
-              --tag "$TAG_NAME" >"$RUNNER_TEMP/release-contract.json"
+            if [[ "$RELEASE_MODE" == "existing-tag-recovery" ]]; then
+              release_tag="$INPUT_TAG"
+            else
+              release_tag="$TAG_NAME"
+            fi
+            if ! python3 tools/release_contract.py \
+                --source-root "$GITHUB_WORKSPACE" \
+                --repository "$GITHUB_WORKSPACE" \
+                --tag "$release_tag" >"$RUNNER_TEMP/release-contract.json"; then
+              sed -n '1,20p' "$RUNNER_TEMP/release-contract.json" >&2
+              exit 1
+            fi
             expected_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_revision"])' "$RUNNER_TEMP/release-contract.json")
-            actual_sha=$(git -c "safe.directory=$GITHUB_WORKSPACE" rev-parse HEAD)
-            test "$actual_sha" = "$expected_sha"
+            if [[ "$RELEASE_MODE" == "existing-tag-recovery" ]]; then
+              test "$expected_sha" = "$INPUT_COMMIT"
+            fi
           fi
+          actual_sha=$(git -c "safe.directory=$GITHUB_WORKSPACE" rev-parse HEAD)
+          test "$actual_sha" = "$expected_sha"
           source_date_epoch=$(git -c "safe.directory=$GITHUB_WORKSPACE" show -s --format=%ct "$expected_sha")
           test "$source_date_epoch" -ge 0
           {

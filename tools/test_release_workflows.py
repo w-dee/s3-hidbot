@@ -27,6 +27,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.build = BUILD.read_text(encoding="utf-8")
         cls.draft = DRAFT.read_text(encoding="utf-8")
+        cls.selector = cls.build.split(
+            "      - name: Select exact immutable checkout ref and release mode\n", 1
+        )[1].split("      - name: Checkout selected immutable revision\n", 1)[0]
+        cls.resolver = cls.build.split(
+            "      - name: Resolve exact candidate or annotated tag commit\n", 1
+        )[1].split("      - name: Enforce release version authority and static guards\n", 1)[0]
 
     def test_release_build_is_read_only_temporary_asset_producer(self) -> None:
         self.assertIn("workflow_dispatch:", self.build)
@@ -44,16 +50,47 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("idf.py flash", self.build)
         self.assertNotIn("--hardware", self.build)
 
-    def test_candidate_and_tag_paths_are_immutable(self) -> None:
+    def test_dispatch_inputs_and_checkout_selector_are_fail_closed(self) -> None:
         self.assertIn("expected_commit:", self.build)
-        self.assertIn("INPUT_COMMIT", self.build)
-        self.assertIn("^[0-9a-f]{40}$", self.build)
-        self.assertIn("actual_sha", self.build)
-        self.assertIn("resolve exact candidate or annotated tag commit".lower(), self.build.lower())
-        self.assertIn("tools/release_contract.py", self.build)
-        self.assertIn("--tag", self.build)
-        self.assertIn("show -s --format=%ct", self.build)
-        self.assertIn("S3_HIDBOT_SOURCE_REVISION", self.build)
+        self.assertRegex(
+            self.build,
+            r"expected_tag:\n\s+description:.*\n\s+required: false\n\s+default: \"\"\n\s+type: string",
+        )
+        self.assertIn("^[0-9a-f]{40}$", self.selector)
+        self.assertIn("^v(0|[1-9][0-9]*)", self.selector)
+        self.assertIn('mode="candidate"', self.selector)
+        self.assertIn('checkout_ref="$INPUT_COMMIT"', self.selector)
+        self.assertIn('mode="existing-tag-recovery"', self.selector)
+        self.assertIn('checkout_ref="refs/tags/$INPUT_TAG"', self.selector)
+        self.assertIn('mode="tag-push"', self.selector)
+        self.assertIn('checkout_ref="$EVENT_REF"', self.selector)
+        self.assertIn("ref: ${{ steps.select.outputs.checkout_ref }}", self.build)
+
+    def test_candidate_recovery_and_tag_paths_are_immutable(self) -> None:
+        self.assertIn('if [[ "$RELEASE_MODE" == "candidate" ]]', self.resolver)
+        self.assertIn('expected_sha="$INPUT_COMMIT"', self.resolver)
+        self.assertIn('release_tag="$INPUT_TAG"', self.resolver)
+        self.assertIn('release_tag="$TAG_NAME"', self.resolver)
+        self.assertIn("tools/release_contract.py", self.resolver)
+        self.assertIn('--tag "$release_tag"', self.resolver)
+        self.assertIn('test "$expected_sha" = "$INPUT_COMMIT"', self.resolver)
+        self.assertIn('actual_sha=$(git -c "safe.directory=$GITHUB_WORKSPACE" rev-parse HEAD)', self.resolver)
+        self.assertIn('test "$actual_sha" = "$expected_sha"', self.resolver)
+        self.assertIn("show -s --format=%ct", self.resolver)
+        self.assertIn("S3_HIDBOT_SOURCE_REVISION", self.resolver)
+
+    def test_tag_resolver_inherits_only_workspace_git_trust(self) -> None:
+        self.assertIn('GIT_CONFIG_COUNT: "1"', self.resolver)
+        self.assertIn("GIT_CONFIG_KEY_0: safe.directory", self.resolver)
+        self.assertIn("GIT_CONFIG_VALUE_0: ${{ github.workspace }}", self.resolver)
+        self.assertNotIn("safe.directory=*", self.build)
+        self.assertNotIn("safe.directory: *", self.build)
+
+    def test_tag_contract_failure_is_visible_without_changing_the_helper(self) -> None:
+        self.assertIn("if ! python3 tools/release_contract.py", self.resolver)
+        self.assertIn("sed -n '1,20p'", self.resolver)
+        self.assertIn('"$RUNNER_TEMP/release-contract.json" >&2', self.resolver)
+        self.assertIn("exit 1", self.resolver)
 
     def test_checkout_free_consumers_cover_both_supported_pythons(self) -> None:
         consumer = self.build.split("  consume:\n", 1)[1]
