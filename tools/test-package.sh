@@ -381,7 +381,7 @@ class Client:
             "idf_version": "v5.5.4",
             "protocol_version": 1,
             "firmware": {
-                "version": "0.1.0-dev",
+                "version": "0.1.0",
                 "source_revision": "a" * 40,
                 "app_elf_sha256": "b" * 64,
                 "build_profile": "freenove-fnk0085",
@@ -396,7 +396,7 @@ identity = ArtifactFirmwareIdentity(
     project="s3-hidbot",
     target="esp32s3",
     protocol_version=1,
-    version="0.1.0-dev",
+    version="0.1.0",
     source_revision="a" * 40,
     app_elf_sha256="b" * 64,
     build_profile="freenove-fnk0085",

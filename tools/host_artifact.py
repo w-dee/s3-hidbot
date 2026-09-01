@@ -75,8 +75,10 @@ def _metadata_value(metadata: str, field: str) -> str:
     raise HostArtifactError(f"wheel metadata is missing {field}")
 
 
-def _validate_wheel(wheel: Path) -> None:
-    if wheel.name != WHEEL_BASENAME:
+def validate_wheel(wheel: Path, distribution_version: str = DISTRIBUTION_VERSION) -> None:
+    expected_basename = f"s3_hidbot_host-{distribution_version}-py3-none-any.whl"
+    dist_info = f"s3_hidbot_host-{distribution_version}.dist-info"
+    if wheel.name != expected_basename:
         raise HostArtifactError(f"unexpected wheel filename: {wheel.name}")
     try:
         with zipfile.ZipFile(wheel) as archive:
@@ -89,7 +91,7 @@ def _validate_wheel(wheel: Path) -> None:
                 path = PurePosixPath(name)
                 if path.is_absolute() or ".." in path.parts:
                     raise HostArtifactError(f"unsafe wheel member path: {name}")
-                if not (name.startswith("hidbot/") or name.startswith(f"{DIST_INFO}/")):
+                if not (name.startswith("hidbot/") or name.startswith(f"{dist_info}/")):
                     raise HostArtifactError(f"unexpected wheel payload path: {name}")
                 if (
                     name.startswith("tests/")
@@ -119,15 +121,15 @@ def _validate_wheel(wheel: Path) -> None:
         if b"/dev/serial/by-id/" in content:
             raise HostArtifactError(f"serial by-id path in wheel payload: {name}")
 
-    metadata = payload.get(f"{DIST_INFO}/METADATA")
-    wheel_metadata = payload.get(f"{DIST_INFO}/WHEEL")
-    entry_points = payload.get(f"{DIST_INFO}/entry_points.txt")
+    metadata = payload.get(f"{dist_info}/METADATA")
+    wheel_metadata = payload.get(f"{dist_info}/WHEEL")
+    entry_points = payload.get(f"{dist_info}/entry_points.txt")
     if metadata is None or wheel_metadata is None or entry_points is None:
         raise HostArtifactError("wheel is missing required dist-info metadata")
     decoded_metadata = metadata.decode("utf-8")
     if _metadata_value(decoded_metadata, "Name") != DISTRIBUTION_NAME:
         raise HostArtifactError("wheel distribution metadata does not match")
-    if _metadata_value(decoded_metadata, "Version") != DISTRIBUTION_VERSION:
+    if _metadata_value(decoded_metadata, "Version") != distribution_version:
         raise HostArtifactError("wheel version metadata does not match")
     if _metadata_value(decoded_metadata, "Requires-Python") != ">=3.11":
         raise HostArtifactError("wheel Requires-Python metadata does not match")
@@ -142,6 +144,12 @@ def _validate_wheel(wheel: Path) -> None:
         raise HostArtifactError("wheel tag is not py3-none-any pure Python")
     if "hidbotctl = hidbot.cli:main" not in entry_points.decode("utf-8"):
         raise HostArtifactError("wheel console entry point does not match")
+
+
+def _validate_wheel(wheel: Path) -> None:
+    """Backward-compatible canonical-development-wheel wrapper."""
+
+    validate_wheel(wheel)
 
 
 def validate_artifact_directory(directory: Path) -> HostWheelArtifact:
