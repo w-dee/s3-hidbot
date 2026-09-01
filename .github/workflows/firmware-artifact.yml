@@ -17,7 +17,7 @@ env:
   # the job container, while the environment value is passed into the bundle
   # manifest by the canonical builder.
   ESP_IDF_CONTAINER_IMAGE: &esp_idf_container_image espressif/idf:v5.5.4@sha256:b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b
-  ARTIFACT_NAME: s3-hidbot-firmware-0.1.0-dev-esp32s3-freenove-fnk0085.tar.gz
+  ARTIFACT_NAME: s3-hidbot-firmware-0.1.0-esp32s3-freenove-fnk0085.tar.gz
 
 defaults:
   run:

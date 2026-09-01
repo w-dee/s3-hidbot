@@ -57,6 +57,9 @@ Run these commands from the repository root:
 ./tools/test-control-protocol.sh
 ./tools/test-firmware.sh
 ./tools/test-firmware-artifact.sh
+python3 tools/test_release_contract.py
+python3 tools/test_release_firmware_equality.py
+python3 tools/test_release_workflows.py
 ./tools/test-nonhardware.sh
 ./tools/test-hardware-hid.sh
 ./tools/run-hardware-hid.sh --hardware --keyboard --json
@@ -89,6 +92,13 @@ manifest/verifier/privacy tests, and performs two independent temporary
 artifact builds to verify byte-for-byte reproducibility. It does not use or
 modify the ordinary `firmware/build` directory and removes all temporary
 outputs when it exits.
+
+The three release helper tests are stdlib-only and run from
+`test-static.sh`. They validate strict firmware/host release versions and
+derived names, annotated-tag peeling, candidate/tag firmware exact-equality
+handling, Actions permissions/triggers/action pins, and immutable draft-run
+correlation. They never create a tag, call GitHub APIs, upload assets, or
+access hardware.
 
 `test-host-artifact.sh` is the focused U6.4A canonical host-wheel producer
 test. It builds a single pure-Python wheel from a temporary staging copy of
@@ -159,6 +169,16 @@ of duplicating their test logic.
   artifact builds, official verification, byte-identical comparison, privacy
   checks, and one temporary Actions artifact upload. It does not flash
   hardware or publish a GitHub Release.
+- Release preparation (`release-build.yml`, U6.6A): manual exact-commit
+  candidates and `v*` tag pushes build temporary `release-assets` only, with
+  `contents: read`. It reuses the canonical firmware and host builders,
+  compares two firmware builds byte-for-byte, verifies the exact asset set,
+  and uses checkout-free Python 3.11/3.12 consumers. It never creates a
+  Release. The separate manual `release-draft.yml` has the narrowly necessary
+  `contents: write` and `actions: read` permissions; it accepts explicit
+  successful candidate and tag-build run IDs for the same tagged commit,
+  requires their firmware archives to be exact bytes, and creates an
+  unpublished draft only.
 
 The workflows run on pushes to every branch and on pull requests. The artifact
 workflow also supports manual `workflow_dispatch` runs. They cancel

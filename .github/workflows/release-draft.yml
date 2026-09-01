@@ -1,0 +1,139 @@
+name: Release draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated release tag, for example v0.1.0
+        required: true
+        type: string
+      release_build_run_id:
+        description: Exact successful tag-build workflow run ID
+        required: true
+        type: string
+      candidate_release_build_run_id:
+        description: Exact successful pre-tag candidate run validated at the hardware gate
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  draft:
+    name: Create one unpublished release draft from a proven tag build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout the requested tag with tag objects
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Resolve and validate the annotated tag commit
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          contract=$(python3 tools/release_contract.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_WORKSPACE" \
+            --tag "$RELEASE_TAG")
+          commit=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["source_revision"])' <<<"$contract")
+          actual=$(git -c "safe.directory=$GITHUB_WORKSPACE" rev-parse HEAD)
+          test "$actual" = "$commit"
+          printf 'RELEASE_COMMIT=%s\n' "$commit" >> "$GITHUB_ENV"
+
+      - name: Prove selected Actions run is the successful immutable tag build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_RUN_ID: ${{ inputs.release_build_run_id }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_release_build_run_id }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RELEASE_RUN_ID" | grep -Eq '^[1-9][0-9]*$'
+          printf '%s' "$CANDIDATE_RUN_ID" | grep -Eq '^[1-9][0-9]*$'
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" >"$RUNNER_TEMP/release-build-run.json"
+          python3 tools/validate_release_build_run.py \
+            --document "$RUNNER_TEMP/release-build-run.json" \
+            --kind tag \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --version 0.1.0 \
+            --commit "$RELEASE_COMMIT" \
+            --run-id "$RELEASE_RUN_ID"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" >"$RUNNER_TEMP/candidate-build-run.json"
+          python3 tools/validate_release_build_run.py \
+            --document "$RUNNER_TEMP/candidate-build-run.json" \
+            --kind candidate \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$RELEASE_COMMIT" \
+            --run-id "$CANDIDATE_RUN_ID"
+
+      - name: Download the exact selected tag-build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/tag-release-assets
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.release_build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download the exact physically validated candidate artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/candidate-release-assets
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_release_build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Reverify exact assets, require candidate/tag byte equality, and reject existing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 tools/verify_release_assets.py \
+            "$RUNNER_TEMP/tag-release-assets" \
+            --source-root "$GITHUB_WORKSPACE" \
+            --source-revision "$RELEASE_COMMIT"
+          python3 tools/verify_release_assets.py \
+            "$RUNNER_TEMP/candidate-release-assets" \
+            --source-root "$GITHUB_WORKSPACE" \
+            --source-revision "$RELEASE_COMMIT"
+          firmware="s3-hidbot-firmware-0.1.0-esp32s3-freenove-fnk0085.tar.gz"
+          python3 tools/compare_release_firmware.py \
+            "$RUNNER_TEMP/candidate-release-assets/$firmware" \
+            "$RUNNER_TEMP/tag-release-assets/$firmware"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "a release or draft already exists for $RELEASE_TAG; refusing to overwrite it" >&2
+            exit 1
+          fi
+
+      - name: Create one GitHub draft release, never publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 tools/render_release_notes.py \
+            --template docs/development/release-notes-v0.1.0.md \
+            --output "$RUNNER_TEMP/release-notes.md" \
+            --tag "$RELEASE_TAG" \
+            --version 0.1.0 \
+            --source-revision "$RELEASE_COMMIT"
+          gh release create "$RELEASE_TAG" \
+            "$RUNNER_TEMP/tag-release-assets/"* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "s3-hidbot $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --draft \
+            --verify-tag
