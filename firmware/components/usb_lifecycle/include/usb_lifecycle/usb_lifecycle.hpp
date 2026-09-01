@@ -26,9 +26,25 @@ enum class ObservedState : std::uint8_t {
 };
 
 enum class ExecutorAction : std::uint8_t {
-    kInstallAndConnect,
-    kConnect,
-    kDisconnect,
+    kInstall,
+    kUninstall,
+};
+
+enum class TransitionResult : std::uint8_t {
+    kAccepted,
+    kNoOp,
+    kBusy,
+};
+
+enum class LifecycleOperation : std::uint8_t {
+    kInstall,
+    kUninstall,
+};
+
+struct LastError {
+    bool present = false;
+    LifecycleOperation operation = LifecycleOperation::kInstall;
+    std::int32_t code = 0;
 };
 
 struct Snapshot {
@@ -38,6 +54,8 @@ struct Snapshot {
     Generation uncertainty_generation = 0;
     bool safety_pending = false;
     bool host_release_uncertain = false;
+    bool recovery_required = false;
+    LastError last_error{};
 };
 
 // The only future owner of install/connect/disconnect side effects.  U7.1A
@@ -46,20 +64,34 @@ struct Snapshot {
 class Executor {
   public:
     virtual ~Executor() = default;
-    virtual void schedule(ExecutorAction action, Snapshot snapshot) = 0;
+    // Returns false only when a bounded executor cannot accept the action.
+    // StateMachine never silently drops an accepted lifecycle action.
+    virtual bool schedule(ExecutorAction action, Snapshot snapshot) = 0;
 };
 
 class StateMachine {
   public:
     StateMachine();
 
-    // Preserve today's boot policy until U7.1B: USB is intended exposed, but
-    // the observed driver state is established only by callbacks.
-    void initialize_current_boot_policy();
+    // U7.1B begins with no native USB stack. UART remains independently
+    // available through the CH343 path.
+    void initialize_hidden_boot_policy();
 
     // Future control-plane intent. These are internal only in U7.1A.
-    void request_attach(Executor &executor);
-    void request_detach(Executor &executor);
+    TransitionResult request_attach(Executor &executor);
+    TransitionResult request_detach(Executor &executor);
+
+    // Completion is owned by the one lifecycle side-effect executor. Install
+    // success means the driver is present, not that a host configured it.
+    void complete_install_success();
+    void complete_install_clean_failure(std::int32_t error_code);
+    void complete_install_ambiguous_failure(std::int32_t error_code);
+
+    // This is the Stage-B teardown linearization point. It advances exactly
+    // once for an accepted detach, immediately before public driver uninstall.
+    Generation begin_uninstall();
+    void complete_uninstall_success();
+    void complete_uninstall_failure(std::int32_t error_code);
 
     // TinyUSB callbacks reconcile observations. They never change desired
     // intent. A false return means an obsolete observation was ignored.
@@ -87,17 +119,25 @@ class StateMachine {
     static constexpr std::uint8_t kDesiredBit = 1U << 0;
     static constexpr std::uint8_t kSafetyPendingBit = 1U << 1;
     static constexpr std::uint8_t kUncertainBit = 1U << 2;
-    static constexpr std::uint8_t kObservedShift = 3;
+    static constexpr std::uint8_t kRecoveryRequiredBit = 1U << 3;
+    static constexpr std::uint8_t kObservedShift = 4;
 
     void set_observed(ObservedState observed);
     ObservedState observed() const;
     DesiredExposure desired() const;
     void advance_generation();
+    void clear_last_error();
+    void record_error(LifecycleOperation operation, std::int32_t error_code);
+    void set_recovery_required(bool required);
 
     static_assert(std::atomic<Generation>::is_always_lock_free);
     std::atomic<Generation> generation_{0};
     std::atomic<Generation> uncertainty_generation_{0};
-    std::atomic<std::uint8_t> state_{kDesiredBit};
+    std::atomic<std::int32_t> last_error_code_{0};
+    std::atomic<std::uint8_t> last_error_operation_{0};
+    std::atomic_bool last_error_present_{false};
+    std::atomic_bool teardown_boundary_started_{false};
+    std::atomic<std::uint8_t> state_{0};
 };
 
 }  // namespace usb_lifecycle

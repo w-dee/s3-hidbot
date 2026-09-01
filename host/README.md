@@ -28,8 +28,9 @@ installation flow is in the project
 ## CLI categories
 
 - Hardware-free validation: `verify-artifact ARTIFACT`.
-- UART read-only diagnostics: `hello`, `ping`, `info`, `usb-status`, and
+- UART read-only diagnostics: `hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, and
   `verify-firmware ARTIFACT`.
+- Explicit USB exposure control: `usb-attach` and `usb-detach`.
 - UART diagnostic with safety action: `self-test`.
 - Explicit safety recovery: `release-all`.
 - Destructive provisioning: `flash-firmware ARTIFACT`.
@@ -39,6 +40,13 @@ The serial port comes from `--port` or machine-local `S3_HIDBOT_SERIAL`.
 For ordinary serial commands, `--baud` overrides `S3_HIDBOT_BAUD`, then 115200
 is used. `flash-firmware` deliberately ignores that environment variable and
 uses its fixed policy.
+
+Native USB HID is hidden by default. Use CH343 UART to request `usb-attach`,
+then poll `usb-exposure-status`; do not infer native USB enumeration from an
+accepted attach response. `usb-detach` attempts safety all-up handling before
+public driver uninstall but cannot prove host-observed release. A lifecycle
+result may retire control authority, so reconnect before later commands. The
+legacy `usb-status` command remains a basic readiness view.
 
 ## Artifact and identity commands
 

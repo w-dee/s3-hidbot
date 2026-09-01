@@ -23,6 +23,7 @@ from .protocol import (
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
+    UsbExposureStatus,
     Response,
     build_keyboard_report_frame,
     build_mouse_report_frame,
@@ -34,6 +35,7 @@ from .protocol import (
     validate_mouse_report_inputs,
     validate_release_all_result,
     validate_mouse_report_result,
+    validate_usb_exposure_status,
     validate_hello_response,
 )
 
@@ -359,6 +361,35 @@ class Client:
     def usb_status(self) -> object:
         with self._lock:
             return self._request_locked("usb.status")
+
+    def usb_exposure_status(self) -> UsbExposureStatus:
+        """Return the strict lifecycle authority snapshot when supported by the peer."""
+
+        with self._lock:
+            self._require_capability_locked("usb.exposure-control-v1")
+            return validate_usb_exposure_status(self._request_locked("usb.exposure.status"))
+
+    def _usb_lifecycle_transition_locked(self, command: str) -> UsbExposureStatus:
+        self._require_capability_locked("usb.exposure-control-v1")
+        result = validate_usb_exposure_status(self._request_locked(command))
+        # An accepted transition revokes firmware authority immediately. The
+        # result shape intentionally does not distinguish accepted from no-op,
+        # so conservatively require the caller to establish a fresh session
+        # before issuing any later control command.
+        self._invalidate_session()
+        return result
+
+    def usb_attach(self) -> UsbExposureStatus:
+        """Request explicit native USB stack installation; reconnect before later commands."""
+
+        with self._lock:
+            return self._usb_lifecycle_transition_locked("usb.attach")
+
+    def usb_detach(self) -> UsbExposureStatus:
+        """Request safety handling and public native USB stack uninstall."""
+
+        with self._lock:
+            return self._usb_lifecycle_transition_locked("usb.detach")
 
     def release_all(self) -> ReleaseAllResult:
         """Request a bounded, safety-only all-up operation on both HID interfaces."""

@@ -25,8 +25,22 @@ struct Sink {
     }
 };
 
-void ready(hid_runtime::StateMachine &state) {
+struct ImmediateLifecycleExecutor final : usb_lifecycle::Executor {
+    bool schedule(usb_lifecycle::ExecutorAction,
+                  usb_lifecycle::Snapshot) override {
+        return true;
+    }
+};
+
+void expose(hid_runtime::StateMachine &state) {
+    ImmediateLifecycleExecutor executor;
+    assert(state.request_usb_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    state.complete_usb_install_success();
     state.on_mount();
+}
+
+void ready(hid_runtime::StateMachine &state) {
+    expose(state);
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
 }
@@ -69,7 +83,7 @@ void test_readiness_refresh_after_mount_without_hid_work() {
     assert(!state.status().keyboard_ready);
     assert(!state.status().mouse_ready);
 
-    state.on_mount();
+    expose(state);
     auto snapshot = state.status();
     assert(snapshot.mounted && !snapshot.suspended);
     assert(!snapshot.keyboard_ready && !snapshot.mouse_ready);
@@ -92,7 +106,7 @@ void test_readiness_refresh_after_mount_without_hid_work() {
 void test_readiness_refresh_after_reattach() {
     hid_runtime::StateMachine state;
 
-    state.on_mount();
+    expose(state);
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
     const std::uint32_t first_generation = state.attach_generation();
@@ -286,7 +300,7 @@ void test_suspend_preserves_safety_and_ignores_late_completion() {
     assert(sink.calls == 3 && sink.instance == 1 && sink.report[1] == 10);
 }
 
-void test_unmount_clears_old_suspend_safety() {
+void test_unmount_preserves_uncertainty_for_fresh_generation_reconciliation() {
     hid_runtime::StateMachine state;
     Sink sink;
     ready(state);
@@ -299,14 +313,20 @@ void test_unmount_clears_old_suspend_safety() {
     const hid_runtime::AuthorityEpoch old_epoch = state.authority_epoch();
     state.on_unmount();
     assert(!state.status().mounted);
-    assert(!state.safety_required(hid_runtime::Interface::kMouse));
+    assert(state.safety_required(hid_runtime::Interface::kMouse));
+    assert(state.host_state_uncertain(hid_runtime::Interface::kMouse));
     state.on_mount();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
     assert(state.attach_generation() != old_attach);
     assert(state.authority_epoch() != old_epoch);
     state.execute(Sink::submit, &sink);
-    // An old attach never sends a delayed all-up into a new host attach.
-    assert(sink.calls == 1);
+    assert(sink.calls == 2 && sink.instance == 0 && sink.report[0] == 0);
+    state.report_complete(0);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 3 && sink.instance == 1 && sink.report[0] == 0);
+    state.report_complete(1);
+    assert(!state.safety_required(hid_runtime::Interface::kMouse));
 }
 
 void test_release_ticket_states_and_historical_submission() {
@@ -388,8 +408,10 @@ void test_release_ticket_partial_and_clean_unmounted() {
     state.on_unmount();
     state.begin_release_all();
     snapshot = state.release_all_snapshot();
-    assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
-    assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    // Unmount cannot prove either host-side all-up when an earlier safety
+    // release was still incomplete. The public operation stays fail-closed.
+    assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kPending);
+    assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kPending);
 }
 
 void test_keyboard_report_ticket_and_confirmed_state() {
@@ -633,15 +655,16 @@ void invalidate_before_submit(hid_runtime::StateMachine *state) {
 }
 
 struct FakeLifecycleExecutor final : usb_lifecycle::Executor {
-    void schedule(usb_lifecycle::ExecutorAction action,
+    bool schedule(usb_lifecycle::ExecutorAction action,
                   usb_lifecycle::Snapshot snapshot) override {
         calls += 1;
         last_action = action;
         last_snapshot = snapshot;
+        return true;
     }
 
     int calls = 0;
-    usb_lifecycle::ExecutorAction last_action = usb_lifecycle::ExecutorAction::kConnect;
+    usb_lifecycle::ExecutorAction last_action = usb_lifecycle::ExecutorAction::kInstall;
     usb_lifecycle::Snapshot last_snapshot{};
 };
 
@@ -684,6 +707,14 @@ void test_late_tokenized_callbacks_cannot_affect_new_generation() {
     state.on_mount();
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
+    // The prior in-flight report is unproven. A new attachment reconciles
+    // only with fresh all-up work before it admits another unsafe ticket.
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2 && sink.instance == 0 && sink.report[0] == 0);
+    state.report_complete(0);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 3 && sink.instance == 1 && sink.report[0] == 0);
+    state.report_complete(1);
 
     assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
            hid_runtime::MouseReportBeginResult::kPublished);
@@ -712,8 +743,9 @@ void test_relative_and_safety_work_do_not_cross_usb_generation() {
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 0);
 
-    // An old all-up retry is likewise canceled rather than applied to the
-    // fresh attachment.
+    // An old all-up retry is canceled rather than applied to the fresh
+    // attachment. The retained uncertainty instead causes distinct
+    // fresh-generation all-up reconciliation work.
     assert(state.queue_mouse_report(1, 0, 0, 0, 0));
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 1);
@@ -724,7 +756,11 @@ void test_relative_and_safety_work_do_not_cross_usb_generation() {
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
     state.execute(Sink::submit, &sink);
-    assert(sink.calls == 1);
+    assert(sink.calls == 2 && sink.instance == 0 && sink.report[0] == 0);
+    state.report_complete(0);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 3 && sink.instance == 1 && sink.report[0] == 0);
+    state.report_complete(1);
 }
 
 void test_internal_detach_preserves_uncertainty_until_explicit_recovery() {
@@ -742,23 +778,48 @@ void test_internal_detach_preserves_uncertainty_until_explicit_recovery() {
     assert(detached.desired == usb_lifecycle::DesiredExposure::kHidden);
     assert(detached.observed == usb_lifecycle::ObservedState::kDetaching);
     assert(detached.safety_pending);
-    assert(detached.host_release_uncertain);
+    assert(!detached.host_release_uncertain);
+    const auto old_generation = detached.generation;
     assert(!state.queue_mouse_report(0, 1, 0, 0, 0));
+    assert(state.request_usb_attach(executor) == usb_lifecycle::TransitionResult::kBusy);
 
-    // A fresh lifecycle does not turn an unproven host release into a clean
-    // state. It remains fail-closed until a future explicit recovery policy.
-    state.request_usb_attach(executor);
+    // The in-flight old-generation report needs lifecycle-owned all-up. A
+    // failed/timed-out resolution preserves uncertainty before teardown.
+    assert(state.begin_lifecycle_detach_safety() == hid_runtime::LifecycleSafetyResult::kPending);
+    state.mark_lifecycle_detach_uncertain(old_generation);
+    assert(state.begin_usb_uninstall() == old_generation + 1);
+    state.on_driver_uninstalled();
+    state.complete_usb_uninstall_success();
+    assert(state.usb_lifecycle_snapshot().host_release_uncertain);
+
+    // A fresh stack may be installed, but cannot admit unsafe work until it
+    // sends fresh-generation safety reports.
+    assert(state.request_usb_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    state.complete_usb_install_success();
     state.on_mount();
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
     assert(!state.queue_mouse_report(0, 1, 0, 0, 0));
+    state.execute(Sink::submit, &sink);
+    assert(sink.instance == 0 && sink.report[0] == 0);
+    state.report_complete(0);
+    state.execute(Sink::submit, &sink);
+    assert(sink.instance == 1 && sink.report[0] == 0);
+    state.report_complete(1);
+    assert(state.queue_mouse_report(0, 1, 0, 0, 0));
 
     // A clean lifecycle can, after a fresh generation and fresh authority,
     // accept new work normally.
     hid_runtime::StateMachine clean;
     ready(clean);
-    clean.request_usb_detach(executor);
-    clean.request_usb_attach(executor);
+    const auto clean_old_generation = clean.attach_generation();
+    assert(clean.request_usb_detach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(clean.begin_lifecycle_detach_safety() == hid_runtime::LifecycleSafetyResult::kClean);
+    assert(clean.begin_usb_uninstall() == clean_old_generation + 1);
+    clean.on_driver_uninstalled();
+    clean.complete_usb_uninstall_success();
+    assert(clean.request_usb_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    clean.complete_usb_install_success();
     clean.on_mount();
     clean.set_ready(hid_runtime::Interface::kKeyboard, true);
     clean.set_ready(hid_runtime::Interface::kMouse, true);
@@ -778,7 +839,7 @@ int main() {
     test_executor_submission_bound();
     test_authority_epoch_suspend_resume_barrier();
     test_suspend_preserves_safety_and_ignores_late_completion();
-    test_unmount_clears_old_suspend_safety();
+    test_unmount_preserves_uncertainty_for_fresh_generation_reconciliation();
     test_release_ticket_states_and_historical_submission();
     test_release_ticket_failure_and_lifecycle_cancellation();
     test_release_ticket_partial_and_clean_unmounted();

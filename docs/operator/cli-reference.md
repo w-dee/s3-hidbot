@@ -16,7 +16,8 @@ does not resolve a serial port or use them.
 | Category | Commands |
 | --- | --- |
 | Hardware-free validation | `verify-artifact ARTIFACT` |
-| UART read-only diagnostics | `hello`, `ping`, `info`, `usb-status`, `verify-firmware ARTIFACT` |
+| UART read-only diagnostics | `hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, `verify-firmware ARTIFACT` |
+| Explicit USB exposure control | `usb-attach`, `usb-detach` |
 | UART diagnostic with safety action | `self-test` |
 | Explicit safety recovery | `release-all` |
 | Destructive provisioning | `flash-firmware ARTIFACT` |
@@ -34,13 +35,31 @@ intentionally injects a key, button, or movement.
 | `hidbotctl hello` | UART | Establish a fresh session and show capabilities. |
 | `hidbotctl ping` | UART | Bounded diagnostic ping. |
 | `hidbotctl info` | UART | Device information and available firmware identity. |
-| `hidbotctl usb-status` | UART | Observe native USB lifecycle/readiness; it does not require native USB to be attached. |
+| `hidbotctl usb-status` | UART | Legacy/basic USB readiness shape (`mounted`, `suspended`, and endpoint readiness). It never exposes native USB. |
+| `hidbotctl usb-exposure-status` | UART + `usb.exposure-control-v1` | Observe the authoritative native USB lifecycle state. It accepts no parameters and does not install or uninstall anything. |
+| `hidbotctl usb-attach` | UART + `usb.exposure-control-v1` | Explicitly request a fresh public TinyUSB driver install. The immediate result is an accepted lifecycle snapshot, not mount, enumeration, or endpoint readiness proof. Establish a fresh session before later commands. |
+| `hidbotctl usb-detach` | UART + `usb.exposure-control-v1` | Explicitly request old-generation all-up safety handling followed by public TinyUSB driver uninstall. The immediate result does not prove host-observed release or completed removal. Establish a fresh session before later commands. |
 | `hidbotctl self-test` | UART | Safe diagnostic sequence including `release-all`. |
 | `hidbotctl release-all` | UART | Explicit keyboard/mouse all-up recovery. |
 | `hidbotctl verify-firmware ARTIFACT` | Artifact + UART | Verify artifact first, then fresh hello and system info identity comparison. No flash or HID. |
 | `hidbotctl flash-firmware ARTIFACT` | Artifact + UART + `[flash]` | Destructive verified provisioning. Native USB is not required. |
 | `hidbotctl keyboard-report --unsafe-hid --modifiers N [--key USAGE ...]` | UART + approved native HID topology | One unsafe keyboard report. |
 | `hidbotctl mouse-report --unsafe-hid --buttons N --x N --y N --wheel N --pan N` | UART + approved native HID topology | One unsafe mouse report. |
+
+Native USB HID is hidden at boot. The CH343 UART path is therefore the
+bootstrap/control path: run `usb-attach` only when the native USB topology is
+intended, then poll `usb-exposure-status`. `usb-attach` and `usb-detach` take
+only omitted parameters or `{}` on the wire; non-empty parameters are rejected.
+Repeated attach/detach can allocate and free TinyUSB resources. `self-test`
+does not attach native USB.
+
+`usb-exposure-status` is the lifecycle authority and has exactly `desired`,
+`observed`, `generation`, `mounted`, `suspended`, `keyboard_ready`,
+`mouse_ready`, `safety_pending`, `host_release_uncertain`,
+`recovery_required`, and `last_error`. `last_error` is `null` or an
+`operation`/signed-`code` object. A true `recovery_required` means no automatic
+retry is attempted; reboot or manual operator intervention is required.
+`usb.status` stays wire-compatible as the legacy/basic readiness command.
 
 ## Artifact and firmware identity
 

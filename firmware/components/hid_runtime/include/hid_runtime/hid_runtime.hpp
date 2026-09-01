@@ -21,6 +21,12 @@ enum class ReportKind : std::uint8_t {
     kSafetyMouse,
 };
 
+enum class LifecycleSafetyResult : std::uint8_t {
+    kClean,
+    kPending,
+    kUncertain,
+};
+
 struct StatusSnapshot {
     bool mounted = false;
     bool suspended = false;
@@ -216,9 +222,23 @@ class StateMachine {
 
     // U7.1A internal-only future lifecycle boundary. It does not issue USB
     // hardware calls; U7.1B will connect it to the executor implementation.
-    void request_usb_attach(usb_lifecycle::Executor &executor);
-    void request_usb_detach(usb_lifecycle::Executor &executor);
+    usb_lifecycle::TransitionResult request_usb_attach(usb_lifecycle::Executor &executor);
+    usb_lifecycle::TransitionResult request_usb_detach(usb_lifecycle::Executor &executor);
     usb_lifecycle::Snapshot usb_lifecycle_snapshot() const;
+
+    // Project-owned, lifecycle-only safety operation. It intentionally does
+    // not create a public hid.release_all cache identity. While detaching it
+    // is the sole permitted old-generation HID work.
+    LifecycleSafetyResult begin_lifecycle_detach_safety();
+    bool lifecycle_detach_safety_clean() const;
+    void mark_lifecycle_detach_uncertain(UsbGeneration old_generation);
+    void on_driver_uninstalled();
+    void complete_usb_install_success();
+    void complete_usb_install_clean_failure(std::int32_t error_code);
+    void complete_usb_install_ambiguous_failure(std::int32_t error_code);
+    UsbGeneration begin_usb_uninstall();
+    void complete_usb_uninstall_success();
+    void complete_usb_uninstall_failure(std::int32_t error_code);
 
     StatusSnapshot status() const;
     UsbGeneration attach_generation() const;
@@ -332,6 +352,7 @@ class StateMachine {
     InterfaceState &state(Interface interface);
     const InterfaceState &state(Interface interface) const;
     bool mounted_and_active(Interface interface) const;
+    bool safety_transport_active(Interface interface) const;
     bool any_safety_required() const;
     bool queue_safety(Interface interface);
     bool queue_report(Interface interface, ReportKind kind,
@@ -421,6 +442,8 @@ class Runtime {
                                    std::int8_t vertical, std::int8_t horizontal);
     void request_release_all();
     ReleaseAllResult release_all();
+    LifecycleSafetyResult run_lifecycle_detach_safety();
+    void on_driver_uninstalled();
     void service_sof();
     void on_report_complete(std::uint8_t instance,
                             const std::uint8_t *report = nullptr,
@@ -440,9 +463,11 @@ class Runtime {
     static bool submit_report(void *, std::uint8_t instance,
                               const std::uint8_t *report, std::uint16_t length);
     void set_result(Interface interface, bool failed);
+    void notify_lifecycle_safety_waiter();
 
     StateMachine state_machine_;
     std::atomic<std::uint8_t> result_bits_{0};  // sent bits 0/1, failed bits 2/3
+    std::atomic<void *> lifecycle_safety_waiter_{nullptr};
 };
 
 }  // namespace hid_runtime

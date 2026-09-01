@@ -41,11 +41,16 @@ def main() -> int:
     assert "std::abort()" in main_source
     assert "firmware_identity::Identity s_firmware_identity" in main_source
     assert ".firmware_identity = &s_firmware_identity" in main_source
-    identity_position = main_source.index("build_runtime_identity")
-    tinyusb_position = main_source.index("tinyusb_driver_install")
-    transport_position = main_source.index("uart_control_transport::start")
-    assert identity_position < tinyusb_position
-    assert identity_position < transport_position
+    app_main_position = main_source.index('extern "C" void app_main()')
+    app_main = main_source[app_main_position:]
+    identity_position = app_main.index("build_runtime_identity")
+    lifecycle_position = app_main.index("s_usb_exposure.initialize")
+    transport_position = app_main.index("uart_control_transport::start")
+    assert identity_position < lifecycle_position < transport_position
+    # U7.1B keeps native USB absent at boot: only the dedicated lifecycle
+    # backend may contain the public install call, after UART startup setup.
+    assert "tinyusb_driver_install" not in app_main
+    assert "usb_exposure_control" in main_cmake
     assert '"firmware_identity_adapter.cpp"' in main_cmake
     assert "esp_app_format" in main_cmake
 

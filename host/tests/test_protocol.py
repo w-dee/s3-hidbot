@@ -20,6 +20,7 @@ from hidbot.protocol import (
     validate_release_all_result,
     validate_keyboard_report_result,
     validate_mouse_report_result,
+    validate_usb_exposure_status,
     validate_hello_response,
     validate_system_info,
     evaluate_compatibility,
@@ -98,6 +99,41 @@ class ProtocolTests(unittest.TestCase):
         ):
             with self.assertRaises(ProtocolError):
                 validate_release_all_result(value)
+
+    def test_usb_exposure_status_result_is_exact_and_bounded(self) -> None:
+        value = {
+            "desired": "hidden",
+            "observed": "detaching",
+            "generation": 0xFFFF_FFFF,
+            "mounted": False,
+            "suspended": False,
+            "keyboard_ready": False,
+            "mouse_ready": False,
+            "safety_pending": True,
+            "host_release_uncertain": True,
+            "recovery_required": True,
+            "last_error": {"operation": "uninstall", "code": -7},
+        }
+        parsed = validate_usb_exposure_status(value)
+        self.assertEqual(parsed.desired, "hidden")
+        self.assertEqual(parsed.observed, "detaching")
+        self.assertEqual(parsed.generation, 0xFFFF_FFFF)
+        self.assertIsNotNone(parsed.last_error)
+        assert parsed.last_error is not None
+        self.assertEqual(parsed.last_error.operation, "uninstall")
+        self.assertEqual(parsed.last_error.code, -7)
+        for invalid in (
+            {},
+            {**value, "generation": -1},
+            {**value, "generation": 0x1_0000_0000},
+            {**value, "mounted": 1},
+            {**value, "observed": "connected"},
+            {**value, "last_error": {"operation": "remove", "code": 1}},
+            {**value, "last_error": {"operation": "install", "code": True}},
+            {**value, "extra": False},
+        ):
+            with self.assertRaises(ProtocolError):
+                validate_usb_exposure_status(invalid)
 
     def test_strict_response_and_hello_validation(self) -> None:
         response = parse_response(

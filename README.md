@@ -4,7 +4,8 @@
 interfaces:
 
 - a bounded JSON UART control plane for diagnostics and provisioning; and
-- a native USB Composite HID device (Boot Keyboard + Boot Mouse).
+- a native USB Composite HID device (Boot Keyboard + Boot Mouse), hidden until
+  explicitly exposed over UART.
 
 It is a low-level diagnostic fixture, not a typing, clicking, dragging, or
 macro-automation product.
@@ -48,6 +49,16 @@ They require command-local `--unsafe-hid` and explicit human authorization.
 `release-all` is the explicit all-up recovery command. A report result of
 `submitted` means firmware accepted bytes; it does not prove that a host OS
 consumed the event.
+
+The CH343 UART control plane is the bootstrap path. Current development
+firmware starts with the native TinyUSB stack uninstalled; `usb.attach` creates
+a fresh public TinyUSB instance and `usb.detach` performs lifecycle-owned
+safety handling before public uninstall. `usb.exposure.status` is the
+authoritative lifecycle view, while legacy `usb.status` retains its basic
+readiness schema. Accepted detach does not prove host-observed all-up, and
+uncertainty remains fail-closed across a later attach. v0.1.0 is historical
+always-exposed behavior; it cannot expose a future U7.1B firmware because it
+does not advertise `usb.exposure-control-v1`.
 
 `flash-firmware` is destructive provisioning. It programs only a verified,
 supported plan and returns success only after an exact runtime identity match.

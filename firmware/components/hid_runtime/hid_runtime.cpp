@@ -240,8 +240,21 @@ void StateMachine::on_mount() {
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    clear_interface(interfaces_[0]);
-    clear_interface(interfaces_[1]);
+    if (usb_lifecycle_.has_unresolved_prior_generation()) {
+        // A reinstalled stack cannot prove the prior host observed all-up.
+        // Keep a fresh-generation safety barrier until a new all-up completes.
+        for (InterfaceState &interface_state : interfaces_) {
+            interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
+            interface_state.in_flight.store(false, std::memory_order_release);
+            interface_state.safety_required.store(true, std::memory_order_release);
+            interface_state.host_state_uncertain.store(true, std::memory_order_release);
+            interface_state.logical_state_held.store(false, std::memory_order_release);
+        }
+        request_release_all();
+    } else {
+        clear_interface(interfaces_[0]);
+        clear_interface(interfaces_[1]);
+    }
     release_request_generation_.store(0, std::memory_order_release);
     release_request_authority_epoch_.store(0, std::memory_order_release);
     release_requested_.store(false, std::memory_order_release);
@@ -252,11 +265,16 @@ void StateMachine::on_mount() {
 }
 
 void StateMachine::on_unmount() {
+    const UsbGeneration retired_generation = attach_generation();
     if (!usb_lifecycle_.observe_unmount()) {
+        // Explicit uninstall calls tud_umount_cb() during caller-side
+        // teardown. It is observational only: never change generation,
+        // desired/observed state, or uncertainty here.
+        if (usb_lifecycle_.snapshot().observed == usb_lifecycle::ObservedState::kDetaching) {
+            status_bits_.store(0, std::memory_order_release);
+        }
         return;
     }
-    const bool preserve_uncertainty =
-        usb_lifecycle_.snapshot().desired == usb_lifecycle::DesiredExposure::kHidden;
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -265,27 +283,25 @@ void StateMachine::on_unmount() {
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
     status_bits_.store(0, std::memory_order_release);
-    if (!preserve_uncertainty) {
-        clear_interface(interfaces_[0]);
-        clear_interface(interfaces_[1]);
-    } else {
-        bool uncertainty = false;
-        for (InterfaceState &interface_state : interfaces_) {
-            const bool needs_safety =
-                interface_state.logical_state_held.load(std::memory_order_acquire) ||
-                interface_state.in_flight.load(std::memory_order_acquire) ||
-                interface_state.host_state_uncertain.load(std::memory_order_acquire);
-            interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
-            interface_state.in_flight.store(false, std::memory_order_release);
-            if (needs_safety) {
-                uncertainty = true;
-                interface_state.safety_required.store(true, std::memory_order_release);
-                interface_state.host_state_uncertain.store(true, std::memory_order_release);
-            }
+    bool uncertainty = false;
+    for (InterfaceState &interface_state : interfaces_) {
+        const bool needs_safety =
+            interface_state.logical_state_held.load(std::memory_order_acquire) ||
+            interface_state.in_flight.load(std::memory_order_acquire) ||
+            interface_state.host_state_uncertain.load(std::memory_order_acquire);
+        interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
+        interface_state.in_flight.store(false, std::memory_order_release);
+        if (needs_safety) {
+            uncertainty = true;
+            interface_state.safety_required.store(true, std::memory_order_release);
+            interface_state.host_state_uncertain.store(true, std::memory_order_release);
+            interface_state.logical_state_held.store(false, std::memory_order_release);
+        } else {
+            clear_interface(interface_state);
         }
-        if (uncertainty && !usb_lifecycle_.snapshot().host_release_uncertain) {
-            usb_lifecycle_.mark_release_uncertain();
-        }
+    }
+    if (uncertainty) {
+        usb_lifecycle_.mark_release_uncertain_for_generation(retired_generation);
     }
     release_request_generation_.store(0, std::memory_order_release);
     release_request_authority_epoch_.store(0, std::memory_order_release);
@@ -351,8 +367,12 @@ StatusSnapshot StateMachine::status() const {
     };
 }
 
-void StateMachine::request_usb_attach(usb_lifecycle::Executor &executor) {
-    usb_lifecycle_.request_attach(executor);
+usb_lifecycle::TransitionResult StateMachine::request_usb_attach(
+    usb_lifecycle::Executor &executor) {
+    const usb_lifecycle::TransitionResult transition = usb_lifecycle_.request_attach(executor);
+    if (transition != usb_lifecycle::TransitionResult::kAccepted) {
+        return transition;
+    }
     // Request intent is the fail-closed authority boundary. U7.1A does not
     // invoke an executor in firmware, so this has no current USB behavior.
     cancel_release_ticket();
@@ -361,38 +381,38 @@ void StateMachine::request_usb_attach(usb_lifecycle::Executor &executor) {
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
     status_bits_.store(0, std::memory_order_release);
+    return transition;
 }
 
-void StateMachine::request_usb_detach(usb_lifecycle::Executor &executor) {
+usb_lifecycle::TransitionResult StateMachine::request_usb_detach(
+    usb_lifecycle::Executor &executor) {
     const UsbGeneration retired_generation = attach_generation();
-    usb_lifecycle_.request_detach(executor);
+    const usb_lifecycle::TransitionResult transition = usb_lifecycle_.request_detach(executor);
+    if (transition != usb_lifecycle::TransitionResult::kAccepted) {
+        return transition;
+    }
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    status_bits_.store(0, std::memory_order_release);
-    // Do not clear uncertainty: a hidden transport is not proof the host saw
-    // all-up. Existing current-main unmount behavior remains unchanged.
-    bool uncertainty = false;
+    // Stage A retains mounted/readiness bits so only lifecycle-owned all-up
+    // work can execute in the still-current installed generation. Unsafe work
+    // is already rejected by desired=hidden and the fresh authority epoch.
     for (InterfaceState &interface_state : interfaces_) {
         if (interface_state.logical_state_held.load(std::memory_order_acquire) ||
             interface_state.in_flight.load(std::memory_order_acquire) ||
             interface_state.host_state_uncertain.load(std::memory_order_acquire)) {
-            uncertainty = true;
             interface_state.safety_required.store(true, std::memory_order_release);
             interface_state.host_state_uncertain.store(true, std::memory_order_release);
         }
+        interface_state.in_flight.store(false, std::memory_order_release);
         std::uint8_t expected = kSlotReady;
         interface_state.slot_state.compare_exchange_strong(
             expected, kSlotCanceled, std::memory_order_acq_rel, std::memory_order_acquire);
     }
-    if (uncertainty) {
-        usb_lifecycle_.mark_release_uncertain_for_generation(retired_generation);
-    } else {
-        // Internal all-up was already known before this future detach request.
-        usb_lifecycle_.mark_release_confirmed();
-    }
+    (void)retired_generation;
+    return transition;
 }
 
 usb_lifecycle::Snapshot StateMachine::usb_lifecycle_snapshot() const {
@@ -423,6 +443,20 @@ bool StateMachine::mounted_and_active(Interface interface) const {
            usb_lifecycle_.accepts_hid(
         snapshot.mounted && !snapshot.suspended &&
         (interface == Interface::kKeyboard ? snapshot.keyboard_ready : snapshot.mouse_ready));
+}
+
+bool StateMachine::safety_transport_active(Interface interface) const {
+    const StatusSnapshot snapshot = status();
+    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
+    const bool endpoint_ready = interface == Interface::kKeyboard
+                                    ? snapshot.keyboard_ready
+                                    : snapshot.mouse_ready;
+    return snapshot.mounted && !snapshot.suspended && endpoint_ready &&
+           !lifecycle.recovery_required &&
+           ((lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed &&
+             lifecycle.observed == usb_lifecycle::ObservedState::kMounted) ||
+            (lifecycle.desired == usb_lifecycle::DesiredExposure::kHidden &&
+             lifecycle.observed == usb_lifecycle::ObservedState::kDetaching));
 }
 
 bool StateMachine::any_safety_required() const {
@@ -781,7 +815,7 @@ bool StateMachine::queue_safety(Interface interface) {
     }
     if (attach_generation() != queue_generation ||
         authority_epoch() != queue_authority_epoch ||
-        !mounted_and_active(interface)) {
+        !safety_transport_active(interface)) {
         interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
         return false;
     }
@@ -799,6 +833,96 @@ void StateMachine::request_release_all() {
     cancel_mouse_ticket(MouseReportTicketOutcome::kSafetyPending);
     release_requested_.store(true, std::memory_order_release);
     usb_lifecycle_.mark_release_pending();
+}
+
+LifecycleSafetyResult StateMachine::begin_lifecycle_detach_safety() {
+    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
+    if (lifecycle.desired != usb_lifecycle::DesiredExposure::kHidden ||
+        lifecycle.observed != usb_lifecycle::ObservedState::kDetaching) {
+        return LifecycleSafetyResult::kUncertain;
+    }
+
+    bool requires_all_up = false;
+    for (const Interface interface : {Interface::kKeyboard, Interface::kMouse}) {
+        InterfaceState &interface_state = state(interface);
+        const bool known_clean = known_all_up(interface) &&
+                                 !interface_state.in_flight.load(std::memory_order_acquire) &&
+                                 !interface_state.host_state_uncertain.load(std::memory_order_acquire);
+        if (!known_clean) {
+            requires_all_up = true;
+            interface_state.safety_required.store(true, std::memory_order_release);
+        }
+    }
+    if (!requires_all_up) {
+        usb_lifecycle_.mark_release_confirmed();
+        return LifecycleSafetyResult::kClean;
+    }
+    request_release_all();
+    return LifecycleSafetyResult::kPending;
+}
+
+bool StateMachine::lifecycle_detach_safety_clean() const {
+    return !any_safety_required() &&
+           !interfaces_[0].in_flight.load(std::memory_order_acquire) &&
+           !interfaces_[1].in_flight.load(std::memory_order_acquire) &&
+           !interfaces_[0].host_state_uncertain.load(std::memory_order_acquire) &&
+           !interfaces_[1].host_state_uncertain.load(std::memory_order_acquire);
+}
+
+void StateMachine::mark_lifecycle_detach_uncertain(UsbGeneration old_generation) {
+    for (InterfaceState &interface_state : interfaces_) {
+        interface_state.safety_required.store(true, std::memory_order_release);
+        interface_state.host_state_uncertain.store(true, std::memory_order_release);
+        interface_state.in_flight.store(false, std::memory_order_release);
+        interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
+    }
+    usb_lifecycle_.mark_release_uncertain_for_generation(old_generation);
+}
+
+void StateMachine::on_driver_uninstalled() {
+    cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
+    status_bits_.store(0, std::memory_order_release);
+    if (!usb_lifecycle_.snapshot().host_release_uncertain) {
+        clear_interface(interfaces_[0]);
+        clear_interface(interfaces_[1]);
+    } else {
+        for (InterfaceState &interface_state : interfaces_) {
+            interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
+            interface_state.in_flight.store(false, std::memory_order_release);
+            interface_state.safety_required.store(true, std::memory_order_release);
+            interface_state.host_state_uncertain.store(true, std::memory_order_release);
+            interface_state.logical_state_held.store(false, std::memory_order_release);
+        }
+    }
+    release_request_generation_.store(0, std::memory_order_release);
+    release_request_authority_epoch_.store(0, std::memory_order_release);
+    release_requested_.store(false, std::memory_order_release);
+}
+
+void StateMachine::complete_usb_install_success() {
+    usb_lifecycle_.complete_install_success();
+}
+
+void StateMachine::complete_usb_install_clean_failure(std::int32_t error_code) {
+    usb_lifecycle_.complete_install_clean_failure(error_code);
+}
+
+void StateMachine::complete_usb_install_ambiguous_failure(std::int32_t error_code) {
+    usb_lifecycle_.complete_install_ambiguous_failure(error_code);
+}
+
+UsbGeneration StateMachine::begin_usb_uninstall() {
+    return usb_lifecycle_.begin_uninstall();
+}
+
+void StateMachine::complete_usb_uninstall_success() {
+    usb_lifecycle_.complete_uninstall_success();
+}
+
+void StateMachine::complete_usb_uninstall_failure(std::int32_t error_code) {
+    usb_lifecycle_.complete_uninstall_failure(error_code);
 }
 
 void StateMachine::begin_release_all() {
@@ -1155,7 +1279,7 @@ void StateMachine::execute(SubmitFn submit, void *context) {
         const bool any_safety_pending = any_safety_required();
         if (slot_generation != current_generation ||
             slot_authority_epoch != current_authority_epoch ||
-            !mounted_and_active(interface) ||
+            !(safety_kind ? safety_transport_active(interface) : mounted_and_active(interface)) ||
             stale_unsafe || ((safety_now || any_safety_pending) && !safety_kind)) {
             if (!safety_kind &&
                 (safety_now || unsafe_report_holds_state(kind,
@@ -1175,7 +1299,7 @@ void StateMachine::execute(SubmitFn submit, void *context) {
 #endif
         if (slot_generation != attach_generation() ||
             slot_authority_epoch != authority_epoch() ||
-            !mounted_and_active(interface) ||
+            !(safety_kind ? safety_transport_active(interface) : mounted_and_active(interface)) ||
             interface_state.slot_state.load(std::memory_order_acquire) != kSlotExecuting) {
             interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
             continue;
@@ -1579,6 +1703,39 @@ MouseReportResult Runtime::mouse_report(std::uint8_t buttons, std::int8_t x,
 
 void Runtime::request_release_all() { state_machine_.request_release_all(); }
 
+LifecycleSafetyResult Runtime::run_lifecycle_detach_safety() {
+    const UsbGeneration old_generation = state_machine_.attach_generation();
+    const LifecycleSafetyResult start = state_machine_.begin_lifecycle_detach_safety();
+    if (start != LifecycleSafetyResult::kPending) {
+        if (start != LifecycleSafetyResult::kClean) {
+            state_machine_.mark_lifecycle_detach_uncertain(old_generation);
+        }
+        return start;
+    }
+
+    constexpr TickType_t kLifecycleSafetyWaitTicks = pdMS_TO_TICKS(250);
+    lifecycle_safety_waiter_.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+    const TickType_t wait_start = xTaskGetTickCount();
+    while (!state_machine_.lifecycle_detach_safety_clean()) {
+        const TickType_t elapsed = xTaskGetTickCount() - wait_start;
+        if (elapsed >= kLifecycleSafetyWaitTicks) {
+            break;
+        }
+        // report_complete/report_failed signal this task directly. Waiting
+        // again after the first endpoint's completion allows keyboard and
+        // mouse all-up to resolve independently without a polling sleep.
+        (void)ulTaskNotifyTake(pdTRUE, kLifecycleSafetyWaitTicks - elapsed);
+    }
+    lifecycle_safety_waiter_.store(nullptr, std::memory_order_release);
+    if (state_machine_.lifecycle_detach_safety_clean()) {
+        return LifecycleSafetyResult::kClean;
+    }
+    state_machine_.mark_lifecycle_detach_uncertain(old_generation);
+    return LifecycleSafetyResult::kUncertain;
+}
+
+void Runtime::on_driver_uninstalled() { state_machine_.on_driver_uninstalled(); }
+
 ReleaseAllResult Runtime::release_all() {
     state_machine_.begin_release_all();
     constexpr TickType_t kReleaseAllWaitTicks = pdMS_TO_TICKS(100);
@@ -1645,6 +1802,7 @@ void Runtime::on_report_complete(std::uint8_t instance,
     if (state_machine_.report_complete(instance, report, length) &&
         instance <= static_cast<std::uint8_t>(Interface::kMouse)) {
         set_result(static_cast<Interface>(instance), false);
+        notify_lifecycle_safety_waiter();
     }
 }
 
@@ -1654,9 +1812,17 @@ bool Runtime::on_report_failed(std::uint8_t instance,
     if (state_machine_.report_failed(instance, report, length) &&
         instance <= static_cast<std::uint8_t>(Interface::kMouse)) {
         set_result(static_cast<Interface>(instance), true);
+        notify_lifecycle_safety_waiter();
         return true;
     }
     return false;
+}
+
+void Runtime::notify_lifecycle_safety_waiter() {
+    void *const waiter = lifecycle_safety_waiter_.load(std::memory_order_acquire);
+    if (waiter != nullptr) {
+        xTaskNotifyGive(static_cast<TaskHandle_t>(waiter));
+    }
 }
 
 bool Runtime::take_report_sent(Interface interface) {

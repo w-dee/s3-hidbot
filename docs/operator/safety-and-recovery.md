@@ -8,6 +8,22 @@ need only CH343. VBUS sourcing, backfeed, general dual-cable power safety,
 immediate detach sensing, and board-specific VBUS monitoring are **UNKNOWN**.
 Avoid a dual-cable topology unless it has been deliberately validated.
 
+Native USB HID is hidden at boot. CH343 UART is the bootstrap/control path;
+`usb-attach` explicitly creates a fresh TinyUSB driver instance and
+`usb-detach` performs lifecycle-owned all-up safety handling before public
+driver uninstall. Neither accepted command response proves USB enumeration,
+uninstall completion, or host-observed all-up. Poll `usb-exposure-status` for
+the authoritative lifecycle state; `usb.status` remains only the legacy/basic
+readiness view. Repeated attach/detach can allocate and free TinyUSB resources.
+
+Detach preserves fail-closed uncertainty. `host_release_uncertain:true` means
+the old host state could not be proven released; a later attach requires a
+fresh-generation all-up reconciliation before unsafe HID can proceed. A true
+`recovery_required` means a public install/uninstall may have crossed a partial
+failure boundary: no automatic retry, reconnect, or stack surgery is allowed.
+Use reboot or manual operator intervention. U7.1B does not make `self-test`
+attach USB.
+
 `keyboard-report` and `mouse-report` are unsafe HID injection. They require
 explicit human authorization and command-local `--unsafe-hid`. Raw usages—not
 symbolic key names—are accepted. A successful command does not automatically
@@ -73,6 +89,8 @@ supported verified FNK0085 plan and requires `s3-hidbot-host[flash]` with
 | Flash exits 3–7 with `flash.classification:"FLASHED"` | Programming already succeeded. Do not reflash automatically. Repair UART selection/access if applicable, run `verify-firmware` with the **same** artifact, and preserve the result. |
 | Exit 7 / identity mismatch | Compare the intended Actions run/artifact identity with reported device identity. Stop for review rather than reflashing. |
 | Unsafe HID uncertainty | Run `release-all`. If safety cannot be established, stop unsafe automation and require human review. |
+| `usb.exposure.status.recovery_required:true` | Stop. Do not retry attach/detach automatically; reboot or obtain manual operator intervention. |
+| `usb.exposure.status.host_release_uncertain:true` | Stop unsafe HID. A later authorized attach must first complete fresh-generation all-up reconciliation. |
 
 No unchanged automatic outer retry loop is allowed. After a concrete root cause
 is identified and corrected, a human may explicitly authorize a new programming

@@ -36,6 +36,7 @@ from .protocol import (
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
+    UsbExposureStatus,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
     validate_system_info,
@@ -186,6 +187,9 @@ def _parser() -> argparse.ArgumentParser:
         ("ping", "run the bounded diagnostic ping"),
         ("info", "show device information"),
         ("usb-status", "show USB lifecycle and readiness state"),
+        ("usb-exposure-status", "show explicit native USB exposure lifecycle state"),
+        ("usb-attach", "explicitly install and expose native USB HID"),
+        ("usb-detach", "safely hide and uninstall native USB HID"),
         ("release-all", "perform the safe all-up recovery operation"),
         (
             "self-test",
@@ -297,6 +301,9 @@ def _result_value(command: str, result: object) -> object:
         return asdict(result)
     if command == "mouse-report":
         assert isinstance(result, MouseReportResult)
+        return asdict(result)
+    if command in {"usb-attach", "usb-detach", "usb-exposure-status"}:
+        assert isinstance(result, UsbExposureStatus)
         return asdict(result)
     return result
 
@@ -597,6 +604,12 @@ def main(
                 result = client.info()
             elif args.command == "usb-status":
                 result = client.usb_status()
+            elif args.command == "usb-exposure-status":
+                result = client.usb_exposure_status()
+            elif args.command == "usb-attach":
+                result = client.usb_attach()
+            elif args.command == "usb-detach":
+                result = client.usb_detach()
             elif args.command == "release-all":
                 result = client.release_all()
             elif args.command == "self-test":

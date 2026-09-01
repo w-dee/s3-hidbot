@@ -7,14 +7,23 @@ separate TinyUSB HID Device path. A host must never assume that opening a serial
 device proves that the HID USB path is attached, or vice versa.
 
 The current v1 implementation extends the bounded JSON control core with the mandatory session lease,
-HID runtime safety foundation, the safety-only `hid.release_all` command, and
-the public absolute `hid.keyboard.report` and relative `hid.mouse.report`
-commands. It implements
+HID runtime safety foundation, explicit native-USB exposure control, the
+safety-only `hid.release_all` command, and the public absolute
+`hid.keyboard.report` and relative `hid.mouse.report` commands. It implements
 `protocol.hello`, `system.ping`, `system.info`, `usb.status`,
-`hid.release_all`, `hid.keyboard.report`, and `hid.mouse.report`. There is
-still no keyboard helper, high-level keyboard/mouse automation, asynchronous
-event, USB reconnect, GPIO action, or reset command. Primitive report CLI
-commands are documented below and remain explicitly unsafe.
+`usb.exposure.status`, `usb.attach`, `usb.detach`, `hid.release_all`,
+`hid.keyboard.report`, and `hid.mouse.report`. There is still no keyboard
+helper, high-level keyboard/mouse automation, asynchronous event, BLE route,
+GPIO action, or reset command. Primitive report CLI commands are documented
+below and remain explicitly unsafe.
+
+Native USB is hidden by default: boot initializes HID/runtime state and its
+lifecycle task, then starts the UART control plane without calling
+`tinyusb_driver_install()`. CH343 UART is the bootstrap path. Only the
+dedicated lifecycle task calls the public esp_tinyusb
+`tinyusb_driver_install()` and `tinyusb_driver_uninstall()` APIs; no
+`tud_connect()`, `tud_disconnect()`, deferred TinyUSB function, or private
+TinyUSB lifecycle API is used.
 
 The configured ESP-IDF console UART is used without application hardcoding of
 its UART number, pins, or baud rate. The UART RX control task is the sole
@@ -160,7 +169,7 @@ initial capability list:
 
 ```text
   protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
-  hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
+  usb.exposure-control-v1, hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
   hid.mouse-report-v1, firmware.identity-v1
 ```
 
@@ -171,7 +180,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
@@ -311,7 +320,70 @@ must not treat `boot_id` or the control session as firmware identity.
 
 - `usb.status` returns current TinyUSB `mounted`, `suspended`,
   `keyboard_ready`, and `mouse_ready` booleans. It queries status only and
-  never submits a HID report.
+  never submits a HID report. Its four-field schema is retained for legacy
+  compatibility and does not describe desired exposure, install state, or
+  recovery.
+
+## Explicit USB exposure control
+
+The additive `usb.exposure-control-v1` capability exposes three commands:
+`usb.attach`, `usb.detach`, and `usb.exposure.status`. Each accepts only
+omitted parameters or `{}`; a non-empty parameter object is `INVALID_PARAMS`.
+The protocol version remains `1`.
+
+`usb.exposure.status` returns exactly:
+
+```json
+{
+  "desired": "hidden|exposed",
+  "observed": "driver_not_installed|disconnected|attaching|mounted|suspended|detaching",
+  "generation": 0,
+  "mounted": false,
+  "suspended": false,
+  "keyboard_ready": false,
+  "mouse_ready": false,
+  "safety_pending": false,
+  "host_release_uncertain": false,
+  "recovery_required": false,
+  "last_error": null
+}
+```
+
+`last_error` is `null` or exactly `{ "operation": "install|uninstall",
+"code": <signed integer> }`. At cold boot the state is `hidden` plus
+`driver_not_installed`, generation zero, all runtime booleans false, no
+safety/uncertainty/recovery, and `last_error:null`.
+
+An accepted `usb.attach` revokes unsafe authority, advances the USB generation
+once, publishes `exposed`/`attaching`, and queues one install for the dedicated
+lifecycle task. A successful driver install becomes `disconnected` unless a
+mount callback already observed `mounted`; mount does not advance generation.
+Duplicate attach while exposed is a no-op. A proven clean pre-start install
+failure returns `driver_not_installed` and permits a new attach retry; an
+ambiguous failure remains `attaching` with `recovery_required:true`.
+
+An accepted `usb.detach` immediately publishes `hidden`/`detaching`, revokes
+unsafe authority, and preserves the old USB generation solely for
+lifecycle-owned fixed all-up work. After bounded success, failure, or timeout,
+the task records old-generation uncertainty when required, advances generation
+exactly once, and calls public driver uninstall. A successful uninstall is
+`driver_not_installed`; an uninstall failure stays `detaching` with
+`recovery_required:true`, no automatic retry, and the exact signed error in
+`last_error`. An explicit teardown unmount callback is observational only and
+does not advance generation or clear uncertainty.
+
+Accepted attach/detach responses are cached as exact bytes even though their
+authority transition retires the normal control session. Exact same-ID/same-
+bytes retries replay that response without a second lifecycle action. Other
+subsequent control requires a fresh hello. `usb.attach` during detaching and
+`usb.detach` during attaching return the established `HID_BUSY` taxonomy; no
+in-flight transition is reversed.
+
+Unexpected unmount while still exposed revokes unsafe authority, advances the
+generation once, and publishes `disconnected`; a later mount uses that fresh
+generation. If host release is uncertain, a reattach creates fresh-generation
+all-up reconciliation before unsafe HID is admitted. It never replays old
+relative motion or old all-up work.
 
 Lifecycle transitions do not produce asynchronous machine events.
 
@@ -400,6 +472,14 @@ A wrong-nonce/stale frame must never establish a session. The client applies
 the bounded discard limit and timeout recovery (`TRANSPORT_SYNC` followed by a
 fresh hello) in the generic host core.
 
+`usb.exposure-control-v1` is an optional additive capability. When it is
+advertised, `Client.usb_exposure_status()` validates the strict lifecycle
+schema, while `Client.usb_attach()` and `Client.usb_detach()` perform only the
+explicit requested transition. Each successful transition invalidates the
+client's local session conservatively; the caller must establish a fresh hello
+before issuing a subsequent control request. No host method automatically
+attaches native USB.
+
 `Client.info()` continues to return the raw result object for wire-compatible
 callers. External consumers that need typed compatibility inspection may use
 the pure host validators `validate_system_info()` and
@@ -455,13 +535,14 @@ automatically replays an old logical command; its result is left to the caller
 as unknown/session-lost.
 
 After `connect()`/hello, the host client exposes `ping()`, `info()`,
-`usb_status()`, the safety-only `Client.release_all()` API, and the explicit
+`usb_status()`, optional `usb_exposure_status()`, `usb_attach()`, and
+`usb_detach()`, the safety-only `Client.release_all()` API, and the explicit
 `Client.keyboard_report()` and `Client.mouse_report()` primitive APIs. The CLI
-also exposes explicit `keyboard-report` and `mouse-report` commands, each with
-command-local `--unsafe-hid`; no arbitrary raw command API exists. The hello
-result exposes read-only `lease_ms` metadata. Closing the client only closes
-the injected transport and invalidates local session state; it sends no UART
-command.
+also exposes `usb-exposure-status`, `usb-attach`, `usb-detach`, and explicit
+`keyboard-report` and `mouse-report` commands, each with command-local
+`--unsafe-hid`; no arbitrary raw command API exists. The hello result exposes
+read-only `lease_ms` metadata. Closing the client only closes the injected
+transport and invalidates local session state; it sends no UART command.
 
 The current Freenove FNK0085 materials identify CH343 as the USB-UART bridge.
 Hardware characterization observed safe idle as DTR=true and RTS=true
@@ -486,8 +567,9 @@ failures become `TransportError`; request deadline expiry remains
 `RequestTimeoutError` in the generic client.
 
 The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`,
-`usb-status`, and the safe `self-test` control-plane diagnostic through the
-diagnostic client methods, the safety recovery command `release-all` through
+`usb-status`, `usb-exposure-status`, explicit `usb-attach` and `usb-detach`,
+and the safe `self-test` control-plane diagnostic through the diagnostic
+client methods, the safety recovery command `release-all` through
 `Client.release_all()`, artifact-only validation via `verify-artifact ARTIFACT`,
 verified artifact-to-runtime identity comparison via `verify-firmware ARTIFACT`, and the explicit unsafe primitive
 commands `keyboard-report` and `mouse-report` through the existing Client
@@ -592,14 +674,16 @@ safety barrier immediately before TinyUSB report submission. The bounded
 release-all ticket remains the only public safety operation; keyboard and mouse
 tickets are the explicit public unsafe report paths.
 
-Each mount starts a monotonically increasing attach generation. It remains
-separate from the authority epoch: attach generation advances only at mount
-and unmount while authority advances at every suspend, resume, unmount, and
-mount. Queued work is canceled when either token differs at the final executor
-check. Internal safety requests are generated under the current resumed epoch.
-Unmount clears queued and in-flight bookkeeping, logical state, uncertainty,
-and pending safety work; a later attach starts from all-up state, with no old
-operation or all-up release carried across it.
+The USB generation remains separate from the authority epoch. A newly accepted
+`usb.attach` advances generation once before the public driver install; its
+mount callback does not advance it again. An unexpected unmount while the
+driver remains exposed advances generation once at the host-loss boundary; a
+later mount uses that fresh generation. Conversely, `usb.detach` retains the
+old generation only for lifecycle-owned all-up safety work, records its result,
+then advances generation exactly once before public driver uninstall. Queued
+work is canceled when either token differs at the final executor check.
+Uncertainty is not cleared by teardown; a reattach requires fresh-generation
+all-up reconciliation before unsafe work is admitted.
 
 Keyboard and Mouse logical state is separate from host-state uncertainty. A
 successful submission is provisional until `tud_hid_report_complete_cb`; a

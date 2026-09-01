@@ -58,6 +58,7 @@ def hello_response(
             "system.ping-v1",
             "system.info-v1",
             "usb.status-v1",
+            "usb.exposure-control-v1",
             "hid.lease-v1",
             "hid.release-all-v1",
             "hid.keyboard-report-v1",
@@ -168,6 +169,59 @@ class ClientTests(unittest.TestCase):
         result = client.release_all()
         self.assertEqual(result.keyboard, "already_up")
         self.assertEqual(result.mouse, "submitted")
+
+    def test_usb_exposure_primitives_require_capability_and_retire_local_session(self) -> None:
+        status = {
+            "desired": "exposed",
+            "observed": "attaching",
+            "generation": 1,
+            "mounted": False,
+            "suspended": False,
+            "keyboard_ready": False,
+            "mouse_ready": False,
+            "safety_pending": False,
+            "host_release_uncertain": False,
+            "recovery_required": False,
+            "last_error": None,
+        }
+
+        def on_write(transport: FakeTransport, data: bytes) -> None:
+            if data == TRANSPORT_SYNC:
+                return
+            request_value = request_object(data)
+            if request_value["cmd"] == "protocol.hello":
+                transport.chunks.append(
+                    hello_response(request_value["id"], request_value["params"]["client_nonce"])
+                )
+            elif request_value["cmd"] in {"usb.exposure.status", "usb.attach", "usb.detach"}:
+                self.assertEqual(request_value["params"], {})
+                transport.chunks.append(response(request_value["id"], TOKEN, result=status))
+
+        transport = FakeTransport(on_write)
+        client = self.make_client(transport)
+        client.connect()
+        self.assertEqual(client.usb_exposure_status().observed, "attaching")
+        attached = client.usb_attach()
+        self.assertEqual(attached.generation, 1)
+        self.assertIsNone(client.session)
+        with self.assertRaises(SessionLostError):
+            client.ping()
+        writes_before = len(transport.writes)
+        client.connect()
+        self.assertEqual(client.usb_detach().desired, "exposed")
+        self.assertIsNone(client.session)
+        self.assertGreater(len(transport.writes), writes_before)
+
+    def test_usb_exposure_missing_capability_is_zero_wire(self) -> None:
+        transport = FakeTransport()
+        client = self.make_client(transport)
+        client._session = TOKEN
+        client._capabilities = tuple(BASELINE_REQUIRED_CAPABILITIES)
+        for method in (client.usb_exposure_status, client.usb_attach, client.usb_detach):
+            with self.assertRaises(CompatibilityError):
+                method()
+        self.assertEqual(client.session, TOKEN)
+        self.assertEqual(transport.writes, [])
 
     def test_keyboard_report_returns_typed_result_and_canonical_params(self) -> None:
         def on_write(transport: FakeTransport, data: bytes) -> None:

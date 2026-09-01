@@ -26,6 +26,7 @@ MAX_FIRMWARE_VERSION_BYTES = 31
 MAX_SOURCE_REVISION_BYTES = 40
 MAX_APP_ELF_SHA256_BYTES = 64
 MAX_BUILD_PROFILE_BYTES = 31
+MAX_USB_GENERATION = 0xFFFF_FFFF
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 SOURCE_REVISION_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_SOURCE_REVISION_BYTES}}}\Z")
 APP_ELF_SHA256_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_APP_ELF_SHA256_BYTES}}}\Z")
@@ -46,6 +47,7 @@ BASELINE_REQUIRED_CAPABILITIES = frozenset(
 )
 OPTIONAL_CAPABILITIES = frozenset(
     {
+        "usb.exposure-control-v1",
         "hid.keyboard-report-v1",
         "hid.mouse-report-v1",
         "firmware.identity-v1",
@@ -143,6 +145,31 @@ class KeyboardReportResult:
 @dataclass(frozen=True)
 class MouseReportResult:
     state: Literal["already_set", "submitted"]
+
+
+@dataclass(frozen=True)
+class UsbExposureLastError:
+    operation: Literal["install", "uninstall"]
+    code: int
+
+
+@dataclass(frozen=True)
+class UsbExposureStatus:
+    """Strict usb.exposure.status-v1 lifecycle snapshot."""
+
+    desired: Literal["hidden", "exposed"]
+    observed: Literal[
+        "driver_not_installed", "disconnected", "attaching", "mounted", "suspended", "detaching"
+    ]
+    generation: int
+    mounted: bool
+    suspended: bool
+    keyboard_ready: bool
+    mouse_ready: bool
+    safety_pending: bool
+    host_release_uncertain: bool
+    recovery_required: bool
+    last_error: UsbExposureLastError | None
 
 
 def _reject_constant(value: str) -> None:
@@ -479,6 +506,90 @@ def validate_mouse_report_result(value: Any) -> MouseReportResult:
     if state not in {"already_set", "submitted"}:
         raise ProtocolError("hid.mouse.report result state is invalid")
     return MouseReportResult(state=cast(Literal["already_set", "submitted"], state))
+
+
+def validate_usb_exposure_status(value: Any) -> UsbExposureStatus:
+    """Validate the exact v1 lifecycle status shape returned by all USB exposure commands."""
+
+    fields = {
+        "desired",
+        "observed",
+        "generation",
+        "mounted",
+        "suspended",
+        "keyboard_ready",
+        "mouse_ready",
+        "safety_pending",
+        "host_release_uncertain",
+        "recovery_required",
+        "last_error",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProtocolError("usb.exposure.status result fields are invalid")
+    desired = value["desired"]
+    observed = value["observed"]
+    generation = value["generation"]
+    if desired not in {"hidden", "exposed"}:
+        raise ProtocolError("USB exposure desired state is invalid")
+    if observed not in {
+        "driver_not_installed",
+        "disconnected",
+        "attaching",
+        "mounted",
+        "suspended",
+        "detaching",
+    }:
+        raise ProtocolError("USB exposure observed state is invalid")
+    if type(generation) is not int or not 0 <= generation <= MAX_USB_GENERATION:
+        raise ProtocolError("USB exposure generation is invalid")
+    bool_fields = (
+        "mounted",
+        "suspended",
+        "keyboard_ready",
+        "mouse_ready",
+        "safety_pending",
+        "host_release_uncertain",
+        "recovery_required",
+    )
+    if any(type(value[name]) is not bool for name in bool_fields):
+        raise ProtocolError("USB exposure boolean state is invalid")
+    raw_last_error = value["last_error"]
+    last_error: UsbExposureLastError | None = None
+    if raw_last_error is not None:
+        if not isinstance(raw_last_error, dict) or set(raw_last_error) != {"operation", "code"}:
+            raise ProtocolError("USB exposure last_error fields are invalid")
+        operation = raw_last_error["operation"]
+        code = raw_last_error["code"]
+        if operation not in {"install", "uninstall"}:
+            raise ProtocolError("USB exposure last_error operation is invalid")
+        if type(code) is not int or not -(2**31) <= code <= 2**31 - 1:
+            raise ProtocolError("USB exposure last_error code is invalid")
+        last_error = UsbExposureLastError(
+            operation=cast(Literal["install", "uninstall"], operation), code=code
+        )
+    return UsbExposureStatus(
+        desired=cast(Literal["hidden", "exposed"], desired),
+        observed=cast(
+            Literal[
+                "driver_not_installed",
+                "disconnected",
+                "attaching",
+                "mounted",
+                "suspended",
+                "detaching",
+            ],
+            observed,
+        ),
+        generation=generation,
+        mounted=value["mounted"],
+        suspended=value["suspended"],
+        keyboard_ready=value["keyboard_ready"],
+        mouse_ready=value["mouse_ready"],
+        safety_pending=value["safety_pending"],
+        host_release_uncertain=value["host_release_uncertain"],
+        recovery_required=value["recovery_required"],
+        last_error=last_error,
+    )
 
 
 def _bounded_ascii(value: Any, maximum: int) -> bool:

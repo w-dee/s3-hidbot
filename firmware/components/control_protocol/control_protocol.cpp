@@ -22,9 +22,9 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -36,7 +36,7 @@ constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
 // Every formatter below writes to ResponseFrame::bytes. These conservative
 // bounds cover the largest identity-v1 protocol.hello and system.info responses
 // metadata, four 32-hex values (top-level session, result session, boot ID,
-// and client nonce), nine capabilities, maximum int32 id, framing, and LF.
+// and client nonce), ten capabilities, maximum int32 id, framing, and LF.
 // vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
@@ -61,6 +61,9 @@ static_assert(kMaximumKeyboardReportResponseBytes <= control_session::kMaxRespon
 constexpr std::size_t kMaximumMouseReportResponseBytes =
     kPrefixLength + 150 + control_session::kTokenHexLength + 1;
 static_assert(kMaximumMouseReportResponseBytes <= control_session::kMaxResponseBytes);
+constexpr std::size_t kMaximumUsbExposureResponseBytes =
+    kPrefixLength + 360 + control_session::kTokenHexLength + 1;
+static_assert(kMaximumUsbExposureResponseBytes <= control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
     return value != nullptr && std::strlen(value) <= maximum_length;
@@ -399,6 +402,79 @@ bool make_usb_status(control_session::ResponseFrame *frame,
                         json_bool(status.mouse_ready));
 }
 
+const char *usb_exposure_desired_json(UsbExposureDesired desired) {
+    return desired == UsbExposureDesired::kExposed ? "exposed" : "hidden";
+}
+
+const char *usb_exposure_observed_json(UsbExposureObserved observed) {
+    switch (observed) {
+        case UsbExposureObserved::kDisconnected:
+            return "disconnected";
+        case UsbExposureObserved::kAttaching:
+            return "attaching";
+        case UsbExposureObserved::kMounted:
+            return "mounted";
+        case UsbExposureObserved::kSuspended:
+            return "suspended";
+        case UsbExposureObserved::kDetaching:
+            return "detaching";
+        case UsbExposureObserved::kDriverNotInstalled:
+        default:
+            return "driver_not_installed";
+    }
+}
+
+const char *usb_exposure_operation_json(UsbExposureOperation operation) {
+    return operation == UsbExposureOperation::kUninstall ? "uninstall" : "install";
+}
+
+bool make_usb_exposure_status(control_session::ResponseFrame *frame,
+                              ResponseSession session,
+                              std::int32_t id,
+                              UsbExposureStatus status) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
+    if (!status.last_error.present) {
+        return format_frame(frame,
+                            "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                            "\"session\":%s,\"ok\":true,\"result\":{"
+                            "\"desired\":\"%s\",\"observed\":\"%s\",\"generation\":%lu,"
+                            "\"mounted\":%s,\"suspended\":%s,\"keyboard_ready\":%s,\"mouse_ready\":%s,"
+                            "\"safety_pending\":%s,\"host_release_uncertain\":%s,"
+                            "\"recovery_required\":%s,\"last_error\":null}}\n",
+                            static_cast<long>(id), session_field,
+                            usb_exposure_desired_json(status.desired),
+                            usb_exposure_observed_json(status.observed),
+                            static_cast<unsigned long>(status.generation),
+                            json_bool(status.mounted), json_bool(status.suspended),
+                            json_bool(status.keyboard_ready), json_bool(status.mouse_ready),
+                            json_bool(status.safety_pending),
+                            json_bool(status.host_release_uncertain),
+                            json_bool(status.recovery_required));
+    }
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"desired\":\"%s\",\"observed\":\"%s\",\"generation\":%lu,"
+                        "\"mounted\":%s,\"suspended\":%s,\"keyboard_ready\":%s,\"mouse_ready\":%s,"
+                        "\"safety_pending\":%s,\"host_release_uncertain\":%s,"
+                        "\"recovery_required\":%s,\"last_error\":{\"operation\":\"%s\",\"code\":%ld}}}\n",
+                        static_cast<long>(id), session_field,
+                        usb_exposure_desired_json(status.desired),
+                        usb_exposure_observed_json(status.observed),
+                        static_cast<unsigned long>(status.generation),
+                        json_bool(status.mounted), json_bool(status.suspended),
+                        json_bool(status.keyboard_ready), json_bool(status.mouse_ready),
+                        json_bool(status.safety_pending),
+                        json_bool(status.host_release_uncertain),
+                        json_bool(status.recovery_required),
+                        usb_exposure_operation_json(status.last_error.operation),
+                        static_cast<long>(status.last_error.code));
+}
+
 const char *release_state_json(ReleaseAllInterfaceState state) {
     return state == ReleaseAllInterfaceState::kSubmitted ? "submitted" : "already_up";
 }
@@ -633,7 +709,9 @@ bool Protocol::initialize(const Config &config,
                           control_session::RandomFill random_fill,
                           void *random_context) {
     if (config.output == nullptr || config.usb_status_provider == nullptr ||
-        config.authority_epoch_provider == nullptr || random_fill == nullptr ||
+        config.usb_exposure_status_provider == nullptr || config.usb_attach_provider == nullptr ||
+        config.usb_detach_provider == nullptr || config.authority_epoch_provider == nullptr ||
+        random_fill == nullptr ||
         !is_safe_metadata_string(config.metadata.project) ||
         !is_safe_metadata_string(config.metadata.target) ||
         !is_safe_metadata_string(config.metadata.idf_version) ||
@@ -643,6 +721,7 @@ bool Protocol::initialize(const Config &config,
     }
     config_ = config;
     session_.initialize(random_fill, random_context, config.now, config.now_context);
+    lifecycle_retry_cache_ = {};
     initialized_ = true;
     lease_revoke_notified_ = false;
     return true;
@@ -656,6 +735,34 @@ bool Protocol::write_frame(const control_session::ResponseFrame &frame) const {
 control_session::ResponseFrame &Protocol::prepare_response_scratch() {
     response_scratch_ = {};
     return response_scratch_;
+}
+
+bool Protocol::replay_lifecycle_retry(std::string_view session, std::int32_t id,
+                                      std::string_view payload) {
+    const LifecycleRetryCache &cached = lifecycle_retry_cache_;
+    if (!cached.active || cached.id != id || cached.payload_length != payload.size() ||
+        session.size() != control_session::kTokenHexLength ||
+        std::memcmp(cached.session.data(), session.data(), session.size()) != 0 ||
+        std::memcmp(cached.payload.data(), payload.data(), payload.size()) != 0) {
+        return false;
+    }
+    return write_frame(cached.response);
+}
+
+void Protocol::cache_lifecycle_retry(std::string_view session, std::int32_t id,
+                                     std::string_view payload,
+                                     const control_session::ResponseFrame &response) {
+    if (session.size() != control_session::kTokenHexLength ||
+        payload.size() > control_session::kMaxRequestBytes || response.length == 0) {
+        return;
+    }
+    lifecycle_retry_cache_ = {};
+    lifecycle_retry_cache_.id = id;
+    std::memcpy(lifecycle_retry_cache_.session.data(), session.data(), session.size());
+    std::memcpy(lifecycle_retry_cache_.payload.data(), payload.data(), payload.size());
+    lifecycle_retry_cache_.payload_length = payload.size();
+    lifecycle_retry_cache_.response = response;
+    lifecycle_retry_cache_.active = true;
 }
 
 void Protocol::on_hid_lifecycle_invalidation() {
@@ -852,6 +959,10 @@ void Protocol::handle_frame(std::string_view payload) {
             return;
         }
         session_.activate_hello(client_nonce, payload, new_session, authority_epoch, response);
+        // A successful fresh handshake supersedes any lifecycle retry proof
+        // tied to the former session. Lifecycle invalidation itself must not
+        // clear that proof: accepted attach/detach retries occur after it.
+        lifecycle_retry_cache_ = {};
         lease_revoke_notified_ = false;
         write_frame(response);
         finish();
@@ -884,6 +995,15 @@ void Protocol::handle_frame(std::string_view payload) {
         if (make_error(&response, kUncorrelatableSession, true, id, "INVALID_PARAMS", "params must be an object")) {
             write_frame(response);
         }
+        finish();
+        return;
+    }
+
+    // Attach/detach revoke the authority epoch as part of their accepted
+    // transition. Their exact retry is therefore retained separately from the
+    // normal epoch-scoped request cache and must replay identical bytes only.
+    if ((command == "usb.attach" || command == "usb.detach") &&
+        replay_lifecycle_retry(session, id, payload)) {
         finish();
         return;
     }
@@ -953,6 +1073,50 @@ void Protocol::handle_frame(std::string_view payload) {
             semantically_valid = true;
             completed = make_usb_status(&response, current_session, id,
                                         config_.usb_status_provider(config_.usb_status_context));
+        }
+    } else if (command == "usb.exposure.status") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "usb.exposure.status accepts no params");
+        } else {
+            semantically_valid = true;
+            completed = make_usb_exposure_status(
+                &response, current_session, id,
+                config_.usb_exposure_status_provider(config_.usb_exposure_status_context));
+        }
+    } else if (command == "usb.attach" || command == "usb.detach") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       command == "usb.attach" ? "usb.attach accepts no params"
+                                               : "usb.detach accepts no params");
+        } else {
+            semantically_valid = true;
+            const UsbExposureActionResult action = command == "usb.attach"
+                                                        ? config_.usb_attach_provider(
+                                                              config_.usb_attach_context)
+                                                        : config_.usb_detach_provider(
+                                                              config_.usb_detach_context);
+            if (action == UsbExposureActionResult::kBusy) {
+                completed = make_error(&response, current_session, true, id, "HID_BUSY",
+                                       "USB lifecycle transition is active");
+            } else {
+                completed = make_usb_exposure_status(
+                    &response, current_session, id,
+                    config_.usb_exposure_status_provider(config_.usb_exposure_status_context));
+                if (completed && action == UsbExposureActionResult::kAccepted) {
+                    // Lifecycle intent publishes a new authority epoch. Cache
+                    // this exact response before revoking the session so the
+                    // one permitted same-ID retry remains byte-identical even
+                    // after asynchronous install/uninstall progress.
+                    cache_lifecycle_retry(session, id, payload, response);
+                    session_.revoke_for_lifecycle_invalidation(
+                        config_.authority_epoch_provider(config_.authority_epoch_context));
+                    lease_revoke_notified_ = false;
+                    write_frame(response);
+                    finish();
+                    return;
+                }
+            }
         }
     } else if (command == "hid.release_all") {
         if (!validate_no_params(params)) {

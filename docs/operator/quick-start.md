@@ -16,6 +16,9 @@ USB-C below EN/RST**. It is the CH343 USB-UART port for programming and control.
 The right USB-C below BOOT is native USB-OTG/HID and should remain disconnected
 for this provisioning path. VBUS/backfeed and general dual-cable behavior are
 **UNKNOWN**; do not add a second cable without a deliberately validated setup.
+Native USB HID is hidden by default in the current development firmware. The
+CH343 UART path remains available for bootstrap and lifecycle control even when
+native USB is absent.
 
 ## 1. Select matching stable or development artifacts
 
@@ -126,3 +129,24 @@ Require exit 0 and `match:true`. Save the command's JSON, exit status, package
 and tool versions, source/run identifier, archive SHA-256, and sanitized
 stderr. See [automation evidence](automation.md#evidence-record) and the
 [recovery guide](safety-and-recovery.md) before retrying any failure.
+
+## Native USB exposure after an authorized hardware gate
+
+Do not infer native USB availability from the UART port. When a separately
+authorized native-USB qualification procedure applies, use the UART path to
+request exposure and poll its lifecycle state:
+
+```bash
+hidbotctl --json usb-attach
+# establish a fresh session, then:
+hidbotctl --json usb-exposure-status
+```
+
+Attach creates a fresh TinyUSB stack instance; `attaching` only means the
+request was accepted. Wait for `disconnected` or `mounted` and never treat an
+accepted response as enumeration or endpoint-ready proof. `usb-detach` first
+attempts all-up safety handling and then uninstalls the public TinyUSB stack;
+it does not prove that the host observed the all-up state. If
+`host_release_uncertain` or `recovery_required` is true, stop unsafe use and
+require human review. This software slice is not itself authorization for a
+physical attach/detach operation.

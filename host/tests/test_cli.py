@@ -67,6 +67,7 @@ class FakeTransport:
             "system.ping-v1",
             "system.info-v1",
             "usb.status-v1",
+            "usb.exposure-control-v1",
             "hid.lease-v1",
             "hid.release-all-v1",
             "hid.keyboard-report-v1",
@@ -114,6 +115,50 @@ class FakeTransport:
                     result={"keyboard": "already_up", "mouse": "submitted"},
                 )
             )
+        elif value["cmd"] in {"usb.exposure.status", "usb.attach", "usb.detach"}:
+            if value["cmd"] == "usb.attach":
+                result = {
+                    "desired": "exposed",
+                    "observed": "attaching",
+                    "generation": 1,
+                    "mounted": False,
+                    "suspended": False,
+                    "keyboard_ready": False,
+                    "mouse_ready": False,
+                    "safety_pending": False,
+                    "host_release_uncertain": False,
+                    "recovery_required": False,
+                    "last_error": None,
+                }
+            elif value["cmd"] == "usb.detach":
+                result = {
+                    "desired": "hidden",
+                    "observed": "detaching",
+                    "generation": 1,
+                    "mounted": True,
+                    "suspended": False,
+                    "keyboard_ready": True,
+                    "mouse_ready": True,
+                    "safety_pending": True,
+                    "host_release_uncertain": False,
+                    "recovery_required": False,
+                    "last_error": None,
+                }
+            else:
+                result = {
+                    "desired": "hidden",
+                    "observed": "driver_not_installed",
+                    "generation": 0,
+                    "mounted": False,
+                    "suspended": False,
+                    "keyboard_ready": False,
+                    "mouse_ready": False,
+                    "safety_pending": False,
+                    "host_release_uncertain": False,
+                    "recovery_required": False,
+                    "last_error": None,
+                }
+            self.chunks.append(response(value["id"], TOKEN, result=result))
         elif value["cmd"] in {"hid.keyboard.report", "hid.mouse.report"}:
             params = value["params"]
             if value["cmd"] == "hid.keyboard.report":
@@ -421,6 +466,26 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(errors, "")
         self.assertEqual(output, '{"keyboard":"already_up","mouse":"submitted"}\n')
+
+    def test_usb_exposure_operator_commands_are_explicit(self) -> None:
+        expected = {
+            "usb-exposure-status": ("usb.exposure.status", "hidden", "driver_not_installed"),
+            "usb-attach": ("usb.attach", "exposed", "attaching"),
+            "usb-detach": ("usb.detach", "hidden", "detaching"),
+        }
+        for command, (wire_command, desired, observed) in expected.items():
+            code, output, errors, calls = self.run_cli(
+                ["--port", "dummy-port", "--json", command],
+                {"S3_HIDBOT_SERIAL": "env-port"},
+            )
+            self.assertEqual(code, 0, command)
+            self.assertEqual(errors, "", command)
+            value = json.loads(output)
+            self.assertEqual(value["desired"], desired, command)
+            self.assertEqual(value["observed"], observed, command)
+            self.assertEqual(
+                self.wire_commands(calls), ["protocol.hello", wire_command], command
+            )
 
     def test_self_test_runs_one_safe_session_in_wire_order(self) -> None:
         code, output, errors, calls = self.run_cli(

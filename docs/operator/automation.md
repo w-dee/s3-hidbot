@@ -2,26 +2,29 @@
 
 ## Normative rules for agents and scripts
 
-1. Read-only UART diagnostics (`hello`, `ping`, `info`, `usb-status`, and
+1. Read-only UART diagnostics (`hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, and
    `verify-firmware`) may run without unsafe-HID authorization once the fixture
    is in scope.
-2. `release-all` and `self-test` are safety actions, not arbitrary HID
+2. `usb-attach` and `usb-detach` are explicit lifecycle operations, never an
+   implicit prerequisite of diagnostics or `self-test`. After either result,
+   establish a fresh control session before later commands.
+3. `release-all` and `self-test` are safety actions, not arbitrary HID
    injection; `self-test` includes `release-all`.
-3. Destructive provisioning requires explicit provisioning authorization.
-4. `keyboard-report` and `mouse-report` require explicit human authorization
+4. Destructive provisioning requires explicit provisioning authorization.
+5. `keyboard-report` and `mouse-report` require explicit human authorization
    and command-local `--unsafe-hid`.
-5. Never infer host-OS consumption from `submitted`.
-6. Never outer-retry an unsafe HID command after an ambiguous result.
-7. Never automatically erase flash, change baud, mutate the plan, or repeat
+6. Never infer host-OS consumption from `submitted`.
+7. Never outer-retry an unsafe HID command after an ambiguous result.
+8. Never automatically erase flash, change baud, mutate the plan, or repeat
    flash indefinitely.
-8. `flash-firmware` owns at most three identical programming attempts.
-9. Once JSON reports `flash.classification:"FLASHED"`, a verification failure
+9. `flash-firmware` owns at most three identical programming attempts.
+10. Once JSON reports `flash.classification:"FLASHED"`, a verification failure
    must not trigger reflash; use `verify-firmware` with the same artifact when
    appropriate.
-10. Stop for human review on unresolved exit 8, unresolved post-flash exits
+11. Stop for human review on unresolved exit 8, unresolved post-flash exits
     3–7, provenance doubt, serial ambiguity, unknown dual-cable topology, or
-    HID uncertainty.
-11. Never commit or share machine-local serial paths or local configuration.
+    HID uncertainty, `host_release_uncertain`, or `recovery_required`.
+12. Never commit or share machine-local serial paths or local configuration.
 
 See [safety and recovery](safety-and-recovery.md) for the required bounded
 responses and [CLI reference](cli-reference.md) for exact syntax.

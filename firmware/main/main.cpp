@@ -7,6 +7,7 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "hid_runtime/hid_runtime.hpp"
+#include "usb_exposure_control/usb_exposure_control.hpp"
 #include "uart_control_transport/uart_control_transport.hpp"
 #include "firmware_identity/firmware_identity.hpp"
 #include "firmware_identity_adapter.hpp"
@@ -35,6 +36,7 @@ constexpr uint8_t kKeyboardStringIndex = 4;
 constexpr uint8_t kMouseStringIndex = 5;
 
 hid_runtime::Runtime s_hid_runtime;
+usb_exposure_control::Controller s_usb_exposure;
 firmware_identity::Identity s_firmware_identity;
 
 control_protocol::UsbStatus usb_status(void *) {
@@ -45,6 +47,78 @@ control_protocol::UsbStatus usb_status(void *) {
 
 control_session::AuthorityEpoch hid_authority_epoch(void *) {
     return s_hid_runtime.authority_epoch();
+}
+
+control_protocol::UsbExposureStatus usb_exposure_status(void *) {
+    const usb_exposure_control::ExposureSnapshot snapshot = s_usb_exposure.snapshot();
+    const auto desired = [](usb_lifecycle::DesiredExposure value) {
+        return value == usb_lifecycle::DesiredExposure::kExposed
+                   ? control_protocol::UsbExposureDesired::kExposed
+                   : control_protocol::UsbExposureDesired::kHidden;
+    };
+    const auto observed = [](usb_lifecycle::ObservedState value) {
+        switch (value) {
+            case usb_lifecycle::ObservedState::kDisconnected:
+                return control_protocol::UsbExposureObserved::kDisconnected;
+            case usb_lifecycle::ObservedState::kAttaching:
+                return control_protocol::UsbExposureObserved::kAttaching;
+            case usb_lifecycle::ObservedState::kMounted:
+                return control_protocol::UsbExposureObserved::kMounted;
+            case usb_lifecycle::ObservedState::kSuspended:
+                return control_protocol::UsbExposureObserved::kSuspended;
+            case usb_lifecycle::ObservedState::kDetaching:
+                return control_protocol::UsbExposureObserved::kDetaching;
+            case usb_lifecycle::ObservedState::kDriverNotInstalled:
+            default:
+                return control_protocol::UsbExposureObserved::kDriverNotInstalled;
+        }
+    };
+    const auto operation = [](usb_lifecycle::LifecycleOperation value) {
+        return value == usb_lifecycle::LifecycleOperation::kUninstall
+                   ? control_protocol::UsbExposureOperation::kUninstall
+                   : control_protocol::UsbExposureOperation::kInstall;
+    };
+    return control_protocol::UsbExposureStatus{
+        .desired = desired(snapshot.lifecycle.desired),
+        .observed = observed(snapshot.lifecycle.observed),
+        .generation = snapshot.lifecycle.generation,
+        .mounted = snapshot.runtime.mounted,
+        .suspended = snapshot.runtime.suspended,
+        .keyboard_ready = snapshot.runtime.keyboard_ready,
+        .mouse_ready = snapshot.runtime.mouse_ready,
+        .safety_pending = snapshot.lifecycle.safety_pending,
+        .host_release_uncertain = snapshot.lifecycle.host_release_uncertain,
+        .recovery_required = snapshot.lifecycle.recovery_required,
+        .last_error = {
+            .present = snapshot.lifecycle.last_error.present,
+            .operation = operation(snapshot.lifecycle.last_error.operation),
+            .code = snapshot.lifecycle.last_error.code,
+        },
+    };
+}
+
+control_protocol::UsbExposureActionResult usb_attach(void *) {
+    switch (s_usb_exposure.request_attach()) {
+        case usb_lifecycle::TransitionResult::kAccepted:
+            return control_protocol::UsbExposureActionResult::kAccepted;
+        case usb_lifecycle::TransitionResult::kNoOp:
+            return control_protocol::UsbExposureActionResult::kNoOp;
+        case usb_lifecycle::TransitionResult::kBusy:
+        default:
+            return control_protocol::UsbExposureActionResult::kBusy;
+    }
+}
+
+control_protocol::UsbExposureActionResult usb_detach(void *) {
+    switch (s_usb_exposure.request_detach()) {
+        case usb_lifecycle::TransitionResult::kAccepted:
+            return control_protocol::UsbExposureActionResult::kAccepted;
+        case usb_lifecycle::TransitionResult::kNoOp:
+            return control_protocol::UsbExposureActionResult::kNoOp;
+        case usb_lifecycle::TransitionResult::kBusy:
+        default:
+            return control_protocol::UsbExposureActionResult::kBusy;
+    }
 }
 
 void request_hid_safety_release(void *) {
@@ -274,6 +348,48 @@ void usb_event_handler(tinyusb_event_t *event, void *argument) {
     }
 }
 
+class TinyUsbLifecycleBackend final : public usb_exposure_control::Backend {
+  public:
+    usb_exposure_control::BackendResult install() override {
+        // esp_tinyusb copies the callback and consumes descriptor setup during
+        // install. The descriptors themselves remain static for the complete
+        // duration of every fresh driver instance.
+        tinyusb_config_t configuration = TINYUSB_DEFAULT_CONFIG(usb_event_handler);
+        configuration.descriptor.device = nullptr;
+        configuration.descriptor.full_speed_config = kHidConfigurationDescriptor;
+        configuration.descriptor.string = kHidStringDescriptors;
+        configuration.descriptor.string_count =
+            sizeof(kHidStringDescriptors) / sizeof(kHidStringDescriptors[0]);
+        const esp_err_t result = tinyusb_driver_install(&configuration);
+        if (result == ESP_OK) {
+            return {.kind = usb_exposure_control::BackendResultKind::kSuccess,
+                    .error_code = 0};
+        }
+        ESP_LOGE(kLogTag, "native USB install failed: %ld", static_cast<long>(result));
+        // In esp_tinyusb 2.2.1 these failures arise before the TinyUSB task
+        // can be made active (argument/task preflight or descriptor preflight
+        // followed by the component's PHY cleanup). All other outcomes may
+        // have crossed a partial-start boundary and require manual recovery.
+        const auto kind = result == ESP_ERR_INVALID_ARG || result == ESP_ERR_NOT_SUPPORTED
+                              ? usb_exposure_control::BackendResultKind::kCleanInstallFailure
+                              : usb_exposure_control::BackendResultKind::kAmbiguousInstallFailure;
+        return {.kind = kind, .error_code = static_cast<std::int32_t>(result)};
+    }
+
+    usb_exposure_control::BackendResult uninstall() override {
+        const esp_err_t result = tinyusb_driver_uninstall();
+        if (result == ESP_OK) {
+            return {.kind = usb_exposure_control::BackendResultKind::kSuccess,
+                    .error_code = 0};
+        }
+        ESP_LOGE(kLogTag, "native USB uninstall failed: %ld", static_cast<long>(result));
+        return {.kind = usb_exposure_control::BackendResultKind::kUninstallFailure,
+                .error_code = static_cast<std::int32_t>(result)};
+    }
+};
+
+TinyUsbLifecycleBackend s_usb_backend;
+
 }  // namespace
 
 extern "C" void tud_sof_cb(uint32_t) {
@@ -334,6 +450,10 @@ extern "C" void app_main() {
         std::abort();
     }
     s_hid_runtime.initialize();
+    if (!s_usb_exposure.initialize(&s_hid_runtime, &s_usb_backend)) {
+        ESP_LOGE(kLogTag, "USB lifecycle task initialization failed");
+        std::abort();
+    }
     const gpio_config_t configuration = {
         .pin_bit_mask = 1ULL << kOnboardLed,
         .mode = GPIO_MODE_OUTPUT,
@@ -356,14 +476,6 @@ extern "C" void app_main() {
 #endif
     ESP_LOGI(kLogTag, "S3-HIDBOT BLINK READY");
 
-    tinyusb_config_t tinyusb_configuration = TINYUSB_DEFAULT_CONFIG(usb_event_handler);
-    tinyusb_configuration.descriptor.device = nullptr;
-    tinyusb_configuration.descriptor.full_speed_config = kHidConfigurationDescriptor;
-    tinyusb_configuration.descriptor.string = kHidStringDescriptors;
-    tinyusb_configuration.descriptor.string_count =
-        sizeof(kHidStringDescriptors) / sizeof(kHidStringDescriptors[0]);
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tinyusb_configuration));
-    ESP_LOGI(kLogTag, "S3-HIDBOT USB HID READY");
     const control_protocol::Config protocol_config = {
         .metadata = {
             .project = "s3-hidbot",
@@ -373,6 +485,12 @@ extern "C" void app_main() {
         },
         .usb_status_provider = usb_status,
         .usb_status_context = nullptr,
+        .usb_exposure_status_provider = usb_exposure_status,
+        .usb_exposure_status_context = nullptr,
+        .usb_attach_provider = usb_attach,
+        .usb_attach_context = nullptr,
+        .usb_detach_provider = usb_detach,
+        .usb_detach_context = nullptr,
         .authority_epoch_provider = hid_authority_epoch,
         .authority_epoch_context = nullptr,
         .output = nullptr,
@@ -393,6 +511,7 @@ extern "C" void app_main() {
         .mouse_report_context = nullptr,
     };
     ESP_ERROR_CHECK(uart_control_transport::start(&protocol_config));
+    ESP_LOGI(kLogTag, "native USB HID hidden; use usb.attach over UART to expose it");
 #if defined(CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC) && CONFIG_S3_HIDBOT_BOOT_MOUSE_DIAGNOSTIC
     ESP_LOGI(kLogTag, "S3-HIDBOT MOUSE TEST READY");
 

@@ -105,6 +105,49 @@ struct AuthoritySource {
     }
 };
 
+struct ExposureSource {
+    control_protocol::UsbExposureStatus status{};
+    control_protocol::UsbExposureActionResult attach_result =
+        control_protocol::UsbExposureActionResult::kAccepted;
+    control_protocol::UsbExposureActionResult detach_result =
+        control_protocol::UsbExposureActionResult::kAccepted;
+    AuthoritySource *authority = nullptr;
+    int attach_calls = 0;
+    int detach_calls = 0;
+
+    static control_protocol::UsbExposureStatus get(void *context) {
+        return static_cast<ExposureSource *>(context)->status;
+    }
+
+    static control_protocol::UsbExposureActionResult attach(void *context) {
+        auto *source = static_cast<ExposureSource *>(context);
+        ++source->attach_calls;
+        if (source->attach_result == control_protocol::UsbExposureActionResult::kAccepted) {
+            ++source->status.generation;
+            source->status.desired = control_protocol::UsbExposureDesired::kExposed;
+            source->status.observed = control_protocol::UsbExposureObserved::kAttaching;
+            source->status.recovery_required = false;
+            source->status.last_error = {};
+            assert(source->authority != nullptr);
+            ++source->authority->epoch;
+        }
+        return source->attach_result;
+    }
+
+    static control_protocol::UsbExposureActionResult detach(void *context) {
+        auto *source = static_cast<ExposureSource *>(context);
+        ++source->detach_calls;
+        if (source->detach_result == control_protocol::UsbExposureActionResult::kAccepted) {
+            source->status.desired = control_protocol::UsbExposureDesired::kHidden;
+            source->status.observed = control_protocol::UsbExposureObserved::kDetaching;
+            source->status.safety_pending = true;
+            assert(source->authority != nullptr);
+            ++source->authority->epoch;
+        }
+        return source->detach_result;
+    }
+};
+
 struct ReleaseSource {
     control_protocol::ReleaseAllResult result{
         .success = true,
@@ -176,6 +219,7 @@ struct LeaseFixture {
     RandomSource random;
     LeaseClock clock;
     AuthoritySource authority;
+    ExposureSource exposure;
     ReleaseSource release;
     int expired_callbacks = 0;
     int takeover_callbacks = 0;
@@ -195,10 +239,17 @@ struct LeaseFixture {
     }
 
     LeaseFixture() {
+        exposure.authority = &authority;
         const control_protocol::Config config{
             .metadata = {"s3-hidbot", "esp32s3", "v5.5.4"},
             .usb_status_provider = StatusSource::get,
             .usb_status_context = nullptr,
+            .usb_exposure_status_provider = ExposureSource::get,
+            .usb_exposure_status_context = &exposure,
+            .usb_attach_provider = ExposureSource::attach,
+            .usb_attach_context = &exposure,
+            .usb_detach_provider = ExposureSource::detach,
+            .usb_detach_context = &exposure,
             .authority_epoch_provider = AuthoritySource::get,
             .authority_epoch_context = &authority,
             .output = Sink::write,
@@ -232,6 +283,7 @@ struct Fixture {
     RandomSource random;
     StatusSource status;
     AuthoritySource authority;
+    ExposureSource exposure;
     ReleaseSource release;
     KeyboardSource keyboard;
     MouseSource mouse;
@@ -245,6 +297,7 @@ struct Fixture {
         if (identity_enabled) {
             identity = make_test_identity();
         }
+        exposure.authority = &authority;
         assert(protocol.initialize(configuration(), RandomSource::fill, &random));
     }
 
@@ -258,6 +311,12 @@ struct Fixture {
             },
             .usb_status_provider = StatusSource::get,
             .usb_status_context = &status,
+            .usb_exposure_status_provider = ExposureSource::get,
+            .usb_exposure_status_context = &exposure,
+            .usb_attach_provider = ExposureSource::attach,
+            .usb_attach_context = &exposure,
+            .usb_detach_provider = ExposureSource::detach,
+            .usb_detach_context = &exposure,
             .authority_epoch_provider = AuthoritySource::get,
             .authority_epoch_context = &authority,
             .output = Sink::write,
@@ -594,7 +653,7 @@ void test_identity_hello_and_info_shapes() {
 
     for (std::string_view capability : {
              "protocol.hello-v1", "system.ping-v1", "system.info-v1",
-             "usb.status-v1", "hid.lease-v1", "hid.release-all-v1",
+             "usb.status-v1", "usb.exposure-control-v1", "hid.lease-v1", "hid.release-all-v1",
              "hid.keyboard-report-v1", "hid.mouse-report-v1", "firmware.identity-v1",
          }) {
         assert(count_occurrences(hello, std::string("\"") + std::string(capability) + "\"") == 1);
@@ -702,6 +761,114 @@ void test_response_scratch_reuse() {
 
     fixture.payload(status_request);
     assert(fixture.sink.last() == status_response);
+}
+
+void test_usb_exposure_commands_schema_and_lifecycle_retry_cache() {
+    Fixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session_a = extract_string(fixture.sink.last(), "session");
+
+    fixture.exposure.status = {
+        .desired = control_protocol::UsbExposureDesired::kHidden,
+        .observed = control_protocol::UsbExposureObserved::kDriverNotInstalled,
+        .generation = 0,
+        .mounted = false,
+        .suspended = false,
+        .keyboard_ready = false,
+        .mouse_ready = false,
+        .safety_pending = false,
+        .host_release_uncertain = false,
+        .recovery_required = false,
+        .last_error = {},
+    };
+    fixture.payload(request(2, session_a, "usb.exposure.status"));
+    const std::string cold = fixture.sink.last();
+    require_contains(cold,
+                     "\"result\":{\"desired\":\"hidden\",\"observed\":\"driver_not_installed\","
+                     "\"generation\":0,\"mounted\":false,\"suspended\":false,"
+                     "\"keyboard_ready\":false,\"mouse_ready\":false,\"safety_pending\":false,"
+                     "\"host_release_uncertain\":false,\"recovery_required\":false,\"last_error\":null}");
+    assert(count_occurrences(cold, "\"desired\":") == 1);
+    assert(count_occurrences(cold, "\"last_error\":") == 1);
+
+    const std::string attach = request(3, session_a, "usb.attach");
+    fixture.payload(attach);
+    const std::string accepted_attach = fixture.sink.last();
+    require_contains(accepted_attach,
+                     "\"desired\":\"exposed\",\"observed\":\"attaching\",\"generation\":1");
+    assert(fixture.exposure.attach_calls == 1);
+    // Lifecycle task completion is asynchronous. The exact original retry
+    // remains the accepted linearization response and does not rerun attach.
+    fixture.exposure.status.observed = control_protocol::UsbExposureObserved::kDisconnected;
+    fixture.payload(attach);
+    assert(fixture.sink.last() == accepted_attach);
+    assert(fixture.exposure.attach_calls == 1);
+    fixture.payload(request(4, session_a, "usb.exposure.status"));
+    require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
+
+    fixture.payload(hello_request(1, kNonceB));
+    const std::string session_b = extract_string(fixture.sink.last(), "session");
+    fixture.exposure.attach_result = control_protocol::UsbExposureActionResult::kNoOp;
+    const std::string no_op_attach = request(2, session_b, "usb.attach");
+    fixture.payload(no_op_attach);
+    const std::string no_op_response = fixture.sink.last();
+    require_contains(no_op_response, "\"observed\":\"disconnected\"");
+    assert(fixture.exposure.attach_calls == 2);
+    fixture.payload(no_op_attach);
+    assert(fixture.sink.last() == no_op_response);
+    assert(fixture.exposure.attach_calls == 2);
+
+    fixture.exposure.detach_result = control_protocol::UsbExposureActionResult::kBusy;
+    fixture.payload(request(3, session_b, "usb.detach"));
+    require_contains(fixture.sink.last(), "\"code\":\"HID_BUSY\"");
+    assert(fixture.exposure.detach_calls == 1);
+
+    fixture.exposure.detach_result = control_protocol::UsbExposureActionResult::kAccepted;
+    const std::string detach = request(4, session_b, "usb.detach");
+    fixture.payload(detach);
+    const std::string accepted_detach = fixture.sink.last();
+    require_contains(accepted_detach,
+                     "\"desired\":\"hidden\",\"observed\":\"detaching\"");
+    assert(fixture.exposure.detach_calls == 2);
+    fixture.exposure.status.observed = control_protocol::UsbExposureObserved::kDriverNotInstalled;
+    fixture.exposure.status.safety_pending = false;
+    fixture.payload(detach);
+    assert(fixture.sink.last() == accepted_detach);
+    assert(fixture.exposure.detach_calls == 2);
+
+    fixture.payload(hello_request(1, "00112233445566778899aabbccddeeff"));
+    const std::string session_c = extract_string(fixture.sink.last(), "session");
+    fixture.exposure.status = {
+        .desired = control_protocol::UsbExposureDesired::kHidden,
+        .observed = control_protocol::UsbExposureObserved::kDetaching,
+        .generation = 2,
+        .mounted = false,
+        .suspended = false,
+        .keyboard_ready = false,
+        .mouse_ready = false,
+        .safety_pending = true,
+        .host_release_uncertain = true,
+        .recovery_required = true,
+        .last_error = {
+            .present = true,
+            .operation = control_protocol::UsbExposureOperation::kUninstall,
+            .code = -7,
+        },
+    };
+    fixture.payload("{\"v\":1,\"id\":1,\"session\":\"" + session_c +
+                    "\",\"cmd\":\"usb.exposure.status\"}");
+    require_contains(fixture.sink.last(),
+                     "\"last_error\":{\"operation\":\"uninstall\",\"code\":-7}");
+    const int attach_calls_before_invalid = fixture.exposure.attach_calls;
+    const int detach_calls_before_invalid = fixture.exposure.detach_calls;
+    fixture.payload(request(2, session_c, "usb.attach", "{\"unexpected\":true}"));
+    require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    fixture.payload(request(3, session_c, "usb.detach", "{\"unexpected\":true}"));
+    require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    fixture.payload(request(4, session_c, "usb.exposure.status", "{\"unexpected\":true}"));
+    require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    assert(fixture.exposure.attach_calls == attach_calls_before_invalid);
+    assert(fixture.exposure.detach_calls == detach_calls_before_invalid);
 }
 
 void test_lease_refresh_expiry_and_takeover() {
@@ -954,6 +1121,7 @@ int main() {
     test_nonce_session_and_hello_cache();
     test_request_cache_and_commands();
     test_response_scratch_reuse();
+    test_usb_exposure_commands_schema_and_lifecycle_retry_cache();
     test_stale_response_correlation();
     test_lease_refresh_expiry_and_takeover();
     test_hid_failure_revokes_authority();

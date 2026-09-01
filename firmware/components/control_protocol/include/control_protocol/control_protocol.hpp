@@ -31,6 +31,54 @@ struct UsbStatus {
 };
 
 using UsbStatusProvider = UsbStatus (*)(void *context);
+
+enum class UsbExposureDesired : std::uint8_t {
+    kHidden,
+    kExposed,
+};
+
+enum class UsbExposureObserved : std::uint8_t {
+    kDriverNotInstalled,
+    kDisconnected,
+    kAttaching,
+    kMounted,
+    kSuspended,
+    kDetaching,
+};
+
+enum class UsbExposureOperation : std::uint8_t {
+    kInstall,
+    kUninstall,
+};
+
+struct UsbExposureLastError {
+    bool present = false;
+    UsbExposureOperation operation = UsbExposureOperation::kInstall;
+    std::int32_t code = 0;
+};
+
+struct UsbExposureStatus {
+    UsbExposureDesired desired = UsbExposureDesired::kHidden;
+    UsbExposureObserved observed = UsbExposureObserved::kDriverNotInstalled;
+    std::uint32_t generation = 0;
+    bool mounted = false;
+    bool suspended = false;
+    bool keyboard_ready = false;
+    bool mouse_ready = false;
+    bool safety_pending = false;
+    bool host_release_uncertain = false;
+    bool recovery_required = false;
+    UsbExposureLastError last_error{};
+};
+
+enum class UsbExposureActionResult : std::uint8_t {
+    kAccepted,
+    kNoOp,
+    kBusy,
+};
+
+using UsbExposureStatusProvider = UsbExposureStatus (*)(void *context);
+using UsbExposureActionProvider = UsbExposureActionResult (*)(void *context);
 using AuthorityEpochProvider = control_session::AuthorityEpoch (*)(void *context);
 using OutputSink = bool (*)(void *context, const std::uint8_t *data, std::size_t length);
 using SafetyCallback = void (*)(void *context);
@@ -112,6 +160,12 @@ struct Config {
     Metadata metadata;
     UsbStatusProvider usb_status_provider;
     void *usb_status_context;
+    UsbExposureStatusProvider usb_exposure_status_provider;
+    void *usb_exposure_status_context;
+    UsbExposureActionProvider usb_attach_provider;
+    void *usb_attach_context;
+    UsbExposureActionProvider usb_detach_provider;
+    void *usb_detach_context;
     AuthorityEpochProvider authority_epoch_provider;
     void *authority_epoch_context;
     OutputSink output;
@@ -147,6 +201,11 @@ class Protocol {
     void handle_frame(std::string_view payload);
     control_session::ResponseFrame &prepare_response_scratch();
     bool write_frame(const control_session::ResponseFrame &frame) const;
+    bool replay_lifecycle_retry(std::string_view session, std::int32_t id,
+                                std::string_view payload);
+    void cache_lifecycle_retry(std::string_view session, std::int32_t id,
+                               std::string_view payload,
+                               const control_session::ResponseFrame &response);
 
     Config config_{};
     control_session::State session_{};
@@ -157,6 +216,14 @@ class Protocol {
     // and response buffers on that task's stack.
     char request_json_scratch_[control_session::kMaxRequestBytes + 1]{};
     control_session::ResponseFrame response_scratch_{};
+    struct LifecycleRetryCache {
+        bool active = false;
+        std::int32_t id = 0;
+        std::array<char, control_session::kTokenStorageBytes> session{};
+        std::array<char, control_session::kMaxRequestBytes + 1> payload{};
+        std::size_t payload_length = 0;
+        control_session::ResponseFrame response{};
+    } lifecycle_retry_cache_{};
 };
 
 }  // namespace control_protocol
