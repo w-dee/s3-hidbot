@@ -34,6 +34,15 @@ struct ExposureSnapshot {
     hid_runtime::StatusSnapshot runtime{};
 };
 
+// Immutable command evidence.  Its snapshot is valid only for an accepted or
+// no-op transition; a scheduling failure is deliberately returned as Busy
+// without exposing a pre-schedule snapshot.
+struct CommandOutcome {
+    usb_lifecycle::TransitionResult action_result = usb_lifecycle::TransitionResult::kBusy;
+    bool snapshot_valid = false;
+    ExposureSnapshot snapshot{};
+};
+
 class Controller final : public usb_lifecycle::Executor {
   public:
     struct Action {
@@ -43,8 +52,8 @@ class Controller final : public usb_lifecycle::Executor {
 
     bool initialize(hid_runtime::Runtime *runtime, Backend *backend);
 
-    usb_lifecycle::TransitionResult request_attach();
-    usb_lifecycle::TransitionResult request_detach();
+    CommandOutcome request_attach();
+    CommandOutcome request_detach();
     ExposureSnapshot snapshot() const;
 
     // usb_lifecycle::Executor. Calls originate in the UART/control task and

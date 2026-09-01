@@ -58,6 +58,16 @@ struct Snapshot {
     LastError last_error{};
 };
 
+// The lifecycle state captured when a transition has been accepted for
+// execution.  The snapshot is intentionally copied before the executor can
+// observe the action, so a public command response never depends on later
+// install/uninstall progress.
+struct TransitionOutcome {
+    TransitionResult action_result = TransitionResult::kBusy;
+    bool snapshot_valid = false;
+    Snapshot snapshot{};
+};
+
 // The only future owner of install/connect/disconnect side effects.  U7.1A
 // deliberately supplies no hardware implementation; the fake in native tests
 // proves transition ordering without calling TinyUSB.
@@ -78,8 +88,8 @@ class StateMachine {
     void initialize_hidden_boot_policy();
 
     // Future control-plane intent. These are internal only in U7.1A.
-    TransitionResult request_attach(Executor &executor);
-    TransitionResult request_detach(Executor &executor);
+    TransitionOutcome request_attach(Executor &executor);
+    TransitionOutcome request_detach(Executor &executor);
 
     // Completion is owned by the one lifecycle side-effect executor. Install
     // success means the driver is present, not that a host configured it.

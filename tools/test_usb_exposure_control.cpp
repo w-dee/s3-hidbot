@@ -29,6 +29,10 @@ struct FakeBackend final : usb_exposure_control::Backend {
     };
 };
 
+usb_lifecycle::TransitionResult action(usb_exposure_control::CommandOutcome outcome) {
+    return outcome.action_result;
+}
+
 void test_install_and_uninstall_are_task_owned_and_serialized() {
     hid_runtime::Runtime runtime;
     FakeBackend backend;
@@ -40,8 +44,12 @@ void test_install_and_uninstall_are_task_owned_and_serialized() {
     assert(cold.lifecycle.observed == usb_lifecycle::ObservedState::kDriverNotInstalled);
     assert(backend.install_calls == 0 && backend.uninstall_calls == 0);
 
-    assert(controller.request_attach() == usb_lifecycle::TransitionResult::kAccepted);
-    assert(controller.request_attach() == usb_lifecycle::TransitionResult::kNoOp);
+    const auto accepted_attach = controller.request_attach();
+    assert(action(accepted_attach) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(accepted_attach.snapshot_valid);
+    assert(accepted_attach.snapshot.lifecycle.observed == usb_lifecycle::ObservedState::kAttaching);
+    assert(!accepted_attach.snapshot.runtime.mounted);
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kNoOp);
     assert(backend.install_calls == 0);
     assert(controller.process_one_for_test());
     assert(backend.install_calls == 1);
@@ -53,9 +61,16 @@ void test_install_and_uninstall_are_task_owned_and_serialized() {
     runtime.state_machine().set_ready(hid_runtime::Interface::kKeyboard, true);
     runtime.state_machine().set_ready(hid_runtime::Interface::kMouse, true);
     const auto old_generation = controller.snapshot().lifecycle.generation;
-    assert(controller.request_detach() == usb_lifecycle::TransitionResult::kAccepted);
+    const auto accepted_detach = controller.request_detach();
+    assert(action(accepted_detach) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(accepted_detach.snapshot_valid);
+    assert(accepted_detach.snapshot.lifecycle.observed == usb_lifecycle::ObservedState::kDetaching);
+    assert(accepted_detach.snapshot.lifecycle.generation == old_generation);
+    assert(accepted_detach.snapshot.runtime.mounted);
+    assert(accepted_detach.snapshot.runtime.keyboard_ready);
+    assert(accepted_detach.snapshot.runtime.mouse_ready);
     assert(controller.snapshot().lifecycle.generation == old_generation);
-    assert(controller.request_detach() == usb_lifecycle::TransitionResult::kNoOp);
+    assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kNoOp);
     assert(backend.uninstall_calls == 0);
     assert(controller.process_one_for_test());
     assert(backend.uninstall_calls == 1);
@@ -94,7 +109,7 @@ void test_backend_failure_results_reach_lifecycle_state() {
         .kind = usb_exposure_control::BackendResultKind::kCleanInstallFailure,
         .error_code = -12,
     };
-    assert(controller.request_attach() == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
     assert(controller.process_one_for_test());
     auto snapshot = controller.snapshot().lifecycle;
     assert(snapshot.observed == usb_lifecycle::ObservedState::kDriverNotInstalled);
@@ -105,7 +120,7 @@ void test_backend_failure_results_reach_lifecycle_state() {
         .kind = usb_exposure_control::BackendResultKind::kAmbiguousInstallFailure,
         .error_code = -99,
     };
-    assert(controller.request_attach() == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
     assert(controller.process_one_for_test());
     snapshot = controller.snapshot().lifecycle;
     assert(snapshot.observed == usb_lifecycle::ObservedState::kAttaching);

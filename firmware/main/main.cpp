@@ -49,8 +49,8 @@ control_session::AuthorityEpoch hid_authority_epoch(void *) {
     return s_hid_runtime.authority_epoch();
 }
 
-control_protocol::UsbExposureStatus usb_exposure_status(void *) {
-    const usb_exposure_control::ExposureSnapshot snapshot = s_usb_exposure.snapshot();
+control_protocol::UsbExposureStatus make_usb_exposure_status(
+    const usb_exposure_control::ExposureSnapshot &snapshot) {
     const auto desired = [](usb_lifecycle::DesiredExposure value) {
         return value == usb_lifecycle::DesiredExposure::kExposed
                    ? control_protocol::UsbExposureDesired::kExposed
@@ -97,27 +97,49 @@ control_protocol::UsbExposureStatus usb_exposure_status(void *) {
     };
 }
 
-control_protocol::UsbExposureActionResult usb_attach(void *) {
-    switch (s_usb_exposure.request_attach()) {
+control_protocol::UsbExposureStatus usb_exposure_status(void *) {
+    return make_usb_exposure_status(s_usb_exposure.snapshot());
+}
+
+control_protocol::UsbExposureActionOutcome usb_attach(void *) {
+    const usb_exposure_control::CommandOutcome outcome = s_usb_exposure.request_attach();
+    switch (outcome.action_result) {
         case usb_lifecycle::TransitionResult::kAccepted:
-            return control_protocol::UsbExposureActionResult::kAccepted;
+            return control_protocol::UsbExposureActionOutcome{
+                .action_result = control_protocol::UsbExposureActionResult::kAccepted,
+                .snapshot_valid = outcome.snapshot_valid,
+                .snapshot = make_usb_exposure_status(outcome.snapshot),
+            };
         case usb_lifecycle::TransitionResult::kNoOp:
-            return control_protocol::UsbExposureActionResult::kNoOp;
+            return control_protocol::UsbExposureActionOutcome{
+                .action_result = control_protocol::UsbExposureActionResult::kNoOp,
+                .snapshot_valid = outcome.snapshot_valid,
+                .snapshot = make_usb_exposure_status(outcome.snapshot),
+            };
         case usb_lifecycle::TransitionResult::kBusy:
         default:
-            return control_protocol::UsbExposureActionResult::kBusy;
+            return {};
     }
 }
 
-control_protocol::UsbExposureActionResult usb_detach(void *) {
-    switch (s_usb_exposure.request_detach()) {
+control_protocol::UsbExposureActionOutcome usb_detach(void *) {
+    const usb_exposure_control::CommandOutcome outcome = s_usb_exposure.request_detach();
+    switch (outcome.action_result) {
         case usb_lifecycle::TransitionResult::kAccepted:
-            return control_protocol::UsbExposureActionResult::kAccepted;
+            return control_protocol::UsbExposureActionOutcome{
+                .action_result = control_protocol::UsbExposureActionResult::kAccepted,
+                .snapshot_valid = outcome.snapshot_valid,
+                .snapshot = make_usb_exposure_status(outcome.snapshot),
+            };
         case usb_lifecycle::TransitionResult::kNoOp:
-            return control_protocol::UsbExposureActionResult::kNoOp;
+            return control_protocol::UsbExposureActionOutcome{
+                .action_result = control_protocol::UsbExposureActionResult::kNoOp,
+                .snapshot_valid = outcome.snapshot_valid,
+                .snapshot = make_usb_exposure_status(outcome.snapshot),
+            };
         case usb_lifecycle::TransitionResult::kBusy:
         default:
-            return control_protocol::UsbExposureActionResult::kBusy;
+            return {};
     }
 }
 

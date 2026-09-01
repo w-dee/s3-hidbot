@@ -1091,19 +1091,23 @@ void Protocol::handle_frame(std::string_view payload) {
                                                : "usb.detach accepts no params");
         } else {
             semantically_valid = true;
-            const UsbExposureActionResult action = command == "usb.attach"
-                                                        ? config_.usb_attach_provider(
-                                                              config_.usb_attach_context)
-                                                        : config_.usb_detach_provider(
-                                                              config_.usb_detach_context);
-            if (action == UsbExposureActionResult::kBusy) {
+            const UsbExposureActionOutcome action = command == "usb.attach"
+                                                         ? config_.usb_attach_provider(
+                                                               config_.usb_attach_context)
+                                                         : config_.usb_detach_provider(
+                                                               config_.usb_detach_context);
+            if (action.action_result == UsbExposureActionResult::kBusy) {
                 completed = make_error(&response, current_session, true, id, "HID_BUSY",
                                        "USB lifecycle transition is active");
             } else {
-                completed = make_usb_exposure_status(
-                    &response, current_session, id,
-                    config_.usb_exposure_status_provider(config_.usb_exposure_status_context));
-                if (completed && action == UsbExposureActionResult::kAccepted) {
+                if (!action.snapshot_valid) {
+                    completed = make_error(&response, current_session, true, id, "INTERNAL_ERROR",
+                                           "USB lifecycle transition snapshot is unavailable");
+                } else {
+                    completed = make_usb_exposure_status(&response, current_session, id,
+                                                         action.snapshot);
+                }
+                if (completed && action.action_result == UsbExposureActionResult::kAccepted) {
                     // Lifecycle intent publishes a new authority epoch. Cache
                     // this exact response before revoking the session so the
                     // one permitted same-ID retry remains byte-identical even

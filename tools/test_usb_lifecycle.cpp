@@ -27,6 +27,10 @@ struct FakeExecutor final : usb_lifecycle::Executor {
     std::vector<Call> calls;
 };
 
+usb_lifecycle::TransitionResult action(usb_lifecycle::TransitionOutcome outcome) {
+    return outcome.action_result;
+}
+
 void test_cold_boot_is_hidden_without_action() {
     usb_lifecycle::StateMachine lifecycle;
     const auto boot = lifecycle.snapshot();
@@ -46,7 +50,12 @@ void test_attach_install_and_mount_generation_semantics() {
     usb_lifecycle::StateMachine lifecycle;
     FakeExecutor executor;
 
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    const auto accepted_attach = lifecycle.request_attach(executor);
+    assert(action(accepted_attach) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(accepted_attach.snapshot_valid);
+    assert(accepted_attach.snapshot.desired == usb_lifecycle::DesiredExposure::kExposed);
+    assert(accepted_attach.snapshot.observed == usb_lifecycle::ObservedState::kAttaching);
+    assert(accepted_attach.snapshot.generation == 1);
     assert(executor.calls.size() == 1);
     assert(executor.calls[0].action == usb_lifecycle::ExecutorAction::kInstall);
     const auto attaching = lifecycle.snapshot();
@@ -54,7 +63,7 @@ void test_attach_install_and_mount_generation_semantics() {
     assert(attaching.observed == usb_lifecycle::ObservedState::kAttaching);
     assert(attaching.generation == 1);
     assert(executor.calls[0].snapshot.generation == attaching.generation);
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kNoOp);
+    assert(action(lifecycle.request_attach(executor)) == usb_lifecycle::TransitionResult::kNoOp);
     assert(executor.calls.size() == 1);
 
     lifecycle.complete_install_success();
@@ -73,13 +82,18 @@ void test_attach_install_and_mount_generation_semantics() {
 void test_two_stage_detach_and_callback_reconciliation() {
     usb_lifecycle::StateMachine lifecycle;
     FakeExecutor executor;
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(lifecycle.request_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     lifecycle.complete_install_success();
     assert(lifecycle.observe_mount());
     const auto old_generation = lifecycle.generation();
     lifecycle.mark_release_pending();
 
-    assert(lifecycle.request_detach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    const auto accepted_detach = lifecycle.request_detach(executor);
+    assert(action(accepted_detach) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(accepted_detach.snapshot_valid);
+    assert(accepted_detach.snapshot.desired == usb_lifecycle::DesiredExposure::kHidden);
+    assert(accepted_detach.snapshot.observed == usb_lifecycle::ObservedState::kDetaching);
+    assert(accepted_detach.snapshot.generation == old_generation);
     const auto detaching = lifecycle.snapshot();
     assert(detaching.desired == usb_lifecycle::DesiredExposure::kHidden);
     assert(detaching.observed == usb_lifecycle::ObservedState::kDetaching);
@@ -106,7 +120,7 @@ void test_two_stage_detach_and_callback_reconciliation() {
 void test_failure_classification_and_new_retry() {
     usb_lifecycle::StateMachine lifecycle;
     FakeExecutor executor;
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(lifecycle.request_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     const auto first_generation = lifecycle.generation();
     lifecycle.complete_install_clean_failure(-12);
     const auto clean_failure = lifecycle.snapshot();
@@ -116,7 +130,7 @@ void test_failure_classification_and_new_retry() {
     assert(clean_failure.last_error.present);
     assert(clean_failure.last_error.operation == usb_lifecycle::LifecycleOperation::kInstall);
     assert(clean_failure.last_error.code == -12);
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(lifecycle.request_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     assert(lifecycle.generation() == first_generation + 1);
 
     lifecycle.complete_install_ambiguous_failure(-99);
@@ -124,16 +138,16 @@ void test_failure_classification_and_new_retry() {
     assert(ambiguous_failure.observed == usb_lifecycle::ObservedState::kAttaching);
     assert(ambiguous_failure.recovery_required);
     assert(ambiguous_failure.last_error.present);
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kBusy);
-    assert(lifecycle.request_detach(executor) == usb_lifecycle::TransitionResult::kBusy);
+    assert(action(lifecycle.request_attach(executor)) == usb_lifecycle::TransitionResult::kBusy);
+    assert(action(lifecycle.request_detach(executor)) == usb_lifecycle::TransitionResult::kBusy);
 }
 
 void test_uninstall_failure_is_explicit_recovery_state() {
     usb_lifecycle::StateMachine lifecycle;
     FakeExecutor executor;
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(lifecycle.request_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     lifecycle.complete_install_success();
-    assert(lifecycle.request_detach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(lifecycle.request_detach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     lifecycle.mark_release_confirmed();
     lifecycle.begin_uninstall();
     lifecycle.complete_uninstall_failure(-7);
@@ -146,10 +160,27 @@ void test_uninstall_failure_is_explicit_recovery_state() {
     assert(failed.last_error.code == -7);
 }
 
+void test_schedule_failure_returns_busy_without_accepted_snapshot() {
+    usb_lifecycle::StateMachine lifecycle;
+    FakeExecutor executor;
+    executor.accept = false;
+
+    const auto outcome = lifecycle.request_attach(executor);
+    assert(outcome.action_result == usb_lifecycle::TransitionResult::kBusy);
+    assert(!outcome.snapshot_valid);
+    const auto failed = lifecycle.snapshot();
+    assert(failed.desired == usb_lifecycle::DesiredExposure::kExposed);
+    assert(failed.observed == usb_lifecycle::ObservedState::kAttaching);
+    assert(failed.recovery_required);
+    assert(failed.last_error.present);
+    assert(failed.last_error.operation == usb_lifecycle::LifecycleOperation::kInstall);
+    assert(failed.last_error.code == -1);
+}
+
 void test_external_unmount_advances_once_and_later_mount_reuses_generation() {
     usb_lifecycle::StateMachine lifecycle;
     FakeExecutor executor;
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(lifecycle.request_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     lifecycle.complete_install_success();
     assert(lifecycle.observe_mount());
     const auto mounted_generation = lifecycle.generation();
@@ -163,11 +194,11 @@ void test_external_unmount_advances_once_and_later_mount_reuses_generation() {
 void test_noops_conflicts_and_wrap_boundary() {
     usb_lifecycle::StateMachine lifecycle;
     FakeExecutor executor;
-    assert(lifecycle.request_detach(executor) == usb_lifecycle::TransitionResult::kNoOp);
+    assert(action(lifecycle.request_detach(executor)) == usb_lifecycle::TransitionResult::kNoOp);
     lifecycle.set_generation_for_test(UINT32_MAX);
-    assert(lifecycle.request_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(lifecycle.request_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     assert(lifecycle.generation() == 0);
-    assert(lifecycle.request_detach(executor) == usb_lifecycle::TransitionResult::kBusy);
+    assert(action(lifecycle.request_detach(executor)) == usb_lifecycle::TransitionResult::kBusy);
 }
 
 }  // namespace
@@ -178,6 +209,7 @@ int main() {
     test_two_stage_detach_and_callback_reconciliation();
     test_failure_classification_and_new_retry();
     test_uninstall_failure_is_explicit_recovery_state();
+    test_schedule_failure_returns_busy_without_accepted_snapshot();
     test_external_unmount_advances_once_and_later_mount_reuses_generation();
     test_noops_conflicts_and_wrap_boundary();
 }

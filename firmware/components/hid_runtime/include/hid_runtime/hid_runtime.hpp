@@ -34,6 +34,15 @@ struct StatusSnapshot {
     bool mouse_ready = false;
 };
 
+// Immutable Stage-A evidence for a USB lifecycle command.  Runtime state is
+// captured before the lifecycle action can be observed by its executor.
+struct UsbTransitionOutcome {
+    usb_lifecycle::TransitionResult action_result = usb_lifecycle::TransitionResult::kBusy;
+    bool snapshot_valid = false;
+    usb_lifecycle::Snapshot lifecycle{};
+    StatusSnapshot runtime{};
+};
+
 struct KeyboardState {
     std::uint8_t modifiers = 0;
     std::array<std::uint8_t, 6> keycodes{};
@@ -222,8 +231,8 @@ class StateMachine {
 
     // U7.1A internal-only future lifecycle boundary. It does not issue USB
     // hardware calls; U7.1B will connect it to the executor implementation.
-    usb_lifecycle::TransitionResult request_usb_attach(usb_lifecycle::Executor &executor);
-    usb_lifecycle::TransitionResult request_usb_detach(usb_lifecycle::Executor &executor);
+    UsbTransitionOutcome request_usb_attach(usb_lifecycle::Executor &executor);
+    UsbTransitionOutcome request_usb_detach(usb_lifecycle::Executor &executor);
     usb_lifecycle::Snapshot usb_lifecycle_snapshot() const;
 
     // Project-owned, lifecycle-only safety operation. It intentionally does

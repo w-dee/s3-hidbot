@@ -112,6 +112,8 @@ struct ExposureSource {
     control_protocol::UsbExposureActionResult detach_result =
         control_protocol::UsbExposureActionResult::kAccepted;
     AuthoritySource *authority = nullptr;
+    bool advance_attach_before_return = false;
+    bool advance_detach_before_return = false;
     int attach_calls = 0;
     int detach_calls = 0;
 
@@ -119,7 +121,7 @@ struct ExposureSource {
         return static_cast<ExposureSource *>(context)->status;
     }
 
-    static control_protocol::UsbExposureActionResult attach(void *context) {
+    static control_protocol::UsbExposureActionOutcome attach(void *context) {
         auto *source = static_cast<ExposureSource *>(context);
         ++source->attach_calls;
         if (source->attach_result == control_protocol::UsbExposureActionResult::kAccepted) {
@@ -130,11 +132,30 @@ struct ExposureSource {
             source->status.last_error = {};
             assert(source->authority != nullptr);
             ++source->authority->epoch;
+            const control_protocol::UsbExposureStatus accepted = source->status;
+            if (source->advance_attach_before_return) {
+                source->status.observed = control_protocol::UsbExposureObserved::kMounted;
+                source->status.mounted = true;
+                source->status.keyboard_ready = true;
+                source->status.mouse_ready = true;
+            }
+            return control_protocol::UsbExposureActionOutcome{
+                .action_result = control_protocol::UsbExposureActionResult::kAccepted,
+                .snapshot_valid = true,
+                .snapshot = accepted,
+            };
         }
-        return source->attach_result;
+        if (source->attach_result == control_protocol::UsbExposureActionResult::kNoOp) {
+            return control_protocol::UsbExposureActionOutcome{
+                .action_result = control_protocol::UsbExposureActionResult::kNoOp,
+                .snapshot_valid = true,
+                .snapshot = source->status,
+            };
+        }
+        return {};
     }
 
-    static control_protocol::UsbExposureActionResult detach(void *context) {
+    static control_protocol::UsbExposureActionOutcome detach(void *context) {
         auto *source = static_cast<ExposureSource *>(context);
         ++source->detach_calls;
         if (source->detach_result == control_protocol::UsbExposureActionResult::kAccepted) {
@@ -143,8 +164,31 @@ struct ExposureSource {
             source->status.safety_pending = true;
             assert(source->authority != nullptr);
             ++source->authority->epoch;
+            const control_protocol::UsbExposureStatus accepted = source->status;
+            if (source->advance_detach_before_return) {
+                ++source->status.generation;
+                source->status.observed =
+                    control_protocol::UsbExposureObserved::kDriverNotInstalled;
+                source->status.mounted = false;
+                source->status.suspended = false;
+                source->status.keyboard_ready = false;
+                source->status.mouse_ready = false;
+                source->status.safety_pending = false;
+            }
+            return control_protocol::UsbExposureActionOutcome{
+                .action_result = control_protocol::UsbExposureActionResult::kAccepted,
+                .snapshot_valid = true,
+                .snapshot = accepted,
+            };
         }
-        return source->detach_result;
+        if (source->detach_result == control_protocol::UsbExposureActionResult::kNoOp) {
+            return control_protocol::UsbExposureActionOutcome{
+                .action_result = control_protocol::UsbExposureActionResult::kNoOp,
+                .snapshot_valid = true,
+                .snapshot = source->status,
+            };
+        }
+        return {};
     }
 };
 
@@ -871,6 +915,55 @@ void test_usb_exposure_commands_schema_and_lifecycle_retry_cache() {
     assert(fixture.exposure.detach_calls == detach_calls_before_invalid);
 }
 
+void test_usb_exposure_transition_response_is_frozen_before_provider_progress() {
+    Fixture fixture;
+    fixture.exposure.status = {
+        .desired = control_protocol::UsbExposureDesired::kHidden,
+        .observed = control_protocol::UsbExposureObserved::kDriverNotInstalled,
+        .generation = 0,
+        .mounted = false,
+        .suspended = false,
+        .keyboard_ready = false,
+        .mouse_ready = false,
+        .safety_pending = false,
+        .host_release_uncertain = false,
+        .recovery_required = false,
+        .last_error = {},
+    };
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string attach_session = extract_string(fixture.sink.last(), "session");
+    fixture.exposure.advance_attach_before_return = true;
+    const std::string attach = request(2, attach_session, "usb.attach");
+    fixture.payload(attach);
+    const std::string accepted_attach = fixture.sink.last();
+    require_contains(accepted_attach,
+                     "\"desired\":\"exposed\",\"observed\":\"attaching\",\"generation\":1,"
+                     "\"mounted\":false,\"suspended\":false,\"keyboard_ready\":false,"
+                     "\"mouse_ready\":false");
+    assert(fixture.exposure.status.observed == control_protocol::UsbExposureObserved::kMounted);
+    assert(fixture.exposure.status.mounted);
+    fixture.payload(attach);
+    assert(fixture.sink.last() == accepted_attach);
+    assert(fixture.exposure.attach_calls == 1);
+
+    fixture.payload(hello_request(3, kNonceB));
+    const std::string detach_session = extract_string(fixture.sink.last(), "session");
+    fixture.exposure.advance_detach_before_return = true;
+    const std::string detach = request(4, detach_session, "usb.detach");
+    fixture.payload(detach);
+    const std::string accepted_detach = fixture.sink.last();
+    require_contains(accepted_detach,
+                     "\"desired\":\"hidden\",\"observed\":\"detaching\",\"generation\":1,"
+                     "\"mounted\":true,\"suspended\":false,\"keyboard_ready\":true,"
+                     "\"mouse_ready\":true,\"safety_pending\":true");
+    assert(fixture.exposure.status.observed ==
+           control_protocol::UsbExposureObserved::kDriverNotInstalled);
+    assert(fixture.exposure.status.generation == 2);
+    fixture.payload(detach);
+    assert(fixture.sink.last() == accepted_detach);
+    assert(fixture.exposure.detach_calls == 1);
+}
+
 void test_lease_refresh_expiry_and_takeover() {
     LeaseFixture fixture;
     fixture.payload(hello_request(1, kNonceA));
@@ -1122,6 +1215,7 @@ int main() {
     test_request_cache_and_commands();
     test_response_scratch_reuse();
     test_usb_exposure_commands_schema_and_lifecycle_retry_cache();
+    test_usb_exposure_transition_response_is_frozen_before_provider_progress();
     test_stale_response_correlation();
     test_lease_refresh_expiry_and_takeover();
     test_hid_failure_revokes_authority();

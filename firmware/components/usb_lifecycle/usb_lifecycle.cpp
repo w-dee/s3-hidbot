@@ -70,7 +70,7 @@ void StateMachine::record_error(LifecycleOperation operation, std::int32_t error
     last_error_present_.store(true, std::memory_order_release);
 }
 
-TransitionResult StateMachine::request_attach(Executor &executor) {
+TransitionOutcome StateMachine::request_attach(Executor &executor) {
     std::uint8_t current = state_.load(std::memory_order_acquire);
     do {
         const ObservedState previous_observed =
@@ -79,13 +79,17 @@ TransitionResult StateMachine::request_attach(Executor &executor) {
         const bool recovery_required = (current & kRecoveryRequiredBit) != 0;
 
         if (previous_observed == ObservedState::kDetaching || recovery_required) {
-            return TransitionResult::kBusy;
+            return {};
         }
         if (exposed && previous_observed != ObservedState::kDriverNotInstalled) {
-            return TransitionResult::kNoOp;
+            return TransitionOutcome{
+                .action_result = TransitionResult::kNoOp,
+                .snapshot_valid = true,
+                .snapshot = snapshot(),
+            };
         }
         if (!exposed && previous_observed != ObservedState::kDriverNotInstalled) {
-            return TransitionResult::kBusy;
+            return {};
         }
 
         const std::uint8_t next = static_cast<std::uint8_t>(
@@ -100,33 +104,41 @@ TransitionResult StateMachine::request_attach(Executor &executor) {
             advance_generation();
             const Snapshot accepted = snapshot();
             if (executor.schedule(ExecutorAction::kInstall, accepted)) {
-                return TransitionResult::kAccepted;
+                return TransitionOutcome{
+                    .action_result = TransitionResult::kAccepted,
+                    .snapshot_valid = true,
+                    .snapshot = accepted,
+                };
             }
             // A queue-full result is not a recoverable normal transition:
             // retain fail-closed attaching state and make the fault visible.
             record_error(LifecycleOperation::kInstall, -1);
             set_recovery_required(true);
-            return TransitionResult::kBusy;
+            return {};
         }
     } while (true);
 }
 
-TransitionResult StateMachine::request_detach(Executor &executor) {
+TransitionOutcome StateMachine::request_detach(Executor &executor) {
     std::uint8_t current = state_.load(std::memory_order_acquire);
     do {
         const ObservedState previous_observed =
             static_cast<ObservedState>(current >> kObservedShift);
         const bool exposed = (current & kDesiredBit) != 0;
         if (previous_observed == ObservedState::kAttaching) {
-            return TransitionResult::kBusy;
+            return {};
         }
         if (!exposed && (previous_observed == ObservedState::kDriverNotInstalled ||
                          previous_observed == ObservedState::kDetaching)) {
-            return TransitionResult::kNoOp;
+            return TransitionOutcome{
+                .action_result = TransitionResult::kNoOp,
+                .snapshot_valid = true,
+                .snapshot = snapshot(),
+            };
         }
         if (!exposed || previous_observed == ObservedState::kDriverNotInstalled ||
             (current & kRecoveryRequiredBit) != 0) {
-            return TransitionResult::kBusy;
+            return {};
         }
 
         const std::uint8_t next = static_cast<std::uint8_t>(
@@ -141,11 +153,15 @@ TransitionResult StateMachine::request_detach(Executor &executor) {
             // lifecycle-owned all-up safety work.
             const Snapshot accepted = snapshot();
             if (executor.schedule(ExecutorAction::kUninstall, accepted)) {
-                return TransitionResult::kAccepted;
+                return TransitionOutcome{
+                    .action_result = TransitionResult::kAccepted,
+                    .snapshot_valid = true,
+                    .snapshot = accepted,
+                };
             }
             record_error(LifecycleOperation::kUninstall, -1);
             set_recovery_required(true);
-            return TransitionResult::kBusy;
+            return {};
         }
     } while (true);
 }

@@ -32,9 +32,13 @@ struct ImmediateLifecycleExecutor final : usb_lifecycle::Executor {
     }
 };
 
+usb_lifecycle::TransitionResult action(hid_runtime::UsbTransitionOutcome outcome) {
+    return outcome.action_result;
+}
+
 void expose(hid_runtime::StateMachine &state) {
     ImmediateLifecycleExecutor executor;
-    assert(state.request_usb_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(state.request_usb_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     state.complete_usb_install_success();
     state.on_mount();
 }
@@ -126,6 +130,33 @@ void test_readiness_refresh_after_reattach() {
     state.set_ready(hid_runtime::Interface::kMouse, true);
     snapshot = state.status();
     assert(snapshot.keyboard_ready && snapshot.mouse_ready);
+}
+
+void test_usb_transition_outcomes_freeze_stage_a_runtime() {
+    hid_runtime::StateMachine state;
+    ImmediateLifecycleExecutor executor;
+
+    const auto attach = state.request_usb_attach(executor);
+    assert(attach.action_result == usb_lifecycle::TransitionResult::kAccepted);
+    assert(attach.snapshot_valid);
+    assert(attach.lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed);
+    assert(attach.lifecycle.observed == usb_lifecycle::ObservedState::kAttaching);
+    assert(attach.lifecycle.generation == 1);
+    assert(!attach.runtime.mounted && !attach.runtime.suspended);
+    assert(!attach.runtime.keyboard_ready && !attach.runtime.mouse_ready);
+
+    state.complete_usb_install_success();
+    state.on_mount();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    const auto detach = state.request_usb_detach(executor);
+    assert(detach.action_result == usb_lifecycle::TransitionResult::kAccepted);
+    assert(detach.snapshot_valid);
+    assert(detach.lifecycle.desired == usb_lifecycle::DesiredExposure::kHidden);
+    assert(detach.lifecycle.observed == usb_lifecycle::ObservedState::kDetaching);
+    assert(detach.lifecycle.generation == 1);
+    assert(detach.runtime.mounted && !detach.runtime.suspended);
+    assert(detach.runtime.keyboard_ready && detach.runtime.mouse_ready);
 }
 
 void test_success_failure_and_release() {
@@ -781,7 +812,7 @@ void test_internal_detach_preserves_uncertainty_until_explicit_recovery() {
     assert(!detached.host_release_uncertain);
     const auto old_generation = detached.generation;
     assert(!state.queue_mouse_report(0, 1, 0, 0, 0));
-    assert(state.request_usb_attach(executor) == usb_lifecycle::TransitionResult::kBusy);
+    assert(action(state.request_usb_attach(executor)) == usb_lifecycle::TransitionResult::kBusy);
 
     // The in-flight old-generation report needs lifecycle-owned all-up. A
     // failed/timed-out resolution preserves uncertainty before teardown.
@@ -794,7 +825,7 @@ void test_internal_detach_preserves_uncertainty_until_explicit_recovery() {
 
     // A fresh stack may be installed, but cannot admit unsafe work until it
     // sends fresh-generation safety reports.
-    assert(state.request_usb_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(state.request_usb_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     state.complete_usb_install_success();
     state.on_mount();
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
@@ -813,12 +844,12 @@ void test_internal_detach_preserves_uncertainty_until_explicit_recovery() {
     hid_runtime::StateMachine clean;
     ready(clean);
     const auto clean_old_generation = clean.attach_generation();
-    assert(clean.request_usb_detach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(clean.request_usb_detach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     assert(clean.begin_lifecycle_detach_safety() == hid_runtime::LifecycleSafetyResult::kClean);
     assert(clean.begin_usb_uninstall() == clean_old_generation + 1);
     clean.on_driver_uninstalled();
     clean.complete_usb_uninstall_success();
-    assert(clean.request_usb_attach(executor) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(action(clean.request_usb_attach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
     clean.complete_usb_install_success();
     clean.on_mount();
     clean.set_ready(hid_runtime::Interface::kKeyboard, true);
@@ -832,6 +863,7 @@ int main() {
     test_lifecycle_and_generation_cancellation();
     test_readiness_refresh_after_mount_without_hid_work();
     test_readiness_refresh_after_reattach();
+    test_usb_transition_outcomes_freeze_stage_a_runtime();
     test_success_failure_and_release();
     test_partial_release_and_no_delayed_unsafe_replay();
     test_release_barrier_discards_queued_work();

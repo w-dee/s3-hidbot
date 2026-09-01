@@ -77,8 +77,14 @@ enum class UsbExposureActionResult : std::uint8_t {
     kBusy,
 };
 
+struct UsbExposureActionOutcome {
+    UsbExposureActionResult action_result = UsbExposureActionResult::kBusy;
+    bool snapshot_valid = false;
+    UsbExposureStatus snapshot{};
+};
+
 using UsbExposureStatusProvider = UsbExposureStatus (*)(void *context);
-using UsbExposureActionProvider = UsbExposureActionResult (*)(void *context);
+using UsbExposureActionProvider = UsbExposureActionOutcome (*)(void *context);
 using AuthorityEpochProvider = control_session::AuthorityEpoch (*)(void *context);
 using OutputSink = bool (*)(void *context, const std::uint8_t *data, std::size_t length);
 using SafetyCallback = void (*)(void *context);

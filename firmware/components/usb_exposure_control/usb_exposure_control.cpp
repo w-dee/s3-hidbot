@@ -47,18 +47,36 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend) {
     return true;
 }
 
-usb_lifecycle::TransitionResult Controller::request_attach() {
+CommandOutcome Controller::request_attach() {
     if (!initialized_) {
-        return usb_lifecycle::TransitionResult::kBusy;
+        return {};
     }
-    return runtime_->state_machine().request_usb_attach(*this);
+    const hid_runtime::UsbTransitionOutcome outcome =
+        runtime_->state_machine().request_usb_attach(*this);
+    return CommandOutcome{
+        .action_result = outcome.action_result,
+        .snapshot_valid = outcome.snapshot_valid,
+        .snapshot = ExposureSnapshot{
+            .lifecycle = outcome.lifecycle,
+            .runtime = outcome.runtime,
+        },
+    };
 }
 
-usb_lifecycle::TransitionResult Controller::request_detach() {
+CommandOutcome Controller::request_detach() {
     if (!initialized_) {
-        return usb_lifecycle::TransitionResult::kBusy;
+        return {};
     }
-    return runtime_->state_machine().request_usb_detach(*this);
+    const hid_runtime::UsbTransitionOutcome outcome =
+        runtime_->state_machine().request_usb_detach(*this);
+    return CommandOutcome{
+        .action_result = outcome.action_result,
+        .snapshot_valid = outcome.snapshot_valid,
+        .snapshot = ExposureSnapshot{
+            .lifecycle = outcome.lifecycle,
+            .runtime = outcome.runtime,
+        },
+    };
 }
 
 ExposureSnapshot Controller::snapshot() const {

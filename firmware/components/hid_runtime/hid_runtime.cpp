@@ -367,11 +367,16 @@ StatusSnapshot StateMachine::status() const {
     };
 }
 
-usb_lifecycle::TransitionResult StateMachine::request_usb_attach(
-    usb_lifecycle::Executor &executor) {
-    const usb_lifecycle::TransitionResult transition = usb_lifecycle_.request_attach(executor);
-    if (transition != usb_lifecycle::TransitionResult::kAccepted) {
-        return transition;
+UsbTransitionOutcome StateMachine::request_usb_attach(usb_lifecycle::Executor &executor) {
+    const StatusSnapshot pre_transition_runtime = status();
+    const usb_lifecycle::TransitionOutcome transition = usb_lifecycle_.request_attach(executor);
+    if (transition.action_result != usb_lifecycle::TransitionResult::kAccepted) {
+        return UsbTransitionOutcome{
+            .action_result = transition.action_result,
+            .snapshot_valid = transition.snapshot_valid,
+            .lifecycle = transition.snapshot,
+            .runtime = pre_transition_runtime,
+        };
     }
     // Request intent is the fail-closed authority boundary. U7.1A does not
     // invoke an executor in firmware, so this has no current USB behavior.
@@ -381,15 +386,26 @@ usb_lifecycle::TransitionResult StateMachine::request_usb_attach(
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
     status_bits_.store(0, std::memory_order_release);
-    return transition;
+    return UsbTransitionOutcome{
+        .action_result = transition.action_result,
+        .snapshot_valid = true,
+        .lifecycle = transition.snapshot,
+        // An accepted attach is always reported before install/mount progress.
+        .runtime = {},
+    };
 }
 
-usb_lifecycle::TransitionResult StateMachine::request_usb_detach(
-    usb_lifecycle::Executor &executor) {
+UsbTransitionOutcome StateMachine::request_usb_detach(usb_lifecycle::Executor &executor) {
     const UsbGeneration retired_generation = attach_generation();
-    const usb_lifecycle::TransitionResult transition = usb_lifecycle_.request_detach(executor);
-    if (transition != usb_lifecycle::TransitionResult::kAccepted) {
-        return transition;
+    const StatusSnapshot stage_a_runtime = status();
+    const usb_lifecycle::TransitionOutcome transition = usb_lifecycle_.request_detach(executor);
+    if (transition.action_result != usb_lifecycle::TransitionResult::kAccepted) {
+        return UsbTransitionOutcome{
+            .action_result = transition.action_result,
+            .snapshot_valid = transition.snapshot_valid,
+            .lifecycle = transition.snapshot,
+            .runtime = stage_a_runtime,
+        };
     }
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
@@ -412,7 +428,12 @@ usb_lifecycle::TransitionResult StateMachine::request_usb_detach(
             expected, kSlotCanceled, std::memory_order_acq_rel, std::memory_order_acquire);
     }
     (void)retired_generation;
-    return transition;
+    return UsbTransitionOutcome{
+        .action_result = transition.action_result,
+        .snapshot_valid = true,
+        .lifecycle = transition.snapshot,
+        .runtime = stage_a_runtime,
+    };
 }
 
 usb_lifecycle::Snapshot StateMachine::usb_lifecycle_snapshot() const {
