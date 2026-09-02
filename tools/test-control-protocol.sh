@@ -40,7 +40,6 @@ trap 'rm -f "$temporary_directory/cjson.o" "$temporary_directory/test_control_pr
   "$repository_root/firmware/components/secure_memory/secure_memory.cpp" \
   "$repository_root/firmware/components/sensitive_request/sensitive_request.cpp" \
   "$temporary_directory/cjson.o" \
-  -lcrypto \
   -o "$temporary_directory/test_control_protocol"
 "$temporary_directory/test_control_protocol"
 echo "PASS: control protocol/session tests"

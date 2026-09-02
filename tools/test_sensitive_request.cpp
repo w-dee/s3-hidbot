@@ -5,20 +5,19 @@
 #include <string_view>
 #include <vector>
 
-#include <openssl/sha.h>
-
 #include "sensitive_request/sensitive_request.hpp"
 
 namespace {
 
-struct CryptoFixture {
+struct RecordingHmac {
     std::array<std::uint8_t, sensitive_request::kKeyBytes> observed_key{};
     std::vector<std::uint8_t> observed_input;
+    std::size_t observed_key_length = 0;
     bool random_success = true;
 
     static bool random(void *context, std::uint8_t *output,
                        std::size_t length) {
-        auto *fixture = static_cast<CryptoFixture *>(context);
+        auto *fixture = static_cast<RecordingHmac *>(context);
         if (!fixture->random_success) return false;
         for (std::size_t index = 0; index < length; ++index) {
             output[index] = static_cast<std::uint8_t>(index);
@@ -30,34 +29,36 @@ struct CryptoFixture {
                      std::size_t key_length, const std::uint8_t *input,
                      std::size_t input_length,
                      std::uint8_t output[sensitive_request::kDigestBytes]) {
-        auto *fixture = static_cast<CryptoFixture *>(context);
+        auto *fixture = static_cast<RecordingHmac *>(context);
         assert(key_length == fixture->observed_key.size());
+        fixture->observed_key_length = key_length;
         std::memcpy(fixture->observed_key.data(), key, key_length);
         fixture->observed_input.assign(input, input + input_length);
-        std::array<std::uint8_t, 64> inner_pad{};
-        std::array<std::uint8_t, 64> outer_pad{};
-        std::memcpy(inner_pad.data(), key, key_length);
-        std::memcpy(outer_pad.data(), key, key_length);
-        for (std::size_t index = 0; index < inner_pad.size(); ++index) {
-            inner_pad[index] ^= 0x36U;
-            outer_pad[index] ^= 0x5cU;
+        // TEST-ONLY deterministic provider. It is input-sensitive for retry
+        // identity tests but intentionally is not a cryptographic algorithm.
+        for (std::size_t index = 0; index < sensitive_request::kDigestBytes;
+             ++index) {
+            output[index] = static_cast<std::uint8_t>(
+                key[index] ^ static_cast<std::uint8_t>(0xa5U + index));
         }
-        std::vector<std::uint8_t> inner(inner_pad.begin(), inner_pad.end());
-        inner.insert(inner.end(), input, input + input_length);
-        std::array<std::uint8_t, SHA256_DIGEST_LENGTH> inner_digest{};
-        SHA256(inner.data(), inner.size(), inner_digest.data());
-        std::vector<std::uint8_t> outer(outer_pad.begin(), outer_pad.end());
-        outer.insert(outer.end(), inner_digest.begin(), inner_digest.end());
-        SHA256(outer.data(), outer.size(), output);
+        for (std::size_t index = 0; index < input_length; ++index) {
+            const std::size_t lane = index % sensitive_request::kDigestBytes;
+            output[lane] = static_cast<std::uint8_t>(
+                output[lane] * 33U + input[index] +
+                static_cast<std::uint8_t>(index * 17U));
+        }
+        output[input_length % sensitive_request::kDigestBytes] ^=
+            static_cast<std::uint8_t>(input_length);
         return true;
     }
 };
 
-void test_exact_hmac_layout_and_vector() {
-    CryptoFixture crypto;
+void test_exact_hmac_layout_key_and_deterministic_behavior() {
+    static_assert(sensitive_request::kDigestBytes == 32);
+    RecordingHmac crypto;
     sensitive_request::Identity identity;
-    assert(identity.initialize(CryptoFixture::random, &crypto,
-                               CryptoFixture::hmac, &crypto));
+    assert(identity.initialize(RecordingHmac::random, &crypto,
+                               RecordingHmac::hmac, &crypto));
     constexpr std::string_view payload = "{\"v\":1,\"id\":2}";
     sensitive_request::Digest digest{};
     assert(identity.digest(payload, &digest));
@@ -71,24 +72,32 @@ void test_exact_hmac_layout_and_vector() {
     assert(crypto.observed_input ==
            std::vector<std::uint8_t>(std::begin(expected_input),
                                      std::end(expected_input)));
-    constexpr sensitive_request::Digest expected_digest{
-        0xc1,0xb0,0x57,0xbe,0x1e,0x29,0x61,0x8c,
-        0xa0,0xf5,0x79,0xba,0x82,0x05,0xe2,0xa1,
-        0xaa,0x69,0xd6,0xa1,0xe8,0x0e,0x86,0x10,
-        0xa3,0x54,0xdb,0x1f,0x27,0xc7,0x9c,0x16,
-    };
-    assert(sensitive_request::constant_time_equal(digest, expected_digest));
-    auto different = expected_digest;
-    different.back() ^= 1U;
-    assert(!sensitive_request::constant_time_equal(digest, different));
+    std::array<std::uint8_t, sensitive_request::kKeyBytes> expected_key{};
+    for (std::size_t index = 0; index < expected_key.size(); ++index) {
+        expected_key[index] = static_cast<std::uint8_t>(index);
+    }
+    assert(crypto.observed_key_length == sensitive_request::kKeyBytes);
+    assert(crypto.observed_key == expected_key);
+
+    sensitive_request::Digest exact_retry{};
+    assert(identity.digest(payload, &exact_retry));
+    assert(sensitive_request::constant_time_equal(digest, exact_retry));
+
+    sensitive_request::Digest changed{};
+    assert(identity.digest("{\"v\":1,\"id\":3}", &changed));
+    assert(!sensitive_request::constant_time_equal(digest, changed));
+    auto comparison_mismatch = digest;
+    comparison_mismatch.back() ^= 1U;
+    assert(!sensitive_request::constant_time_equal(
+        digest, comparison_mismatch));
 }
 
 void test_rng_failure_and_clear() {
-    CryptoFixture crypto;
+    RecordingHmac crypto;
     crypto.random_success = false;
     sensitive_request::Identity identity;
-    assert(!identity.initialize(CryptoFixture::random, &crypto,
-                                CryptoFixture::hmac, &crypto));
+    assert(!identity.initialize(RecordingHmac::random, &crypto,
+                                RecordingHmac::hmac, &crypto));
     assert(!identity.ready());
     sensitive_request::Digest digest{};
     assert(!identity.digest("secret", &digest));
@@ -98,7 +107,7 @@ void test_rng_failure_and_clear() {
 }  // namespace
 
 int main() {
-    test_exact_hmac_layout_and_vector();
+    test_exact_hmac_layout_key_and_deterministic_behavior();
     test_rng_failure_and_clear();
     return 0;
 }

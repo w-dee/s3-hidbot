@@ -9,8 +9,6 @@
 #include <string_view>
 #include <vector>
 
-#include <openssl/sha.h>
-
 #include "cJSON.h"
 #include "control_framing/control_framing.hpp"
 #include "control_protocol/control_protocol.hpp"
@@ -155,27 +153,26 @@ struct RandomSource {
     }
 };
 
-bool hmac_sha256(void *, const std::uint8_t *key, std::size_t key_length,
-                 const std::uint8_t *input, std::size_t input_length,
-                 std::uint8_t output[sensitive_request::kDigestBytes]) {
-    assert(key_length <= 64);
-    std::array<std::uint8_t, 64> inner_pad{};
-    std::array<std::uint8_t, 64> outer_pad{};
-    for (std::size_t index = 0; index < key_length; ++index) {
-        inner_pad[index] = key[index];
-        outer_pad[index] = key[index];
+// TEST-ONLY deterministic provider. This deliberately does not implement or
+// claim cryptographic HMAC; production provider integration is firmware-owned.
+bool deterministic_hmac(void *, const std::uint8_t *key,
+                        std::size_t key_length, const std::uint8_t *input,
+                        std::size_t input_length,
+                        std::uint8_t output[sensitive_request::kDigestBytes]) {
+    assert(key_length == sensitive_request::kKeyBytes);
+    for (std::size_t index = 0; index < sensitive_request::kDigestBytes;
+         ++index) {
+        output[index] = static_cast<std::uint8_t>(
+            key[index] ^ static_cast<std::uint8_t>(0xa5U + index));
     }
-    for (std::size_t index = 0; index < inner_pad.size(); ++index) {
-        inner_pad[index] ^= 0x36U;
-        outer_pad[index] ^= 0x5cU;
+    for (std::size_t index = 0; index < input_length; ++index) {
+        const std::size_t lane = index % sensitive_request::kDigestBytes;
+        output[lane] = static_cast<std::uint8_t>(
+            output[lane] * 33U + input[index] +
+            static_cast<std::uint8_t>(index * 17U));
     }
-    std::vector<std::uint8_t> inner(inner_pad.begin(), inner_pad.end());
-    inner.insert(inner.end(), input, input + input_length);
-    std::array<std::uint8_t, SHA256_DIGEST_LENGTH> inner_digest{};
-    SHA256(inner.data(), inner.size(), inner_digest.data());
-    std::vector<std::uint8_t> outer(outer_pad.begin(), outer_pad.end());
-    outer.insert(outer.end(), inner_digest.begin(), inner_digest.end());
-    SHA256(outer.data(), outer.size(), output);
+    output[input_length % sensitive_request::kDigestBytes] ^=
+        static_cast<std::uint8_t>(input_length);
     return true;
 }
 
@@ -599,7 +596,7 @@ struct LeaseFixture {
         };
         assert(protocol.initialize(config, RandomSource::fill, &random,
                                    RandomSource::secure_fill, &random,
-                                   hmac_sha256, nullptr));
+                                   deterministic_hmac, nullptr));
     }
 
     void payload(std::string_view json) {
@@ -634,7 +631,7 @@ struct Fixture {
         route.authority = &authority;
         assert(protocol.initialize(configuration(), RandomSource::fill, &random,
                                    RandomSource::secure_fill, &random,
-                                   hmac_sha256, nullptr));
+                                   deterministic_hmac, nullptr));
     }
 
     control_protocol::Config configuration() {
@@ -1066,7 +1063,7 @@ void test_invalid_identity_rejected_at_protocol_initialization() {
         control_protocol::Protocol rejected;
         assert(!rejected.initialize(fixture.configuration(), RandomSource::fill,
                                     &fixture.random, RandomSource::secure_fill,
-                                    &fixture.random, hmac_sha256, nullptr));
+                                    &fixture.random, deterministic_hmac, nullptr));
     };
 
     expect_rejected([](firmware_identity::Identity &identity) {
@@ -1939,7 +1936,7 @@ void test_pairing_rng_failure_is_startup_fail_closed() {
     control_protocol::Protocol rejected;
     assert(!rejected.initialize(fixture.configuration(), RandomSource::fill,
                                 &fixture.random, fail_secure_random, nullptr,
-                                hmac_sha256, nullptr));
+                                deterministic_hmac, nullptr));
     assert(fixture.pairing.respond_calls == 0);
 }
 
