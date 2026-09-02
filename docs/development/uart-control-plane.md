@@ -57,7 +57,12 @@ state are owned by the serialized HID control executor and fenced by the exact
 BLE generation, connection handle, and registered characteristic handle. A
 composite link is ready only when both notification subscriptions and all
 U7.5A security/store/lifecycle conditions are current and the peer is not
-suspended. The fixed control queue is depth 12; overflow remains a fail-closed,
+suspended. The executor is also the sole writer of compound BLE security state.
+A NimBLE store callback atomically inhibits readiness for the exact published
+connection epoch before it queues failure evidence; the executor then commits
+that evidence. A retired epoch cannot inhibit a reused handle, while a fatal
+persistent-store failure inhibits every later connection until reboot. The
+fixed control queue is depth 12; overflow remains a fail-closed,
 recovery-required BLE lifecycle fault. The compiled notification adapter uses
 `ble_gatts_notify_custom()` with exact 8-byte keyboard and 5-byte mouse values;
 acceptance means only local NimBLE stack acceptance. It has no UART command,

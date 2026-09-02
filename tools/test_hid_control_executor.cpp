@@ -108,6 +108,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     }
     void begin_security(ble_lifecycle::Generation generation,
                         std::uint16_t connection_handle) override {
+        security_inhibit.begin_connection(generation, connection_handle);
         security.begin_connection(generation, connection_handle);
     }
     void refresh_security(std::uint16_t connection_handle,
@@ -119,18 +120,36 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     }
     void retire_security(ble_lifecycle::Generation generation,
                          std::uint16_t connection_handle) override {
+        security_inhibit.retire_connection(generation, connection_handle);
         security.retire_connection(generation, connection_handle);
     }
     void mark_security_unhealthy(
         ble_lifecycle::Generation generation) override {
         security.mark_lifecycle_unhealthy(generation);
     }
+    void apply_store_failure(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle,
+        ble_security::StoreFailureKind kind, std::int32_t status,
+        bool persistent_store_unhealthy) override {
+        ++apply_store_failure_calls;
+        security.apply_store_failure(generation, connection_handle, kind,
+                                     status, persistent_store_unhealthy);
+    }
     ble_security::Snapshot security_snapshot() const override {
-        return security.snapshot();
+        auto snapshot = security.snapshot();
+        if (snapshot.coherent && security_inhibit.inhibits(
+                                     snapshot.generation,
+                                     snapshot.connection_handle)) {
+            snapshot.project_verified_bond_persisted = false;
+            snapshot.store_healthy = false;
+        }
+        return snapshot;
     }
     bool security_ready_for_hid(ble_lifecycle::Generation generation,
                                 std::uint16_t connection_handle) const override {
-        return security.security_ready_for_hid(generation, connection_handle);
+        return !security_inhibit.inhibits(generation, connection_handle) &&
+               security.security_ready_for_hid(generation, connection_handle);
     }
     void record_heap_checkpoint(HeapCheckpoint checkpoint) override {
         ++heap_checkpoint_calls;
@@ -145,10 +164,22 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
                               ble_lifecycle::Generation generation,
                               std::uint16_t connection = ble_lifecycle::kNoConnection,
                               std::int32_t status = 0) {
+        const auto failure_kind =
+            kind == hid_control_executor::BleEventKind::kStoreFull
+                ? ble_security::StoreFailureKind::kCapacityFull
+                : kind == hid_control_executor::BleEventKind::kStorageFailure
+                      ? ble_security::StoreFailureKind::kWrite
+                      : ble_security::StoreFailureKind::kNone;
+        if (failure_kind != ble_security::StoreFailureKind::kNone) {
+            (void)security_inhibit.inhibit(
+                generation, connection,
+                kind == hid_control_executor::BleEventKind::kStorageFailure);
+        }
         return sink->signal_ble_event({.kind = kind,
                                       .generation = generation,
                                       .connection_handle = connection,
-                                      .status = status});
+                                      .status = status,
+                                      .store_failure_kind = failure_kind});
     }
     hid_control_executor::BleEventSink *sink = nullptr;
     hid_control_executor::BleDatabase *active_database = nullptr;
@@ -166,6 +197,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     int arm_pairing_timeout_calls = 0;
     int cancel_pairing_timeout_calls = 0;
     int refresh_security_calls = 0;
+    int apply_store_failure_calls = 0;
     int heap_checkpoint_calls = 0;
     std::int32_t initialize_result = 0;
     std::int32_t advertising_result = 0;
@@ -180,6 +212,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     std::uint32_t timer_pairing_id = 0;
     std::uint64_t now_us = 0;
     ble_security::State security{};
+    ble_security::ReadinessInhibit security_inhibit{};
     ble_security::LinkSecurityEvidence security_link{};
     ble_security::PersistedSecurityEvidence security_persisted{};
     HeapCheckpoint last_heap_checkpoint = HeapCheckpoint::kColdBoot;
@@ -1062,9 +1095,8 @@ void test_ble_link_readiness_security_and_suspend_predicate() {
     assert(controller.process_one_for_test());
     assert(controller.ble_link_ready());
 
-    ble.security.observe_store_failure(
-        generation, connection, ble_security::StoreFailureKind::kWrite, -1,
-        true);
+    ble.apply_store_failure(generation, connection,
+                            ble_security::StoreFailureKind::kWrite, -1, true);
     assert(!controller.ble_link_ready());
 
     const auto disable = controller.request_ble_disable();
@@ -1072,6 +1104,92 @@ void test_ble_link_readiness_security_and_suspend_predicate() {
     assert(!controller.ble_link_ready());
     assert(controller.process_one_for_test());
     assert(!controller.ble_hid_peer_snapshot().active);
+}
+
+void test_store_failure_immediately_inhibits_stale_verification() {
+    for (const auto kind : {hid_control_executor::BleEventKind::kStoreFull,
+                            hid_control_executor::BleEventKind::kStorageFailure}) {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        constexpr std::uint16_t connection = 74;
+        connect_ble(runtime, usb, ble, database, controller, connection);
+        const auto generation = controller.ble_snapshot().generation;
+        subscribe_composite(controller, database, generation, connection);
+        make_security_ready(ble);
+        ble.refresh_security(connection);
+        assert(controller.ble_link_ready());
+
+        const int applies_before = ble.apply_store_failure_calls;
+        assert(ble.event(kind, connection, -17));
+        // Callback capture inhibits readiness before the queued event runs.
+        assert(!controller.ble_link_ready());
+        assert(ble.apply_store_failure_calls == applies_before);
+
+        // Model a healthy verification result that began before the callback
+        // and commits before the serialized failure event is consumed.
+        ble.refresh_security(connection);
+        assert(ble.security.security_ready_for_hid(generation, connection));
+        assert(!controller.ble_link_ready());
+
+        assert(controller.process_one_for_test());
+        assert(ble.apply_store_failure_calls == applies_before + 1);
+        assert(!controller.ble_link_ready());
+        assert(!ble.security_ready_for_hid(generation, connection));
+        if (kind == hid_control_executor::BleEventKind::kStorageFailure) {
+            assert(controller.ble_snapshot().recovery_required);
+            assert(!controller.ble_hid_peer_snapshot().active);
+        } else {
+            assert(!controller.ble_snapshot().recovery_required);
+            assert(ble.disconnect_calls == 1);
+        }
+    }
+}
+
+void test_store_failure_identity_reuse_is_fenced() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t reused_connection = 75;
+    connect_ble(runtime, usb, ble, database, controller, reused_connection);
+    const auto generation_a = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation_a, reused_connection);
+    make_security_ready(ble);
+    ble.refresh_security(reused_connection);
+    assert(controller.ble_link_ready());
+
+    // Capture immediate A/X inhibition without consuming its detailed event.
+    assert(ble.security_inhibit.inhibit(generation_a, reused_connection, false));
+    assert(!controller.ble_link_ready());
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                     reused_connection));
+    assert(controller.process_one_for_test());
+
+    const auto generation_b = controller.ble_snapshot().generation;
+    assert(generation_b != generation_a);
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect,
+                     reused_connection));
+    assert(controller.process_one_for_test());
+    subscribe_composite(controller, database, generation_b, reused_connection,
+                        hid_control_executor::BleSubscriptionReason::kRestore);
+    make_security_ready(ble);
+    ble.refresh_security(reused_connection);
+    assert(controller.ble_link_ready());
+
+    // Old A/X failure and verification traffic cannot affect reused B/X.
+    assert(ble.event_for_generation(
+        hid_control_executor::BleEventKind::kStoreFull, generation_a,
+        reused_connection, -18));
+    ble.security.apply_verification(generation_a, reused_connection,
+                                    ble.security_link,
+                                    ble.security_persisted);
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+    assert(ble.apply_store_failure_calls == 0);
 }
 
 void test_internal_ble_notification_adapter_and_result_model() {
@@ -1701,6 +1819,30 @@ void test_queue_burst_overflow_and_id_wrap_fail_closed() {
         assert(controller.pairing_snapshot().last_result ==
                ble_pairing::LastResult::kQueueOverflow);
         assert(ble.disconnect_calls == 1);
+        assert(!controller.ble_hid_peer_snapshot().active);
+        const hid_control_executor::BleHidWorkIdentity retired{
+            .generation = ble.active_generation,
+            .connection_handle = 51,
+            .characteristic_handle = database.handles.keyboard_value,
+        };
+        assert(controller.submit_ble_keyboard(
+                   retired, hid_control_executor::kBleKeyboardAllUp) ==
+               hid_control_executor::BleHidSubmitResult::kStale);
+        assert(database.notify_calls == 0);
+        while (controller.process_one_for_test()) {
+        }
+        assert(queue_subscription(
+            controller, retired.generation, retired.connection_handle,
+            hid_control_executor::BleHidInterface::kKeyboard,
+            retired.characteristic_handle, true));
+        assert(queue_control_point(
+            controller, retired.generation, retired.connection_handle,
+            database.handles.control_point_value, false));
+        assert(controller.process_one_for_test());
+        assert(controller.process_one_for_test());
+        assert(!controller.ble_hid_peer_snapshot().active);
+        assert(!controller.ble_link_ready());
+        assert(database.notify_calls == 0);
     }
     {
         hid_runtime::Runtime runtime;
@@ -1859,6 +2001,8 @@ int main() {
     test_ble_busy_has_no_stage_a_and_usb_detach_does_not_change_ble();
     test_generation_owned_cccd_restore_term_and_clearing();
     test_ble_link_readiness_security_and_suspend_predicate();
+    test_store_failure_immediately_inhibits_stale_verification();
+    test_store_failure_identity_reuse_is_fenced();
     test_internal_ble_notification_adapter_and_result_model();
     test_pairing_input_response_and_initiation();
     test_public_pairing_rpc_mailbox_status_and_races();

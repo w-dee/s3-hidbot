@@ -7,6 +7,13 @@
 
 namespace ble_security {
 
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+              "BLE callback coordination requires lock-free 32-bit atomics");
+static_assert(std::atomic<std::uint16_t>::is_always_lock_free,
+              "BLE callback coordination requires lock-free 16-bit atomics");
+static_assert(std::atomic_bool::is_always_lock_free,
+              "BLE callback coordination requires lock-free bool atomics");
+
 constexpr std::uint8_t kRequiredKeySize = 16;
 constexpr std::uint8_t kBondCapacity = 3;
 
@@ -58,8 +65,37 @@ struct Snapshot {
     std::int32_t last_store_status = 0;
 };
 
-// Fixed-size, zero-allocation security state. NimBLE host callbacks are the
-// single writer; readers obtain a bounded atomic snapshot.
+// Callback-safe, fail-closed readiness inhibition. The serialized executor
+// publishes one exact connection identity at a time. A callback may only set
+// the inhibition token for that published identity; retirement or a new
+// executor-owned connection epoch makes an old token irrelevant without a
+// callback-side clear. Fatal persistent-store failure is global until reboot.
+class ReadinessInhibit final {
+  public:
+    void begin_connection(ble_lifecycle::Generation generation,
+                          std::uint16_t connection_handle);
+    void retire_connection(ble_lifecycle::Generation generation,
+                           std::uint16_t connection_handle);
+    bool inhibit(ble_lifecycle::Generation generation,
+                 std::uint16_t connection_handle,
+                 bool persistent_store_unhealthy);
+    bool inhibits(ble_lifecycle::Generation generation,
+                  std::uint16_t connection_handle) const;
+
+  private:
+    std::atomic<ble_lifecycle::Generation> generation_{0};
+    std::atomic<std::uint16_t> connection_handle_{
+        ble_lifecycle::kNoConnection};
+    std::atomic<std::uint32_t> authority_token_{0};
+    std::atomic<std::uint32_t> inhibited_token_{0};
+    std::atomic_bool persistent_store_unhealthy_{false};
+    // Executor-owned; zero is reserved for an inactive authority.
+    std::uint32_t next_authority_token_ = 1;
+};
+
+// Fixed-size, zero-allocation compound security state. The serialized
+// executor is its sole writer. Readers obtain a bounded coherent snapshot;
+// callback-side immediate inhibition is kept separately in ReadinessInhibit.
 class State final {
   public:
     void begin_connection(ble_lifecycle::Generation generation,
@@ -67,10 +103,10 @@ class State final {
                           bool lifecycle_healthy = true);
     void retire_connection(ble_lifecycle::Generation generation,
                            std::uint16_t connection_handle);
-    void observe_store_failure(ble_lifecycle::Generation generation,
-                               std::uint16_t connection_handle,
-                               StoreFailureKind kind, std::int32_t status,
-                               bool persistent_store_unhealthy);
+    void apply_store_failure(ble_lifecycle::Generation generation,
+                             std::uint16_t connection_handle,
+                             StoreFailureKind kind, std::int32_t status,
+                             bool persistent_store_unhealthy);
     void apply_verification(ble_lifecycle::Generation generation,
                             std::uint16_t connection_handle,
                             LinkSecurityEvidence link,

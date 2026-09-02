@@ -7,6 +7,7 @@
 namespace {
 using ble_security::LinkSecurityEvidence;
 using ble_security::PersistedSecurityEvidence;
+using ble_security::ReadinessInhibit;
 using ble_security::State;
 using ble_security::StoredSecurityRecord;
 
@@ -79,12 +80,12 @@ void readiness_and_fencing() {
         assert(!weak.security_ready_for_hid(generation, handle));
     }
 
-    state.observe_store_failure(generation - 1, handle,
+    state.apply_store_failure(generation - 1, handle,
         ble_security::StoreFailureKind::kWrite, -1, false);
-    state.observe_store_failure(generation, handle + 1,
+    state.apply_store_failure(generation, handle + 1,
         ble_security::StoreFailureKind::kWrite, -1, false);
     assert(state.security_ready_for_hid(generation, handle));
-    state.observe_store_failure(generation, handle,
+    state.apply_store_failure(generation, handle,
         ble_security::StoreFailureKind::kCapacityFull, -2, false);
     assert(!state.security_ready_for_hid(generation, handle));
     const auto failed = state.snapshot();
@@ -97,7 +98,7 @@ void readiness_and_fencing() {
         store_failure.begin_connection(generation, handle);
         store_failure.apply_verification(generation, handle, valid_link(),
                                          valid_persisted());
-        store_failure.observe_store_failure(generation, handle, kind, -3, true);
+        store_failure.apply_store_failure(generation, handle, kind, -3, true);
         assert(!store_failure.snapshot().project_verified_bond_persisted);
         assert(!store_failure.security_ready_for_hid(generation, handle));
         store_failure.begin_connection(generation + 1, handle + 1);
@@ -111,6 +112,33 @@ void readiness_and_fencing() {
     assert(!lifecycle.security_ready_for_hid(generation, handle));
     lifecycle.retire_connection(generation, handle);
     assert(!lifecycle.snapshot().connected);
+}
+
+void immediate_inhibit_identity_fencing() {
+    constexpr ble_lifecycle::Generation generation_a = 17;
+    constexpr ble_lifecycle::Generation generation_b = 18;
+    constexpr std::uint16_t reused_handle = 73;
+    ReadinessInhibit inhibit;
+
+    inhibit.begin_connection(generation_a, reused_handle);
+    assert(!inhibit.inhibits(generation_a, reused_handle));
+    assert(!inhibit.inhibit(generation_a - 1, reused_handle, false));
+    assert(!inhibit.inhibit(generation_a, reused_handle + 1, false));
+    assert(!inhibit.inhibits(generation_a, reused_handle));
+    assert(inhibit.inhibit(generation_a, reused_handle, false));
+    assert(inhibit.inhibits(generation_a, reused_handle));
+
+    inhibit.retire_connection(generation_a, reused_handle);
+    inhibit.begin_connection(generation_b, reused_handle);
+    assert(!inhibit.inhibits(generation_b, reused_handle));
+    assert(!inhibit.inhibit(generation_a, reused_handle, false));
+    assert(!inhibit.inhibits(generation_b, reused_handle));
+
+    assert(inhibit.inhibit(generation_b, reused_handle, true));
+    assert(inhibit.inhibits(generation_b, reused_handle));
+    inhibit.retire_connection(generation_b, reused_handle);
+    inhibit.begin_connection(generation_b + 1, reused_handle + 1);
+    assert(inhibit.inhibits(generation_b + 1, reused_handle + 1));
 }
 
 class FixedIdentityStore {
@@ -145,6 +173,7 @@ void capacity_is_fail_closed() {
 int main() {
     verification_matrix();
     readiness_and_fencing();
+    immediate_inhibit_identity_fencing();
     capacity_is_fail_closed();
     return 0;
 }

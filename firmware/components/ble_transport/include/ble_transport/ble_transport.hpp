@@ -42,6 +42,11 @@ class Backend final : public hid_control_executor::BleBackend {
                          std::uint16_t connection_handle) override;
     void mark_security_unhealthy(
         ble_lifecycle::Generation generation) override;
+    void apply_store_failure(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle,
+        ble_security::StoreFailureKind kind, std::int32_t status,
+        bool persistent_store_unhealthy) override;
     void record_heap_checkpoint(HeapCheckpoint checkpoint) override;
 
     ble_security::Snapshot security_snapshot() const override;
@@ -79,6 +84,7 @@ class Backend final : public hid_control_executor::BleBackend {
     std::atomic<std::uint16_t> current_connection_{
         ble_lifecycle::kNoConnection};
     std::atomic_bool identity_resolved_{false};
+    ble_security::ReadinessInhibit security_inhibit_{};
     ble_security::State security_{};
     ble_store_read_fn *original_store_read_ = nullptr;
     ble_store_write_fn *original_store_write_ = nullptr;

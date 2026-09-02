@@ -128,6 +128,8 @@ struct BleEvent {
     BleHidInterface hid_interface = BleHidInterface::kUnknown;
     BleSubscriptionReason subscription_reason =
         BleSubscriptionReason::kUnknown;
+    ble_security::StoreFailureKind store_failure_kind =
+        ble_security::StoreFailureKind::kNone;
     bool notify_enabled = false;
     bool suspended = false;
 };
@@ -191,6 +193,12 @@ class BleBackend {
                                  std::uint16_t connection_handle) = 0;
     virtual void mark_security_unhealthy(
         ble_lifecycle::Generation generation) = 0;
+    // Serialized executor commit of failure evidence captured by a callback.
+    virtual void apply_store_failure(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle,
+        ble_security::StoreFailureKind kind, std::int32_t status,
+        bool persistent_store_unhealthy) = 0;
     virtual ble_security::Snapshot security_snapshot() const = 0;
     virtual bool security_ready_for_hid(
         ble_lifecycle::Generation generation,

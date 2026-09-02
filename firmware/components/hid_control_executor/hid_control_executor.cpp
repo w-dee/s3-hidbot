@@ -1077,6 +1077,10 @@ void Controller::process_ble_event(BleEvent event) {
         case BleEventKind::kStoreFull:
             if (event.generation == ble_state_.generation() &&
                 event.connection_handle == ble_state_.connection_handle()) {
+                ble_backend_->apply_store_failure(
+                    event.generation, event.connection_handle,
+                    ble_security::StoreFailureKind::kCapacityFull, event.status,
+                    false);
                 terminate_security_connection(
                     ble_pairing::LastResult::kStoreFull, false);
             }
@@ -1084,6 +1088,14 @@ void Controller::process_ble_event(BleEvent event) {
         case BleEventKind::kStorageFailure:
             if (event.generation == ble_state_.generation() &&
                 event.connection_handle == ble_state_.connection_handle()) {
+                const auto kind =
+                    event.store_failure_kind ==
+                            ble_security::StoreFailureKind::kDelete
+                        ? ble_security::StoreFailureKind::kDelete
+                        : ble_security::StoreFailureKind::kWrite;
+                ble_backend_->apply_store_failure(
+                    event.generation, event.connection_handle, kind,
+                    event.status, true);
                 terminate_security_connection(
                     ble_pairing::LastResult::kStorage, true);
             }

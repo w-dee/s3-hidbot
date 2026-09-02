@@ -10,6 +10,60 @@ bool record_is_valid(const StoredSecurityRecord &record) {
 
 }  // namespace
 
+void ReadinessInhibit::begin_connection(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) {
+    authority_token_.store(0, std::memory_order_release);
+    generation_.store(generation, std::memory_order_relaxed);
+    connection_handle_.store(connection_handle, std::memory_order_relaxed);
+    std::uint32_t token = next_authority_token_++;
+    if (token == 0) {
+        token = next_authority_token_++;
+    }
+    authority_token_.store(token, std::memory_order_release);
+}
+
+void ReadinessInhibit::retire_connection(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) {
+    const std::uint32_t token = authority_token_.load(std::memory_order_acquire);
+    if (token != 0 && generation_.load(std::memory_order_relaxed) == generation &&
+        connection_handle_.load(std::memory_order_relaxed) == connection_handle &&
+        authority_token_.load(std::memory_order_acquire) == token) {
+        authority_token_.store(0, std::memory_order_release);
+    }
+}
+
+bool ReadinessInhibit::inhibit(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle,
+    bool persistent_store_unhealthy) {
+    if (persistent_store_unhealthy) {
+        persistent_store_unhealthy_.store(true, std::memory_order_release);
+    }
+    const std::uint32_t token = authority_token_.load(std::memory_order_acquire);
+    if (token == 0 || generation_.load(std::memory_order_relaxed) != generation ||
+        connection_handle_.load(std::memory_order_relaxed) != connection_handle ||
+        authority_token_.load(std::memory_order_acquire) != token) {
+        return false;
+    }
+    inhibited_token_.store(token, std::memory_order_release);
+    return authority_token_.load(std::memory_order_acquire) == token;
+}
+
+bool ReadinessInhibit::inhibits(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) const {
+    if (persistent_store_unhealthy_.load(std::memory_order_acquire)) {
+        return true;
+    }
+    const std::uint32_t token = authority_token_.load(std::memory_order_acquire);
+    return token != 0 && generation_.load(std::memory_order_relaxed) == generation &&
+           connection_handle_.load(std::memory_order_relaxed) == connection_handle &&
+           authority_token_.load(std::memory_order_acquire) == token &&
+           inhibited_token_.load(std::memory_order_acquire) == token;
+}
+
 void State::begin_write() {
     sequence_.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -57,10 +111,10 @@ void State::retire_connection(ble_lifecycle::Generation generation,
     end_write();
 }
 
-void State::observe_store_failure(ble_lifecycle::Generation generation,
-                                  std::uint16_t connection_handle,
-                                  StoreFailureKind kind, std::int32_t status,
-                                  bool persistent_store_unhealthy) {
+void State::apply_store_failure(ble_lifecycle::Generation generation,
+                                std::uint16_t connection_handle,
+                                StoreFailureKind kind, std::int32_t status,
+                                bool persistent_store_unhealthy) {
     const Snapshot current = snapshot();
     if (!current.coherent || current.generation != generation ||
         current.connection_handle != connection_handle) {

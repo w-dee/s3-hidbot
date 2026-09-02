@@ -454,11 +454,13 @@ void Backend::begin_security(ble_lifecycle::Generation generation,
                              std::uint16_t connection_handle) {
     current_connection_.store(connection_handle, std::memory_order_release);
     identity_resolved_.store(false, std::memory_order_release);
+    security_inhibit_.begin_connection(generation, connection_handle);
     security_.begin_connection(generation, connection_handle);
 }
 
 void Backend::retire_security(ble_lifecycle::Generation generation,
                               std::uint16_t connection_handle) {
+    security_inhibit_.retire_connection(generation, connection_handle);
     security_.retire_connection(generation, connection_handle);
     if (current_connection_.load(std::memory_order_acquire) ==
         connection_handle) {
@@ -471,6 +473,15 @@ void Backend::retire_security(ble_lifecycle::Generation generation,
 void Backend::mark_security_unhealthy(
     ble_lifecycle::Generation generation) {
     security_.mark_lifecycle_unhealthy(generation);
+}
+
+void Backend::apply_store_failure(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle,
+    ble_security::StoreFailureKind kind, std::int32_t status,
+    bool persistent_store_unhealthy) {
+    security_.apply_store_failure(generation, connection_handle, kind, status,
+                                  persistent_store_unhealthy);
 }
 
 void Backend::record_heap_checkpoint(HeapCheckpoint checkpoint) {
@@ -487,13 +498,21 @@ void Backend::record_heap_checkpoint(HeapCheckpoint checkpoint) {
 }
 
 ble_security::Snapshot Backend::security_snapshot() const {
-    return security_.snapshot();
+    auto snapshot = security_.snapshot();
+    if (snapshot.coherent && security_inhibit_.inhibits(
+                                 snapshot.generation,
+                                 snapshot.connection_handle)) {
+        snapshot.project_verified_bond_persisted = false;
+        snapshot.store_healthy = false;
+    }
+    return snapshot;
 }
 
 bool Backend::security_ready_for_hid(
     ble_lifecycle::Generation generation,
     std::uint16_t connection_handle) const {
-    return security_.security_ready_for_hid(generation, connection_handle);
+    return !security_inhibit_.inhibits(generation, connection_handle) &&
+           security_.security_ready_for_hid(generation, connection_handle);
 }
 
 void Backend::refresh_security(std::uint16_t connection_handle,
@@ -551,13 +570,20 @@ void Backend::observe_store_failure(ble_security::StoreFailureKind kind,
                                     std::int32_t status,
                                     bool persistent_store_unhealthy,
                                     std::uint16_t connection_handle) {
-    security_.observe_store_failure(
-        generation_.load(std::memory_order_acquire),
-        connection_handle, kind, status, persistent_store_unhealthy);
-    (void)signal(persistent_store_unhealthy
-                     ? hid_control_executor::BleEventKind::kStorageFailure
-                     : hid_control_executor::BleEventKind::kStoreFull,
-                 connection_handle, status);
+    const auto generation = generation_.load(std::memory_order_acquire);
+    (void)security_inhibit_.inhibit(generation, connection_handle,
+                                    persistent_store_unhealthy);
+    if (sink_ != nullptr) {
+        (void)sink_->signal_ble_event({
+            .kind = persistent_store_unhealthy
+                        ? hid_control_executor::BleEventKind::kStorageFailure
+                        : hid_control_executor::BleEventKind::kStoreFull,
+            .generation = generation,
+            .connection_handle = connection_handle,
+            .status = status,
+            .store_failure_kind = kind,
+        });
+    }
 }
 
 int Backend::store_read(int object_type, const union ble_store_key *key,

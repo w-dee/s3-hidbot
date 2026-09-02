@@ -51,7 +51,10 @@ U7.4A extends deterministic `tools/test-hid-control-executor.sh` and
 `tools/test_ble_hid_service_static.py` coverage. They verify generation-owned
 CCCD and Control Point state, combined security readiness, bounded callback
 capture, exact internal report payloads, no retry, and that the notification
-adapter remains unreachable from the public route. These are included by
+adapter remains unreachable from the public route. The focused BLE security
+and executor suites also interleave immediate store-failure inhibition with
+stale healthy verification, exercise generation/connection-handle reuse, and
+prove queue overflow retires notification authority. These are included by
 `test-native.sh`, `test-static.sh`, and therefore canonical
 `test-nonhardware.sh`. An ESP-IDF target build remains mandatory because the
 service database, mbuf allocation, and NimBLE notification API are
