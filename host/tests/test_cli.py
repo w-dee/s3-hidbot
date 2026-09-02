@@ -72,6 +72,7 @@ class FakeTransport:
             "hid.release-all-v1",
             "hid.keyboard-report-v1",
             "hid.mouse-report-v1",
+            "hid.output-route-v1",
         ]
         self.info_result: object = {"project": "s3-hidbot"}
 
@@ -159,6 +160,21 @@ class FakeTransport:
                     "last_error": None,
                 }
             self.chunks.append(response(value["id"], TOKEN, result=result))
+        elif value["cmd"] in {"hid.route.status", "hid.route.set"}:
+            route = value["params"].get("route", "none")
+            self.chunks.append(
+                response(
+                    value["id"],
+                    TOKEN,
+                    result={
+                        "desired": route,
+                        "active": route,
+                        "generation": 1 if route == "usb" else 0,
+                        "transition": "stable",
+                        "ready": route == "usb",
+                    },
+                )
+            )
         elif value["cmd"] in {"hid.keyboard.report", "hid.mouse.report"}:
             params = value["params"]
             if value["cmd"] == "hid.keyboard.report":
@@ -485,6 +501,25 @@ class CliTests(unittest.TestCase):
             self.assertEqual(value["observed"], observed, command)
             self.assertEqual(
                 self.wire_commands(calls), ["protocol.hello", wire_command], command
+            )
+
+    def test_hid_route_operator_commands_are_explicit(self) -> None:
+        for argv, wire_command, desired in (
+            (["hid-route-status"], "hid.route.status", "none"),
+            (["hid-route-set", "none"], "hid.route.set", "none"),
+            (["hid-route-set", "usb"], "hid.route.set", "usb"),
+        ):
+            code, output, errors, calls = self.run_cli(
+                ["--port", "dummy-port", "--json", *argv],
+                {"S3_HIDBOT_SERIAL": "env-port"},
+            )
+            self.assertEqual(code, 0, argv)
+            self.assertEqual(errors, "", argv)
+            value = json.loads(output)
+            self.assertEqual(value["desired"], desired)
+            self.assertEqual(value["active"], desired)
+            self.assertEqual(
+                self.wire_commands(calls), ["protocol.hello", wire_command]
             )
 
     def test_self_test_runs_one_safe_session_in_wire_order(self) -> None:

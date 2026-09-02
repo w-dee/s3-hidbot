@@ -22,9 +22,9 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -36,7 +36,7 @@ constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
 // Every formatter below writes to ResponseFrame::bytes. These conservative
 // bounds cover the largest identity-v1 protocol.hello and system.info responses
 // metadata, four 32-hex values (top-level session, result session, boot ID,
-// and client nonce), ten capabilities, maximum int32 id, framing, and LF.
+// and client nonce), eleven capabilities, maximum int32 id, framing, and LF.
 // vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
@@ -64,6 +64,9 @@ static_assert(kMaximumMouseReportResponseBytes <= control_session::kMaxResponseB
 constexpr std::size_t kMaximumUsbExposureResponseBytes =
     kPrefixLength + 360 + control_session::kTokenHexLength + 1;
 static_assert(kMaximumUsbExposureResponseBytes <= control_session::kMaxResponseBytes);
+constexpr std::size_t kMaximumHidRouteResponseBytes =
+    kPrefixLength + 220 + control_session::kTokenHexLength + 1;
+static_assert(kMaximumHidRouteResponseBytes <= control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
     return value != nullptr && std::strlen(value) <= maximum_length;
@@ -475,6 +478,36 @@ bool make_usb_exposure_status(control_session::ResponseFrame *frame,
                         static_cast<long>(status.last_error.code));
 }
 
+const char *output_route_json(OutputRoute route) {
+    return route == OutputRoute::kUsb ? "usb" : "none";
+}
+
+const char *route_transition_json(RouteTransition transition) {
+    return transition == RouteTransition::kReleasing ? "releasing" : "stable";
+}
+
+bool make_hid_route_status(control_session::ResponseFrame *frame,
+                           ResponseSession session,
+                           std::int32_t id,
+                           HidRouteStatus status) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"desired\":\"%s\",\"active\":\"%s\",\"generation\":%lu,"
+                        "\"transition\":\"%s\",\"ready\":%s}}\n",
+                        static_cast<long>(id), session_field,
+                        output_route_json(status.desired),
+                        output_route_json(status.active),
+                        static_cast<unsigned long>(status.generation),
+                        route_transition_json(status.transition),
+                        json_bool(status.ready));
+}
+
 const char *release_state_json(ReleaseAllInterfaceState state) {
     return state == ReleaseAllInterfaceState::kSubmitted ? "submitted" : "already_up";
 }
@@ -545,6 +578,25 @@ bool validate_hello_params(const cJSON *params, std::string_view *client_nonce) 
         return false;
     }
     return control_session::is_lower_hex_token(*client_nonce);
+}
+
+bool validate_route_set_params(const cJSON *params, OutputRoute *route) {
+    static constexpr const char *kFields[] = {"route"};
+    std::string_view value;
+    if (route == nullptr || !cJSON_IsObject(params) ||
+        !object_has_only_fields(params, kFields, 1) ||
+        !get_bounded_nonempty_string(params, "route", 4, &value)) {
+        return false;
+    }
+    if (value == "none") {
+        *route = OutputRoute::kNone;
+        return true;
+    }
+    if (value == "usb") {
+        *route = OutputRoute::kUsb;
+        return true;
+    }
+    return false;
 }
 
 bool allowed_keyboard_usage(std::uint8_t usage) {
@@ -710,7 +762,8 @@ bool Protocol::initialize(const Config &config,
                           void *random_context) {
     if (config.output == nullptr || config.usb_status_provider == nullptr ||
         config.usb_exposure_status_provider == nullptr || config.usb_attach_provider == nullptr ||
-        config.usb_detach_provider == nullptr || config.authority_epoch_provider == nullptr ||
+        config.usb_detach_provider == nullptr || config.hid_route_status_provider == nullptr ||
+        config.hid_route_set_provider == nullptr || config.authority_epoch_provider == nullptr ||
         random_fill == nullptr ||
         !is_safe_metadata_string(config.metadata.project) ||
         !is_safe_metadata_string(config.metadata.target) ||
@@ -1002,7 +1055,8 @@ void Protocol::handle_frame(std::string_view payload) {
     // Attach/detach revoke the authority epoch as part of their accepted
     // transition. Their exact retry is therefore retained separately from the
     // normal epoch-scoped request cache and must replay identical bytes only.
-    if ((command == "usb.attach" || command == "usb.detach") &&
+    if ((command == "usb.attach" || command == "usb.detach" ||
+         command == "hid.route.set") &&
         replay_control_transition_retry(session, id, payload)) {
         finish();
         return;
@@ -1120,6 +1174,62 @@ void Protocol::handle_frame(std::string_view payload) {
                     finish();
                     return;
                 }
+            }
+        }
+    } else if (command == "hid.route.status") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "hid.route.status accepts no params");
+        } else {
+            semantically_valid = true;
+            completed = make_hid_route_status(
+                &response, current_session, id,
+                config_.hid_route_status_provider(config_.hid_route_status_context));
+        }
+    } else if (command == "hid.route.set") {
+        OutputRoute desired{};
+        if (!validate_route_set_params(params, &desired)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "hid.route.set route must be none or usb");
+        } else {
+            semantically_valid = true;
+            const HidRouteActionOutcome action =
+                config_.hid_route_set_provider(config_.hid_route_set_context, desired);
+            switch (action.action_result) {
+                case HidRouteActionResult::kBusy:
+                    completed = make_error(&response, current_session, true, id,
+                                           "HID_BUSY", "control transition is active");
+                    break;
+                case HidRouteActionResult::kNotReady:
+                    completed = make_error(&response, current_session, true, id,
+                                           "HID_NOT_READY", "requested HID route is not ready");
+                    break;
+                case HidRouteActionResult::kSafetyPending:
+                    completed = make_error(&response, current_session, true, id,
+                                           "HID_SAFETY_PENDING",
+                                           "HID safety recovery is pending");
+                    break;
+                case HidRouteActionResult::kAccepted:
+                case HidRouteActionResult::kNoOp:
+                    if (!action.snapshot_valid) {
+                        completed = make_error(&response, current_session, true, id,
+                                               "INTERNAL_ERROR",
+                                               "HID route snapshot is unavailable");
+                        break;
+                    }
+                    completed = make_hid_route_status(&response, current_session, id,
+                                                      action.snapshot);
+                    if (completed &&
+                        action.action_result == HidRouteActionResult::kAccepted) {
+                        cache_control_transition_retry(session, id, payload, response);
+                        session_.revoke_for_lifecycle_invalidation(
+                            config_.authority_epoch_provider(config_.authority_epoch_context));
+                        lease_revoke_notified_ = false;
+                        write_frame(response);
+                        finish();
+                        return;
+                    }
+                    break;
             }
         }
     } else if (command == "hid.release_all") {

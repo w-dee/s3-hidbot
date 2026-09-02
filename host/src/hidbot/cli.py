@@ -33,10 +33,12 @@ from .provisioning_workflow import (
 from .serial_transport import PySerialTransport
 from .provisioning import stage_and_verify_firmware_bundle
 from .protocol import (
+    HidRouteStatus,
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
     UsbExposureStatus,
+    OutputRoute,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
     validate_system_info,
@@ -190,6 +192,8 @@ def _parser() -> argparse.ArgumentParser:
         ("usb-exposure-status", "show explicit native USB exposure lifecycle state"),
         ("usb-attach", "explicitly install and expose native USB HID"),
         ("usb-detach", "safely hide and uninstall native USB HID"),
+        ("hid-route-status", "show the explicit HID output route"),
+        ("hid-route-set", "select none or USB as the HID output route"),
         ("release-all", "perform the safe all-up recovery operation"),
         (
             "self-test",
@@ -219,6 +223,12 @@ def _parser() -> argparse.ArgumentParser:
             suppress_defaults=True,
             hidden_help=hidden_help,
         )
+        if name == "hid-route-set":
+            command.add_argument(
+                "route",
+                choices=[route.value for route in OutputRoute],
+                help="explicit HID output route",
+            )
         if name in {"verify-artifact", "verify-firmware", "flash-firmware"}:
             command.add_argument(
                 "artifact",
@@ -304,6 +314,9 @@ def _result_value(command: str, result: object) -> object:
         return asdict(result)
     if command in {"usb-attach", "usb-detach", "usb-exposure-status"}:
         assert isinstance(result, UsbExposureStatus)
+        return asdict(result)
+    if command in {"hid-route-status", "hid-route-set"}:
+        assert isinstance(result, HidRouteStatus)
         return asdict(result)
     return result
 
@@ -610,6 +623,10 @@ def main(
                 result = client.usb_attach()
             elif args.command == "usb-detach":
                 result = client.usb_detach()
+            elif args.command == "hid-route-status":
+                result = client.hid_route_status()
+            elif args.command == "hid-route-set":
+                result = client.hid_route_set(args.route)
             elif args.command == "release-all":
                 result = client.release_all()
             elif args.command == "self-test":

@@ -7,6 +7,7 @@ import math
 import re
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Literal, cast
 
 from .errors import CompatibilityError, ProtocolError
@@ -51,6 +52,7 @@ OPTIONAL_CAPABILITIES = frozenset(
         "hid.keyboard-report-v1",
         "hid.mouse-report-v1",
         "firmware.identity-v1",
+        "hid.output-route-v1",
     }
 )
 KNOWN_OPTIONAL_CAPABILITIES = OPTIONAL_CAPABILITIES
@@ -170,6 +172,22 @@ class UsbExposureStatus:
     host_release_uncertain: bool
     recovery_required: bool
     last_error: UsbExposureLastError | None
+
+
+class OutputRoute(str, Enum):
+    NONE = "none"
+    USB = "usb"
+
+
+@dataclass(frozen=True)
+class HidRouteStatus:
+    """Strict hid.output-route-v1 transaction snapshot."""
+
+    desired: OutputRoute
+    active: OutputRoute
+    generation: int
+    transition: Literal["stable", "releasing"]
+    ready: bool
 
 
 def _reject_constant(value: str) -> None:
@@ -334,6 +352,26 @@ def build_command_frame(request_id: int, session: str, command: str) -> bytes:
             "session": session,
             "cmd": command,
             "params": {},
+        }
+    )
+
+
+def build_hid_route_set_frame(
+    request_id: int, session: str, route: OutputRoute
+) -> bytes:
+    if type(request_id) is not int or not 0 <= request_id <= MAX_ID:
+        raise ProtocolError("request id is invalid")
+    if not isinstance(session, str) or TOKEN_PATTERN.fullmatch(session) is None:
+        raise ProtocolError("session is invalid")
+    if not isinstance(route, OutputRoute):
+        raise ProtocolError("HID output route is invalid")
+    return _serialize_request(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "session": session,
+            "cmd": "hid.route.set",
+            "params": {"route": route.value},
         }
     )
 
@@ -589,6 +627,41 @@ def validate_usb_exposure_status(value: Any) -> UsbExposureStatus:
         host_release_uncertain=value["host_release_uncertain"],
         recovery_required=value["recovery_required"],
         last_error=last_error,
+    )
+
+
+def validate_hid_route_status(value: Any) -> HidRouteStatus:
+    fields = {"desired", "active", "generation", "transition", "ready"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProtocolError("hid.route status result fields are invalid")
+    try:
+        desired = OutputRoute(value["desired"])
+        active = OutputRoute(value["active"])
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("HID output route value is invalid") from exc
+    generation = value["generation"]
+    transition = value["transition"]
+    ready = value["ready"]
+    if type(generation) is not int or not 0 <= generation <= MAX_USB_GENERATION:
+        raise ProtocolError("HID route generation is invalid")
+    if transition not in {"stable", "releasing"}:
+        raise ProtocolError("HID route transition is invalid")
+    if type(ready) is not bool:
+        raise ProtocolError("HID route readiness is invalid")
+    if transition == "releasing" and not (
+        desired is OutputRoute.NONE and active is OutputRoute.USB and not ready
+    ):
+        raise ProtocolError("HID route releasing state is invalid")
+    if transition == "stable" and desired is not active:
+        raise ProtocolError("HID route stable state is invalid")
+    if active is OutputRoute.NONE and ready:
+        raise ProtocolError("HID route none cannot be ready")
+    return HidRouteStatus(
+        desired=desired,
+        active=active,
+        generation=generation,
+        transition=cast(Literal["stable", "releasing"], transition),
+        ready=ready,
     )
 
 

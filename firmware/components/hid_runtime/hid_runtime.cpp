@@ -361,7 +361,6 @@ void StateMachine::set_ready(Interface interface, bool ready) {
     } else {
         status_bits_.fetch_and(static_cast<std::uint8_t>(~bit), std::memory_order_release);
     }
-    apply_u7_1b_compatibility_route();
 }
 
 StatusSnapshot StateMachine::status() const {
@@ -666,26 +665,6 @@ bool StateMachine::unsafe_route_active(RouteGeneration generation,
                                        HidTransport transport) const {
     return transport == HidTransport::kUsb &&
            route_.matches(hid_route::OutputRoute::kUsb, generation);
-}
-
-bool StateMachine::compatibility_usb_route_can_select() const {
-    const StatusSnapshot snapshot = status();
-    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
-    return snapshot.mounted && !snapshot.suspended &&
-           (snapshot.keyboard_ready || snapshot.mouse_ready) &&
-           !any_safety_required() && !lifecycle.safety_pending &&
-           !lifecycle.host_release_uncertain && !lifecycle.recovery_required &&
-           lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed &&
-           lifecycle.observed == usb_lifecycle::ObservedState::kMounted;
-}
-
-void StateMachine::apply_u7_1b_compatibility_route() {
-    // U7.2A-only policy: this is the one removable compatibility seam. Public
-    // Model B selection remains deferred, so attach never selects before a
-    // clean mounted/readiness state exists.
-    if (compatibility_usb_route_can_select()) {
-        (void)route_.commit_usb_if_none();
-    }
 }
 
 bool StateMachine::safety_transport_active(Interface interface) const {
@@ -1920,7 +1899,6 @@ bool StateMachine::report_complete_for_token(std::uint8_t instance, HidWorkToken
     if ((kind == ReportKind::kSafetyKeyboard || kind == ReportKind::kSafetyMouse) &&
         !any_safety_required()) {
         usb_lifecycle_.mark_release_confirmed();
-        apply_u7_1b_compatibility_route();
     }
     return true;
 }

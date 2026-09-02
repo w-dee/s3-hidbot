@@ -417,8 +417,6 @@ class StateMachine {
     InterfaceState &state(Interface interface);
     const InterfaceState &state(Interface interface) const;
     bool mounted_and_active(Interface interface) const;
-    bool compatibility_usb_route_can_select() const;
-    void apply_u7_1b_compatibility_route();
     void retire_unsafe_route_authority();
     bool route_usb_ready(const hid_route::Snapshot &route,
                          const usb_lifecycle::Snapshot &lifecycle,

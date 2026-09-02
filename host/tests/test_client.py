@@ -13,7 +13,7 @@ from hidbot.errors import (
     SessionLostError,
 )
 from hidbot.framing import FRAME_PREFIX, TRANSPORT_SYNC
-from hidbot.protocol import BASELINE_REQUIRED_CAPABILITIES, MAX_ID
+from hidbot.protocol import BASELINE_REQUIRED_CAPABILITIES, MAX_ID, OutputRoute
 
 
 TOKEN = "0123456789abcdef0123456789abcdef"
@@ -63,6 +63,7 @@ def hello_response(
             "hid.release-all-v1",
             "hid.keyboard-report-v1",
             "hid.mouse-report-v1",
+            "hid.output-route-v1",
         ]
     return response(
         request_id,
@@ -222,6 +223,49 @@ class ClientTests(unittest.TestCase):
                 method()
         self.assertEqual(client.session, TOKEN)
         self.assertEqual(transport.writes, [])
+
+    def test_hid_route_primitives_are_typed_strict_and_capability_gated(self) -> None:
+        route_status = {
+            "desired": "usb",
+            "active": "usb",
+            "generation": 7,
+            "transition": "stable",
+            "ready": True,
+        }
+
+        def on_write(transport: FakeTransport, data: bytes) -> None:
+            if data == TRANSPORT_SYNC:
+                return
+            value = request_object(data)
+            if value["cmd"] == "protocol.hello":
+                transport.chunks.append(
+                    hello_response(value["id"], value["params"]["client_nonce"])
+                )
+            elif value["cmd"] == "hid.route.status":
+                self.assertEqual(value["params"], {})
+                transport.chunks.append(response(value["id"], TOKEN, result=route_status))
+            elif value["cmd"] == "hid.route.set":
+                self.assertEqual(value["params"], {"route": "usb"})
+                transport.chunks.append(response(value["id"], TOKEN, result=route_status))
+
+        transport = FakeTransport(on_write)
+        client = self.make_client(transport)
+        client.connect()
+        self.assertEqual(client.hid_route_status().active, OutputRoute.USB)
+        self.assertTrue(client.hid_route_status().ready)
+        self.assertEqual(client.hid_route_set(OutputRoute.USB).generation, 7)
+        self.assertIsNone(client.session)
+
+        missing = self.make_client(FakeTransport())
+        missing._session = TOKEN
+        missing._capabilities = tuple(BASELINE_REQUIRED_CAPABILITIES)
+        with self.assertRaises(CompatibilityError):
+            missing.hid_route_status()
+        with self.assertRaises(CompatibilityError):
+            missing.hid_route_set(OutputRoute.USB)
+        with self.assertRaises(ProtocolError):
+            missing.hid_route_set("ble")
+        self.assertEqual(missing._transport.writes, [])
 
     def test_keyboard_report_returns_typed_result_and_canonical_params(self) -> None:
         def on_write(transport: FakeTransport, data: bytes) -> None:

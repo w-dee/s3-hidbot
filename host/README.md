@@ -31,6 +31,7 @@ installation flow is in the project
 - UART read-only diagnostics: `hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, and
   `verify-firmware ARTIFACT`.
 - Explicit USB exposure control: `usb-attach` and `usb-detach`.
+- Explicit HID output routing: `hid-route-status` and `hid-route-set none|usb`.
 - UART diagnostic with safety action: `self-test`.
 - Explicit safety recovery: `release-all`.
 - Destructive provisioning: `flash-firmware ARTIFACT`.
@@ -43,7 +44,10 @@ uses its fixed policy.
 
 Native USB HID is hidden by default. Use CH343 UART to request `usb-attach`,
 then poll `usb-exposure-status`; do not infer native USB enumeration from an
-accepted attach response. `usb-detach` attempts safety all-up handling before
+accepted attach response. Exposure and routing are separate: mount leaves the
+route at `none`, so use `hid-route-set usb`, establish a fresh hello, and only
+then submit an authorized unsafe report. `hid-route-set none` safely releases
+the old route but leaves USB mounted. `usb-detach` attempts safety all-up handling before
 public driver uninstall but cannot prove host-observed release. A lifecycle
 result may retire control authority, so reconnect before later commands. The
 legacy `usb-status` command remains a basic readiness view.

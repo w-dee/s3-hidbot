@@ -140,13 +140,24 @@ request exposure and poll its lifecycle state:
 hidbotctl --json usb-attach
 # establish a fresh session, then:
 hidbotctl --json usb-exposure-status
+# when status is mounted and both endpoints are ready:
+hidbotctl --json hid-route-set usb
+# establish another fresh session before unsafe HID
 ```
 
 Attach creates a fresh TinyUSB stack instance; `attaching` only means the
 request was accepted. Wait for `disconnected` or `mounted` and never treat an
-accepted response as enumeration or endpoint-ready proof. `usb-detach` first
+accepted response as enumeration or endpoint-ready proof. Mount does not select
+an HID output route: reports remain `HID_NOT_READY` until explicit
+`hid-route-set usb`. `hid-route-set none` leaves native USB mounted while safely
+retiring HID output authority. `usb-detach` first
 attempts all-up safety handling and then uninstalls the public TinyUSB stack;
 it does not prove that the host observed the all-up state. If
 `host_release_uncertain` or `recovery_required` is true, stop unsafe use and
 require human review. This software slice is not itself authorization for a
 physical attach/detach operation.
+
+This is an intentional U7.2B migration. The old sequence was `usb-attach`, wait
+for mount, then send HID. The U7.2B sequence is `usb-attach`, wait for mount,
+observe `HID_NOT_READY` for HID while the route is none, run
+`hid-route-set usb`, establish a fresh hello session, and only then send HID.

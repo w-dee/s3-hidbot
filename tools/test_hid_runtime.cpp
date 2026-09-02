@@ -47,6 +47,8 @@ void ready(hid_runtime::StateMachine &state) {
     expose(state);
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
 }
 
 void test_lifecycle_and_generation_cancellation() {
@@ -145,10 +147,13 @@ void test_route_generation_is_independent_and_gates_stale_unsafe_work() {
     expose(state);
     assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
     const hid_route::Snapshot usb_route = state.route_snapshot();
     assert(usb_route.active == hid_route::OutputRoute::kUsb);
     assert(usb_route.generation == 1);
-    state.set_ready(hid_runtime::Interface::kMouse, true);
 
     assert(state.queue_mouse_report(0, 1, 0, 0, 0));
     state.set_before_submit_hook_for_test(invalidate_route_before_submit);
@@ -356,7 +361,7 @@ void test_attach_boundary_blocks_stale_hidden_reconciliation() {
     assert(!state.usb_lifecycle_snapshot().safety_pending);
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
-    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
 }
 
 void test_later_attach_after_clean_hidden_release_has_no_stale_work() {
@@ -377,7 +382,7 @@ void test_later_attach_after_clean_hidden_release_has_no_stale_work() {
     assert(sink.calls == 0);
     assert(!state.release_requested_for_test());
     assert(!state.usb_lifecycle_snapshot().safety_pending);
-    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
 }
 
 void test_uncertainty_is_not_zero_work_terminalized() {
@@ -555,6 +560,9 @@ void test_suspend_preserves_safety_and_ignores_late_completion() {
     assert(sink.calls == 2 && sink.instance == 0 && sink.report[0] == 0 && sink.report[2] == 0);
     state.report_complete(0);
     assert(!state.safety_required(hid_runtime::Interface::kKeyboard));
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
     assert(state.queue_mouse_report(0, 10, 0, 0, 0));
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 3 && sink.instance == 1 && sink.report[1] == 10);
@@ -761,6 +769,8 @@ void test_keyboard_report_ticket_cancellation_and_barriers() {
     // until the all-up barrier completes.
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
     assert(state.queue_mouse_report(1, 0, 0, 0, 0));
     state.execute(Sink::submit, &sink);
     state.request_release_all();
@@ -857,7 +867,10 @@ void test_mouse_report_ticket_cancellation_and_failure() {
            hid_runtime::MouseReportTicketOutcome::kAuthorityLost);
     state.finalize_mouse_report();
     state.on_resume();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
 
     // TinyUSB submit=false is terminal for the unsafe report and does not
     // cause a later SOF retry or an inverse movement.
@@ -975,6 +988,9 @@ void test_late_tokenized_callbacks_cannot_affect_new_generation() {
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 3 && sink.instance == 1 && sink.report[0] == 0);
     state.report_complete(1);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
 
     assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
            hid_runtime::MouseReportBeginResult::kPublished);
@@ -1013,6 +1029,8 @@ void test_relative_and_safety_work_do_not_cross_usb_generation() {
     state.set_ready(hid_runtime::Interface::kMouse, true);
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 0);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
 
     // An old all-up retry is canceled rather than applied to the fresh
     // attachment. The retained uncertainty instead causes distinct

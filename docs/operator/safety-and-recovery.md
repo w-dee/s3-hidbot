@@ -15,14 +15,18 @@ driver uninstall. Neither accepted command response proves USB enumeration,
 uninstall completion, or host-observed all-up. Poll `usb-exposure-status` for
 the authoritative lifecycle state; `usb.status` remains only the legacy/basic
 readiness view. Repeated attach/detach can allocate and free TinyUSB resources.
+Exposure and HID output selection are independent. Mount/resume never selects
+USB; `hid-route-set usb` is required, and an actual selection requires a fresh
+hello before unsafe reports. `hid-route-set none` performs any required all-up
+on the old USB route and leaves the USB device mounted.
 
 Detach preserves fail-closed uncertainty. `host_release_uncertain:true` means
 the old host state could not be proven released; a later attach requires a
 fresh-generation all-up reconciliation before unsafe HID can proceed. A true
 `recovery_required` means a public install/uninstall may have crossed a partial
 failure boundary: no automatic retry, reconnect, or stack surgery is allowed.
-Use reboot or manual operator intervention. U7.1B does not make `self-test`
-attach USB.
+Use reboot or manual operator intervention. `self-test` does not attach USB or
+select an HID output route.
 
 `keyboard-report` and `mouse-report` are unsafe HID injection. They require
 explicit human authorization and command-local `--unsafe-hid`. Raw usages—not
@@ -88,7 +92,7 @@ supported verified FNK0085 plan and requires `s3-hidbot-host[flash]` with
 | Exit 8 | Stop. The internal programming budget is exhausted. Do not blindly retry, erase, change baud, or mutate the plan. Preserve diagnostics and request review. |
 | Flash exits 3–7 with `flash.classification:"FLASHED"` | Programming already succeeded. Do not reflash automatically. Repair UART selection/access if applicable, run `verify-firmware` with the **same** artifact, and preserve the result. |
 | Exit 7 / identity mismatch | Compare the intended Actions run/artifact identity with reported device identity. Stop for review rather than reflashing. |
-| Unsafe HID uncertainty | Run `release-all`. If safety cannot be established, stop unsafe automation and require human review. |
+| Unsafe HID uncertainty | Run `release-all`. If safety cannot be established, keep route `none`, stop unsafe automation, and require human review. |
 | `usb.exposure.status.recovery_required:true` | Stop. Do not retry attach/detach automatically; reboot or obtain manual operator intervention. |
 | `usb.exposure.status.host_release_uncertain:true` | Stop unsafe HID. A later authorized attach must first complete fresh-generation all-up reconciliation. |
 

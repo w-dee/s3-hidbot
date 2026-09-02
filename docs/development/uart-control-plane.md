@@ -7,11 +7,12 @@ separate TinyUSB HID Device path. A host must never assume that opening a serial
 device proves that the HID USB path is attached, or vice versa.
 
 The current v1 implementation extends the bounded JSON control core with the mandatory session lease,
-HID runtime safety foundation, explicit native-USB exposure control, the
-safety-only `hid.release_all` command, and the public absolute
+HID runtime safety foundation, explicit native-USB exposure control, explicit
+HID output routing, the safety-only `hid.release_all` command, and the public absolute
 `hid.keyboard.report` and relative `hid.mouse.report` commands. It implements
 `protocol.hello`, `system.ping`, `system.info`, `usb.status`,
-`usb.exposure.status`, `usb.attach`, `usb.detach`, `hid.release_all`,
+`usb.exposure.status`, `usb.attach`, `usb.detach`, `hid.route.status`,
+`hid.route.set`, `hid.release_all`,
 `hid.keyboard.report`, and `hid.mouse.report`. There is still no keyboard
 helper, high-level keyboard/mouse automation, asynchronous event, BLE route,
 GPIO action, or reset command. Primitive report CLI commands are documented
@@ -170,7 +171,7 @@ initial capability list:
 ```text
   protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
   usb.exposure-control-v1, hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
-  hid.mouse-report-v1, firmware.identity-v1
+  hid.mouse-report-v1, firmware.identity-v1, hid.output-route-v1
 ```
 
 For a successful hello, top-level `session` equals `result.session`. Both are
@@ -180,7 +181,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1","hid.output-route-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
@@ -387,6 +388,62 @@ relative motion or old all-up work.
 
 Lifecycle transitions do not produce asynchronous machine events.
 
+## Explicit HID output routing
+
+The additive `hid.output-route-v1` capability exposes `hid.route.status` and
+`hid.route.set` without changing protocol version 1. USB exposure and HID
+output selection are independent: `usb.attach`, mount, resume, reattach, and
+reconnect never select USB. Unsafe keyboard and mouse reports return
+`HID_NOT_READY` while the route is none.
+
+`hid.route.status` accepts only omitted params or `{}`. `hid.route.set` accepts
+exactly `{"route":"none"}` or `{"route":"usb"}`. Missing/additional fields,
+non-string values, unknown strings, and `"ble"` are `INVALID_PARAMS`; U7.2B
+does not initialize or advertise BLE.
+
+Both successful commands return exactly:
+
+```json
+{
+  "desired": "none|usb",
+  "active": "none|usb",
+  "generation": 0,
+  "transition": "stable|releasing",
+  "ready": false
+}
+```
+
+Cold boot is stable none, generation zero, not ready, and is queryable over
+UART while native USB remains hidden. Route generation is an opaque uint32
+authority epoch: consumers may compare only equality/inequality; it is not an
+ordered value or transition count, wrap is permitted, and a preempted
+authority retirement may consume an epoch.
+
+Selecting USB requires stable none, exposed/mounted USB, no suspend, both HID
+endpoints ready, no safety pending, no host-release uncertainty, and no
+recovery requirement. A clean selection is synchronous, advances route
+generation, revokes unsafe/session authority, and returns a frozen stable USB
+snapshot. Hidden, attaching, disconnected, suspended, detaching, or recovery
+states return `HID_NOT_READY`; safety or host uncertainty returns
+`HID_SAFETY_PENDING`; a shared lifecycle/route transition returns `HID_BUSY`.
+
+USB-to-none first publishes the frozen Stage-A response `desired=none`,
+`active=usb`, old generation, `transition=releasing`, `ready=false`. It revokes
+unsafe authority and cancels stale work, then uses the single control executor
+to send any required all-up over the old USB identity. Stable none is published
+only after clean or fail-closed terminalization; USB remains installed and
+mounted. Failure retains uncertainty in USB transport state and never selects
+another route. Suspend/unmount immediately close unsafe authority and
+terminalize none without waiting for the control task; resume/reconnect do not
+restore the route.
+
+Accepted route mutations share the exact serialized control-transition retry
+cache with USB attach/detach. Same original session, ID, and request bytes may
+replay the immutable accepted response after session revocation; asynchronous
+completion cannot change it, and a fresh hello retires the proof. Stable
+none-to-none and ready USB-to-USB are no-ops with no generation, authority,
+session, release, safety, or executor change.
+
 ## Absolute keyboard reports
 
 `hid.keyboard.report` is the first public unsafe HID operation. Its only
@@ -464,10 +521,11 @@ valid `boot_id`, expected project/protocol version, exact `lease_ms:5000`, and
 a valid capabilities list. The host compatibility baseline is the six safe
 control-plane capabilities: `protocol.hello-v1`, `system.ping-v1`,
 `system.info-v1`, `usb.status-v1`, `hid.lease-v1`, and
-`hid.release-all-v1`. Keyboard and mouse report capabilities are optional;
-the corresponding Client methods fail locally before allocating an ID or
-writing a frame when the peer does not advertise them. Unknown additional
-capabilities are preserved and do not make an otherwise compatible peer fail.
+`hid.release-all-v1`. Keyboard, mouse, and explicit output-route capabilities
+are optional; the corresponding Client methods fail locally before allocating
+an ID or writing a frame when the peer does not advertise them. Unknown
+additional capabilities are preserved and do not make an otherwise compatible
+peer fail.
 A wrong-nonce/stale frame must never establish a session. The client applies
 the bounded discard limit and timeout recovery (`TRANSPORT_SYNC` followed by a
 fresh hello) in the generic host core.
@@ -516,10 +574,10 @@ matching top-level/result sessions, a valid boot ID, `s3-hidbot` identity, the
 six-capability baseline (`protocol.hello-v1`, `system.ping-v1`,
 `system.info-v1`, `usb.status-v1`, `hid.lease-v1`, and
 `hid.release-all-v1`), exact lease metadata, and a unique bounded capability
-list. Keyboard and mouse report capabilities are optional; the corresponding
-Client methods fail locally before allocating an ID or writing a frame when
-the peer does not advertise them. Unknown additional capabilities are
-preserved and do not make an otherwise compatible peer fail. A stale hello
+list. Keyboard, mouse, and explicit output-route capabilities are optional;
+the corresponding Client methods fail locally before allocating an ID or
+writing a frame when the peer does not advertise them. Unknown additional
+capabilities are preserved and do not make an otherwise compatible peer fail. A stale hello
 with the wrong nonce never establishes a session. `session:null` errors are
 retained only as bounded untrusted diagnostics and cannot complete a request.
 
@@ -536,10 +594,12 @@ as unknown/session-lost.
 
 After `connect()`/hello, the host client exposes `ping()`, `info()`,
 `usb_status()`, optional `usb_exposure_status()`, `usb_attach()`, and
-`usb_detach()`, the safety-only `Client.release_all()` API, and the explicit
+`usb_detach()`, optional `hid_route_status()` and `hid_route_set()`, the
+safety-only `Client.release_all()` API, and the explicit
 `Client.keyboard_report()` and `Client.mouse_report()` primitive APIs. The CLI
-also exposes `usb-exposure-status`, `usb-attach`, `usb-detach`, and explicit
-`keyboard-report` and `mouse-report` commands, each with command-local
+also exposes `usb-exposure-status`, `usb-attach`, `usb-detach`,
+`hid-route-status`, `hid-route-set none|usb`, and explicit `keyboard-report`
+and `mouse-report` commands, each with command-local
 `--unsafe-hid`; no arbitrary raw command API exists. The hello result exposes
 read-only `lease_ms` metadata. Closing the client only closes the injected
 transport and invalidates local session state; it sends no UART command.
@@ -568,6 +628,7 @@ failures become `TransportError`; request deadline expiry remains
 
 The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`,
 `usb-status`, `usb-exposure-status`, explicit `usb-attach` and `usb-detach`,
+explicit `hid-route-status` and `hid-route-set none|usb`,
 and the safe `self-test` control-plane diagnostic through the diagnostic
 client methods, the safety recovery command `release-all` through
 `Client.release_all()`, artifact-only validation via `verify-artifact ARTIFACT`,
@@ -712,8 +773,9 @@ instantaneous endpoint availability, including endpoint-busy state; they are
 not a promise that a host will remain attached or that a queued report will be
 delivered.
 The existing Configuration 1, Boot Keyboard/Mouse interfaces, endpoints
-0x81/0x82, descriptors, and VID/PID are unchanged. The public commands are the
-safety-only `hid.release_all`, `hid.keyboard.report`, and `hid.mouse.report`.
+0x81/0x82, descriptors, and VID/PID are unchanged. The public HID commands are
+the safety-only `hid.release_all`, the unsafe `hid.keyboard.report` and
+`hid.mouse.report` primitives, and `hid.route.status` and `hid.route.set`.
 The optional BOOT-button diagnostic remains build-time
 disabled by default and routes any enabled test report through the runtime.
 

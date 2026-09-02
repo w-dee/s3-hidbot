@@ -143,6 +143,56 @@ control_protocol::UsbExposureActionOutcome usb_detach(void *) {
     }
 }
 
+control_protocol::HidRouteStatus make_hid_route_status(
+    hid_runtime::RouteStatusSnapshot snapshot) {
+    const auto route = [](hid_route::OutputRoute value) {
+        return value == hid_route::OutputRoute::kUsb
+                   ? control_protocol::OutputRoute::kUsb
+                   : control_protocol::OutputRoute::kNone;
+    };
+    return control_protocol::HidRouteStatus{
+        .desired = route(snapshot.route.desired),
+        .active = route(snapshot.route.active),
+        .generation = snapshot.route.generation,
+        .transition = snapshot.route.transition == hid_route::Transition::kReleasing
+                          ? control_protocol::RouteTransition::kReleasing
+                          : control_protocol::RouteTransition::kStable,
+        .ready = snapshot.ready,
+    };
+}
+
+control_protocol::HidRouteStatus hid_route_status(void *) {
+    return make_hid_route_status(s_usb_exposure.route_snapshot());
+}
+
+control_protocol::HidRouteActionOutcome hid_route_set(
+    void *, control_protocol::OutputRoute desired) {
+    const hid_control_executor::RouteCommandOutcome outcome =
+        s_usb_exposure.request_route(desired == control_protocol::OutputRoute::kUsb
+                                         ? hid_route::OutputRoute::kUsb
+                                         : hid_route::OutputRoute::kNone);
+    const auto result = [](hid_runtime::RouteTransitionResult value) {
+        switch (value) {
+            case hid_runtime::RouteTransitionResult::kAccepted:
+                return control_protocol::HidRouteActionResult::kAccepted;
+            case hid_runtime::RouteTransitionResult::kNoOp:
+                return control_protocol::HidRouteActionResult::kNoOp;
+            case hid_runtime::RouteTransitionResult::kNotReady:
+                return control_protocol::HidRouteActionResult::kNotReady;
+            case hid_runtime::RouteTransitionResult::kSafetyPending:
+                return control_protocol::HidRouteActionResult::kSafetyPending;
+            case hid_runtime::RouteTransitionResult::kBusy:
+            default:
+                return control_protocol::HidRouteActionResult::kBusy;
+        }
+    };
+    return control_protocol::HidRouteActionOutcome{
+        .action_result = result(outcome.action_result),
+        .snapshot_valid = outcome.snapshot_valid,
+        .snapshot = make_hid_route_status(outcome.snapshot),
+    };
+}
+
 void request_hid_safety_release(void *) {
     s_hid_runtime.request_release_all();
 }
@@ -513,6 +563,10 @@ extern "C" void app_main() {
         .usb_attach_context = nullptr,
         .usb_detach_provider = usb_detach,
         .usb_detach_context = nullptr,
+        .hid_route_status_provider = hid_route_status,
+        .hid_route_status_context = nullptr,
+        .hid_route_set_provider = hid_route_set,
+        .hid_route_set_context = nullptr,
         .authority_epoch_provider = hid_authority_epoch,
         .authority_epoch_context = nullptr,
         .output = nullptr,

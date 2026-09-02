@@ -752,8 +752,9 @@ def run_keyboard_smoke(
 
     The injected seams keep all tests off physical `/dev/input` and serial
     devices while the production path reuses the existing host transport and
-    ``Client`` APIs.  A successful run has one connect, one down, one explicit
-    all-up keyboard report, one final ``release_all``, and one close.
+    ``Client`` APIs. A successful run explicitly selects USB, establishes a
+    fresh session, performs one down and one explicit all-up keyboard report,
+    then runs ``release_all`` and returns the route to none before close.
     """
 
     if not serial_port or baudrate <= 0:
@@ -782,6 +783,7 @@ def run_keyboard_smoke(
         "up_latency_ms": None,
         "cleanup_attempted": False,
         "cleanup_result": None,
+        "route_cleanup": None,
     }
     event_evidence = _EventEvidence()
     event_evidence.update(evidence)
@@ -789,6 +791,7 @@ def run_keyboard_smoke(
     transport: Any | None = None
     client: Any | None = None
     session_started = False
+    route_selected = False
     down_accepted = False
     down_observed = False
     cleanup_error: Exception | None = None
@@ -823,6 +826,9 @@ def run_keyboard_smoke(
         client = client_factory(transport, event_timeout)
         client.connect()
         session_started = True
+        client.hid_route_set("usb")
+        route_selected = True
+        client.connect()
 
         down_result = client.keyboard_report(modifiers=0, keys=[F24_USAGE])
         down_state = _report_state(down_result)
@@ -890,6 +896,8 @@ def run_keyboard_smoke(
         evidence["cleanup_attempted"] = True
         try:
             evidence["cleanup_result"] = _release_result(client.release_all())
+            evidence["route_cleanup"] = client.hid_route_set("none").active.value
+            route_selected = False
         except Exception as exc:
             # The final release_all is safety cleanup, so a failure here is a
             # distinct cleanup-only result rather than a primary report error.
@@ -924,6 +932,13 @@ def run_keyboard_smoke(
                     evidence["cleanup_result"] = _release_result(client.release_all())
                 except Exception as exc:
                     cleanup_error = exc
+            if route_selected:
+                try:
+                    evidence["route_cleanup"] = client.hid_route_set("none").active.value
+                    route_selected = False
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
         if client is not None:
             try:
                 client.close()
@@ -1129,6 +1144,7 @@ def run_mouse_smoke(
         "packet_complete": False,
         "cleanup_attempted": False,
         "cleanup_result": None,
+        "route_cleanup": None,
     }
     event_evidence = _MouseEventEvidence()
     event_evidence.update(evidence)
@@ -1136,6 +1152,7 @@ def run_mouse_smoke(
     transport: Any | None = None
     client: Any | None = None
     session_started = False
+    route_selected = False
     cleanup_error: Exception | None = None
     primary_error: MouseSmokeError | None = None
     batch_number = 0
@@ -1151,6 +1168,9 @@ def run_mouse_smoke(
         client = client_factory(transport, event_timeout)
         client.connect()
         session_started = True
+        client.hid_route_set("usb")
+        route_selected = True
+        client.connect()
 
         result = client.mouse_report(0, 1, 0, 0, 0)
         report_state = _report_state(result)
@@ -1189,6 +1209,8 @@ def run_mouse_smoke(
             evidence["cleanup_result"] = _release_result(
                 client.release_all(), error_type=MouseSmokeError
             )
+            evidence["route_cleanup"] = client.hid_route_set("none").active.value
+            route_selected = False
         except Exception as exc:
             cleanup_error = exc
         evidence["status"] = "pass"
@@ -1211,6 +1233,13 @@ def run_mouse_smoke(
                 )
             except Exception as exc:
                 cleanup_error = exc
+        if route_selected and client is not None:
+            try:
+                evidence["route_cleanup"] = client.hid_route_set("none").active.value
+                route_selected = False
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if client is not None:
             try:
                 client.close()

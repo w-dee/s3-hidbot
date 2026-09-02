@@ -8,16 +8,19 @@ from hidbot.protocol import (
     BASELINE_REQUIRED_CAPABILITIES,
     CompatibilityResult,
     FirmwareIdentity,
+    OutputRoute,
     HelloResponse,
     OPTIONAL_CAPABILITIES,
     REQUIRED_CAPABILITIES,
     SystemInfo,
     build_command_frame,
+    build_hid_route_set_frame,
     build_keyboard_report_frame,
     build_mouse_report_frame,
     build_hello_frame,
     parse_response,
     validate_release_all_result,
+    validate_hid_route_status,
     validate_keyboard_report_result,
     validate_mouse_report_result,
     validate_usb_exposure_status,
@@ -36,6 +39,39 @@ def frame_payload(value: object) -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_hid_route_builder_and_strict_status(self) -> None:
+        self.assertEqual(
+            build_hid_route_set_frame(3, TOKEN, OutputRoute.USB),
+            b'@HIDBOT {"v":1,"id":3,"session":"0123456789abcdef0123456789abcdef",'
+            b'"cmd":"hid.route.set","params":{"route":"usb"}}\n',
+        )
+        parsed = validate_hid_route_status(
+            {
+                "desired": "none",
+                "active": "usb",
+                "generation": 0xFFFF_FFFF,
+                "transition": "releasing",
+                "ready": False,
+            }
+        )
+        self.assertEqual(parsed.desired, OutputRoute.NONE)
+        self.assertEqual(parsed.active, OutputRoute.USB)
+        for invalid in (
+            {},
+            {"desired": "ble", "active": "none", "generation": 0,
+             "transition": "stable", "ready": False},
+            {"desired": "none", "active": "usb", "generation": 0,
+             "transition": "stable", "ready": False},
+            {"desired": "none", "active": "none", "generation": -1,
+             "transition": "stable", "ready": False},
+            {"desired": "none", "active": "none", "generation": 0,
+             "transition": "stable", "ready": True},
+        ):
+            with self.assertRaises(ProtocolError):
+                validate_hid_route_status(invalid)
+        with self.assertRaises(ProtocolError):
+            build_hid_route_set_frame(1, TOKEN, "ble")  # type: ignore[arg-type]
+
     def test_keyboard_report_builder_and_strict_result(self) -> None:
         frame = build_keyboard_report_frame(3, TOKEN, 2, [4, 5, 0xA4, 0xB0, 0xDD])
         self.assertEqual(

@@ -20,17 +20,21 @@ from .errors import (
 from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
+    HidRouteStatus,
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
     UsbExposureStatus,
+    OutputRoute,
     Response,
     build_keyboard_report_frame,
+    build_hid_route_set_frame,
     build_mouse_report_frame,
     build_command_frame,
     build_hello_frame,
     parse_response,
     validate_keyboard_report_result,
+    validate_hid_route_status,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
     validate_release_all_result,
@@ -390,6 +394,36 @@ class Client:
 
         with self._lock:
             return self._usb_lifecycle_transition_locked("usb.detach")
+
+    def hid_route_status(self) -> HidRouteStatus:
+        """Return the coherent explicit HID output-route transaction state."""
+
+        with self._lock:
+            self._require_capability_locked("hid.output-route-v1")
+            return validate_hid_route_status(self._request_locked("hid.route.status"))
+
+    def hid_route_set(self, route: OutputRoute | str) -> HidRouteStatus:
+        """Select none or USB explicitly; reconnect after an actual transition."""
+
+        try:
+            selected = route if isinstance(route, OutputRoute) else OutputRoute(route)
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError("HID output route is invalid") from exc
+        with self._lock:
+            self._require_capability_locked("hid.output-route-v1")
+            request_id, session = self._allocate_request_id_locked()
+            result = validate_hid_route_status(
+                self._request_frame_locked(
+                    request_id,
+                    session,
+                    build_hid_route_set_frame(request_id, session, selected),
+                )
+            )
+            # The exact result schema intentionally does not expose whether a
+            # stable result was an accepted mutation or a firmware no-op.
+            # Conservatively reconnect; firmware itself keeps no-op authority.
+            self._invalidate_session()
+            return result
 
     def release_all(self) -> ReleaseAllResult:
         """Request a bounded, safety-only all-up operation on both HID interfaces."""

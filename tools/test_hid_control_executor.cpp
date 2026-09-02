@@ -86,6 +86,10 @@ void mount_ready(hid_runtime::Runtime &runtime) {
 }
 
 void hold_f24(hid_runtime::Runtime &runtime, ReportSink &sink) {
+    if (runtime.state_machine().route_snapshot().active == hid_route::OutputRoute::kNone) {
+        assert(runtime.state_machine().request_route_usb().action_result ==
+               hid_runtime::RouteTransitionResult::kAccepted);
+    }
     const std::array<std::uint8_t, 6> f24 = {115, 0, 0, 0, 0, 0};
     assert(runtime.state_machine().queue_keyboard_report(0, f24));
     runtime.state_machine().execute(ReportSink::submit, &sink);
@@ -321,6 +325,8 @@ void test_route_zero_work_is_synchronous_and_never_uninstalls_usb() {
     hid_control_executor::Controller controller;
     complete_attach(runtime, backend, controller);
     mount_ready(runtime);
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
     const auto usb_generation = controller.snapshot().lifecycle.generation;
 
     const auto release = controller.request_route(hid_route::OutputRoute::kNone);

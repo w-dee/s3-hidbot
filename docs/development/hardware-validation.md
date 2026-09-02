@@ -146,14 +146,17 @@ fail-closed. After the release is observed, the quiet tail remains strict: any
 
 Its bounded order is: discover the validated keyboard, open and drain the
 read-only observer, construct/open one transport, connect one Client session,
-submit one F24-down report, observe `KEY_F24` value `1`, submit one explicit
+explicitly select route USB, establish a fresh session, submit one F24-down
+report, observe `KEY_F24` value `1`, submit one explicit
 keyboard all-up report, observe value `0` (with only pre-release F24 repeats
-tolerated), request one final `release_all`, then close the Client/transport
+tolerated), request one final `release_all`, return the route to none while USB
+remains mounted, then close the Client/transport
 and observer. It does not use a subprocess per report, retry HID requests, or
 replay a timed-out event. A down report that was accepted but not observed gets
 one bounded best-effort all-up attempt before final cleanup. Any failure after
-session start attempts at most one final `release_all`; the primary failure is
-preserved and a cleanup-only failure is reported separately. `EV_SYN` records
+session start attempts at most one final `release_all` and one route-none
+cleanup when USB was selected; the primary failure is preserved and a
+cleanup-only failure is reported separately. `EV_SYN` records
 are ignored, and bounded structured event evidence records phase, batch,
 position, timestamp, type, code, value, and classification. It separately
 reports the total observed pre-release repeat count and any repeat-limit event.
@@ -197,6 +200,9 @@ tests. A split read is nevertheless valid, while duplicate or wrong relative
 events, key events, unsupported metadata, `SYN_DROPPED`, and other `EV_SYN`
 values fail closed.
 The bounded quiet tail remains strict and rejects any later input event.
+The current Model B runner explicitly selects route USB, establishes a fresh
+session before the one relative report, then performs `release_all` and returns
+the route to none without detaching USB.
 Evidence records movement observation separately from packet completion, so a
 `REL_X` seen without its `SYN_REPORT` is reported as observed-but-incomplete,
 not as proof that no movement occurred. The raw evdev `REL_X` smoke is now

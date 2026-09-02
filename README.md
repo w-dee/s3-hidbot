@@ -55,7 +55,10 @@ firmware starts with the native TinyUSB stack uninstalled; `usb.attach` creates
 a fresh public TinyUSB instance and `usb.detach` performs lifecycle-owned
 safety handling before public uninstall. `usb.exposure.status` is the
 authoritative lifecycle view, while legacy `usb.status` retains its basic
-readiness schema. Accepted detach does not prove host-observed all-up, and
+readiness schema. USB exposure does not select an HID output: even after mount,
+unsafe reports return `HID_NOT_READY` until `hid.route.set {"route":"usb"}`.
+`hid.route.set {"route":"none"}` safely removes the route while leaving USB
+mounted. Accepted detach does not prove host-observed all-up, and
 uncertainty remains fail-closed across a later attach. v0.1.0 is historical
 always-exposed behavior; it cannot expose a future U7.1B firmware because it
 does not advertise `usb.exposure-control-v1`.

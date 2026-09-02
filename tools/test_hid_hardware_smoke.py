@@ -312,6 +312,10 @@ class KeyboardSmokeTests(unittest.TestCase):
                 actions.append("hello")
                 return SimpleNamespace(session="session")
 
+            def hid_route_set(self, route: str) -> object:
+                actions.append(f"route_{route}")
+                return SimpleNamespace(active=SimpleNamespace(value=route))
+
             def keyboard_report(self, modifiers: int, keys: list[int]) -> object:
                 report_calls.append((modifiers, list(keys)))
                 actions.append("keyboard_down" if keys else "keyboard_up")
@@ -366,12 +370,15 @@ class KeyboardSmokeTests(unittest.TestCase):
                 "transport_open",
                 "client_construct",
                 "hello",
+                "route_usb",
+                "hello",
                 "keyboard_down",
                 "observe",
                 "keyboard_up",
                 "observe",
                 "observe",
                 "release_all",
+                "route_none",
                 "transport_close",
                 "observer_close",
             ],
@@ -732,6 +739,10 @@ class MouseSmokeTests(unittest.TestCase):
                 actions.append("hello")
                 return SimpleNamespace(session="session")
 
+            def hid_route_set(self, route: str) -> object:
+                actions.append(f"route_{route}")
+                return SimpleNamespace(active=SimpleNamespace(value=route))
+
             def mouse_report(
                 self, buttons: int, x: int, y: int, wheel: int, pan: int
             ) -> object:
@@ -789,10 +800,13 @@ class MouseSmokeTests(unittest.TestCase):
                 "transport_open",
                 "client_construct",
                 "hello",
+                "route_usb",
+                "hello",
                 "mouse_report",
                 "observe",
                 "observe",
                 "release_all",
+                "route_none",
                 "transport_close",
                 "observer_close",
             ],

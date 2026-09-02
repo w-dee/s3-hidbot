@@ -85,6 +85,42 @@ struct UsbExposureActionOutcome {
 
 using UsbExposureStatusProvider = UsbExposureStatus (*)(void *context);
 using UsbExposureActionProvider = UsbExposureActionOutcome (*)(void *context);
+
+enum class OutputRoute : std::uint8_t {
+    kNone,
+    kUsb,
+};
+
+enum class RouteTransition : std::uint8_t {
+    kStable,
+    kReleasing,
+};
+
+struct HidRouteStatus {
+    OutputRoute desired = OutputRoute::kNone;
+    OutputRoute active = OutputRoute::kNone;
+    std::uint32_t generation = 0;
+    RouteTransition transition = RouteTransition::kStable;
+    bool ready = false;
+};
+
+enum class HidRouteActionResult : std::uint8_t {
+    kAccepted,
+    kNoOp,
+    kBusy,
+    kNotReady,
+    kSafetyPending,
+};
+
+struct HidRouteActionOutcome {
+    HidRouteActionResult action_result = HidRouteActionResult::kBusy;
+    bool snapshot_valid = false;
+    HidRouteStatus snapshot{};
+};
+
+using HidRouteStatusProvider = HidRouteStatus (*)(void *context);
+using HidRouteActionProvider = HidRouteActionOutcome (*)(void *context,
+                                                         OutputRoute desired);
 using AuthorityEpochProvider = control_session::AuthorityEpoch (*)(void *context);
 using OutputSink = bool (*)(void *context, const std::uint8_t *data, std::size_t length);
 using SafetyCallback = void (*)(void *context);
@@ -172,6 +208,10 @@ struct Config {
     void *usb_attach_context;
     UsbExposureActionProvider usb_detach_provider;
     void *usb_detach_context;
+    HidRouteStatusProvider hid_route_status_provider;
+    void *hid_route_status_context;
+    HidRouteActionProvider hid_route_set_provider;
+    void *hid_route_set_context;
     AuthorityEpochProvider authority_epoch_provider;
     void *authority_epoch_context;
     OutputSink output;

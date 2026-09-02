@@ -193,6 +193,66 @@ struct ExposureSource {
     }
 };
 
+struct RouteSource {
+    control_protocol::HidRouteStatus status{};
+    control_protocol::HidRouteActionResult result =
+        control_protocol::HidRouteActionResult::kAccepted;
+    AuthoritySource *authority = nullptr;
+    bool finish_release_before_return = false;
+    int set_calls = 0;
+
+    static control_protocol::HidRouteStatus get(void *context) {
+        return static_cast<RouteSource *>(context)->status;
+    }
+
+    static control_protocol::HidRouteActionOutcome set(
+        void *context, control_protocol::OutputRoute desired) {
+        auto *source = static_cast<RouteSource *>(context);
+        ++source->set_calls;
+        if (source->result == control_protocol::HidRouteActionResult::kAccepted) {
+            assert(source->authority != nullptr);
+            ++source->authority->epoch;
+            if (desired == control_protocol::OutputRoute::kUsb) {
+                ++source->status.generation;
+                source->status.desired = control_protocol::OutputRoute::kUsb;
+                source->status.active = control_protocol::OutputRoute::kUsb;
+                source->status.transition = control_protocol::RouteTransition::kStable;
+                source->status.ready = true;
+                return control_protocol::HidRouteActionOutcome{
+                    .action_result = source->result,
+                    .snapshot_valid = true,
+                    .snapshot = source->status,
+                };
+            }
+            source->status.desired = control_protocol::OutputRoute::kNone;
+            source->status.transition = control_protocol::RouteTransition::kReleasing;
+            source->status.ready = false;
+            const control_protocol::HidRouteStatus accepted = source->status;
+            if (source->finish_release_before_return) {
+                source->status.active = control_protocol::OutputRoute::kNone;
+                ++source->status.generation;
+                source->status.transition = control_protocol::RouteTransition::kStable;
+            }
+            return control_protocol::HidRouteActionOutcome{
+                .action_result = source->result,
+                .snapshot_valid = true,
+                .snapshot = accepted,
+            };
+        }
+        if (source->result == control_protocol::HidRouteActionResult::kNoOp) {
+            return control_protocol::HidRouteActionOutcome{
+                .action_result = source->result,
+                .snapshot_valid = true,
+                .snapshot = source->status,
+            };
+        }
+        return control_protocol::HidRouteActionOutcome{
+            .action_result = source->result,
+            .snapshot_valid = false,
+        };
+    }
+};
+
 struct ReleaseSource {
     control_protocol::ReleaseAllResult result{
         .success = true,
@@ -265,6 +325,7 @@ struct LeaseFixture {
     LeaseClock clock;
     AuthoritySource authority;
     ExposureSource exposure;
+    RouteSource route;
     ReleaseSource release;
     int expired_callbacks = 0;
     int takeover_callbacks = 0;
@@ -326,6 +387,7 @@ struct LeaseFixture {
 
     LeaseFixture() {
         exposure.authority = &authority;
+        route.authority = &authority;
         const control_protocol::Config config{
             .metadata = {"s3-hidbot", "esp32s3", "v5.5.4"},
             .usb_status_provider = LeaseFixture::usb_status,
@@ -336,6 +398,10 @@ struct LeaseFixture {
             .usb_attach_context = &exposure,
             .usb_detach_provider = ExposureSource::detach,
             .usb_detach_context = &exposure,
+            .hid_route_status_provider = RouteSource::get,
+            .hid_route_status_context = &route,
+            .hid_route_set_provider = RouteSource::set,
+            .hid_route_set_context = &route,
             .authority_epoch_provider = AuthoritySource::get,
             .authority_epoch_context = &authority,
             .output = Sink::write,
@@ -370,6 +436,7 @@ struct Fixture {
     StatusSource status;
     AuthoritySource authority;
     ExposureSource exposure;
+    RouteSource route;
     ReleaseSource release;
     KeyboardSource keyboard;
     MouseSource mouse;
@@ -384,6 +451,7 @@ struct Fixture {
             identity = make_test_identity();
         }
         exposure.authority = &authority;
+        route.authority = &authority;
         assert(protocol.initialize(configuration(), RandomSource::fill, &random));
     }
 
@@ -403,6 +471,10 @@ struct Fixture {
             .usb_attach_context = &exposure,
             .usb_detach_provider = ExposureSource::detach,
             .usb_detach_context = &exposure,
+            .hid_route_status_provider = RouteSource::get,
+            .hid_route_status_context = &route,
+            .hid_route_set_provider = RouteSource::set,
+            .hid_route_set_context = &route,
             .authority_epoch_provider = AuthoritySource::get,
             .authority_epoch_context = &authority,
             .output = Sink::write,
@@ -1301,6 +1373,100 @@ void test_mouse_report_schema_result_and_cache() {
     assert(fixture.mouse.calls == 3);
 }
 
+void test_hid_route_schema_frozen_retry_and_errors() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string hello = fixture.sink.last();
+    const std::string session = extract_string(hello, "session");
+    assert(count_occurrences(hello, "\"hid.output-route-v1\"") == 1);
+    assert(count_occurrences(hello, "-v1\"") == 11);
+    assert(hello.size() <= kMaxLogicalMachineFrameBytes);
+
+    fixture.payload(request(2, session, "hid.route.status"));
+    const std::string boot = fixture.sink.last();
+    require_contains(boot, "\"desired\":\"none\"");
+    require_contains(boot, "\"active\":\"none\"");
+    require_contains(boot, "\"generation\":0");
+    require_contains(boot, "\"transition\":\"stable\"");
+    require_contains(boot, "\"ready\":false");
+    assert(boot.find("\"mounted\":") == std::string::npos);
+    assert(boot.find("\"safety_pending\":") == std::string::npos);
+
+    int id = 3;
+    for (const char *params : {
+             "{}", "{\"route\":null}", "{\"route\":1}",
+             "{\"route\":\"ble\"}", "{\"route\":\"USB\"}",
+             "{\"route\":\"usb\",\"extra\":true}",
+         }) {
+        fixture.payload(request(id++, session, "hid.route.set", params));
+        require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    }
+    assert(fixture.route.set_calls == 0);
+
+    const std::string select = request(id++, session, "hid.route.set",
+                                       "{\"route\":\"usb\"}");
+    fixture.payload(select);
+    const std::string accepted_usb = fixture.sink.last();
+    require_contains(accepted_usb, "\"desired\":\"usb\"");
+    require_contains(accepted_usb, "\"active\":\"usb\"");
+    require_contains(accepted_usb, "\"generation\":1");
+    require_contains(accepted_usb, "\"transition\":\"stable\"");
+    require_contains(accepted_usb, "\"ready\":true");
+    assert(fixture.route.set_calls == 1);
+    fixture.payload(select);
+    assert(fixture.sink.last() == accepted_usb);
+    assert(fixture.route.set_calls == 1);
+    fixture.payload(request(id, session, "hid.route.set", "{\"route\":\"none\"}"));
+    require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
+
+    fixture.payload(hello_request(1, kNonceB));
+    const std::string second_session = extract_string(fixture.sink.last(), "session");
+    fixture.route.finish_release_before_return = true;
+    const std::string release = request(1, second_session, "hid.route.set",
+                                        "{\"route\":\"none\"}");
+    fixture.payload(release);
+    const std::string accepted_release = fixture.sink.last();
+    require_contains(accepted_release, "\"desired\":\"none\"");
+    require_contains(accepted_release, "\"active\":\"usb\"");
+    require_contains(accepted_release, "\"generation\":1");
+    require_contains(accepted_release, "\"transition\":\"releasing\"");
+    require_contains(accepted_release, "\"ready\":false");
+    assert(fixture.route.status.active == control_protocol::OutputRoute::kNone);
+    assert(fixture.route.status.generation == 2);
+    fixture.payload(release);
+    assert(fixture.sink.last() == accepted_release);
+    assert(fixture.route.set_calls == 2);
+
+    Fixture noop;
+    noop.route.result = control_protocol::HidRouteActionResult::kNoOp;
+    noop.payload(hello_request(1, kNonceA));
+    const std::string noop_session = extract_string(noop.sink.last(), "session");
+    const std::string noop_request = request(2, noop_session, "hid.route.set",
+                                             "{\"route\":\"none\"}");
+    noop.payload(noop_request);
+    const std::string noop_response = noop.sink.last();
+    noop.payload(noop_request);
+    assert(noop.sink.last() == noop_response);
+    assert(noop.route.set_calls == 1);
+    noop.payload(request(3, noop_session, "system.ping"));
+    require_contains(noop.sink.last(), "\"pong\":true");
+
+    for (const auto &[result, code] : {
+             std::pair{control_protocol::HidRouteActionResult::kBusy, "HID_BUSY"},
+             std::pair{control_protocol::HidRouteActionResult::kNotReady, "HID_NOT_READY"},
+             std::pair{control_protocol::HidRouteActionResult::kSafetyPending,
+                       "HID_SAFETY_PENDING"},
+         }) {
+        Fixture failure;
+        failure.route.result = result;
+        failure.payload(hello_request(1, kNonceA));
+        const std::string failure_session = extract_string(failure.sink.last(), "session");
+        failure.payload(request(2, failure_session, "hid.route.set",
+                                "{\"route\":\"usb\"}"));
+        require_contains(failure.sink.last(), std::string("\"code\":\"") + code + "\"");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1319,6 +1485,7 @@ int main() {
     test_release_all_result_cache_and_pending_error();
     test_keyboard_report_schema_result_and_cache();
     test_mouse_report_schema_result_and_cache();
+    test_hid_route_schema_frozen_retry_and_errors();
     test_identity_hello_and_info_shapes();
     test_invalid_identity_rejected_at_protocol_initialization();
     return 0;
