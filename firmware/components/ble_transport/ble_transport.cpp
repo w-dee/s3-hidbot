@@ -50,6 +50,10 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     sink_ = sink;
     database_ = database;
     generation_.store(generation, std::memory_order_release);
+    if (database_ != nullptr) {
+        database_->bind_event_sink(sink_);
+        database_->set_generation(generation);
+    }
     instance_ = this;
     // Never erase NVS as an initialization fallback; unrelated data must not
     // be destroyed merely to expose BLE.
@@ -147,6 +151,9 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
 
 void Backend::set_generation(ble_lifecycle::Generation generation) {
     generation_.store(generation, std::memory_order_release);
+    if (database_ != nullptr) {
+        database_->set_generation(generation);
+    }
 }
 
 void Backend::host_task(void *) { nimble_port_run(); }
@@ -220,6 +227,9 @@ void Backend::on_reset(int reason) {
         // so a following sync callback already carries the new identity.
         const auto retired = instance_->generation_.fetch_add(
             1, std::memory_order_acq_rel);
+        if (instance_->database_ != nullptr) {
+            instance_->database_->set_generation(retired + 1U);
+        }
         instance_->current_connection_.store(ble_lifecycle::kNoConnection,
                                              std::memory_order_release);
         instance_->identity_resolved_.store(false, std::memory_order_release);
@@ -303,9 +313,43 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 ble_lifecycle::kNoConnection, event->adv_complete.reason);
             break;
         case BLE_GAP_EVENT_SUBSCRIBE:
-            if (backend->database_ != nullptr) {
-                backend->database_->on_subscribe(event->subscribe.attr_handle,
-                                                 event->subscribe.cur_notify != 0);
+            if (backend->database_ != nullptr && backend->sink_ != nullptr) {
+                const auto handles = backend->database_->hid_handles();
+                hid_control_executor::BleHidInterface interface =
+                    hid_control_executor::BleHidInterface::kUnknown;
+                if (event->subscribe.attr_handle == handles.keyboard_value) {
+                    interface = hid_control_executor::BleHidInterface::kKeyboard;
+                } else if (event->subscribe.attr_handle == handles.mouse_value) {
+                    interface = hid_control_executor::BleHidInterface::kMouse;
+                }
+                hid_control_executor::BleSubscriptionReason reason =
+                    hid_control_executor::BleSubscriptionReason::kUnknown;
+                switch (event->subscribe.reason) {
+                    case BLE_GAP_SUBSCRIBE_REASON_WRITE:
+                        reason = hid_control_executor::BleSubscriptionReason::kWrite;
+                        break;
+                    case BLE_GAP_SUBSCRIBE_REASON_TERM:
+                        reason = hid_control_executor::BleSubscriptionReason::kTerm;
+                        break;
+                    case BLE_GAP_SUBSCRIBE_REASON_RESTORE:
+                        reason = hid_control_executor::BleSubscriptionReason::kRestore;
+                        break;
+                    default:
+                        break;
+                }
+                if (interface != hid_control_executor::BleHidInterface::kUnknown &&
+                    reason != hid_control_executor::BleSubscriptionReason::kUnknown) {
+                    (void)backend->sink_->signal_ble_event({
+                        .kind = hid_control_executor::BleEventKind::kSubscription,
+                        .generation = backend->generation_.load(
+                            std::memory_order_acquire),
+                        .connection_handle = event->subscribe.conn_handle,
+                        .attribute_handle = event->subscribe.attr_handle,
+                        .hid_interface = interface,
+                        .subscription_reason = reason,
+                        .notify_enabled = event->subscribe.cur_notify != 0,
+                    });
+                }
             }
             break;
         default:

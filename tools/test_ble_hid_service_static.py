@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic guards for the deliberately notification-free U7.3 database."""
+"""Deterministic guards for the internal-only U7.4A BLE HID foundation."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ TRANSPORT = ROOT / "firmware/components/ble_transport/ble_transport.cpp"
 EXECUTOR_HEADER = ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp"
 SDKCONFIG_DEFAULTS = ROOT / "firmware/sdkconfig.defaults"
 PROJECT_COMPONENTS = ROOT / "firmware/components"
+MAIN = ROOT / "firmware/main/main.cpp"
+CONTROL_PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
 
 
 def main() -> int:
@@ -22,6 +24,8 @@ def main() -> int:
     transport = TRANSPORT.read_text(encoding="utf-8")
     executor_header = EXECUTOR_HEADER.read_text(encoding="utf-8")
     sdkconfig_defaults = SDKCONFIG_DEFAULTS.read_text(encoding="utf-8")
+    main = MAIN.read_text(encoding="utf-8")
+    control_protocol = CONTROL_PROTOCOL.read_text(encoding="utf-8")
 
     report_body = re.search(r"kReportMap\{(.*?)\};", header, re.DOTALL)
     assert report_body is not None
@@ -73,8 +77,32 @@ def main() -> int:
         path.read_text(encoding="utf-8")
         for path in PROJECT_COMPONENTS.glob("ble_*/*.cpp")
     )
-    for notification_api in ("ble_gatts_notify", "ble_gatts_indicate"):
-        assert notification_api not in project_ble_sources
+    assert len(re.findall(r"\bble_gatts_notify_custom\s*\(", project_ble_sources)) == 1
+    assert not re.search(r"\bble_gatts_notify\s*\(", project_ble_sources)
+    assert not re.search(r"\bble_gatts_indicate(?:_custom)?\s*\(", project_ble_sources)
+    assert "ble_hs_mbuf_from_flat(payload, payload_length)" in service
+    assert "BleNotifyBackendResult::kResourceFailure" in service
+    assert "BleNotifyBackendResult::kStackAccepted" in service
+    assert "bind_event_sink" in header
+    assert "BleEventKind::kControlPoint" in service
+    assert "value == 0" in service
+    assert "OS_MBUF_PKTLEN(context->om) != 1" in service
+    assert "length != 1 || value > 1" in service
+    assert "BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN" in service
+    assert "suspended_.store" not in service
+
+    assert "BLE_GAP_EVENT_SUBSCRIBE" in transport
+    for field in ("conn_handle", "attr_handle", "cur_notify", "reason"):
+        assert f"event->subscribe.{field}" in transport
+    for reason in ("WRITE", "TERM", "RESTORE"):
+        assert f"BLE_GAP_SUBSCRIBE_REASON_{reason}" in transport
+    assert "database_->on_subscribe" not in transport
+    assert "BleEventKind::kSubscription" in transport
+    assert "submit_ble_keyboard" not in main
+    assert "submit_ble_mouse" not in main
+    assert "hid.output-route-v2" not in control_protocol
+    assert "hid.route.v2." not in control_protocol
+    assert "hid.route.set route must be none or usb" in control_protocol
 
     assert 'kDeviceName[] = "s3-hidbot"' in transport
     assert "kHidAppearance = 0x03c0" in transport

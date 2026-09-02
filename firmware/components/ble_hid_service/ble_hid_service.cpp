@@ -3,6 +3,7 @@
 #include "host/ble_att.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "host/ble_hs_mbuf.h"
 #include "host/ble_uuid.h"
 #include "os/os_mbuf.h"
 
@@ -161,29 +162,60 @@ int Database::validate_registered_database() {
     return 0;
 }
 
-void Database::clear_peer_state() {
-    subscriptions_.clear();
-    suspended_.store(false, std::memory_order_release);
+void Database::bind_event_sink(hid_control_executor::BleEventSink *sink) {
+    event_sink_ = sink;
 }
 
-void Database::on_subscribe(std::uint16_t attribute_handle, bool enabled) {
-    subscriptions_.observe(attribute_handle, s_keyboard_value_handle,
-                           s_mouse_value_handle, enabled);
+void Database::set_generation(ble_lifecycle::Generation generation) {
+    generation_.store(generation, std::memory_order_release);
 }
 
-bool Database::keyboard_subscribed() const {
-    return subscriptions_.keyboard();
+hid_control_executor::BleHidHandles Database::hid_handles() const {
+    return {
+        .keyboard_value = s_keyboard_value_handle,
+        .mouse_value = s_mouse_value_handle,
+        .control_point_value = s_control_point_value_handle,
+    };
 }
 
-bool Database::mouse_subscribed() const {
-    return subscriptions_.mouse();
+hid_control_executor::BleNotifyBackendResult Database::notify_custom(
+    std::uint16_t connection_handle, std::uint16_t characteristic_handle,
+    const std::uint8_t *payload, std::uint16_t payload_length) {
+    const bool keyboard = characteristic_handle == s_keyboard_value_handle &&
+                          payload_length == kNeutralKeyboard.size();
+    const bool mouse = characteristic_handle == s_mouse_value_handle &&
+                       payload_length == kNeutralMouse.size();
+    if (payload == nullptr || (!keyboard && !mouse)) {
+        return hid_control_executor::BleNotifyBackendResult::kStackRejected;
+    }
+    struct os_mbuf *buffer = ble_hs_mbuf_from_flat(payload, payload_length);
+    if (buffer == nullptr) {
+        return hid_control_executor::BleNotifyBackendResult::kResourceFailure;
+    }
+    // ble_gatts_notify_custom consumes buffer on every configured return path.
+    // No caller-side free or retry is valid after this call.
+    const int result = ble_gatts_notify_custom(
+        connection_handle, characteristic_handle, buffer);
+    if (result == 0) {
+        return hid_control_executor::BleNotifyBackendResult::kStackAccepted;
+    }
+    return result == BLE_HS_ENOMEM
+               ? hid_control_executor::BleNotifyBackendResult::kResourceFailure
+               : hid_control_executor::BleNotifyBackendResult::kStackRejected;
 }
 
-bool Database::suspended() const {
-    return suspended_.load(std::memory_order_acquire);
+bool Database::capture_control_point(std::uint16_t connection_handle,
+                                     bool suspended) {
+    return event_sink_ != nullptr && event_sink_->signal_ble_event({
+        .kind = hid_control_executor::BleEventKind::kControlPoint,
+        .generation = generation_.load(std::memory_order_acquire),
+        .connection_handle = connection_handle,
+        .attribute_handle = s_control_point_value_handle,
+        .suspended = suspended,
+    });
 }
 
-int Database::access(std::uint16_t, std::uint16_t,
+int Database::access(std::uint16_t connection_handle, std::uint16_t,
                      struct ble_gatt_access_ctxt *context, void *argument) {
     if (context == nullptr || argument == nullptr) {
         return BLE_ATT_ERR_UNLIKELY;
@@ -212,8 +244,10 @@ int Database::access(std::uint16_t, std::uint16_t,
                 length != 1 || value > 1) {
                 return BLE_ATT_ERR_UNLIKELY;
             }
-            s_database->suspended_.store(value == 0, std::memory_order_release);
-            return 0;
+            return s_database->capture_control_point(connection_handle,
+                                                     value == 0)
+                       ? 0
+                       : BLE_ATT_ERR_INSUFFICIENT_RES;
         }
     }
     return BLE_ATT_ERR_UNLIKELY;

@@ -15,14 +15,14 @@ namespace hid_control_executor {
 namespace {
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
-constexpr std::size_t kActionQueueDepth = 8;
 constexpr std::uint32_t kLifecycleTaskStackBytes = 4096;
 constexpr std::size_t kLifecycleTaskStackDepth =
     kLifecycleTaskStackBytes / sizeof(StackType_t);
 constexpr UBaseType_t kLifecycleTaskPriority = tskIDLE_PRIORITY + 3;
 
 StaticQueue_t s_queue_storage;
-std::uint8_t s_queue_bytes[kActionQueueDepth * sizeof(Controller::Action)]{};
+std::uint8_t s_queue_bytes[Controller::kActionQueueDepth *
+                           sizeof(Controller::Action)]{};
 StaticTask_t s_task_storage;
 StackType_t s_task_stack[kLifecycleTaskStackDepth]{};
 QueueHandle_t s_action_queue = nullptr;
@@ -74,6 +74,7 @@ BleCommandOutcome Controller::request_ble_enable() {
         if (!enqueue(item)) {
             ble_state_.complete_fault(outcome.snapshot.generation,
                                       ble_lifecycle::Operation::kEnable, -1);
+            clear_ble_hid_peer();
             release_operation(operation);
             return {};
         }
@@ -108,6 +109,7 @@ BleCommandOutcome Controller::request_ble_disable() {
         if (!enqueue(item)) {
             ble_state_.complete_fault(outcome.snapshot.generation,
                                       ble_lifecycle::Operation::kDisable, -1);
+            clear_ble_hid_peer();
             release_operation(operation);
             return {};
         }
@@ -121,6 +123,34 @@ BleCommandOutcome Controller::request_ble_disable() {
 
 ble_lifecycle::Snapshot Controller::ble_snapshot() const {
     return ble_state_.snapshot();
+}
+
+BleHidPeerSnapshot Controller::ble_hid_peer_snapshot() const {
+    return ble_hid_peer_;
+}
+
+bool Controller::ble_link_ready() const {
+    if (ble_backend_ == nullptr || ble_database_ == nullptr ||
+        !ble_hid_peer_.active || ble_hid_peer_.suspended ||
+        !ble_hid_peer_.keyboard_notify_enabled ||
+        !ble_hid_peer_.mouse_notify_enabled) {
+        return false;
+    }
+    const auto lifecycle = ble_state_.snapshot();
+    const auto handles = ble_database_->hid_handles();
+    return lifecycle.generation == ble_hid_peer_.generation &&
+           lifecycle.desired == ble_lifecycle::DesiredExposure::kExposed &&
+           lifecycle.observed == ble_lifecycle::ObservedState::kConnected &&
+           lifecycle.connected && !lifecycle.recovery_required &&
+           ble_state_.connection_handle() == ble_hid_peer_.connection_handle &&
+           handles.keyboard_value != 0 && handles.mouse_value != 0 &&
+           handles.control_point_value != 0 &&
+           handles.keyboard_value == ble_hid_peer_.handles.keyboard_value &&
+           handles.mouse_value == ble_hid_peer_.handles.mouse_value &&
+           handles.control_point_value ==
+               ble_hid_peer_.handles.control_point_value &&
+           ble_backend_->security_ready_for_hid(
+               ble_hid_peer_.generation, ble_hid_peer_.connection_handle);
 }
 
 ble_pairing::Snapshot Controller::pairing_snapshot() const {
@@ -312,16 +342,120 @@ RouteCommandOutcome Controller::request_route(hid_route::OutputRoute desired) {
                                .snapshot = outcome.snapshot};
 }
 
+void Controller::begin_ble_hid_peer(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) {
+    clear_ble_hid_peer();
+    if (ble_database_ == nullptr ||
+        connection_handle == ble_lifecycle::kNoConnection) {
+        return;
+    }
+    const auto handles = ble_database_->hid_handles();
+    if (handles.keyboard_value == 0 || handles.mouse_value == 0 ||
+        handles.control_point_value == 0 ||
+        handles.keyboard_value == handles.mouse_value ||
+        handles.keyboard_value == handles.control_point_value ||
+        handles.mouse_value == handles.control_point_value) {
+        return;
+    }
+    ble_hid_peer_ = {
+        .generation = generation,
+        .connection_handle = connection_handle,
+        .handles = handles,
+        .active = true,
+    };
+}
+
+void Controller::clear_ble_hid_peer() { ble_hid_peer_ = {}; }
+
+bool Controller::current_ble_hid_identity(
+    BleHidWorkIdentity identity, BleHidInterface interface) const {
+    if (!ble_hid_peer_.active || identity.generation != ble_hid_peer_.generation ||
+        identity.connection_handle != ble_hid_peer_.connection_handle) {
+        return false;
+    }
+    const std::uint16_t expected_handle =
+        interface == BleHidInterface::kKeyboard
+            ? ble_hid_peer_.handles.keyboard_value
+            : interface == BleHidInterface::kMouse
+                  ? ble_hid_peer_.handles.mouse_value
+                  : 0;
+    return expected_handle != 0 &&
+           identity.characteristic_handle == expected_handle;
+}
+
+bool Controller::ble_hid_interface_ready(
+    BleHidWorkIdentity identity, BleHidInterface interface) const {
+    if (!current_ble_hid_identity(identity, interface) ||
+        ble_backend_ == nullptr || ble_database_ == nullptr ||
+        ble_hid_peer_.suspended) {
+        return false;
+    }
+    const auto lifecycle = ble_state_.snapshot();
+    const auto handles = ble_database_->hid_handles();
+    const std::uint16_t current_handle =
+        interface == BleHidInterface::kKeyboard ? handles.keyboard_value
+                                                : handles.mouse_value;
+    const bool subscribed = interface == BleHidInterface::kKeyboard
+                                ? ble_hid_peer_.keyboard_notify_enabled
+                                : ble_hid_peer_.mouse_notify_enabled;
+    return current_handle == identity.characteristic_handle && subscribed &&
+           lifecycle.generation == identity.generation &&
+           lifecycle.desired == ble_lifecycle::DesiredExposure::kExposed &&
+           lifecycle.observed == ble_lifecycle::ObservedState::kConnected &&
+           lifecycle.connected && !lifecycle.recovery_required &&
+           ble_state_.connection_handle() == identity.connection_handle &&
+           ble_backend_->security_ready_for_hid(identity.generation,
+                                                identity.connection_handle);
+}
+
+BleHidSubmitResult Controller::submit_ble_report(
+    BleHidWorkIdentity identity, BleHidInterface interface,
+    const std::uint8_t *payload, std::uint16_t payload_length) {
+    if (!current_ble_hid_identity(identity, interface)) {
+        return BleHidSubmitResult::kStale;
+    }
+    if (!ble_hid_interface_ready(identity, interface)) {
+        return BleHidSubmitResult::kNotReady;
+    }
+    const auto result = ble_database_->notify_custom(
+        identity.connection_handle, identity.characteristic_handle, payload,
+        payload_length);
+    switch (result) {
+        case BleNotifyBackendResult::kStackAccepted:
+            return BleHidSubmitResult::kStackAccepted;
+        case BleNotifyBackendResult::kResourceFailure:
+            return BleHidSubmitResult::kResourceFailure;
+        case BleNotifyBackendResult::kStackRejected:
+        default:
+            return BleHidSubmitResult::kStackRejected;
+    }
+}
+
+BleHidSubmitResult Controller::submit_ble_keyboard(
+    BleHidWorkIdentity identity, const BleKeyboardReport &report) {
+    return submit_ble_report(identity, BleHidInterface::kKeyboard,
+                             report.data(), report.size());
+}
+
+BleHidSubmitResult Controller::submit_ble_mouse(
+    BleHidWorkIdentity identity, const BleMouseReport &report) {
+    BleMouseReport bounded = report;
+    bounded[0] &= 0x1fU;
+    return submit_ble_report(identity, BleHidInterface::kMouse,
+                             bounded.data(), bounded.size());
+}
+
 bool Controller::enqueue(Action item) {
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     if (fail_next_enqueue_) {
         fail_next_enqueue_ = false;
         return false;
     }
-    if (native_count_ == 8) {
+    if (native_count_ == kActionQueueDepth) {
         return false;
     }
-    native_queue_[(native_head_ + native_count_) % 8] = item;
+    native_queue_[(native_head_ + native_count_) % kActionQueueDepth] = item;
     ++native_count_;
     return true;
 #else
@@ -433,6 +567,7 @@ void Controller::process(Action action) {
             release_operation(action.operation);
             return;
         }
+        clear_ble_hid_peer();
         if (current.advertising) {
             const std::int32_t result = ble_backend_->stop_advertising();
             if (result != 0) {
@@ -449,9 +584,6 @@ void Controller::process(Action action) {
                          result, action.operation);
             }
             return;
-        }
-        if (ble_database_ != nullptr) {
-            ble_database_->clear_peer_state();
         }
         ble_state_.complete_disable(current.generation);
         ble_backend_->record_heap_checkpoint(
@@ -552,9 +684,10 @@ void Controller::process(Action action) {
 void Controller::fail_ble(ble_lifecycle::Generation generation,
                           ble_lifecycle::Operation operation, std::int32_t code,
                           ControlOperation owner) {
+    const bool current_generation = generation == ble_state_.generation();
     ble_state_.complete_fault(generation, operation, code);
-    if (ble_database_ != nullptr) {
-        ble_database_->clear_peer_state();
+    if (current_generation) {
+        clear_ble_hid_peer();
     }
     release_operation(owner);
 }
@@ -773,6 +906,7 @@ void Controller::process_ble_event(BleEvent event) {
         case BleEventKind::kConnect:
             if (ble_state_.observe_connect(event.generation,
                                            event.connection_handle)) {
+                begin_ble_hid_peer(event.generation, event.connection_handle);
                 pairing_complete_seen_ = false;
                 pairing_deadline_us_ = 0;
                 wipe_pairing_mailbox();
@@ -806,9 +940,7 @@ void Controller::process_ble_event(BleEvent event) {
                                             event.connection_handle);
             ble_backend_->retire_security(event.generation,
                                           event.connection_handle);
-            if (ble_database_ != nullptr) {
-                ble_database_->clear_peer_state();
-            }
+            clear_ble_hid_peer();
             if (expected) {
                 ble_state_.complete_disable(event.generation);
                 ble_backend_->record_heap_checkpoint(
@@ -845,6 +977,7 @@ void Controller::process_ble_event(BleEvent event) {
             return;
         case BleEventKind::kReset: {
             const auto before_reset = ble_state_.snapshot();
+            clear_ble_hid_peer();
             pairing_state_.reset();
             pairing_deadline_us_ = 0;
             wipe_pairing_mailbox();
@@ -856,9 +989,6 @@ void Controller::process_ble_event(BleEvent event) {
             }
             pairing_complete_seen_ = false;
             if (!ble_state_.begin_reset_recovery(event.generation, event.status)) {
-                if (ble_database_ != nullptr) {
-                    ble_database_->clear_peer_state();
-                }
                 release_operation(active_operation_.load(std::memory_order_acquire));
                 return;
             }
@@ -958,6 +1088,32 @@ void Controller::process_ble_event(BleEvent event) {
                     ble_pairing::LastResult::kStorage, true);
             }
             return;
+        case BleEventKind::kSubscription: {
+            if (!ble_hid_peer_.active ||
+                event.generation != ble_hid_peer_.generation ||
+                event.connection_handle != ble_hid_peer_.connection_handle ||
+                event.subscription_reason == BleSubscriptionReason::kUnknown) {
+                return;
+            }
+            if (event.hid_interface == BleHidInterface::kKeyboard &&
+                event.attribute_handle == ble_hid_peer_.handles.keyboard_value) {
+                ble_hid_peer_.keyboard_notify_enabled = event.notify_enabled;
+            } else if (event.hid_interface == BleHidInterface::kMouse &&
+                       event.attribute_handle ==
+                           ble_hid_peer_.handles.mouse_value) {
+                ble_hid_peer_.mouse_notify_enabled = event.notify_enabled;
+            }
+            return;
+        }
+        case BleEventKind::kControlPoint:
+            if (ble_hid_peer_.active &&
+                event.generation == ble_hid_peer_.generation &&
+                event.connection_handle == ble_hid_peer_.connection_handle &&
+                event.attribute_handle ==
+                    ble_hid_peer_.handles.control_point_value) {
+                ble_hid_peer_.suspended = event.suspended;
+            }
+            return;
     }
 }
 
@@ -967,7 +1123,8 @@ bool Controller::process_one_for_test() {
         return false;
     }
     const Action action = native_queue_[native_head_];
-    native_head_ = static_cast<std::uint8_t>((native_head_ + 1) % 8);
+    native_head_ = static_cast<std::uint8_t>(
+        (native_head_ + 1U) % kActionQueueDepth);
     --native_count_;
     process(action);
     return true;

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 #include "ble_pairing/ble_pairing.hpp"
@@ -59,7 +60,63 @@ enum class BleEventKind : std::uint8_t {
     kPairingTimeout,
     kStoreFull,
     kStorageFailure,
+    kSubscription,
+    kControlPoint,
 };
+
+enum class BleHidInterface : std::uint8_t {
+    kUnknown,
+    kKeyboard,
+    kMouse,
+};
+
+enum class BleSubscriptionReason : std::uint8_t {
+    kUnknown,
+    kWrite,
+    kTerm,
+    kRestore,
+};
+
+enum class BleNotifyBackendResult : std::uint8_t {
+    kStackAccepted,
+    kResourceFailure,
+    kStackRejected,
+};
+
+enum class BleHidSubmitResult : std::uint8_t {
+    kStackAccepted,
+    kNotReady,
+    kStale,
+    kResourceFailure,
+    kStackRejected,
+};
+
+struct BleHidHandles {
+    std::uint16_t keyboard_value = 0;
+    std::uint16_t mouse_value = 0;
+    std::uint16_t control_point_value = 0;
+};
+
+struct BleHidWorkIdentity {
+    ble_lifecycle::Generation generation = 0;
+    std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
+    std::uint16_t characteristic_handle = 0;
+};
+
+struct BleHidPeerSnapshot {
+    ble_lifecycle::Generation generation = 0;
+    std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
+    BleHidHandles handles{};
+    bool active = false;
+    bool keyboard_notify_enabled = false;
+    bool mouse_notify_enabled = false;
+    bool suspended = false;
+};
+
+using BleKeyboardReport = std::array<std::uint8_t, 8>;
+using BleMouseReport = std::array<std::uint8_t, 5>;
+inline constexpr BleKeyboardReport kBleKeyboardAllUp{};
+inline constexpr BleMouseReport kBleMouseAllUp{};
 
 struct BleEvent {
     BleEventKind kind = BleEventKind::kSync;
@@ -67,6 +124,12 @@ struct BleEvent {
     std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
     std::int32_t status = 0;
     std::uint32_t pairing_id = 0;
+    std::uint16_t attribute_handle = 0;
+    BleHidInterface hid_interface = BleHidInterface::kUnknown;
+    BleSubscriptionReason subscription_reason =
+        BleSubscriptionReason::kUnknown;
+    bool notify_enabled = false;
+    bool suspended = false;
 };
 
 class BleEventSink {
@@ -83,8 +146,12 @@ class BleDatabase {
     // Called only after the NimBLE GATT server has started. A zero result is
     // required before any project HID advertisement may become visible.
     virtual int validate_registered_database() = 0;
-    virtual void clear_peer_state() = 0;
-    virtual void on_subscribe(std::uint16_t attribute_handle, bool enabled) = 0;
+    virtual void bind_event_sink(BleEventSink *sink) = 0;
+    virtual void set_generation(ble_lifecycle::Generation generation) = 0;
+    virtual BleHidHandles hid_handles() const = 0;
+    virtual BleNotifyBackendResult notify_custom(
+        std::uint16_t connection_handle, std::uint16_t characteristic_handle,
+        const std::uint8_t *payload, std::uint16_t payload_length) = 0;
 };
 
 class BleBackend {
@@ -170,6 +237,7 @@ struct PairingStatusSnapshot {
 
 class Controller final : public usb_lifecycle::Executor, public BleEventSink {
   public:
+    static constexpr std::size_t kActionQueueDepth = 12;
     enum class ActionKind : std::uint8_t {
         kUsbInstall,
         kUsbDetach,
@@ -221,6 +289,16 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
                   usb_lifecycle::Snapshot snapshot) override;
     bool signal_ble_event(BleEvent event) override;
 
+    // Internal U7.4A seams. They are not wired to UART, public HID commands,
+    // or route selection. Submission callers must already be executing in
+    // the serialized control-owner context.
+    BleHidPeerSnapshot ble_hid_peer_snapshot() const;
+    bool ble_link_ready() const;
+    BleHidSubmitResult submit_ble_keyboard(
+        BleHidWorkIdentity identity, const BleKeyboardReport &report);
+    BleHidSubmitResult submit_ble_mouse(
+        BleHidWorkIdentity identity, const BleMouseReport &report);
+
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     bool process_one_for_test();
     ControlOperation active_operation_for_test() const;
@@ -250,6 +328,16 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     PairingStatusSnapshot current_pairing_status() const;
     void wipe_pairing_mailbox();
     void complete_pairing_rpc(std::uint32_t token);
+    void begin_ble_hid_peer(ble_lifecycle::Generation generation,
+                            std::uint16_t connection_handle);
+    void clear_ble_hid_peer();
+    bool current_ble_hid_identity(BleHidWorkIdentity identity,
+                                  BleHidInterface interface) const;
+    bool ble_hid_interface_ready(BleHidWorkIdentity identity,
+                                 BleHidInterface interface) const;
+    BleHidSubmitResult submit_ble_report(
+        BleHidWorkIdentity identity, BleHidInterface interface,
+        const std::uint8_t *payload, std::uint16_t payload_length);
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     static void task_entry(void *context);
@@ -283,9 +371,10 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     PairingStatusSnapshot pairing_rpc_status_{};
     ble_pairing::RespondResult pairing_rpc_result_ =
         ble_pairing::RespondResult::kNotPending;
+    BleHidPeerSnapshot ble_hid_peer_{};
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
-    Action native_queue_[8]{};
+    Action native_queue_[kActionQueueDepth]{};
     std::uint8_t native_head_ = 0;
     std::uint8_t native_count_ = 0;
     bool fail_next_enqueue_ = false;

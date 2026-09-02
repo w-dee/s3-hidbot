@@ -29,8 +29,8 @@ def main() -> int:
         "kind", "generation", "connection_handle", "status", "pairing_id"
     }
     assert not re.search(r"\b(passkey|secret|ltk|irk|address)\b", event.group(1), re.I)
-    assert "constexpr std::size_t kActionQueueDepth = 8;" in executor
-    assert "native_queue_[8]" in executor_header
+    assert "static constexpr std::size_t kActionQueueDepth = 12;" in executor_header
+    assert "native_queue_[kActionQueueDepth]" in executor_header
     assert "xQueueSend(s_action_queue, &item, 0)" in executor
     assert "ble_event_overflow_.store(true" in executor
 

@@ -5,7 +5,6 @@
 #include <cstdint>
 
 #include "hid_control_executor/hid_control_executor.hpp"
-#include "ble_hid_service/subscription_state.hpp"
 
 struct ble_gatt_access_ctxt;
 
@@ -33,20 +32,24 @@ class Database final : public hid_control_executor::BleDatabase {
   public:
     int register_database() override;
     int validate_registered_database() override;
-    void clear_peer_state() override;
-    void on_subscribe(std::uint16_t attribute_handle, bool enabled) override;
-
-    bool keyboard_subscribed() const;
-    bool mouse_subscribed() const;
-    bool suspended() const;
+    void bind_event_sink(hid_control_executor::BleEventSink *sink) override;
+    void set_generation(ble_lifecycle::Generation generation) override;
+    hid_control_executor::BleHidHandles hid_handles() const override;
+    hid_control_executor::BleNotifyBackendResult notify_custom(
+        std::uint16_t connection_handle, std::uint16_t characteristic_handle,
+        const std::uint8_t *payload,
+        std::uint16_t payload_length) override;
 
     static int access(std::uint16_t connection_handle,
                       std::uint16_t attribute_handle,
                       struct ble_gatt_access_ctxt *context, void *argument);
 
   private:
-    SubscriptionState subscriptions_{};
-    std::atomic_bool suspended_{false};
+    bool capture_control_point(std::uint16_t connection_handle,
+                               bool suspended);
+
+    hid_control_executor::BleEventSink *event_sink_ = nullptr;
+    std::atomic<ble_lifecycle::Generation> generation_{0};
 };
 
 }  // namespace ble_hid_service

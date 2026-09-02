@@ -45,11 +45,14 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         if (initialize_result != 0) {
             return initialize_result;
         }
-        return active_database == nullptr ? -1
-                                          : active_database->register_database();
+        if (active_database == nullptr) return -1;
+        active_database->bind_event_sink(event_sink);
+        active_database->set_generation(generation);
+        return active_database->register_database();
     }
     void set_generation(ble_lifecycle::Generation generation) override {
         active_generation = generation;
+        if (active_database != nullptr) active_database->set_generation(generation);
     }
     std::int32_t start_advertising() override {
         ++advertising_attempts;
@@ -191,13 +194,45 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
         ++validate_calls;
         return validate_result;
     }
-    void clear_peer_state() override { ++clear_calls; }
-    void on_subscribe(std::uint16_t, bool) override {}
+    void bind_event_sink(hid_control_executor::BleEventSink *value) override {
+        sink = value;
+    }
+    void set_generation(ble_lifecycle::Generation value) override {
+        generation = value;
+    }
+    hid_control_executor::BleHidHandles hid_handles() const override {
+        return handles;
+    }
+    hid_control_executor::BleNotifyBackendResult notify_custom(
+        std::uint16_t connection_handle, std::uint16_t characteristic_handle,
+        const std::uint8_t *payload, std::uint16_t payload_length) override {
+        ++notify_calls;
+        last_connection = connection_handle;
+        last_characteristic = characteristic_handle;
+        last_payload_length = payload_length;
+        last_payload.fill(0);
+        assert(payload_length <= last_payload.size());
+        std::memcpy(last_payload.data(), payload, payload_length);
+        return notify_result;
+    }
     int register_calls = 0;
     int validate_calls = 0;
-    int clear_calls = 0;
     int register_result = 0;
     int validate_result = 0;
+    int notify_calls = 0;
+    hid_control_executor::BleEventSink *sink = nullptr;
+    ble_lifecycle::Generation generation = 0;
+    hid_control_executor::BleHidHandles handles{
+        .keyboard_value = 10,
+        .mouse_value = 20,
+        .control_point_value = 30,
+    };
+    std::uint16_t last_connection = ble_lifecycle::kNoConnection;
+    std::uint16_t last_characteristic = 0;
+    std::uint16_t last_payload_length = 0;
+    std::array<std::uint8_t, 8> last_payload{};
+    hid_control_executor::BleNotifyBackendResult notify_result =
+        hid_control_executor::BleNotifyBackendResult::kStackAccepted;
 };
 
 struct AcceptingExecutor final : usb_lifecycle::Executor {
@@ -645,7 +680,7 @@ void test_ble_lifecycle_is_shared_serialized_and_transport_independent() {
     assert(ble.advertising_calls == 2);
     assert(ble.last_heap_checkpoint ==
            hid_control_executor::BleBackend::HeapCheckpoint::kReadvertising);
-    assert(database.clear_calls == 1);
+    assert(!controller.ble_hid_peer_snapshot().active);
     assert(runtime.state_machine().authority_epoch() == epoch_before);
 }
 
@@ -835,10 +870,304 @@ void make_security_ready(FakeBleBackend &ble, bool identity = true) {
                               .peer = valid_security_record()};
 }
 
+bool queue_subscription(
+    hid_control_executor::Controller &controller,
+    ble_lifecycle::Generation generation, std::uint16_t connection_handle,
+    hid_control_executor::BleHidInterface interface,
+    std::uint16_t attribute_handle, bool enabled,
+    hid_control_executor::BleSubscriptionReason reason =
+        hid_control_executor::BleSubscriptionReason::kWrite) {
+    return controller.signal_ble_event({
+        .kind = hid_control_executor::BleEventKind::kSubscription,
+        .generation = generation,
+        .connection_handle = connection_handle,
+        .attribute_handle = attribute_handle,
+        .hid_interface = interface,
+        .subscription_reason = reason,
+        .notify_enabled = enabled,
+    });
+}
+
+bool queue_control_point(hid_control_executor::Controller &controller,
+                         ble_lifecycle::Generation generation,
+                         std::uint16_t connection_handle,
+                         std::uint16_t attribute_handle, bool suspended) {
+    return controller.signal_ble_event({
+        .kind = hid_control_executor::BleEventKind::kControlPoint,
+        .generation = generation,
+        .connection_handle = connection_handle,
+        .attribute_handle = attribute_handle,
+        .suspended = suspended,
+    });
+}
+
+void subscribe_composite(hid_control_executor::Controller &controller,
+                         FakeBleDatabase &database,
+                         ble_lifecycle::Generation generation,
+                         std::uint16_t connection_handle,
+                         hid_control_executor::BleSubscriptionReason reason =
+                             hid_control_executor::BleSubscriptionReason::kWrite) {
+    assert(queue_subscription(controller, generation, connection_handle,
+                              hid_control_executor::BleHidInterface::kKeyboard,
+                              database.handles.keyboard_value, true, reason));
+    assert(controller.process_one_for_test());
+    assert(queue_subscription(controller, generation, connection_handle,
+                              hid_control_executor::BleHidInterface::kMouse,
+                              database.handles.mouse_value, true, reason));
+    assert(controller.process_one_for_test());
+}
+
+void test_generation_owned_cccd_restore_term_and_clearing() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 71;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    auto peer = controller.ble_hid_peer_snapshot();
+    assert(peer.active && peer.generation == generation);
+    assert(peer.connection_handle == connection && !peer.suspended);
+    assert(!peer.keyboard_notify_enabled && !peer.mouse_notify_enabled);
+
+    // A restored CCCD is retained independently of security event ordering,
+    // but cannot make the composite link ready on its own.
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, true,
+        hid_control_executor::BleSubscriptionReason::kRestore));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_hid_peer_snapshot().keyboard_notify_enabled);
+    assert(!controller.ble_link_ready());
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kMouse,
+        database.handles.mouse_value, true,
+        hid_control_executor::BleSubscriptionReason::kRestore));
+    assert(controller.process_one_for_test());
+    assert(!controller.ble_link_ready());
+
+    make_security_ready(ble);
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     connection));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+
+    // Unknown, mismatched, and stale tuples cannot mutate current evidence.
+    assert(queue_subscription(
+        controller, generation - 1U, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, false));
+    assert(controller.process_one_for_test());
+    assert(queue_subscription(
+        controller, generation, static_cast<std::uint16_t>(connection + 1U),
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, false));
+    assert(controller.process_one_for_test());
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard, 999, false));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+
+    assert(ble.event_for_generation(
+        hid_control_executor::BleEventKind::kTimeout, generation - 1U,
+        ble_lifecycle::kNoConnection, -9));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, false,
+        hid_control_executor::BleSubscriptionReason::kTerm));
+    assert(controller.process_one_for_test());
+    assert(!controller.ble_link_ready());
+    assert(!controller.ble_hid_peer_snapshot().keyboard_notify_enabled);
+
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, true,
+        hid_control_executor::BleSubscriptionReason::kRestore));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kMouse,
+        database.handles.mouse_value, false));
+    assert(controller.process_one_for_test());
+    assert(!controller.ble_link_ready());
+
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                     connection));
+    assert(controller.process_one_for_test());
+    assert(!controller.ble_hid_peer_snapshot().active);
+    const auto next_generation = controller.ble_snapshot().generation;
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect,
+                     static_cast<std::uint16_t>(connection + 1U)));
+    assert(controller.process_one_for_test());
+    const auto next_peer = controller.ble_hid_peer_snapshot();
+    assert(next_peer.active && next_peer.generation == next_generation);
+    assert(!next_peer.suspended && !next_peer.keyboard_notify_enabled &&
+           !next_peer.mouse_notify_enabled);
+}
+
+void test_ble_link_readiness_security_and_suspend_predicate() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 72;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    assert(!controller.ble_link_ready());
+
+    ble.security_link.encrypted = true;
+    ble.refresh_security(connection);
+    assert(!controller.ble_link_ready());
+    ble.security_link.authenticated = true;
+    ble.refresh_security(connection);
+    assert(!controller.ble_link_ready());
+    ble.security_link.key_size = 15;
+    ble.refresh_security(connection);
+    assert(!controller.ble_link_ready());
+    ble.security_link.key_size = ble_security::kRequiredKeySize;
+    ble.refresh_security(connection);
+    assert(!controller.ble_link_ready());
+    ble.security_link.nimble_bonded = true;
+    ble.security_link.identity_resolved = true;
+    ble.refresh_security(connection);
+    assert(!controller.ble_link_ready());
+    ble.security_persisted = {.our = valid_security_record(),
+                              .peer = valid_security_record()};
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    assert(queue_control_point(controller, generation, connection,
+                               database.handles.control_point_value, true));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_hid_peer_snapshot().suspended);
+    assert(!controller.ble_link_ready());
+    assert(queue_control_point(controller, generation - 1U, connection,
+                               database.handles.control_point_value, false));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_hid_peer_snapshot().suspended);
+    assert(queue_control_point(controller, generation, connection,
+                               database.handles.control_point_value, false));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+
+    ble.security.observe_store_failure(
+        generation, connection, ble_security::StoreFailureKind::kWrite, -1,
+        true);
+    assert(!controller.ble_link_ready());
+
+    const auto disable = controller.request_ble_disable();
+    assert(disable.action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(!controller.ble_link_ready());
+    assert(controller.process_one_for_test());
+    assert(!controller.ble_hid_peer_snapshot().active);
+}
+
+void test_internal_ble_notification_adapter_and_result_model() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 73;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    const hid_control_executor::BleHidWorkIdentity keyboard_identity{
+        .generation = generation,
+        .connection_handle = connection,
+        .characteristic_handle = database.handles.keyboard_value,
+    };
+    const hid_control_executor::BleKeyboardReport keyboard{
+        0x02, 0x00, 0x73, 0x00, 0x00, 0x00, 0x00, 0x00};
+    assert(controller.submit_ble_keyboard(keyboard_identity, keyboard) ==
+           hid_control_executor::BleHidSubmitResult::kNotReady);
+    assert(database.notify_calls == 0);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+    assert(controller.submit_ble_keyboard(keyboard_identity, keyboard) ==
+           hid_control_executor::BleHidSubmitResult::kStackAccepted);
+    assert(database.notify_calls == 1);
+    assert(database.last_connection == connection);
+    assert(database.last_characteristic == database.handles.keyboard_value);
+    assert(database.last_payload_length == 8);
+    assert(database.last_payload == keyboard);
+
+    const hid_control_executor::BleHidWorkIdentity mouse_identity{
+        .generation = generation,
+        .connection_handle = connection,
+        .characteristic_handle = database.handles.mouse_value,
+    };
+    const hid_control_executor::BleMouseReport mouse{
+        0xff, 0x81, 0x7f, 0xfe, 0x01};
+    assert(controller.submit_ble_mouse(mouse_identity, mouse) ==
+           hid_control_executor::BleHidSubmitResult::kStackAccepted);
+    assert(database.notify_calls == 2);
+    assert(database.last_characteristic == database.handles.mouse_value);
+    assert(database.last_payload_length == 5);
+    assert(database.last_payload[0] == 0x1f);
+    for (std::size_t index = 1; index < mouse.size(); ++index) {
+        assert(database.last_payload[index] == mouse[index]);
+    }
+    static_assert(hid_control_executor::kBleKeyboardAllUp.size() == 8);
+    static_assert(hid_control_executor::kBleMouseAllUp.size() == 5);
+    for (const auto byte : hid_control_executor::kBleKeyboardAllUp) assert(byte == 0);
+    for (const auto byte : hid_control_executor::kBleMouseAllUp) assert(byte == 0);
+
+    auto stale = keyboard_identity;
+    ++stale.generation;
+    assert(controller.submit_ble_keyboard(stale, keyboard) ==
+           hid_control_executor::BleHidSubmitResult::kStale);
+    stale = keyboard_identity;
+    ++stale.characteristic_handle;
+    assert(controller.submit_ble_keyboard(stale, keyboard) ==
+           hid_control_executor::BleHidSubmitResult::kStale);
+    assert(database.notify_calls == 2);
+
+    database.notify_result =
+        hid_control_executor::BleNotifyBackendResult::kResourceFailure;
+    assert(controller.submit_ble_keyboard(keyboard_identity, keyboard) ==
+           hid_control_executor::BleHidSubmitResult::kResourceFailure);
+    assert(database.notify_calls == 3);
+    database.notify_result =
+        hid_control_executor::BleNotifyBackendResult::kStackRejected;
+    assert(controller.submit_ble_keyboard(keyboard_identity, keyboard) ==
+           hid_control_executor::BleHidSubmitResult::kStackRejected);
+    assert(database.notify_calls == 4);  // exactly one call per request; no retry
+
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, false));
+    assert(controller.process_one_for_test());
+    assert(controller.submit_ble_keyboard(keyboard_identity, keyboard) ==
+           hid_control_executor::BleHidSubmitResult::kNotReady);
+    assert(database.notify_calls == 4);
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kMouse,
+        database.handles.mouse_value, false));
+    assert(controller.process_one_for_test());
+    assert(controller.submit_ble_mouse(mouse_identity, mouse) ==
+           hid_control_executor::BleHidSubmitResult::kNotReady);
+    assert(database.notify_calls == 4);
+}
+
 void assert_fatal_storage_terminal_state(
     hid_control_executor::Controller &controller, FakeBleBackend &ble,
-    FakeBleDatabase &database, std::uint16_t handle,
-    int advertising_calls_before_disconnect) {
+    std::uint16_t handle, int advertising_calls_before_disconnect) {
     const auto failed = controller.ble_snapshot();
     assert(failed.desired == ble_lifecycle::DesiredExposure::kExposed);
     assert(failed.observed == ble_lifecycle::ObservedState::kFault);
@@ -854,7 +1183,7 @@ void assert_fatal_storage_terminal_state(
     assert(ble.timer_pairing_id == 0);
     assert(controller.pairing_mailbox_zero_for_test());
     assert(!ble.security_ready_for_hid(failed.generation, handle));
-    assert(database.clear_calls == 1);
+    assert(!controller.ble_hid_peer_snapshot().active);
     assert(ble.disconnect_calls == 1);
 
     assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, handle));
@@ -896,7 +1225,7 @@ void run_persisted_bond_reread_failure(
     assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
                      handle, 0));
     assert(controller.process_one_for_test());
-    assert_fatal_storage_terminal_state(controller, ble, database, handle,
+    assert_fatal_storage_terminal_state(controller, ble, handle,
                                         advertising_calls);
 }
 
@@ -932,7 +1261,7 @@ void test_low_level_storage_error_is_fatal_and_stale_generation_is_ignored() {
         assert(ble.event(hid_control_executor::BleEventKind::kStorageFailure,
                          84));
         assert(controller.process_one_for_test());
-        assert_fatal_storage_terminal_state(controller, ble, database, 84,
+        assert_fatal_storage_terminal_state(controller, ble, 84,
                                             advertising_calls);
     }
     {
@@ -1225,6 +1554,111 @@ void test_timeout_repeat_store_and_disconnect_results() {
 }
 
 void test_queue_burst_overflow_and_id_wrap_fail_closed() {
+    static_assert(hid_control_executor::Controller::kActionQueueDepth == 12);
+    static_assert(sizeof(hid_control_executor::BleHidPeerSnapshot) == 16);
+    {
+        // One control action plus a bounded fresh-security burst can exceed
+        // the old depth eight before the serialized task gets CPU time.
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &usb, &ble, &database));
+        assert(controller.request_ble_enable().action_result ==
+               ble_lifecycle::TransitionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        assert(ble.event(hid_control_executor::BleEventKind::kSync));
+        assert(controller.process_one_for_test());
+        assert(action(controller.request_attach()) ==
+               usb_lifecycle::TransitionResult::kAccepted);
+        constexpr std::uint16_t connection = 49;
+        assert(ble.event(hid_control_executor::BleEventKind::kConnect,
+                         connection));
+        assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction,
+                         connection, 1));
+        assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                         connection));
+        assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
+                         connection));
+        assert(ble.event(hid_control_executor::BleEventKind::kIdentityResolved,
+                         connection));
+        assert(queue_subscription(
+            controller, ble.active_generation, connection,
+            hid_control_executor::BleHidInterface::kKeyboard,
+            database.handles.keyboard_value, true));
+        assert(queue_subscription(
+            controller, ble.active_generation, connection,
+            hid_control_executor::BleHidInterface::kMouse,
+            database.handles.mouse_value, true));
+        assert(ble.event(hid_control_executor::BleEventKind::kStoreFull,
+                         connection));
+        assert(ble.event(hid_control_executor::BleEventKind::kPairingTimeout,
+                         connection));
+    }
+    {
+        // Bond restore: one overlapping control action, connect/security,
+        // identity, two CCCD restores, and bounded store/timer callbacks.
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &usb, &ble, &database));
+        assert(controller.request_ble_enable().action_result ==
+               ble_lifecycle::TransitionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        assert(ble.event(hid_control_executor::BleEventKind::kSync));
+        assert(controller.process_one_for_test());
+        assert(action(controller.request_attach()) ==
+               usb_lifecycle::TransitionResult::kAccepted);
+        constexpr std::uint16_t connection = 48;
+        assert(ble.event(hid_control_executor::BleEventKind::kConnect,
+                         connection));
+        assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                         connection));
+        assert(ble.event(hid_control_executor::BleEventKind::kIdentityResolved,
+                         connection));
+        assert(queue_subscription(
+            controller, ble.active_generation, connection,
+            hid_control_executor::BleHidInterface::kKeyboard,
+            database.handles.keyboard_value, true,
+            hid_control_executor::BleSubscriptionReason::kRestore));
+        assert(queue_subscription(
+            controller, ble.active_generation, connection,
+            hid_control_executor::BleHidInterface::kMouse,
+            database.handles.mouse_value, true,
+            hid_control_executor::BleSubscriptionReason::kRestore));
+        assert(ble.event(hid_control_executor::BleEventKind::kStoreFull,
+                         connection));
+        assert(ble.event(hid_control_executor::BleEventKind::kPairingTimeout,
+                         connection));
+    }
+    {
+        // Disconnect: both TERM callbacks, disconnect, and one overlapping
+        // control action plus a bounded timer callback all fit together.
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 47);
+        assert(action(controller.request_attach()) ==
+               usb_lifecycle::TransitionResult::kAccepted);
+        assert(queue_subscription(
+            controller, ble.active_generation, 47,
+            hid_control_executor::BleHidInterface::kKeyboard,
+            database.handles.keyboard_value, false,
+            hid_control_executor::BleSubscriptionReason::kTerm));
+        assert(queue_subscription(
+            controller, ble.active_generation, 47,
+            hid_control_executor::BleHidInterface::kMouse,
+            database.handles.mouse_value, false,
+            hid_control_executor::BleSubscriptionReason::kTerm));
+        assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 47));
+        assert(ble.event(hid_control_executor::BleEventKind::kPairingTimeout,
+                         47));
+    }
     {
         hid_runtime::Runtime runtime;
         FakeBackend usb;
@@ -1234,7 +1668,9 @@ void test_queue_burst_overflow_and_id_wrap_fail_closed() {
         connect_ble(runtime, usb, ble, database, controller, 50);
         assert(action(controller.request_attach()) ==
                usb_lifecycle::TransitionResult::kAccepted);
-        for (int index = 0; index < 7; ++index) {
+        for (std::size_t index = 0;
+             index < hid_control_executor::Controller::kActionQueueDepth - 1;
+             ++index) {
             assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction,
                              50, 1));
         }
@@ -1252,7 +1688,9 @@ void test_queue_burst_overflow_and_id_wrap_fail_closed() {
         FakeBleDatabase database;
         hid_control_executor::Controller controller;
         connect_ble(runtime, usb, ble, database, controller, 51);
-        for (int index = 0; index < 8; ++index) {
+        for (std::size_t index = 0;
+             index < hid_control_executor::Controller::kActionQueueDepth;
+             ++index) {
             assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction,
                              51, 1));
         }
@@ -1419,6 +1857,9 @@ int main() {
     test_stale_sync_cannot_validate_or_advertise();
     test_retained_cycles_validate_without_duplicate_registration();
     test_ble_busy_has_no_stage_a_and_usb_detach_does_not_change_ble();
+    test_generation_owned_cccd_restore_term_and_clearing();
+    test_ble_link_readiness_security_and_suspend_predicate();
+    test_internal_ble_notification_adapter_and_result_model();
     test_pairing_input_response_and_initiation();
     test_public_pairing_rpc_mailbox_status_and_races();
     test_security_event_ordering_and_existing_bond();

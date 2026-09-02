@@ -41,7 +41,7 @@ control executor. Its only live states are `idle`, `securing`, and
 sticky last result. A boot-local nonzero monotonic pairing ID fences a pending
 input action by BLE generation and connection handle, with a 25-second input
 deadline and fail-closed wrap behavior. NimBLE callbacks enqueue only bounded,
-non-secret metadata into the fixed depth-8 control queue. Queue overflow is a
+non-secret metadata into the fixed shared control queue. Queue overflow is a
 recovery-required BLE lifecycle fault; ordinary store capacity, timeout,
 repeat-pairing, or peer failure disconnects without global recovery. This
 internal model is exposed in Slice C by the firmware-only
@@ -49,7 +49,19 @@ internal model is exposed in Slice C by the firmware-only
 `ble.pairing.respond` commands. The full identity hello now has 13 unique
 capabilities. Slice D adds the strictly typed host API and explicit no-echo
 CLI for those frozen commands, without a firmware change. No BLE route or HID
-notification output is added.
+notification output is publicly reachable.
+
+U7.4A adds an internal-only BLE HID output prerequisite without changing this
+public protocol. Keyboard and mouse CCCD evidence and HID Control Point suspend
+state are owned by the serialized HID control executor and fenced by the exact
+BLE generation, connection handle, and registered characteristic handle. A
+composite link is ready only when both notification subscriptions and all
+U7.5A security/store/lifecycle conditions are current and the peer is not
+suspended. The fixed control queue is depth 12; overflow remains a fail-closed,
+recovery-required BLE lifecycle fault. The compiled notification adapter uses
+`ble_gatts_notify_custom()` with exact 8-byte keyboard and 5-byte mouse values;
+acceptance means only local NimBLE stack acceptance. It has no UART command,
+BLE route, delayed retry, or peer-delivery claim in U7.4A.
 
 `ble.pairing.status` accepts omitted or empty params. Its exact result fields
 are `state`, `generation`, `connected`, `pairing_id`, `action`,
