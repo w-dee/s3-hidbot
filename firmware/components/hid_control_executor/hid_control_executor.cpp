@@ -126,6 +126,9 @@ bool Controller::ble_link_ready() const {
         return false;
     }
     const auto lifecycle = ble_state_.snapshot();
+    if (ble_event_overflow_pending(lifecycle.generation)) {
+        return false;
+    }
     const auto handles = ble_database_->hid_handles();
     return lifecycle.generation == ble_hid_peer_.generation &&
            lifecycle.desired == ble_lifecycle::DesiredExposure::kExposed &&
@@ -214,10 +217,7 @@ bool Controller::signal_ble_event(BleEvent event) {
     if (enqueue(item)) {
         return true;
     }
-    overflow_generation_.store(event.generation, std::memory_order_relaxed);
-    overflow_connection_.store(event.connection_handle,
-                               std::memory_order_relaxed);
-    ble_event_overflow_.store(true, std::memory_order_release);
+    mark_ble_event_overflow(event);
     return false;
 }
 
@@ -381,6 +381,9 @@ bool Controller::ble_hid_interface_ready(
         return false;
     }
     const auto lifecycle = ble_state_.snapshot();
+    if (ble_event_overflow_pending(lifecycle.generation)) {
+        return false;
+    }
     const auto handles = ble_database_->hid_handles();
     const std::uint16_t current_handle =
         interface == BleHidInterface::kKeyboard ? handles.keyboard_value
@@ -747,40 +750,180 @@ void Controller::commit_persistent_store_failure(
              owner);
 }
 
-bool Controller::consume_ble_overflow() {
-    if (!ble_event_overflow_.exchange(false, std::memory_order_acq_rel) ||
-        ble_backend_ == nullptr) {
+bool Controller::event_targets_current_ble_authority(BleEvent event) const {
+    const auto generation = ble_state_.generation();
+    if (event.generation != generation) {
         return false;
     }
     const auto current = ble_state_.snapshot();
-    const auto generation =
-        overflow_generation_.load(std::memory_order_acquire);
-    const auto connection =
-        overflow_connection_.load(std::memory_order_acquire);
-    if (generation != current.generation ||
-        (connection != ble_lifecycle::kNoConnection && current.connected &&
-         connection != ble_state_.connection_handle())) {
+    const auto connection = ble_state_.connection_handle();
+    if (current.generation != generation ||
+        ble_state_.generation() != generation) {
         return false;
     }
-    pairing_state_.fail_closed(current.generation,
-                               ble_state_.connection_handle(),
-                               ble_pairing::LastResult::kQueueOverflow);
-    pairing_deadline_us_ = 0;
-    wipe_pairing_mailbox();
-    ble_backend_->cancel_pairing_timeout();
-    ble_backend_->mark_security_unhealthy(current.generation);
-    if (current.connected) {
-        (void)ble_backend_->disconnect(ble_state_.connection_handle());
+    switch (event.kind) {
+        case BleEventKind::kConnect:
+            return !current.connected &&
+                   current.desired ==
+                       ble_lifecycle::DesiredExposure::kExposed &&
+                   current.observed ==
+                       ble_lifecycle::ObservedState::kAdvertising &&
+                   event.connection_handle != ble_lifecycle::kNoConnection;
+        case BleEventKind::kDisconnect:
+        case BleEventKind::kPasskeyAction:
+        case BleEventKind::kEncryptionChange:
+        case BleEventKind::kPairingComplete:
+        case BleEventKind::kIdentityResolved:
+        case BleEventKind::kRepeatPairing:
+        case BleEventKind::kPairingTimeout:
+        case BleEventKind::kStoreFull:
+        case BleEventKind::kSubscription:
+        case BleEventKind::kControlPoint:
+            return current.connected &&
+                   event.connection_handle == connection;
+        case BleEventKind::kSync:
+        case BleEventKind::kAdvertisingComplete:
+        case BleEventKind::kReset:
+        case BleEventKind::kTimeout:
+        case BleEventKind::kStorageFailure:
+            return true;
     }
-    const auto active = active_operation_.load(std::memory_order_acquire);
-    const auto ble_owner =
-        active == ControlOperation::kBleEnable ||
-                active == ControlOperation::kBleDisable
-            ? active
-            : ControlOperation::kNone;
-    fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -2,
-             ble_owner);
-    return true;
+    return false;
+}
+
+void Controller::mark_ble_event_overflow(BleEvent event) {
+    if (!event_targets_current_ble_authority(event)) {
+        return;
+    }
+    const auto authority = event.generation;
+    if (authority == 0) {
+        if (event_targets_current_ble_authority(event)) {
+            overflow_authority_zero_.store(true, std::memory_order_release);
+        }
+        return;
+    }
+    auto observed = overflow_authority_.load(std::memory_order_acquire);
+    while (observed != authority) {
+        // Revalidate immediately before the CAS. If the authority changed,
+        // this producer must not overwrite a newer authority's pending bit.
+        if (!event_targets_current_ble_authority(event)) {
+            return;
+        }
+        if (overflow_authority_.compare_exchange_weak(
+                observed, authority, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+bool Controller::ble_event_overflow_pending(
+    ble_lifecycle::Generation generation) const {
+    return generation == 0
+               ? overflow_authority_zero_.load(std::memory_order_acquire)
+               : overflow_authority_.load(std::memory_order_acquire) ==
+                     generation;
+}
+
+bool Controller::consume_ble_overflow() {
+    if (ble_backend_ == nullptr) {
+        return false;
+    }
+    while (true) {
+        const auto authority = ble_state_.generation();
+        if (ble_event_overflow_pending(authority)) {
+            const auto current = ble_state_.snapshot();
+            if (current.generation != authority ||
+                ble_state_.generation() != authority) {
+                continue;
+            }
+            const auto clear_authority = [this, authority]() {
+                if (authority == 0) {
+                    overflow_authority_zero_.store(
+                        false, std::memory_order_release);
+                    return;
+                }
+                auto consumed = authority;
+                (void)overflow_authority_.compare_exchange_strong(
+                    consumed, 0, std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+            };
+            // The boot-global fatal store latch is reconciled first and has
+            // already retired this authority more strongly. Do not replace
+            // its retained storage diagnosis with the generic queue result.
+            if (persistent_store_failure_committed_) {
+                clear_authority();
+                return true;
+            }
+            pairing_state_.fail_closed(
+                current.generation, ble_state_.connection_handle(),
+                ble_pairing::LastResult::kQueueOverflow);
+            pairing_deadline_us_ = 0;
+            wipe_pairing_mailbox();
+            ble_backend_->cancel_pairing_timeout();
+            ble_backend_->mark_security_unhealthy(current.generation);
+            if (current.connected) {
+                (void)ble_backend_->disconnect(
+                    ble_state_.connection_handle());
+            }
+            const auto active =
+                active_operation_.load(std::memory_order_acquire);
+            const auto ble_owner =
+                current.observed == ble_lifecycle::ObservedState::kEnabling &&
+                        active == ControlOperation::kBleEnable
+                    ? ControlOperation::kBleEnable
+                    : current.observed ==
+                                  ble_lifecycle::ObservedState::kDisabling &&
+                              active == ControlOperation::kBleDisable
+                          ? ControlOperation::kBleDisable
+                          : ControlOperation::kNone;
+            fail_ble(current.generation, ble_lifecycle::Operation::kRuntime,
+                     -2, ble_owner);
+
+            // Clear only the exact authority that was fail-closed. A producer
+            // that has already published a newer current authority makes the
+            // CAS fail, leaving that uncertainty pending for the next loop.
+            clear_authority();
+            return true;
+        }
+        if (authority == 0) {
+            auto stale = overflow_authority_.load(std::memory_order_acquire);
+            if (stale == 0) {
+                return false;
+            }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+            if (overflow_consume_hook_ != nullptr) {
+                const auto hook = overflow_consume_hook_;
+                overflow_consume_hook_ = nullptr;
+                hook(*this);
+            }
+#endif
+            (void)overflow_authority_.compare_exchange_strong(
+                stale, 0, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            continue;
+        }
+        auto stale_zero = true;
+        if (overflow_authority_zero_.compare_exchange_strong(
+                stale_zero, false, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            continue;
+        }
+        auto stale = overflow_authority_.load(std::memory_order_acquire);
+        if (stale == 0) {
+            return false;
+        }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+        if (overflow_consume_hook_ != nullptr) {
+            const auto hook = overflow_consume_hook_;
+            overflow_consume_hook_ = nullptr;
+            hook(*this);
+        }
+#endif
+        (void)overflow_authority_.compare_exchange_strong(
+            stale, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
 }
 
 void Controller::terminate_security_connection(ble_pairing::LastResult result,
@@ -1210,6 +1353,16 @@ bool Controller::dequeue_one_for_test(Action &action) {
 }
 
 void Controller::process_for_test(Action action) { process(action); }
+
+void Controller::set_overflow_consume_hook_for_test(
+    OverflowConsumeHook hook) {
+    overflow_consume_hook_ = hook;
+}
+
+void Controller::set_ble_generation_for_test(
+    ble_lifecycle::Generation generation) {
+    ble_state_.set_generation_for_test(generation);
+}
 
 ControlOperation Controller::active_operation_for_test() const {
     return active_operation_.load(std::memory_order_acquire);

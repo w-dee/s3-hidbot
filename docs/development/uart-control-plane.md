@@ -76,8 +76,20 @@ lost to a full queue or a concurrent disable advances generation. Compound
 security snapshots use a single-writer/read-many
 sequence counter: executor serialization supplies the one writer and concurrent
 status/HID readers retry incoherent observations. The fixed control queue is
-depth 12; overflow remains a fail-closed,
-recovery-required BLE lifecycle fault. The compiled notification adapter uses
+depth 12. Queue-full publication uses one lock-free, generation-authority
+sticky token rather than a separately published generation/connection tuple.
+Generation zero uses a separate lock-free presence bit so zero can remain the
+inactive value of the primary token without losing wrap fail-closed behavior.
+Only an event that still targets the current lifecycle (and, for peer events,
+the current connection) may set or replace a stale token; producers never
+clear it. Readiness observes the token immediately. The executor clears only a
+stale token by compare/exchange or the exact token after fail-closing that
+authority, so concurrent and stale producers cannot erase current uncertainty
+or carry it into a later authority. Overflow remains a fail-closed,
+recovery-required BLE lifecycle fault. StoreFull itself remains local and does
+not set the boot-global persistent-store latch, although losing its detailed
+event to queue overflow invokes the independent generic recovery policy. The
+compiled notification adapter uses
 `ble_gatts_notify_custom()` with exact 8-byte keyboard and 5-byte mouse values;
 acceptance means only local NimBLE stack acceptance. It has no UART command,
 BLE route, delayed retry, or peer-delivery claim in U7.4A.

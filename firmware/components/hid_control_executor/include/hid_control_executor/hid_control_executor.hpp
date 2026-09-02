@@ -314,9 +314,12 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
         BleHidWorkIdentity identity, const BleMouseReport &report);
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    using OverflowConsumeHook = void (*)(Controller &controller);
     bool process_one_for_test();
     bool dequeue_one_for_test(Action &action);
     void process_for_test(Action action);
+    void set_overflow_consume_hook_for_test(OverflowConsumeHook hook);
+    void set_ble_generation_for_test(ble_lifecycle::Generation generation);
     ControlOperation active_operation_for_test() const;
     bool reserve_operation_for_test(ControlOperation operation);
     void release_operation_for_test(ControlOperation operation);
@@ -341,6 +344,10 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
                                        bool fatal);
     void reconcile_security(std::uint16_t connection_handle,
                             bool pairing_complete_seen);
+    bool event_targets_current_ble_authority(BleEvent event) const;
+    void mark_ble_event_overflow(BleEvent event);
+    bool ble_event_overflow_pending(
+        ble_lifecycle::Generation generation) const;
     bool consume_ble_overflow();
     void reconcile_pairing_deadline();
     PairingStatusSnapshot current_pairing_status() const;
@@ -370,10 +377,15 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     ble_pairing::StateMachine pairing_state_{};
     bool initialized_ = false;
     std::atomic<ControlOperation> active_operation_{ControlOperation::kNone};
-    std::atomic_bool ble_event_overflow_{false};
-    std::atomic<ble_lifecycle::Generation> overflow_generation_{0};
-    std::atomic<std::uint16_t> overflow_connection_{
-        ble_lifecycle::kNoConnection};
+    // A nonzero value is the exact BLE lifecycle authority whose event stream
+    // became uncertain. Generation zero has a separate bit so zero can remain
+    // the inactive sentinel for the primary atomic. Producers replace only a
+    // stale authority with the current one; they never publish a connection
+    // tuple or clear pending uncertainty.
+    static_assert(std::atomic<ble_lifecycle::Generation>::is_always_lock_free);
+    static_assert(std::atomic_bool::is_always_lock_free);
+    std::atomic<ble_lifecycle::Generation> overflow_authority_{0};
+    std::atomic_bool overflow_authority_zero_{false};
     // Executor-owned acknowledgment of the boot-lifetime backend latch.
     // The callback-side latch itself remains monotonic and authoritative.
     bool persistent_store_failure_committed_ = false;
@@ -399,6 +411,7 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     std::uint8_t native_head_ = 0;
     std::uint8_t native_count_ = 0;
     bool fail_next_enqueue_ = false;
+    OverflowConsumeHook overflow_consume_hook_ = nullptr;
 #endif
 };
 

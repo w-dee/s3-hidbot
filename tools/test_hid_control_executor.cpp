@@ -1365,6 +1365,263 @@ void fill_queue_with_stale_security_events(
     }
 }
 
+void publish_current_timeout_overflow_during_consume(
+    hid_control_executor::Controller &controller) {
+    assert(!controller.signal_ble_event({
+        .kind = hid_control_executor::BleEventKind::kTimeout,
+        .generation = controller.ble_snapshot().generation,
+        .connection_handle = ble_lifecycle::kNoConnection,
+        .status = -77,
+    }));
+}
+
+void test_overflow_current_then_stale_preserves_cccd_fail_closed() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 90;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, false));
+    assert(!controller.ble_link_ready());
+    assert(!ble.event_for_generation(
+        hid_control_executor::BleEventKind::kEncryptionChange,
+        generation - 1U, connection));
+
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().recovery_required);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(!controller.ble_link_ready());
+    assert(ble.disconnect_calls == 1);
+}
+
+void test_overflow_stale_then_current_security_fails_closed() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 91;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!ble.event_for_generation(
+        hid_control_executor::BleEventKind::kEncryptionChange,
+        generation - 1U, connection));
+    assert(controller.ble_link_ready());
+    assert(!ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                      connection));
+    assert(!controller.ble_link_ready());
+
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().recovery_required);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(!ble.security_ready_for_hid(generation, connection));
+    assert(ble.disconnect_calls == 1);
+}
+
+void test_two_current_overflows_preserve_suspend_fail_closed() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 92;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!queue_control_point(controller, generation, connection,
+                                database.handles.control_point_value, true));
+    assert(!controller.ble_link_ready());
+    assert(!ble.event(hid_control_executor::BleEventKind::kPairingTimeout,
+                      connection));
+
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().recovery_required);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(ble.disconnect_calls == 1);
+    while (controller.process_one_for_test()) {
+    }
+    assert(ble.disconnect_calls == 1);
+}
+
+void test_stale_overflow_does_not_poison_reused_handle_authority() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 93;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation_a = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation_a, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    fill_queue_with_stale_security_events(
+        ble, generation_a, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                      connection));
+    hid_control_executor::Controller::Action deferred{};
+    assert(controller.dequeue_one_for_test(deferred));
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    controller.process_for_test(deferred);
+    assert(!controller.ble_snapshot().recovery_required);
+    while (controller.process_one_for_test()) {
+    }
+
+    const auto generation_b = controller.ble_snapshot().generation;
+    assert(generation_b != generation_a);
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                     connection));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kIdle);
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect,
+                     connection));
+    assert(controller.process_one_for_test());
+    const auto generation_c = controller.ble_snapshot().generation;
+    assert(generation_c != generation_a && generation_c != generation_b);
+    subscribe_composite(controller, database, generation_c, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    for (std::size_t index = 0;
+         index < hid_control_executor::Controller::kActionQueueDepth; ++index) {
+        assert(ble.event_for_generation(
+            hid_control_executor::BleEventKind::kEncryptionChange,
+            generation_a, connection));
+    }
+    assert(!ble.event_for_generation(
+        hid_control_executor::BleEventKind::kEncryptionChange,
+        generation_a, connection));
+    assert(controller.ble_link_ready());
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+    assert(!controller.ble_snapshot().recovery_required);
+}
+
+void test_overflow_consumer_cas_preserves_racing_current_producer() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 94;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation_a = controller.ble_snapshot().generation;
+
+    fill_queue_with_stale_security_events(
+        ble, generation_a, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                      connection));
+    hid_control_executor::Controller::Action deferred{};
+    assert(controller.dequeue_one_for_test(deferred));
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.ble_snapshot().generation != generation_a);
+    controller.set_overflow_consume_hook_for_test(
+        publish_current_timeout_overflow_during_consume);
+    controller.process_for_test(deferred);
+
+    assert(controller.ble_snapshot().recovery_required);
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kFault);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(ble.disconnect_calls == 1);
+}
+
+void test_dropped_store_full_uses_generic_fault_not_global_fatal() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 95;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!ble.event(hid_control_executor::BleEventKind::kStoreFull,
+                      connection, -45));
+    assert(!ble.persistent_store_failure_observed());
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().recovery_required);
+    assert(ble.apply_persistent_store_failure_calls == 0);
+    assert(!ble.persistent_store_failure_observed());
+}
+
+void test_overflow_generation_zero_wrap_remains_fail_closed() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 96;
+    controller.set_ble_generation_for_test(
+        std::numeric_limits<ble_lifecycle::Generation>::max());
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    assert(generation == 0);
+    subscribe_composite(controller, database, generation, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, false));
+    assert(!controller.ble_link_ready());
+    assert(!ble.event_for_generation(
+        hid_control_executor::BleEventKind::kEncryptionChange,
+        std::numeric_limits<ble_lifecycle::Generation>::max(), connection));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().recovery_required);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(ble.disconnect_calls == 1);
+}
+
 void test_fatal_storage_overflow_survives_disable_generation_advance() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
@@ -1402,6 +1659,8 @@ void test_fatal_storage_overflow_survives_disable_generation_advance() {
     assert(failed.observed == ble_lifecycle::ObservedState::kFault);
     assert(failed.recovery_required && !failed.advertising && !failed.connected);
     assert(ble.apply_persistent_store_failure_calls == 1);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kStorage);
     assert(!ble.security.snapshot().store_healthy);
     assert(controller.active_operation_for_test() == ControlOperation::kNone);
     assert(!controller.ble_hid_peer_snapshot().active);
@@ -2377,6 +2636,13 @@ int main() {
     test_disable_request_defers_security_retirement_to_executor();
     test_fatal_storage_latch_preempts_disable_retirement();
     test_fatal_storage_latch_preempts_disconnect_retirement();
+    test_overflow_current_then_stale_preserves_cccd_fail_closed();
+    test_overflow_stale_then_current_security_fails_closed();
+    test_two_current_overflows_preserve_suspend_fail_closed();
+    test_stale_overflow_does_not_poison_reused_handle_authority();
+    test_overflow_consumer_cas_preserves_racing_current_producer();
+    test_dropped_store_full_uses_generic_fault_not_global_fatal();
+    test_overflow_generation_zero_wrap_remains_fail_closed();
     test_fatal_storage_overflow_survives_disable_generation_advance();
     test_fatal_storage_overflow_survives_disconnect();
     test_fatal_storage_without_connection_preempts_enable_and_is_idempotent();

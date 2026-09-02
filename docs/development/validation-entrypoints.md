@@ -67,8 +67,15 @@ every executor processing boundary. Deterministic SMP-order tests dequeue an
 action, advance disable generation, and then resume executor processing to prove
 that a lost detailed fatal event still commits one idempotent global fault;
 queue-full disconnect, no-connection fatal, repeated fatal, and StoreFull
-contrast cases cover the other fallback boundaries. These are included
-by `test-native.sh`, `test-static.sh`, and therefore canonical
+contrast cases cover the other fallback boundaries. Authority-scoped overflow
+tests cover current-then-stale, stale-then-current,
+multiple-current, same-handle authority reuse, and a deterministic
+producer/consumer CAS interleaving, including generation-zero wrap. Dropped
+CCCD-disable and Control Point
+Suspend events inhibit readiness immediately, before the executor performs the
+single idempotent recovery fault. A stale producer can neither replace a
+current sticky token nor poison a newer lifecycle generation. These checks are
+included by `test-native.sh`, `test-static.sh`, and therefore canonical
 `test-nonhardware.sh`. An ESP-IDF target build remains mandatory because the
 service database, mbuf allocation, and NimBLE notification API are
 target-linked. None of these checks performs radio, serial, or hardware

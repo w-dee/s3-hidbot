@@ -32,7 +32,24 @@ def main() -> int:
     assert "static constexpr std::size_t kActionQueueDepth = 12;" in executor_header
     assert "native_queue_[kActionQueueDepth]" in executor_header
     assert "xQueueSend(s_action_queue, &item, 0)" in executor
-    assert "ble_event_overflow_.store(true" in executor
+    assert "mark_ble_event_overflow(event);" in executor
+    assert "overflow_authority_.compare_exchange_weak(" in executor
+    assert "ble_event_overflow_pending(lifecycle.generation)" in executor
+    for obsolete in ("std::atomic_bool ble_event_overflow_{",
+                     "overflow_generation_", "overflow_connection_"):
+        assert obsolete not in executor_header
+        assert obsolete not in executor
+
+    consume = re.search(
+        r"bool Controller::consume_ble_overflow\(\) \{(.*?)"
+        r"\n\}\n\nvoid Controller::terminate_security_connection",
+        executor, re.S)
+    assert consume
+    assert "ble_event_overflow_pending(authority)" in consume.group(1)
+    assert "fail_ble(" in consume.group(1)
+    assert consume.group(1).index("ble_event_overflow_pending(authority)") < \
+        consume.group(1).index("fail_ble(")
+    assert "compare_exchange_strong(" in consume.group(1)
 
     process = re.search(
         r"void Controller::process\(Action action\) \{(.*?)"
