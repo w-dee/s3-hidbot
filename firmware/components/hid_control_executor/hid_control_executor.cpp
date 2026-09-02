@@ -643,7 +643,7 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
                 ble_pairing::LastResult::kSecurityPolicy, false);
         } else if (!security.project_verified_bond_persisted) {
             terminate_security_connection(ble_pairing::LastResult::kStorage,
-                                          false);
+                                          true);
         }
     }
 }

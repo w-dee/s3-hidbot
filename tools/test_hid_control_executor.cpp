@@ -835,6 +835,149 @@ void make_security_ready(FakeBleBackend &ble, bool identity = true) {
                               .peer = valid_security_record()};
 }
 
+void assert_fatal_storage_terminal_state(
+    hid_control_executor::Controller &controller, FakeBleBackend &ble,
+    FakeBleDatabase &database, std::uint16_t handle,
+    int advertising_calls_before_disconnect) {
+    const auto failed = controller.ble_snapshot();
+    assert(failed.desired == ble_lifecycle::DesiredExposure::kExposed);
+    assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failed.recovery_required);
+    assert(!failed.advertising && !failed.connected);
+    assert(failed.last_error.present);
+    assert(failed.last_error.operation == ble_lifecycle::Operation::kRuntime);
+    assert(controller.pairing_snapshot().live_state ==
+           ble_pairing::LiveState::kIdle);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kStorage);
+    assert(controller.pairing_snapshot().pairing_id == 0);
+    assert(ble.timer_pairing_id == 0);
+    assert(controller.pairing_mailbox_zero_for_test());
+    assert(!ble.security_ready_for_hid(failed.generation, handle));
+    assert(database.clear_calls == 1);
+    assert(ble.disconnect_calls == 1);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, handle));
+    assert(controller.process_one_for_test());
+    const auto after_disconnect = controller.ble_snapshot();
+    assert(after_disconnect.desired == ble_lifecycle::DesiredExposure::kExposed);
+    assert(after_disconnect.observed == ble_lifecycle::ObservedState::kFault);
+    assert(after_disconnect.recovery_required);
+    assert(!after_disconnect.advertising && !after_disconnect.connected);
+    assert(ble.advertising_calls == advertising_calls_before_disconnect);
+
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kBusy);
+    const auto after_disable = controller.ble_snapshot();
+    assert(after_disable.observed == ble_lifecycle::ObservedState::kFault);
+    assert(after_disable.recovery_required);
+}
+
+void run_persisted_bond_reread_failure(
+    ble_security::PersistedSecurityEvidence persisted,
+    std::uint16_t handle) {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    connect_ble(runtime, usb, ble, database, controller, handle);
+    assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction,
+                     handle, 1));
+    assert(controller.process_one_for_test());
+    const auto pending = controller.pairing_snapshot();
+    const std::array<char, 6> secret = {'0', '0', '0', '1', '2', '3'};
+    assert(controller.respond_to_pairing(pending.generation, handle,
+                                         pending.pairing_id, secret) ==
+           ble_pairing::RespondResult::kAccepted);
+    make_security_ready(ble);
+    ble.security_persisted = persisted;
+    const int advertising_calls = ble.advertising_calls;
+    assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
+                     handle, 0));
+    assert(controller.process_one_for_test());
+    assert_fatal_storage_terminal_state(controller, ble, database, handle,
+                                        advertising_calls);
+}
+
+void test_missing_our_sec_is_fatal_storage_failure() {
+    run_persisted_bond_reread_failure(
+        {.our = {}, .peer = valid_security_record()}, 81);
+}
+
+void test_missing_peer_sec_is_fatal_storage_failure() {
+    run_persisted_bond_reread_failure(
+        {.our = valid_security_record(), .peer = {}}, 82);
+}
+
+void test_persisted_bond_reread_mismatch_is_fatal_storage_failure() {
+    auto mismatched = valid_security_record();
+    mismatched.identity_matches = false;
+    run_persisted_bond_reread_failure(
+        {.our = valid_security_record(), .peer = mismatched}, 83);
+}
+
+void test_low_level_storage_error_is_fatal_and_stale_generation_is_ignored() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 84);
+        assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction,
+                         84, 1));
+        assert(controller.process_one_for_test());
+        const int advertising_calls = ble.advertising_calls;
+        assert(ble.event(hid_control_executor::BleEventKind::kStorageFailure,
+                         84));
+        assert(controller.process_one_for_test());
+        assert_fatal_storage_terminal_state(controller, ble, database, 84,
+                                            advertising_calls);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 85);
+        const auto generation = controller.ble_snapshot().generation;
+        assert(ble.event_for_generation(
+            hid_control_executor::BleEventKind::kStorageFailure,
+            generation - 1, 85));
+        assert(controller.process_one_for_test());
+        const auto current = controller.ble_snapshot();
+        assert(current.observed == ble_lifecycle::ObservedState::kConnected);
+        assert(current.connected && !current.recovery_required);
+        assert(ble.disconnect_calls == 0);
+        assert(ble.advertising_calls == 1);
+    }
+}
+
+void test_store_full_remains_recoverable_and_readvertises() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    connect_ble(runtime, usb, ble, database, controller, 86);
+    assert(ble.event(hid_control_executor::BleEventKind::kStoreFull, 86));
+    assert(controller.process_one_for_test());
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kStoreFull);
+    assert(!controller.ble_snapshot().recovery_required);
+    assert(ble.disconnect_calls == 1);
+    const int advertising_calls = ble.advertising_calls;
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 86));
+    assert(controller.process_one_for_test());
+    const auto recovered = controller.ble_snapshot();
+    assert(recovered.observed == ble_lifecycle::ObservedState::kAdvertising);
+    assert(recovered.advertising && !recovered.connected);
+    assert(!recovered.recovery_required);
+    assert(ble.advertising_calls == advertising_calls + 1);
+}
+
 void test_pairing_input_response_and_initiation() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
@@ -1279,6 +1422,11 @@ int main() {
     test_pairing_input_response_and_initiation();
     test_public_pairing_rpc_mailbox_status_and_races();
     test_security_event_ordering_and_existing_bond();
+    test_missing_our_sec_is_fatal_storage_failure();
+    test_missing_peer_sec_is_fatal_storage_failure();
+    test_persisted_bond_reread_mismatch_is_fatal_storage_failure();
+    test_low_level_storage_error_is_fatal_and_stale_generation_is_ignored();
+    test_store_full_remains_recoverable_and_readvertises();
     test_timeout_repeat_store_and_disconnect_results();
     test_queue_burst_overflow_and_id_wrap_fail_closed();
     test_policy_persistence_disconnect_disable_and_bounded_burst();
