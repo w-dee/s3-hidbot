@@ -1405,6 +1405,26 @@ void publish_current_timeout_overflow_during_consume(
     }));
 }
 
+void drain_executor_before_fallback_publication(
+    hid_control_executor::Controller &controller) {
+    // This hook runs inside the failed producer after queue-full was observed,
+    // but before the sticky fallback is published.  It deterministically
+    // reproduces the old final-drain lost-wakeup window without sleeps.
+    assert(controller.process_wake_cycle_for_test());
+    assert(!controller.process_one_for_test());
+}
+
+void publish_lifecycle_fallback_while_executor_active(
+    hid_control_executor::Controller &controller) {
+    controller.signal_ble_lifecycle_handoff_failure();
+}
+
+void clear_retained_executor_wake(
+    hid_control_executor::Controller &controller) {
+    assert(controller.process_wake_cycle_for_test());
+    assert(!controller.executor_wake_pending_for_test());
+}
+
 void test_reset_sync_normal_handoff_reaches_advertising() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
@@ -1428,6 +1448,183 @@ void test_reset_sync_normal_handoff_reaches_advertising() {
     assert(controller.ble_snapshot().observed ==
            ble_lifecycle::ObservedState::kAdvertising);
     assert(!controller.ble_snapshot().recovery_required);
+}
+
+void test_sync_fallback_wakes_after_executor_final_queue_drain() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    advertise_ble(runtime, usb, ble, database, controller);
+    const auto generation = controller.ble_snapshot().generation;
+    const auto next_generation = generation + 1U;
+
+    fill_queue_with_stale_security_events(
+        ble, generation, ble_lifecycle::kNoConnection,
+        hid_control_executor::Controller::kActionQueueDepth - 1U);
+    ble.set_generation(next_generation);
+    assert(ble.lifecycle_event_for_generation(
+        hid_control_executor::BleEventKind::kReset, generation, -71));
+    controller.set_ble_enqueue_failure_hook_for_test(
+        hid_control_executor::Controller::BleEnqueueFailurePhase::
+            kAfterGenericFallback,
+        drain_executor_before_fallback_publication);
+
+    assert(!ble.lifecycle_event_for_generation(
+        hid_control_executor::BleEventKind::kSync, next_generation));
+    const auto stranded_without_wake = controller.ble_snapshot();
+    assert(stranded_without_wake.observed ==
+           ble_lifecycle::ObservedState::kEnabling);
+    assert(!stranded_without_wake.advertising);
+    assert(controller.executor_wake_pending_for_test());
+
+    assert(controller.process_wake_cycle_for_test());
+    const auto failed = controller.ble_snapshot();
+    assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failed.recovery_required && !failed.advertising);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    assert(ble.advertising_calls == 1);
+}
+
+void test_generic_overflow_wakes_after_executor_final_queue_drain() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t orphan = 106;
+    advertise_ble(runtime, usb, ble, database, controller);
+    const auto generation = controller.ble_snapshot().generation;
+    ble.orphan_terminate_result = -82;
+
+    fill_queue_with_stale_security_events(
+        ble, generation, orphan,
+        hid_control_executor::Controller::kActionQueueDepth);
+    controller.set_ble_enqueue_failure_hook_for_test(
+        hid_control_executor::Controller::BleEnqueueFailurePhase::
+            kBeforeGenericFallback,
+        drain_executor_before_fallback_publication);
+    assert(!ble.event(hid_control_executor::BleEventKind::kConnect, orphan));
+    assert(ble.orphan_terminate_calls == 1);
+    assert(ble.last_orphan_connection == orphan);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(!controller.ble_link_ready());
+    assert(controller.executor_wake_pending_for_test());
+
+    assert(controller.process_wake_cycle_for_test());
+    const auto failed = controller.ble_snapshot();
+    assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failed.recovery_required && !failed.advertising);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kQueueOverflow);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    assert(ble.advertising_calls == 1);
+}
+
+void test_adopted_peer_overflow_wakes_after_final_queue_drain() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 107;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    controller.set_ble_enqueue_failure_hook_for_test(
+        hid_control_executor::Controller::BleEnqueueFailurePhase::
+            kBeforeGenericFallback,
+        drain_executor_before_fallback_publication);
+    assert(!queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        database.handles.keyboard_value, false));
+    assert(!controller.ble_link_ready());
+    assert(controller.executor_wake_pending_for_test());
+
+    assert(controller.process_wake_cycle_for_test());
+    assert(controller.ble_snapshot().recovery_required);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(!ble.security_ready_for_hid(generation, connection));
+    assert(ble.disconnect_calls == 1);
+}
+
+void test_fallback_wake_retention_active_and_coalesced_priority() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        advertise_ble(runtime, usb, ble, database, controller);
+        clear_retained_executor_wake(controller);
+
+        // Publication before a wait (equivalently while the task is blocked)
+        // remains pending until the executor takes the wake.
+        controller.signal_ble_lifecycle_handoff_failure();
+        assert(controller.executor_wake_pending_for_test());
+        assert(controller.process_wake_cycle_for_test());
+        assert(controller.ble_snapshot().recovery_required);
+        assert(controller.ble_snapshot().observed ==
+               ble_lifecycle::ObservedState::kFault);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        advertise_ble(runtime, usb, ble, database, controller);
+        clear_retained_executor_wake(controller);
+        const auto generation = controller.ble_snapshot().generation;
+
+        assert(ble.event_for_generation(
+            hid_control_executor::BleEventKind::kEncryptionChange,
+            generation - 1U, ble_lifecycle::kNoConnection));
+        controller.set_process_after_reconciliation_hook_for_test(
+            publish_lifecycle_fallback_while_executor_active);
+        assert(controller.process_wake_cycle_for_test());
+        // The final reconciliation catches publication during active work;
+        // the retained notification can cause a harmless follow-up pass.
+        assert(controller.ble_snapshot().recovery_required);
+        assert(controller.ble_snapshot().observed ==
+               ble_lifecycle::ObservedState::kFault);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        advertise_ble(runtime, usb, ble, database, controller);
+        clear_retained_executor_wake(controller);
+        const auto generation = controller.ble_snapshot().generation;
+
+        fill_queue_with_stale_security_events(
+            ble, generation, ble_lifecycle::kNoConnection,
+            hid_control_executor::Controller::kActionQueueDepth);
+        assert(!ble.event(hid_control_executor::BleEventKind::kTimeout,
+                          ble_lifecycle::kNoConnection, -83));
+        controller.signal_ble_lifecycle_handoff_failure();
+        // The native boolean models coalesced task notifications: both sticky
+        // causes require only one wake cycle, with lifecycle outranking generic.
+        assert(controller.executor_wake_pending_for_test());
+        assert(controller.process_wake_cycle_for_test());
+        assert(!controller.executor_wake_pending_for_test());
+        assert(controller.ble_snapshot().recovery_required);
+        assert(controller.ble_snapshot().observed ==
+               ble_lifecycle::ObservedState::kFault);
+        assert(controller.pairing_snapshot().last_result ==
+               ble_pairing::LastResult::kQueueOverflow);
+    }
 }
 
 void test_dropped_future_sync_cannot_leave_reset_enabling() {
@@ -2899,6 +3096,10 @@ int main() {
     test_fatal_storage_latch_preempts_disable_retirement();
     test_fatal_storage_latch_preempts_disconnect_retirement();
     test_reset_sync_normal_handoff_reaches_advertising();
+    test_sync_fallback_wakes_after_executor_final_queue_drain();
+    test_generic_overflow_wakes_after_executor_final_queue_drain();
+    test_adopted_peer_overflow_wakes_after_final_queue_drain();
+    test_fallback_wake_retention_active_and_coalesced_priority();
     test_dropped_future_sync_cannot_leave_reset_enabling();
     test_dropped_future_lifecycle_timeout_cannot_leave_reset_enabling();
     test_stale_sync_does_not_set_handoff_failure();

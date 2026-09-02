@@ -6,6 +6,67 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_disconnect_watchdog_ordering_model() -> None:
+    """Exercise the source-enforced arm/initiate/callback ownership order."""
+    none, sync, disconnect = "none", "sync", "disconnect"
+
+    class Watchdog:
+        def __init__(self):
+            self.purpose = none
+            self.lifecycle = "disabling"
+
+        def arm(self, purpose):
+            self.purpose = purpose
+            return 0
+
+        def cancel(self, purpose):
+            if self.purpose == purpose:
+                self.purpose = none
+
+        def complete_disconnect(self):
+            self.cancel(disconnect)
+            self.lifecycle = "idle"
+
+    def invoke(model, terminate_result=0, immediate_completion=False,
+               arm_result=0):
+        if arm_result != 0:
+            return arm_result
+        assert model.arm(disconnect) == 0
+        if immediate_completion:
+            model.complete_disconnect()
+        if terminate_result in (0, "already"):
+            return 0
+        model.cancel(disconnect)
+        model.lifecycle = "fault"
+        return terminate_result
+
+    immediate = Watchdog()
+    assert invoke(immediate, immediate_completion=True) == 0
+    assert immediate.purpose == none
+    assert immediate.lifecycle == "idle"
+
+    failed = Watchdog()
+    assert invoke(failed, terminate_result="not-connected") == "not-connected"
+    assert failed.purpose == none
+    assert failed.lifecycle == "fault"
+
+    delayed = Watchdog()
+    assert invoke(delayed) == 0
+    assert delayed.purpose == disconnect
+    delayed.complete_disconnect()
+    assert delayed.purpose == none
+    assert delayed.lifecycle == "idle"
+
+    already = Watchdog()
+    assert invoke(already, terminate_result="already") == 0
+    assert already.purpose == disconnect
+
+    stale = Watchdog()
+    stale.purpose = sync
+    stale.cancel(disconnect)
+    assert stale.purpose == sync
+
+
 def main() -> int:
     executor_header = (ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp").read_text()
     executor = (ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp").read_text()
@@ -38,6 +99,30 @@ def main() -> int:
     assert "ble_event_overflow_pending(lifecycle.generation)" in executor
     assert "ble_lifecycle_handoff_failure_.store(true" in executor
     assert "reconcile_ble_lifecycle_handoff_failure()" in executor
+    lifecycle_fallback = re.search(
+        r"void Controller::signal_ble_lifecycle_handoff_failure\(\) \{(.*?)\n\}",
+        executor, re.S)
+    assert lifecycle_fallback
+    assert lifecycle_fallback.group(1).index(
+        "ble_lifecycle_handoff_failure_.store(") < \
+        lifecycle_fallback.group(1).index("request_executor_wake();")
+    generic_fallback = re.search(
+        r"void Controller::mark_ble_event_overflow\(BleEvent event\) \{(.*?)"
+        r"\n\}\n\nbool Controller::ble_event_overflow_pending",
+        executor, re.S)
+    assert generic_fallback
+    assert "request_executor_wake();" in generic_fallback.group(1)
+    assert generic_fallback.group(1).count("request_executor_wake();") >= 3
+    wake = re.search(
+        r"void Controller::request_executor_wake\(\) \{(.*?)\n\}",
+        executor, re.S)
+    assert wake and "xTaskNotifyGive(s_executor_task)" in wake.group(1)
+    task_loop = re.search(
+        r"void Controller::task_loop\(\) \{(.*?)\n\}", executor, re.S)
+    assert task_loop
+    assert "ulTaskNotifyTake(pdTRUE, portMAX_DELAY)" in task_loop.group(1)
+    assert "xQueueReceive(s_action_queue, &action, 0)" in task_loop.group(1)
+    assert "reconcile_ble_fallbacks(nullptr);" in task_loop.group(1)
     for obsolete in ("std::atomic_bool ble_event_overflow_{",
                      "overflow_generation_", "overflow_connection_"):
         assert obsolete not in executor_header
@@ -101,6 +186,20 @@ def main() -> int:
     assert "LifecycleTimeoutPurpose::kDisconnect" in disconnect.group(1)
     assert "std::atomic<LifecycleTimeoutPurpose>::is_always_lock_free" in \
         transport_header
+    disconnect_call = re.search(
+        r"std::int32_t Backend::disconnect\(std::uint16_t connection_handle\) \{"
+        r"(.*?)\n\}\n\nstd::int32_t Backend::terminate_orphan_connection",
+        transport, re.S)
+    assert disconnect_call
+    disconnect_body = disconnect_call.group(1)
+    assert disconnect_body.index("arm_timeout(") < \
+        disconnect_body.index("ble_gap_terminate(")
+    assert "terminate_result == 0 || terminate_result == BLE_HS_EALREADY" in \
+        disconnect_body
+    assert disconnect_body.index("ble_gap_terminate(") < \
+        disconnect_body.index(
+            "cancel_timeout(LifecycleTimeoutPurpose::kDisconnect)")
+    test_disconnect_watchdog_ordering_model()
 
     disable_request = re.search(
         r"BleCommandOutcome Controller::request_ble_disable\(\) \{(.*?)"

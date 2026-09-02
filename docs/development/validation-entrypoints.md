@@ -84,7 +84,17 @@ tests prove immediate exact-handle orphan termination, no false peer adoption,
 harmless orphan Disconnect processing, and retained logical fail-close when
 the termination API rejects the request. The target/static contract fixes
 production cardinality at one BLE connection and verifies the ESP-IDF v5.5.4
-callback-side termination call remains direct and non-deferred. These checks
+callback-side termination call remains direct and non-deferred. The suites also
+use native hooks to pause failed Sync, current overflow, dropped Connect,
+and adopted-peer producers until after the executor's old final queue-drain
+boundary. They then prove that the independent retained wake alone commits the
+sticky failure without unrelated traffic. Wake-before-wait, blocked/idle,
+active-executor, and coalesced lifecycle-plus-generic cases cover the remaining
+lost-wakeup windows and reconciliation priority. Static source guards plus a
+deterministic watchdog model verify arm-before-terminate ordering, immediate and
+delayed Disconnect completion, synchronous initiation failure cleanup,
+`BLE_HS_EALREADY` retention, and exact-purpose protection from stale Disconnect
+cancellation. These checks
 are included by `test-native.sh`, `test-static.sh`, and therefore canonical
 `test-nonhardware.sh`. An ESP-IDF target build remains mandatory because the
 service database, mbuf allocation, and NimBLE notification API are

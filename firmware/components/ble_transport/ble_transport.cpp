@@ -441,13 +441,26 @@ std::int32_t Backend::start_advertising() {
 std::int32_t Backend::stop_advertising() { return ble_gap_adv_stop(); }
 
 std::int32_t Backend::disconnect(std::uint16_t connection_handle) {
-    const int result =
-        ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
-    if (result != 0) {
-        return result;
+    // Establish the typed watchdog before NimBLE can expose completion on
+    // another core.  A callback can therefore only cancel an already-owned
+    // Disconnect watchdog, and this caller never arms one after initiation.
+    const std::int32_t timeout_result = arm_timeout(
+        kDisconnectTimeoutUs, LifecycleTimeoutPurpose::kDisconnect);
+    if (timeout_result != ESP_OK) {
+        return timeout_result;
     }
-    return arm_timeout(kDisconnectTimeoutUs,
-                       LifecycleTimeoutPurpose::kDisconnect);
+    const int terminate_result =
+        ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (terminate_result == 0 || terminate_result == BLE_HS_EALREADY) {
+        // EALREADY specifically means this connection is already terminating;
+        // its Disconnect callback is still the owner of forward progress.
+        return 0;
+    }
+    // ENOTCONN and every other nonzero result initiated no new termination in
+    // ESP-IDF v5.5.4 NimBLE.  Release only this exact purpose; a concurrent
+    // Sync watchdog cannot be cancelled by this cleanup.
+    cancel_timeout(LifecycleTimeoutPurpose::kDisconnect);
+    return terminate_result;
 }
 
 std::int32_t Backend::terminate_orphan_connection(

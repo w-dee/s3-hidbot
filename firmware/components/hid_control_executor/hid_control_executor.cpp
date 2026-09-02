@@ -26,6 +26,7 @@ std::uint8_t s_queue_bytes[Controller::kActionQueueDepth *
 StaticTask_t s_task_storage;
 StackType_t s_task_stack[kLifecycleTaskStackDepth]{};
 QueueHandle_t s_action_queue = nullptr;
+TaskHandle_t s_executor_task = nullptr;
 StaticSemaphore_t s_pairing_rpc_completion_storage;
 SemaphoreHandle_t s_pairing_rpc_completion = nullptr;
 #endif
@@ -49,9 +50,13 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
                                         &s_queue_storage);
     s_pairing_rpc_completion =
         xSemaphoreCreateBinaryStatic(&s_pairing_rpc_completion_storage);
-    if (s_action_queue == nullptr || s_pairing_rpc_completion == nullptr ||
-        xTaskCreateStatic(task_entry, "hid_control", kLifecycleTaskStackDepth,
-                          this, kLifecycleTaskPriority, s_task_stack, &s_task_storage) == nullptr) {
+    if (s_action_queue == nullptr || s_pairing_rpc_completion == nullptr) {
+        return false;
+    }
+    s_executor_task = xTaskCreateStatic(
+        task_entry, "hid_control", kLifecycleTaskStackDepth, this,
+        kLifecycleTaskPriority, s_task_stack, &s_task_storage);
+    if (s_executor_task == nullptr) {
         return false;
     }
 #endif
@@ -218,7 +223,25 @@ bool Controller::signal_ble_event(BleEvent event) {
     if (enqueue(item)) {
         return true;
     }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (ble_enqueue_failure_hook_ != nullptr &&
+        ble_enqueue_failure_phase_ ==
+            BleEnqueueFailurePhase::kBeforeGenericFallback) {
+        const auto hook = ble_enqueue_failure_hook_;
+        ble_enqueue_failure_hook_ = nullptr;
+        hook(*this);
+    }
+#endif
     mark_ble_event_overflow(event);
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (ble_enqueue_failure_hook_ != nullptr &&
+        ble_enqueue_failure_phase_ ==
+            BleEnqueueFailurePhase::kAfterGenericFallback) {
+        const auto hook = ble_enqueue_failure_hook_;
+        ble_enqueue_failure_hook_ = nullptr;
+        hook(*this);
+    }
+#endif
     if (event.kind == BleEventKind::kConnect && event.status == 0 &&
         event.connection_handle != ble_lifecycle::kNoConnection &&
         ble_backend_ != nullptr) {
@@ -234,6 +257,7 @@ bool Controller::signal_ble_event(BleEvent event) {
 
 void Controller::signal_ble_lifecycle_handoff_failure() {
     ble_lifecycle_handoff_failure_.store(true, std::memory_order_release);
+    request_executor_wake();
 }
 
 ControlOperation Controller::operation_for(usb_lifecycle::ExecutorAction action) {
@@ -465,9 +489,24 @@ bool Controller::enqueue(Action item) {
     }
     native_queue_[(native_head_ + native_count_) % kActionQueueDepth] = item;
     ++native_count_;
+    request_executor_wake();
     return true;
 #else
-    return xQueueSend(s_action_queue, &item, 0) == pdPASS;
+    if (xQueueSend(s_action_queue, &item, 0) != pdPASS) {
+        return false;
+    }
+    request_executor_wake();
+    return true;
+#endif
+}
+
+void Controller::request_executor_wake() {
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    native_executor_wake_pending_.store(true, std::memory_order_release);
+#else
+    if (s_executor_task != nullptr) {
+        (void)xTaskNotifyGive(s_executor_task);
+    }
 #endif
 }
 
@@ -494,33 +533,15 @@ void Controller::process(Action action) {
         release_operation(action.operation);
         return;
     }
-    // The backend latch is boot-lifetime global truth, unlike the
-    // generation/connection-scoped overflow mailbox. Reconcile it before
-    // consuming an overflow identity so disable Stage A or disconnect cannot
-    // make a lost detailed storage event stale.
-    if (ble_backend_ != nullptr &&
-        ble_backend_->persistent_store_failure_observed()) {
-        const bool detailed =
-            action.kind == ActionKind::kBleEvent &&
-            action.ble_event.kind == BleEventKind::kStorageFailure;
-        const auto kind =
-            detailed && action.ble_event.store_failure_kind ==
-                            ble_security::StoreFailureKind::kDelete
-                ? ble_security::StoreFailureKind::kDelete
-                : ble_security::StoreFailureKind::kWrite;
-        commit_persistent_store_failure(
-            kind, detailed ? action.ble_event.status : -3);
+    const bool suppress_ble_event = reconcile_ble_fallbacks(&action);
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (process_after_reconciliation_hook_ != nullptr) {
+        const auto hook = process_after_reconciliation_hook_;
+        process_after_reconciliation_hook_ = nullptr;
+        hook(*this);
     }
-    const bool lifecycle_handoff_failed =
-        reconcile_ble_lifecycle_handoff_failure();
-    // The handoff latch is boot-lifetime authoritative once set. Drop every
-    // queued BLE callback after its fault commit so an old Reset cannot revive
-    // the lifecycle into Enabling after the only Sync/timeout path was lost.
-    if (lifecycle_handoff_failed && action.kind == ActionKind::kBleEvent) {
-        (void)consume_ble_overflow();
-        return;
-    }
-    if (consume_ble_overflow() && action.kind == ActionKind::kBleEvent) {
+#endif
+    if (suppress_ble_event && action.kind == ActionKind::kBleEvent) {
         return;
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
@@ -731,6 +752,36 @@ void Controller::process(Action action) {
     release_operation(action.operation);
 }
 
+bool Controller::reconcile_ble_fallbacks(const Action *action) {
+    // The backend latch is boot-lifetime global truth, unlike the
+    // generation/connection-scoped overflow mailbox. Reconcile it before
+    // consuming an overflow identity so disable Stage A or disconnect cannot
+    // make a lost detailed storage event stale.
+    if (ble_backend_ != nullptr &&
+        ble_backend_->persistent_store_failure_observed()) {
+        const bool detailed =
+            action != nullptr && action->kind == ActionKind::kBleEvent &&
+            action->ble_event.kind == BleEventKind::kStorageFailure;
+        const auto kind =
+            detailed && action->ble_event.store_failure_kind ==
+                            ble_security::StoreFailureKind::kDelete
+                ? ble_security::StoreFailureKind::kDelete
+                : ble_security::StoreFailureKind::kWrite;
+        commit_persistent_store_failure(
+            kind, detailed ? action->ble_event.status : -3);
+    }
+    const bool lifecycle_handoff_failed =
+        reconcile_ble_lifecycle_handoff_failure();
+    // The handoff latch is boot-lifetime authoritative once set. Drop every
+    // queued BLE callback after its fault commit so an old Reset cannot revive
+    // the lifecycle into Enabling after the only Sync/timeout path was lost.
+    if (lifecycle_handoff_failed) {
+        (void)consume_ble_overflow();
+        return true;
+    }
+    return consume_ble_overflow();
+}
+
 void Controller::fail_ble(ble_lifecycle::Generation generation,
                           ble_lifecycle::Operation operation, std::int32_t code,
                           ControlOperation owner) {
@@ -824,6 +875,7 @@ void Controller::mark_ble_event_overflow(BleEvent event) {
     if (authority == 0) {
         if (event_targets_current_ble_authority(event)) {
             overflow_authority_zero_.store(true, std::memory_order_release);
+            request_executor_wake();
         }
         return;
     }
@@ -837,9 +889,15 @@ void Controller::mark_ble_event_overflow(BleEvent event) {
         if (overflow_authority_.compare_exchange_weak(
                 observed, authority, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
+            request_executor_wake();
             return;
         }
     }
+    // A prior wake may already have been consumed by an executor that has not
+    // yet reconciled this still-actionable sticky authority. Re-notify when a
+    // producer confirms the same current authority; notifications may safely
+    // coalesce because the atomic token remains the source of truth.
+    request_executor_wake();
 }
 
 bool Controller::ble_event_overflow_pending(
@@ -1424,6 +1482,23 @@ bool Controller::process_one_for_test() {
     return true;
 }
 
+bool Controller::process_wake_cycle_for_test() {
+    if (!native_executor_wake_pending_.exchange(false,
+                                                std::memory_order_acq_rel)) {
+        return false;
+    }
+    Action action{};
+    while (dequeue_one_for_test(action)) {
+        process(action);
+    }
+    (void)reconcile_ble_fallbacks(nullptr);
+    return true;
+}
+
+bool Controller::executor_wake_pending_for_test() const {
+    return native_executor_wake_pending_.load(std::memory_order_acquire);
+}
+
 bool Controller::dequeue_one_for_test(Action &action) {
     if (native_count_ == 0) {
         return false;
@@ -1440,6 +1515,17 @@ void Controller::process_for_test(Action action) { process(action); }
 void Controller::set_overflow_consume_hook_for_test(
     OverflowConsumeHook hook) {
     overflow_consume_hook_ = hook;
+}
+
+void Controller::set_ble_enqueue_failure_hook_for_test(
+    BleEnqueueFailurePhase phase, BleEnqueueFailureHook hook) {
+    ble_enqueue_failure_phase_ = phase;
+    ble_enqueue_failure_hook_ = hook;
+}
+
+void Controller::set_process_after_reconciliation_hook_for_test(
+    ProcessAfterReconciliationHook hook) {
+    process_after_reconciliation_hook_ = hook;
 }
 
 void Controller::set_ble_generation_for_test(
@@ -1482,10 +1568,20 @@ void Controller::task_entry(void *context) {
 
 void Controller::task_loop() {
     while (true) {
+        // A direct task notification is the shared capacity-independent wake
+        // for both normal queue work and sticky BLE fallbacks. pdTRUE coalesces
+        // any accumulated notifications; the authoritative details remain in
+        // the queue and fallback atomics. A notification given before this
+        // wait remains pending, closing the check-then-sleep race.
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         Action action{};
-        if (xQueueReceive(s_action_queue, &action, portMAX_DELAY) == pdPASS) {
+        while (xQueueReceive(s_action_queue, &action, 0) == pdPASS) {
             process(action);
         }
+        // Catch publication while the last action was active. If publication
+        // instead races after this check, its retained notification makes the
+        // next wait return immediately.
+        (void)reconcile_ble_fallbacks(nullptr);
     }
 }
 #endif

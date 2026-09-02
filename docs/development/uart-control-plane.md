@@ -93,10 +93,25 @@ Reset/Sync ownership transfer has a separate boot-lifetime, lock-free failure
 latch because the NimBLE backend can legitimately publish the post-Reset
 generation before the executor consumes the retired-generation Reset event. A
 failed Reset, Sync, or one-shot lifecycle-timeout enqueue sets this latch before
-the Sync watchdog is cancelled. A lock-free timer-purpose discriminator ensures
-that Sync and Disconnect callbacks cancel only their own watchdog, and a
-Disconnect callback does so only after its event is queued. The next executor
-boundary commits one
+the Sync watchdog is cancelled. Every successful action enqueue and every
+actionable lifecycle or generic-overflow fallback publication gives the static
+executor task a direct task notification. The notification is independent of
+queue capacity, nonblocking in the actual task callback contexts, and retained
+when given before `ulTaskNotifyTake(pdTRUE, portMAX_DELAY)`. Multiple wakes may
+coalesce because the FIFO queue and sticky fallback atomics, rather than the
+notification count, contain the authoritative work. On each wake the executor
+reconciles before normal action handling, drains the bounded queue without
+waiting, and performs a final fallback reconciliation before waiting again. A
+publication racing after that final check leaves its notification pending, so
+there is no check-then-sleep lost-wakeup window on either ESP32-S3 core.
+A lock-free timer-purpose discriminator ensures that Sync and Disconnect
+callbacks cancel only their own watchdog, and a Disconnect callback does so
+only after its event is queued. Disconnect now establishes and arms its typed
+watchdog before calling `ble_gap_terminate()`. A synchronous initiation failure
+cancels that exact purpose; `BLE_HS_EALREADY` retains the watchdog because the
+existing termination still owns an eventual callback. Immediate completion can
+therefore cancel an already-armed watchdog, and the caller never rearms it.
+The next executor boundary commits one
 recovery-required queue fault and suppresses all later BLE callback actions
 until reboot. Thus a lost Sync or terminal timeout cannot strand the lifecycle
 in `enabling`, stale ordinary Sync events cannot complete a newer generation,

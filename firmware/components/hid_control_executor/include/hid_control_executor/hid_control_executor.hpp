@@ -326,10 +326,22 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     using OverflowConsumeHook = void (*)(Controller &controller);
+    enum class BleEnqueueFailurePhase : std::uint8_t {
+        kBeforeGenericFallback,
+        kAfterGenericFallback,
+    };
+    using BleEnqueueFailureHook = void (*)(Controller &controller);
+    using ProcessAfterReconciliationHook = void (*)(Controller &controller);
     bool process_one_for_test();
+    bool process_wake_cycle_for_test();
+    bool executor_wake_pending_for_test() const;
     bool dequeue_one_for_test(Action &action);
     void process_for_test(Action action);
     void set_overflow_consume_hook_for_test(OverflowConsumeHook hook);
+    void set_ble_enqueue_failure_hook_for_test(
+        BleEnqueueFailurePhase phase, BleEnqueueFailureHook hook);
+    void set_process_after_reconciliation_hook_for_test(
+        ProcessAfterReconciliationHook hook);
     void set_ble_generation_for_test(ble_lifecycle::Generation generation);
     ControlOperation active_operation_for_test() const;
     bool reserve_operation_for_test(ControlOperation operation);
@@ -342,6 +354,8 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
   private:
     void process(Action action);
     bool enqueue(Action action);
+    void request_executor_wake();
+    bool reconcile_ble_fallbacks(const Action *action);
     bool claim_operation(ControlOperation operation);
     void release_operation(ControlOperation operation);
     static ControlOperation operation_for(usb_lifecycle::ExecutorAction action);
@@ -430,7 +444,12 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     std::uint8_t native_head_ = 0;
     std::uint8_t native_count_ = 0;
     bool fail_next_enqueue_ = false;
+    std::atomic_bool native_executor_wake_pending_{false};
     OverflowConsumeHook overflow_consume_hook_ = nullptr;
+    BleEnqueueFailureHook ble_enqueue_failure_hook_ = nullptr;
+    BleEnqueueFailurePhase ble_enqueue_failure_phase_ =
+        BleEnqueueFailurePhase::kBeforeGenericFallback;
+    ProcessAfterReconciliationHook process_after_reconciliation_hook_ = nullptr;
 #endif
 };
 
