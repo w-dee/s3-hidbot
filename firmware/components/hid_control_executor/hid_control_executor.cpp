@@ -1079,11 +1079,18 @@ void Controller::terminate_security_connection(ble_pairing::LastResult result,
     (void)pairing_state_.complete(current.generation, handle, result);
     ble_backend_->cancel_pairing_timeout();
     ble_backend_->retire_security(current.generation, handle);
-    (void)ble_backend_->disconnect(handle);
+    const std::int32_t disconnect_result = ble_backend_->disconnect(handle);
     if (fatal) {
         ble_backend_->mark_security_unhealthy(current.generation);
         fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -3,
                  ControlOperation::kNone);
+    } else if (disconnect_result != 0) {
+        // The peer authority was revoked above, but without a successfully
+        // established Disconnect operation there is no completion or watchdog
+        // to advance the lifecycle. Terminalize that uncertainty now.
+        ble_backend_->mark_security_unhealthy(current.generation);
+        fail_ble(current.generation, ble_lifecycle::Operation::kRuntime,
+                 disconnect_result, ControlOperation::kNone);
     }
 }
 

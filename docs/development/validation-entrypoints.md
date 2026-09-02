@@ -90,11 +90,16 @@ and adopted-peer producers until after the executor's old final queue-drain
 boundary. They then prove that the independent retained wake alone commits the
 sticky failure without unrelated traffic. Wake-before-wait, blocked/idle,
 active-executor, and coalesced lifecycle-plus-generic cases cover the remaining
-lost-wakeup windows and reconciliation priority. Static source guards plus a
-deterministic watchdog model verify arm-before-terminate ordering, immediate and
-delayed Disconnect completion, synchronous initiation failure cleanup,
-`BLE_HS_EALREADY` retention, and exact-purpose protection from stale Disconnect
-cancellation. These checks
+lost-wakeup windows and reconciliation priority. Static source guards verify
+arm-before-terminate ordering, immediate and delayed Disconnect completion,
+synchronous initiation failure cleanup, `BLE_HS_EALREADY` retention, and
+exact-purpose protection from stale Disconnect cancellation. The dedicated
+`tools/test-ble-lifecycle-watchdog.sh` native suite exercises the production
+lock-free ownership protocol directly: cross-purpose and same-purpose arm
+conflicts, exact arm-failure release, and mutually exclusive cancel/timeout
+claims. Executor regressions verify that StoreFull, pairing-timeout, SMP, and
+repeat-pairing teardown failures terminalize lifecycle recovery without turning
+StoreFull into persistent storage corruption. These checks
 are included by `test-native.sh`, `test-static.sh`, and therefore canonical
 `test-nonhardware.sh`. An ESP-IDF target build remains mandatory because the
 service database, mbuf allocation, and NimBLE notification API are
@@ -105,6 +110,7 @@ Run these commands from the repository root:
 
 ```text
 ./tools/test-static.sh
+./tools/test-ble-lifecycle-watchdog.sh
 ./tools/test-host.sh
 ./tools/test-package.sh
 ./tools/test-native.sh

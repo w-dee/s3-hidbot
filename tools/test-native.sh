@@ -8,6 +8,7 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 "$repository_root/tools/test-sensitive-request.sh"
 "$repository_root/tools/test-usb-lifecycle.sh"
 "$repository_root/tools/test-ble-lifecycle.sh"
+"$repository_root/tools/test-ble-lifecycle-watchdog.sh"
 "$repository_root/tools/test-ble-security.sh"
 "$repository_root/tools/test-ble-pairing.sh"
 "$repository_root/tools/test-hid-route.sh"

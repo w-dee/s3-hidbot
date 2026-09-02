@@ -6,71 +6,11 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_disconnect_watchdog_ordering_model() -> None:
-    """Exercise the source-enforced arm/initiate/callback ownership order."""
-    none, sync, disconnect = "none", "sync", "disconnect"
-
-    class Watchdog:
-        def __init__(self):
-            self.purpose = none
-            self.lifecycle = "disabling"
-
-        def arm(self, purpose):
-            self.purpose = purpose
-            return 0
-
-        def cancel(self, purpose):
-            if self.purpose == purpose:
-                self.purpose = none
-
-        def complete_disconnect(self):
-            self.cancel(disconnect)
-            self.lifecycle = "idle"
-
-    def invoke(model, terminate_result=0, immediate_completion=False,
-               arm_result=0):
-        if arm_result != 0:
-            return arm_result
-        assert model.arm(disconnect) == 0
-        if immediate_completion:
-            model.complete_disconnect()
-        if terminate_result in (0, "already"):
-            return 0
-        model.cancel(disconnect)
-        model.lifecycle = "fault"
-        return terminate_result
-
-    immediate = Watchdog()
-    assert invoke(immediate, immediate_completion=True) == 0
-    assert immediate.purpose == none
-    assert immediate.lifecycle == "idle"
-
-    failed = Watchdog()
-    assert invoke(failed, terminate_result="not-connected") == "not-connected"
-    assert failed.purpose == none
-    assert failed.lifecycle == "fault"
-
-    delayed = Watchdog()
-    assert invoke(delayed) == 0
-    assert delayed.purpose == disconnect
-    delayed.complete_disconnect()
-    assert delayed.purpose == none
-    assert delayed.lifecycle == "idle"
-
-    already = Watchdog()
-    assert invoke(already, terminate_result="already") == 0
-    assert already.purpose == disconnect
-
-    stale = Watchdog()
-    stale.purpose = sync
-    stale.cancel(disconnect)
-    assert stale.purpose == sync
-
-
 def main() -> int:
     executor_header = (ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp").read_text()
     executor = (ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp").read_text()
     transport_header = (ROOT / "firmware/components/ble_transport/include/ble_transport/ble_transport.hpp").read_text()
+    watchdog_header = (ROOT / "firmware/components/ble_transport/include/ble_transport/lifecycle_watchdog.hpp").read_text()
     transport = (ROOT / "firmware/components/ble_transport/ble_transport.cpp").read_text()
     pairing_header = (ROOT / "firmware/components/ble_pairing/include/ble_pairing/ble_pairing.hpp").read_text()
     protocol = (ROOT / "firmware/components/control_protocol/control_protocol.cpp").read_text()
@@ -175,17 +115,27 @@ def main() -> int:
         r"void Backend::timeout_callback\(void \*context\) \{(.*?)\n\}",
         transport, re.S)
     assert timeout
-    assert "timeout_purpose_.exchange(" in timeout.group(1)
+    assert "timeout_ownership_.begin_timeout()" in timeout.group(1)
+    assert "timeout_ownership_.complete_timeout(purpose)" in timeout.group(1)
     assert timeout.group(1).index("backend->signal(") < \
-        timeout.group(1).index("signal_ble_lifecycle_handoff_failure()")
+        timeout.group(1).index("signal_ble_lifecycle_handoff_failure()") < \
+        timeout.group(1).index("complete_timeout(purpose)")
     disconnect = re.search(
         r"case BLE_GAP_EVENT_DISCONNECT:(.*?)break;", transport, re.S)
     assert disconnect
     assert disconnect.group(1).index("backend->signal(") < \
         disconnect.group(1).index("backend->cancel_timeout(")
     assert "LifecycleTimeoutPurpose::kDisconnect" in disconnect.group(1)
-    assert "std::atomic<LifecycleTimeoutPurpose>::is_always_lock_free" in \
-        transport_header
+    assert "LifecycleWatchdogOwnership timeout_ownership_" in transport_header
+    assert "std::atomic<Phase>::is_always_lock_free" in watchdog_header
+    for operation in ("try_acquire", "release_after_arm_failure",
+                      "begin_cancel", "complete_cancel", "begin_timeout",
+                      "complete_timeout"):
+        assert operation in watchdog_header
+    for phase in ("kSyncArmed", "kDisconnectArmed", "kSyncCancelling",
+                  "kDisconnectCancelling", "kSyncFiring",
+                  "kDisconnectFiring"):
+        assert phase in watchdog_header
     disconnect_call = re.search(
         r"std::int32_t Backend::disconnect\(std::uint16_t connection_handle\) \{"
         r"(.*?)\n\}\n\nstd::int32_t Backend::terminate_orphan_connection",
@@ -199,7 +149,29 @@ def main() -> int:
     assert disconnect_body.index("ble_gap_terminate(") < \
         disconnect_body.index(
             "cancel_timeout(LifecycleTimeoutPurpose::kDisconnect)")
-    test_disconnect_watchdog_ordering_model()
+    arm = re.search(
+        r"std::int32_t Backend::arm_timeout\(.*?\) \{(.*?)\n\}",
+        transport, re.S)
+    assert arm
+    assert arm.group(1).index("timeout_ownership_.try_acquire(purpose)") < \
+        arm.group(1).index("esp_timer_start_once(") < \
+        arm.group(1).index("release_after_arm_failure(purpose)")
+    assert "esp_timer_stop(" not in arm.group(1)
+    cancel = re.search(
+        r"void Backend::cancel_timeout\(.*?\) \{(.*?)\n\}",
+        transport, re.S)
+    assert cancel
+    assert cancel.group(1).index("begin_cancel(purpose)") < \
+        cancel.group(1).index("esp_timer_stop(") < \
+        cancel.group(1).index("complete_cancel(purpose)")
+
+    teardown = re.search(
+        r"void Controller::terminate_security_connection\(.*?\) \{(.*?)\n\}",
+        executor, re.S)
+    assert teardown
+    assert "const std::int32_t disconnect_result" in teardown.group(1)
+    assert "else if (disconnect_result != 0)" in teardown.group(1)
+    assert "fail_ble(" in teardown.group(1)
 
     disable_request = re.search(
         r"BleCommandOutcome Controller::request_ble_disable\(\) \{(.*?)"

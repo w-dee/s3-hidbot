@@ -165,10 +165,11 @@ void Backend::host_task(void *) { nimble_port_run(); }
 
 void Backend::timeout_callback(void *context) {
     auto *backend = static_cast<Backend *>(context);
-    if (backend != nullptr &&
-        backend->timeout_purpose_.exchange(
-            LifecycleTimeoutPurpose::kNone, std::memory_order_acq_rel) !=
-            LifecycleTimeoutPurpose::kNone) {
+    if (backend == nullptr) {
+        return;
+    }
+    const auto purpose = backend->timeout_ownership_.begin_timeout();
+    if (purpose != LifecycleTimeoutPurpose::kNone) {
         const bool published = backend->signal(
             hid_control_executor::BleEventKind::kTimeout,
             ble_lifecycle::kNoConnection, kLifecycleTimeoutError);
@@ -178,6 +179,9 @@ void Backend::timeout_callback(void *context) {
             // legitimately leads the executor across a Reset handoff.
             backend->sink_->signal_ble_lifecycle_handoff_failure();
         }
+        // Retain the firing owner through durable event/fallback publication.
+        // A different purpose cannot acquire this timer incarnation early.
+        (void)backend->timeout_ownership_.complete_timeout(purpose);
     }
 }
 
@@ -199,31 +203,28 @@ void Backend::pairing_timeout_callback(void *context) {
 
 std::int32_t Backend::arm_timeout(std::uint64_t microseconds,
                                   LifecycleTimeoutPurpose purpose) {
-    timeout_purpose_.store(LifecycleTimeoutPurpose::kNone,
-                           std::memory_order_release);
-    if (timeout_timer_ != nullptr && esp_timer_is_active(timeout_timer_)) {
-        (void)esp_timer_stop(timeout_timer_);
+    // Same-purpose re-arm and cross-purpose replacement are both rejected.
+    // The current owner remains intact and its caller retains forward progress.
+    if (!timeout_ownership_.try_acquire(purpose)) {
+        return ESP_ERR_INVALID_STATE;
     }
-    timeout_purpose_.store(purpose, std::memory_order_release);
     const esp_err_t result = esp_timer_start_once(timeout_timer_, microseconds);
     if (result != ESP_OK) {
-        LifecycleTimeoutPurpose expected = purpose;
-        (void)timeout_purpose_.compare_exchange_strong(
-            expected, LifecycleTimeoutPurpose::kNone,
-            std::memory_order_acq_rel, std::memory_order_acquire);
+        (void)timeout_ownership_.release_after_arm_failure(purpose);
     }
     return result;
 }
 
 void Backend::cancel_timeout(LifecycleTimeoutPurpose purpose) {
-    LifecycleTimeoutPurpose expected = purpose;
-    if (timeout_purpose_.compare_exchange_strong(
-            expected, LifecycleTimeoutPurpose::kNone,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        if (timeout_timer_ != nullptr && esp_timer_is_active(timeout_timer_)) {
-            (void)esp_timer_stop(timeout_timer_);
-        }
+    // Keep the exact owner in a cancelling phase until the physical timer has
+    // stopped. A new purpose cannot reuse the handle in the CAS-to-stop gap.
+    if (!timeout_ownership_.begin_cancel(purpose)) {
+        return;
     }
+    if (timeout_timer_ != nullptr && esp_timer_is_active(timeout_timer_)) {
+        (void)esp_timer_stop(timeout_timer_);
+    }
+    (void)timeout_ownership_.complete_cancel(purpose);
 }
 
 bool Backend::signal(hid_control_executor::BleEventKind kind,

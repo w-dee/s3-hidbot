@@ -2756,6 +2756,120 @@ void test_timeout_repeat_store_and_disconnect_results() {
     }
 }
 
+void test_store_full_disconnect_failure_terminalizes_recovery() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 109;
+    constexpr std::int32_t disconnect_error = -91;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+    ble.disconnect_result = disconnect_error;
+
+    assert(ble.event(hid_control_executor::BleEventKind::kStoreFull,
+                     connection, -90));
+    assert(controller.process_one_for_test());
+
+    const auto failed = controller.ble_snapshot();
+    assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failed.recovery_required && !failed.connected && !failed.advertising);
+    assert(failed.last_error.present &&
+           failed.last_error.operation == ble_lifecycle::Operation::kRuntime &&
+           failed.last_error.code == disconnect_error);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kStoreFull);
+    assert(!ble.persistent_store_failure_observed());
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(!controller.ble_link_ready());
+    assert(ble.disconnect_calls == 1);
+}
+
+void test_pairing_timeout_disconnect_failure_terminalizes_recovery() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 110;
+    constexpr std::int32_t disconnect_error = -92;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction,
+                     connection, 1));
+    assert(controller.process_one_for_test());
+    const auto pending = controller.pairing_snapshot();
+    ble.disconnect_result = disconnect_error;
+
+    assert(ble.sink->signal_ble_event({
+        .kind = hid_control_executor::BleEventKind::kPairingTimeout,
+        .generation = pending.generation,
+        .connection_handle = connection,
+        .pairing_id = pending.pairing_id,
+    }));
+    assert(controller.process_one_for_test());
+
+    const auto failed = controller.ble_snapshot();
+    assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failed.recovery_required && !failed.connected);
+    assert(failed.last_error.present &&
+           failed.last_error.code == disconnect_error);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kTimeout);
+    assert(ble.disconnect_calls == 1);
+}
+
+void test_smp_and_repeat_pairing_disconnect_failures_terminalize_recovery() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        constexpr std::int32_t disconnect_error = -93;
+        advertise_ble(runtime, usb, ble, database, controller);
+        ble.initiate_security_result = -94;
+        ble.disconnect_result = disconnect_error;
+        assert(ble.event(hid_control_executor::BleEventKind::kConnect, 111));
+        assert(controller.process_one_for_test());
+
+        const auto failed = controller.ble_snapshot();
+        assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+        assert(failed.recovery_required && !failed.connected);
+        assert(failed.last_error.present &&
+               failed.last_error.code == disconnect_error);
+        assert(controller.pairing_snapshot().last_result ==
+               ble_pairing::LastResult::kSmpFailed);
+        assert(ble.disconnect_calls == 1);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        constexpr std::int32_t disconnect_error = -95;
+        connect_ble(runtime, usb, ble, database, controller, 112);
+        ble.disconnect_result = disconnect_error;
+
+        assert(ble.event(hid_control_executor::BleEventKind::kRepeatPairing,
+                         112));
+        assert(controller.process_one_for_test());
+        const auto failed = controller.ble_snapshot();
+        assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+        assert(failed.recovery_required && !failed.connected);
+        assert(failed.last_error.present &&
+               failed.last_error.code == disconnect_error);
+        assert(controller.pairing_snapshot().last_result ==
+               ble_pairing::LastResult::kRepeatPairing);
+        assert(ble.disconnect_calls == 1);
+    }
+}
+
 void test_queue_burst_overflow_and_id_wrap_fail_closed() {
     static_assert(hid_control_executor::Controller::kActionQueueDepth == 12);
     static_assert(sizeof(hid_control_executor::BleHidPeerSnapshot) == 16);
@@ -3129,6 +3243,9 @@ int main() {
     test_low_level_storage_error_is_global_even_with_stale_identity();
     test_store_full_remains_recoverable_and_readvertises();
     test_timeout_repeat_store_and_disconnect_results();
+    test_store_full_disconnect_failure_terminalizes_recovery();
+    test_pairing_timeout_disconnect_failure_terminalizes_recovery();
+    test_smp_and_repeat_pairing_disconnect_failures_terminalize_recovery();
     test_queue_burst_overflow_and_id_wrap_fail_closed();
     test_policy_persistence_disconnect_disable_and_bounded_burst();
 }

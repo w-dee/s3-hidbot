@@ -104,13 +104,19 @@ reconciles before normal action handling, drains the bounded queue without
 waiting, and performs a final fallback reconciliation before waiting again. A
 publication racing after that final check leaves its notification pending, so
 there is no check-then-sleep lost-wakeup window on either ESP32-S3 core.
-A lock-free timer-purpose discriminator ensures that Sync and Disconnect
-callbacks cancel only their own watchdog, and a Disconnect callback does so
-only after its event is queued. Disconnect now establishes and arms its typed
-watchdog before calling `ble_gap_terminate()`. A synchronous initiation failure
-cancels that exact purpose; `BLE_HS_EALREADY` retains the watchdog because the
-existing termination still owns an eventual callback. Immediate completion can
-therefore cancel an already-armed watchdog, and the caller never rearms it.
+A lock-free timer ownership protocol ensures that Sync and Disconnect cannot
+replace one another's watchdog. Same-purpose re-arm is also rejected. Cancel
+and timeout use transitional exact-owner states until physical timer stop or
+durable timeout publication completes, so the timer handle cannot be reused in
+either handoff gap. A Disconnect callback cancels only its own watchdog and
+does so only after its event is queued. Disconnect establishes and arms its
+typed watchdog before calling `ble_gap_terminate()`. A timer-arm or synchronous
+initiation failure releases that exact purpose; `BLE_HS_EALREADY` retains the
+watchdog because the existing termination still owns an eventual callback.
+Immediate completion can therefore cancel an already-armed watchdog, and the
+caller never rearms it. Nonfatal peer-security teardown propagates inability to
+establish this bounded operation into a recovery-required lifecycle fault;
+successful StoreFull teardown remains connection-local and may re-advertise.
 The next executor boundary commits one
 recovery-required queue fault and suppresses all later BLE callback actions
 until reboot. Thus a lost Sync or terminal timeout cannot strand the lifecycle

@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "ble_security/ble_security.hpp"
+#include "ble_transport/lifecycle_watchdog.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
 #include "esp_timer.h"
 #include "host/ble_store.h"
@@ -62,11 +63,7 @@ class Backend final : public hid_control_executor::BleBackend {
     static int on_gap_event(struct ble_gap_event *event, void *context);
 
   private:
-    enum class LifecycleTimeoutPurpose : std::uint8_t {
-        kNone,
-        kSync,
-        kDisconnect,
-    };
+    using LifecycleTimeoutPurpose = detail::LifecycleWatchdogPurpose;
 
     bool signal(hid_control_executor::BleEventKind kind,
                 std::uint16_t connection_handle, std::int32_t status);
@@ -103,9 +100,7 @@ class Backend final : public hid_control_executor::BleBackend {
     std::uint8_t own_address_type_ = 0;
     bool initialized_ = false;
     esp_timer_handle_t timeout_timer_ = nullptr;
-    static_assert(std::atomic<LifecycleTimeoutPurpose>::is_always_lock_free);
-    std::atomic<LifecycleTimeoutPurpose> timeout_purpose_{
-        LifecycleTimeoutPurpose::kNone};
+    detail::LifecycleWatchdogOwnership timeout_ownership_{};
     esp_timer_handle_t pairing_timer_ = nullptr;
     std::atomic<ble_lifecycle::Generation> pairing_timer_generation_{0};
     std::atomic<std::uint16_t> pairing_timer_connection_{
