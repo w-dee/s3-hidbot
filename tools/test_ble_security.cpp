@@ -81,12 +81,12 @@ void readiness_and_fencing() {
     }
 
     state.apply_store_failure(generation - 1, handle,
-        ble_security::StoreFailureKind::kWrite, -1, false);
+        ble_security::StoreFailureKind::kWrite, -1);
     state.apply_store_failure(generation, handle + 1,
-        ble_security::StoreFailureKind::kWrite, -1, false);
+        ble_security::StoreFailureKind::kWrite, -1);
     assert(state.security_ready_for_hid(generation, handle));
     state.apply_store_failure(generation, handle,
-        ble_security::StoreFailureKind::kCapacityFull, -2, false);
+        ble_security::StoreFailureKind::kCapacityFull, -2);
     assert(!state.security_ready_for_hid(generation, handle));
     const auto failed = state.snapshot();
     assert(failed.coherent && !failed.store_healthy);
@@ -98,9 +98,14 @@ void readiness_and_fencing() {
         store_failure.begin_connection(generation, handle);
         store_failure.apply_verification(generation, handle, valid_link(),
                                          valid_persisted());
-        store_failure.apply_store_failure(generation, handle, kind, -3, true);
-        assert(!store_failure.snapshot().project_verified_bond_persisted);
+        store_failure.apply_persistent_store_failure(kind, -3);
+        const auto failed = store_failure.snapshot();
+        assert(!failed.project_verified_bond_persisted);
+        assert(!failed.store_healthy && !failed.lifecycle_healthy);
+        assert(failed.last_store_failure == kind);
         assert(!store_failure.security_ready_for_hid(generation, handle));
+        store_failure.retire_connection(generation, handle);
+        assert(!store_failure.snapshot().connected);
         store_failure.begin_connection(generation + 1, handle + 1);
         assert(!store_failure.snapshot().store_healthy);
     }
@@ -135,6 +140,7 @@ void immediate_inhibit_identity_fencing() {
     assert(!inhibit.inhibits(generation_b, reused_handle));
 
     assert(inhibit.inhibit(generation_b, reused_handle, true));
+    assert(inhibit.persistent_failure_observed());
     assert(inhibit.inhibits(generation_b, reused_handle));
     inhibit.retire_connection(generation_b, reused_handle);
     inhibit.begin_connection(generation_b + 1, reused_handle + 1);

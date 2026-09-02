@@ -185,6 +185,9 @@ class BleBackend {
                                      std::uint16_t connection_handle,
                                      std::uint32_t pairing_id) = 0;
     virtual void cancel_pairing_timeout() = 0;
+    // These compound-security mutation seams are executor-only. Callback and
+    // UART contexts may publish simple atomic inhibition/lifecycle Stage A,
+    // but must enqueue work before calling any of these methods.
     virtual void begin_security(ble_lifecycle::Generation generation,
                                 std::uint16_t connection_handle) = 0;
     virtual void refresh_security(std::uint16_t connection_handle,
@@ -193,12 +196,15 @@ class BleBackend {
                                  std::uint16_t connection_handle) = 0;
     virtual void mark_security_unhealthy(
         ble_lifecycle::Generation generation) = 0;
-    // Serialized executor commit of failure evidence captured by a callback.
+    // Serialized executor commit of connection-local failure evidence.
     virtual void apply_store_failure(
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle,
-        ble_security::StoreFailureKind kind, std::int32_t status,
-        bool persistent_store_unhealthy) = 0;
+        ble_security::StoreFailureKind kind, std::int32_t status) = 0;
+    // Serialized executor commit of a subsystem-global persistent-store fault.
+    virtual void apply_persistent_store_failure(
+        ble_security::StoreFailureKind kind, std::int32_t status) = 0;
+    virtual bool persistent_store_failure_observed() const = 0;
     virtual ble_security::Snapshot security_snapshot() const = 0;
     virtual bool security_ready_for_hid(
         ble_lifecycle::Generation generation,

@@ -45,8 +45,10 @@ class Backend final : public hid_control_executor::BleBackend {
     void apply_store_failure(
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle,
-        ble_security::StoreFailureKind kind, std::int32_t status,
-        bool persistent_store_unhealthy) override;
+        ble_security::StoreFailureKind kind, std::int32_t status) override;
+    void apply_persistent_store_failure(
+        ble_security::StoreFailureKind kind, std::int32_t status) override;
+    bool persistent_store_failure_observed() const override;
     void record_heap_checkpoint(HeapCheckpoint checkpoint) override;
 
     ble_security::Snapshot security_snapshot() const override;

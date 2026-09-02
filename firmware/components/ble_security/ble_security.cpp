@@ -64,6 +64,10 @@ bool ReadinessInhibit::inhibits(
            inhibited_token_.load(std::memory_order_acquire) == token;
 }
 
+bool ReadinessInhibit::persistent_failure_observed() const {
+    return persistent_store_unhealthy_.load(std::memory_order_acquire);
+}
+
 void State::begin_write() {
     sequence_.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -113,19 +117,27 @@ void State::retire_connection(ble_lifecycle::Generation generation,
 
 void State::apply_store_failure(ble_lifecycle::Generation generation,
                                 std::uint16_t connection_handle,
-                                StoreFailureKind kind, std::int32_t status,
-                                bool persistent_store_unhealthy) {
+                                StoreFailureKind kind, std::int32_t status) {
     const Snapshot current = snapshot();
     if (!current.coherent || current.generation != generation ||
         current.connection_handle != connection_handle) {
         return;
     }
-    if (persistent_store_unhealthy) {
-        persistent_store_healthy_.store(false, std::memory_order_release);
-    }
     begin_write();
     std::uint32_t flags = flags_.load(std::memory_order_relaxed);
     flags &= ~(kPersisted | kStoreHealthy);
+    flags_.store(flags, std::memory_order_relaxed);
+    last_store_failure_.store(kind, std::memory_order_relaxed);
+    last_store_status_.store(status, std::memory_order_relaxed);
+    end_write();
+}
+
+void State::apply_persistent_store_failure(StoreFailureKind kind,
+                                           std::int32_t status) {
+    begin_write();
+    persistent_store_healthy_.store(false, std::memory_order_relaxed);
+    std::uint32_t flags = flags_.load(std::memory_order_relaxed);
+    flags &= ~(kPersisted | kStoreHealthy | kLifecycleHealthy);
     flags_.store(flags, std::memory_order_relaxed);
     last_store_failure_.store(kind, std::memory_order_relaxed);
     last_store_status_.store(status, std::memory_order_relaxed);

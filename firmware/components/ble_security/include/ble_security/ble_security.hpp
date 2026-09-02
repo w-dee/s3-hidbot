@@ -81,6 +81,7 @@ class ReadinessInhibit final {
                  bool persistent_store_unhealthy);
     bool inhibits(ble_lifecycle::Generation generation,
                   std::uint16_t connection_handle) const;
+    bool persistent_failure_observed() const;
 
   private:
     std::atomic<ble_lifecycle::Generation> generation_{0};
@@ -93,9 +94,12 @@ class ReadinessInhibit final {
     std::uint32_t next_authority_token_ = 1;
 };
 
-// Fixed-size, zero-allocation compound security state. The serialized
-// executor is its sole writer. Readers obtain a bounded coherent snapshot;
-// callback-side immediate inhibition is kept separately in ReadinessInhibit.
+// Fixed-size, zero-allocation compound security state. The serialized HID
+// control executor is its sole runtime writer; concurrent status/HID readers
+// obtain a bounded coherent snapshot through the sequence counter. The
+// sequence counter is a single-writer/read-many mechanism, not multi-writer
+// synchronization. Callback-side immediate inhibition is kept separately in
+// ReadinessInhibit.
 class State final {
   public:
     void begin_connection(ble_lifecycle::Generation generation,
@@ -105,8 +109,9 @@ class State final {
                            std::uint16_t connection_handle);
     void apply_store_failure(ble_lifecycle::Generation generation,
                              std::uint16_t connection_handle,
-                             StoreFailureKind kind, std::int32_t status,
-                             bool persistent_store_unhealthy);
+                             StoreFailureKind kind, std::int32_t status);
+    void apply_persistent_store_failure(StoreFailureKind kind,
+                                        std::int32_t status);
     void apply_verification(ble_lifecycle::Generation generation,
                             std::uint16_t connection_handle,
                             LinkSecurityEvidence link,

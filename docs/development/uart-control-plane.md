@@ -60,9 +60,20 @@ U7.5A security/store/lifecycle conditions are current and the peer is not
 suspended. The executor is also the sole writer of compound BLE security state.
 A NimBLE store callback atomically inhibits readiness for the exact published
 connection epoch before it queues failure evidence; the executor then commits
-that evidence. A retired epoch cannot inhibit a reused handle, while a fatal
-persistent-store failure inhibits every later connection until reboot. The
-fixed control queue is depth 12; overflow remains a fail-closed,
+that evidence. `ble.disable` performs only lifecycle Stage A in the UART/control
+context: the new hidden/disabling generation immediately fails the exact
+lifecycle/peer readiness predicate, while compound security retirement waits
+for the queued executor action. This leaves one compound-state writer even
+when verification and disable ordering overlap. A retired epoch cannot inhibit
+a reused handle. StoreFull remains connection-local and exact-identity fenced;
+a fatal persistent-store failure is subsystem-global, inhibits every later
+connection until reboot, and is committed as a recovery-required lifecycle
+fault even if disable or disconnect retired its originating identity first.
+The global callback latch also blocks every re-advertise path until that queued
+fault is committed. Compound security snapshots use a single-writer/read-many
+sequence counter: executor serialization supplies the one writer and concurrent
+status/HID readers retry incoherent observations. The fixed control queue is
+depth 12; overflow remains a fail-closed,
 recovery-required BLE lifecycle fault. The compiled notification adapter uses
 `ble_gatts_notify_custom()` with exact 8-byte keyboard and 5-byte mouse values;
 acceptance means only local NimBLE stack acceptance. It has no UART command,

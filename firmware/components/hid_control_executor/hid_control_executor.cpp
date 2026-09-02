@@ -91,19 +91,8 @@ BleCommandOutcome Controller::request_ble_disable() {
     if (!initialized_ || ble_backend_ == nullptr || !claim_operation(operation)) {
         return {};
     }
-    const auto before = ble_state_.snapshot();
     const ble_lifecycle::TransitionOutcome outcome = ble_state_.begin_disable();
     if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
-        wipe_pairing_mailbox();
-        pairing_deadline_us_ = 0;
-        pairing_state_.disable();
-        pairing_complete_seen_ = false;
-        ble_backend_->cancel_pairing_timeout();
-        if (before.connected) {
-            ble_backend_->retire_security(before.generation,
-                                          ble_state_.connection_handle());
-        }
-        ble_backend_->set_generation(outcome.snapshot.generation);
         const Action item{.kind = ActionKind::kBleDisable,
                           .operation = operation};
         if (!enqueue(item)) {
@@ -547,6 +536,9 @@ void Controller::process(Action action) {
             }
             return;
         }
+        if (ble_backend_->persistent_store_failure_observed()) {
+            return;
+        }
         const std::int32_t result = ble_backend_->start_advertising();
         if (result == 0) {
             ble_state_.complete_advertising(current.generation);
@@ -567,7 +559,20 @@ void Controller::process(Action action) {
             release_operation(action.operation);
             return;
         }
+        // Stage A already made public readiness fail closed. Everything below,
+        // including compound security retirement, runs only in this executor.
         clear_ble_hid_peer();
+        wipe_pairing_mailbox();
+        pairing_deadline_us_ = 0;
+        pairing_state_.disable();
+        pairing_complete_seen_ = false;
+        ble_backend_->cancel_pairing_timeout();
+        const auto security = ble_backend_->security_snapshot();
+        if (security.coherent && security.connected) {
+            ble_backend_->retire_security(security.generation,
+                                          security.connection_handle);
+        }
+        ble_backend_->set_generation(current.generation);
         if (current.advertising) {
             const std::int32_t result = ble_backend_->stop_advertising();
             if (result != 0) {
@@ -887,6 +892,9 @@ void Controller::process_ble_event(BleEvent event) {
             if (!ble_state_.complete_sync(event.generation)) {
                 return;
             }
+            if (ble_backend_->persistent_store_failure_observed()) {
+                return;
+            }
             const std::int32_t result = ble_backend_->start_advertising();
             if (result == 0) {
                 ble_state_.complete_advertising(event.generation);
@@ -948,6 +956,9 @@ void Controller::process_ble_event(BleEvent event) {
                 release_operation(ControlOperation::kBleDisable);
                 return;
             }
+            if (ble_backend_->persistent_store_failure_observed()) {
+                return;
+            }
             const auto generation = ble_state_.generation();
             ble_backend_->set_generation(generation);
             const std::int32_t result = ble_backend_->start_advertising();
@@ -968,6 +979,9 @@ void Controller::process_ble_event(BleEvent event) {
                 ble_state_.snapshot().desired ==
                     ble_lifecycle::DesiredExposure::kExposed &&
                 !ble_state_.snapshot().connected) {
+                if (ble_backend_->persistent_store_failure_observed()) {
+                    return;
+                }
                 const std::int32_t result = ble_backend_->start_advertising();
                 if (result != 0) {
                     fail_ble(event.generation, ble_lifecycle::Operation::kRuntime,
@@ -1079,27 +1093,47 @@ void Controller::process_ble_event(BleEvent event) {
                 event.connection_handle == ble_state_.connection_handle()) {
                 ble_backend_->apply_store_failure(
                     event.generation, event.connection_handle,
-                    ble_security::StoreFailureKind::kCapacityFull, event.status,
-                    false);
+                    ble_security::StoreFailureKind::kCapacityFull, event.status);
                 terminate_security_connection(
                     ble_pairing::LastResult::kStoreFull, false);
             }
             return;
-        case BleEventKind::kStorageFailure:
-            if (event.generation == ble_state_.generation() &&
-                event.connection_handle == ble_state_.connection_handle()) {
-                const auto kind =
-                    event.store_failure_kind ==
-                            ble_security::StoreFailureKind::kDelete
-                        ? ble_security::StoreFailureKind::kDelete
-                        : ble_security::StoreFailureKind::kWrite;
-                ble_backend_->apply_store_failure(
-                    event.generation, event.connection_handle, kind,
-                    event.status, true);
-                terminate_security_connection(
-                    ble_pairing::LastResult::kStorage, true);
+        case BleEventKind::kStorageFailure: {
+            // Persistent storage is a subsystem-global authority. Its fault
+            // commit must survive retirement of the connection that exposed it.
+            const auto kind =
+                event.store_failure_kind ==
+                        ble_security::StoreFailureKind::kDelete
+                    ? ble_security::StoreFailureKind::kDelete
+                    : ble_security::StoreFailureKind::kWrite;
+            ble_backend_->apply_persistent_store_failure(kind, event.status);
+            const auto current = ble_state_.snapshot();
+            const auto handle = ble_state_.connection_handle();
+            pairing_deadline_us_ = 0;
+            wipe_pairing_mailbox();
+            pairing_complete_seen_ = false;
+            pairing_state_.fail_closed(current.generation, handle,
+                                       ble_pairing::LastResult::kStorage);
+            ble_backend_->cancel_pairing_timeout();
+            const auto security = ble_backend_->security_snapshot();
+            if (security.coherent && security.connected) {
+                ble_backend_->retire_security(security.generation,
+                                              security.connection_handle);
             }
+            if (current.connected) {
+                (void)ble_backend_->disconnect(handle);
+            }
+            const auto active =
+                active_operation_.load(std::memory_order_acquire);
+            const auto owner =
+                active == ControlOperation::kBleEnable ||
+                        active == ControlOperation::kBleDisable
+                    ? active
+                    : ControlOperation::kNone;
+            fail_ble(current.generation, ble_lifecycle::Operation::kRuntime,
+                     -3, owner);
             return;
+        }
         case BleEventKind::kSubscription: {
             if (!ble_hid_peer_.active ||
                 event.generation != ble_hid_peer_.generation ||

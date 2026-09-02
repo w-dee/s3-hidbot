@@ -54,8 +54,15 @@ capture, exact internal report payloads, no retry, and that the notification
 adapter remains unreachable from the public route. The focused BLE security
 and executor suites also interleave immediate store-failure inhibition with
 stale healthy verification, exercise generation/connection-handle reuse, and
-prove queue overflow retires notification authority. These are included by
-`test-native.sh`, `test-static.sh`, and therefore canonical
+prove queue overflow retires notification authority. They additionally prove
+that a disable request changes no compound security state before executor
+processing while public readiness is already false, and deterministically
+order fatal-store delivery after disable or disconnect retirement. Those fatal
+events still commit global recovery faults and block re-advertising, whereas a
+stale StoreFull remains local and cannot poison a future same-handle peer. A
+static guard rejects compound-security mutation from the disable request path
+or direct production owners outside the BLE backend wrapper. These are included
+by `test-native.sh`, `test-static.sh`, and therefore canonical
 `test-nonhardware.sh`. An ESP-IDF target build remains mandatory because the
 service database, mbuf allocation, and NimBLE notification API are
 target-linked. None of these checks performs radio, serial, or hardware

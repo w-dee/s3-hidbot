@@ -478,10 +478,17 @@ void Backend::mark_security_unhealthy(
 void Backend::apply_store_failure(
     ble_lifecycle::Generation generation,
     std::uint16_t connection_handle,
-    ble_security::StoreFailureKind kind, std::int32_t status,
-    bool persistent_store_unhealthy) {
-    security_.apply_store_failure(generation, connection_handle, kind, status,
-                                  persistent_store_unhealthy);
+    ble_security::StoreFailureKind kind, std::int32_t status) {
+    security_.apply_store_failure(generation, connection_handle, kind, status);
+}
+
+void Backend::apply_persistent_store_failure(
+    ble_security::StoreFailureKind kind, std::int32_t status) {
+    security_.apply_persistent_store_failure(kind, status);
+}
+
+bool Backend::persistent_store_failure_observed() const {
+    return security_inhibit_.persistent_failure_observed();
 }
 
 void Backend::record_heap_checkpoint(HeapCheckpoint checkpoint) {

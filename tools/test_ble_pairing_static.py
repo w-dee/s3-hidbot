@@ -34,6 +34,33 @@ def main() -> int:
     assert "xQueueSend(s_action_queue, &item, 0)" in executor
     assert "ble_event_overflow_.store(true" in executor
 
+    disable_request = re.search(
+        r"BleCommandOutcome Controller::request_ble_disable\(\) \{(.*?)"
+        r"\n\}\n\nble_lifecycle::Snapshot Controller::ble_snapshot",
+        executor, re.S)
+    assert disable_request
+    for forbidden in ("retire_security", "begin_security", "refresh_security",
+                      "mark_security_unhealthy", "apply_store_failure",
+                      "apply_persistent_store_failure", "security_snapshot"):
+        assert forbidden not in disable_request.group(1)
+
+    compound_mutations = (
+        "begin_connection", "retire_connection", "apply_store_failure",
+        "apply_persistent_store_failure", "apply_verification",
+        "mark_lifecycle_unhealthy",
+    )
+    production_sources = list((ROOT / "firmware/components").rglob("*.cpp"))
+    for mutation in compound_mutations:
+        direct_owners = {
+            path.relative_to(ROOT).as_posix()
+            for path in production_sources
+            if re.search(rf"\bsecurity_\s*\.\s*{mutation}\s*\(",
+                         path.read_text())
+        }
+        assert direct_owners <= {
+            "firmware/components/ble_transport/ble_transport.cpp"
+        }
+
     assert "BLE_GAP_EVENT_PASSKEY_ACTION" in transport
     assert "event->passkey.params.action == BLE_SM_IOACT_INPUT" in transport
     assert "BLE_GAP_EVENT_REPEAT_PAIRING" in transport
