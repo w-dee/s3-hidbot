@@ -22,9 +22,13 @@ trap 'rm -f "$temporary_directory/cjson.o" "$temporary_directory/test_control_pr
   -I"$repository_root/firmware/components/hid_runtime/include" \
   -I"$repository_root/firmware/components/hid_route/include" \
   -I"$repository_root/firmware/components/usb_lifecycle/include" \
+  -I"$repository_root/firmware/components/secure_memory/include" \
+  -I"$repository_root/firmware/components/sensitive_request/include" \
   -I"$IDF_PATH/components/json/cJSON" \
-  -DFIRMWARE_IDENTITY_NATIVE_TEST \
+  -DFIRMWARE_IDENTITY_NATIVE_TEST -DCONTROL_PROTOCOL_NATIVE_TEST \
+  -DCONTROL_FRAMING_NATIVE_TEST \
   -DHID_RUNTIME_NATIVE_TEST \
+  -DCONTROL_SESSION_NATIVE_TEST \
   "$repository_root/tools/test_control_protocol.cpp" \
   "$repository_root/firmware/components/control_framing/control_framing.cpp" \
   "$repository_root/firmware/components/control_session/control_session.cpp" \
@@ -33,7 +37,10 @@ trap 'rm -f "$temporary_directory/cjson.o" "$temporary_directory/test_control_pr
   "$repository_root/firmware/components/hid_runtime/hid_runtime.cpp" \
   "$repository_root/firmware/components/hid_route/hid_route.cpp" \
   "$repository_root/firmware/components/usb_lifecycle/usb_lifecycle.cpp" \
+  "$repository_root/firmware/components/secure_memory/secure_memory.cpp" \
+  "$repository_root/firmware/components/sensitive_request/sensitive_request.cpp" \
   "$temporary_directory/cjson.o" \
+  -lcrypto \
   -o "$temporary_directory/test_control_protocol"
 "$temporary_directory/test_control_protocol"
 echo "PASS: control protocol/session tests"

@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string_view>
 
+#include "sensitive_request/sensitive_request.hpp"
+
 namespace control_session {
 
 inline constexpr std::size_t kTokenHexLength = 32;
@@ -70,12 +72,33 @@ class State {
                                        std::string_view request_bytes,
                                        AuthorityEpoch current_epoch,
                                        const ResponseFrame **cached_response) const;
+    RequestCacheResult inspect_sensitive_request(
+        std::string_view session, std::int32_t id, std::size_t payload_length,
+        const sensitive_request::Digest &digest,
+        AuthorityEpoch current_epoch,
+        const ResponseFrame **cached_response) const;
     void cache_completed_request(std::int32_t id,
                                  std::string_view request_bytes,
                                  AuthorityEpoch authority_epoch,
                                  const ResponseFrame &response);
+    void cache_completed_sensitive_request(
+        std::int32_t id, std::size_t payload_length,
+        const sensitive_request::Digest &digest,
+        AuthorityEpoch authority_epoch, const ResponseFrame &response);
 
     void revoke_for_lifecycle_invalidation(AuthorityEpoch current_epoch);
+
+#ifdef CONTROL_SESSION_NATIVE_TEST
+    struct RequestCacheSnapshot {
+        bool valid = false;
+        bool sensitive = false;
+        std::int32_t id = 0;
+        std::size_t payload_length = 0;
+        bool raw_storage_zero = false;
+        sensitive_request::Digest digest{};
+    };
+    RequestCacheSnapshot request_cache_snapshot_for_test() const;
+#endif
 
   private:
     struct HelloCache {
@@ -90,9 +113,11 @@ class State {
 
     struct RequestCache {
         bool valid = false;
+        bool sensitive = false;
         std::int32_t id = 0;
         char request[kMaxRequestBytes + 1]{};
         std::size_t request_length = 0;
+        sensitive_request::Digest digest{};
         AuthorityEpoch authority_epoch = 0;
         ResponseFrame response{};
     };

@@ -111,6 +111,7 @@ class BleBackend {
         std::uint16_t connection_handle) = 0;
     virtual std::int32_t inject_passkey(std::uint16_t connection_handle,
                                        std::uint32_t passkey) = 0;
+    virtual std::uint64_t monotonic_time_us() const = 0;
     virtual void arm_pairing_timeout(ble_lifecycle::Generation generation,
                                      std::uint16_t connection_handle,
                                      std::uint32_t pairing_id) = 0;
@@ -158,6 +159,15 @@ struct BleCommandOutcome {
     ble_lifecycle::Snapshot snapshot{};
 };
 
+struct PairingStatusSnapshot {
+    bool available = false;
+    ble_pairing::Snapshot pairing{};
+    ble_security::Snapshot security{};
+    ble_lifecycle::Generation generation = 0;
+    bool connected = false;
+    std::uint32_t remaining_ms = 0;
+};
+
 class Controller final : public usb_lifecycle::Executor, public BleEventSink {
   public:
     enum class ActionKind : std::uint8_t {
@@ -167,6 +177,8 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
         kBleEnable,
         kBleDisable,
         kBleEvent,
+        kPairingStatus,
+        kPairingRespond,
     };
 
     struct Action {
@@ -175,6 +187,7 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
         hid_route::Snapshot route{};
         ControlOperation operation = ControlOperation::kNone;
         BleEvent ble_event{};
+        std::uint32_t mailbox_token = 0;
     };
 
     bool initialize(hid_runtime::Runtime *runtime, Backend *backend,
@@ -190,6 +203,10 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     BleCommandOutcome request_ble_disable();
     ble_lifecycle::Snapshot ble_snapshot() const;
     ble_pairing::Snapshot pairing_snapshot() const;
+    PairingStatusSnapshot request_pairing_status();
+    ble_pairing::RespondResult request_pairing_response(
+        std::uint32_t pairing_id,
+        const std::array<char, 6> &six_digit_secret);
 
     // Internal executor-owned seam. It is deliberately not connected to the
     // UART protocol; callers must already run in the serialized owner context.
@@ -211,6 +228,7 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     void release_operation_for_test(ControlOperation operation);
     void fail_next_enqueue_for_test();
     void set_next_pairing_id_for_test(std::uint32_t value);
+    bool pairing_mailbox_zero_for_test() const;
 #endif
 
   private:
@@ -228,6 +246,10 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     void reconcile_security(std::uint16_t connection_handle,
                             bool pairing_complete_seen);
     bool consume_ble_overflow();
+    void reconcile_pairing_deadline();
+    PairingStatusSnapshot current_pairing_status() const;
+    void wipe_pairing_mailbox();
+    void complete_pairing_rpc(std::uint32_t token);
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     static void task_entry(void *context);
@@ -247,6 +269,20 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     std::atomic<std::uint16_t> overflow_connection_{
         ble_lifecycle::kNoConnection};
     bool pairing_complete_seen_ = false;
+    std::uint64_t pairing_deadline_us_ = 0;
+    struct PairingMailbox {
+        ble_lifecycle::Generation generation = 0;
+        std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
+        std::uint32_t pairing_id = 0;
+        std::array<char, 6> secret{};
+        std::uint32_t token = 0;
+        bool occupied = false;
+    } pairing_mailbox_{};
+    std::atomic<std::uint32_t> pairing_rpc_pending_{0};
+    std::uint32_t next_pairing_rpc_token_ = 1;
+    PairingStatusSnapshot pairing_rpc_status_{};
+    ble_pairing::RespondResult pairing_rpc_result_ =
+        ble_pairing::RespondResult::kNotPending;
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     Action native_queue_[8]{};

@@ -1,5 +1,7 @@
 #include "control_framing/control_framing.hpp"
 
+#include "secure_memory/secure_memory.hpp"
+
 namespace control_framing {
 namespace {
 
@@ -11,7 +13,7 @@ void Transport::reset_line() {
     line_state_ = LineState::kSeekingPrefix;
     prefix_match_length_ = 0;
     frame_length_ = 0;
-    frame_[0] = '\0';
+    secure_memory::zero(frame_, sizeof(frame_));
 }
 
 void Transport::reset() {
@@ -103,5 +105,16 @@ void Transport::consume(const std::uint8_t *data,
         consume_line_byte(byte, callback, context);
     }
 }
+
+#ifdef CONTROL_FRAMING_NATIVE_TEST
+bool Transport::storage_zero_for_test() const {
+    for (const char byte : frame_) {
+        if (byte != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
 
 }  // namespace control_framing

@@ -90,6 +90,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         last_injected_value = passkey;
         return inject_result;
     }
+    std::uint64_t monotonic_time_us() const override { return now_us; }
     void arm_pairing_timeout(ble_lifecycle::Generation generation,
                              std::uint16_t connection_handle,
                              std::uint32_t pairing_id) override {
@@ -174,6 +175,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     ble_lifecycle::Generation timer_generation = 0;
     std::uint16_t timer_connection = ble_lifecycle::kNoConnection;
     std::uint32_t timer_pairing_id = 0;
+    std::uint64_t now_us = 0;
     ble_security::State security{};
     ble_security::LinkSecurityEvidence security_link{};
     ble_security::PersistedSecurityEvidence security_persisted{};
@@ -888,6 +890,100 @@ void test_pairing_input_response_and_initiation() {
     assert(ble.inject_calls == 1);
 }
 
+void test_public_pairing_rpc_mailbox_status_and_races() {
+    const std::array<char, 6> secret = {'0', '0', '0', '1', '2', '3'};
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 71);
+        assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction, 71, 1));
+        assert(controller.process_one_for_test());
+        const auto pending = controller.pairing_snapshot();
+        const auto status = controller.request_pairing_status();
+        assert(status.generation == pending.generation && status.connected);
+        assert(status.pairing.live_state == ble_pairing::LiveState::kWaitingInput);
+        assert(status.remaining_ms == ble_pairing::kInputTimeoutMs);
+        assert(controller.request_pairing_response(pending.pairing_id, secret) ==
+               ble_pairing::RespondResult::kAccepted);
+        assert(ble.inject_calls == 1 && ble.last_injected_value == 123);
+        assert(controller.pairing_mailbox_zero_for_test());
+        assert(controller.request_pairing_response(pending.pairing_id, secret) ==
+               ble_pairing::RespondResult::kNotPending);
+        assert(ble.inject_calls == 1);
+        assert(controller.pairing_mailbox_zero_for_test());
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 72);
+        assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction, 72, 1));
+        assert(controller.process_one_for_test());
+        const auto pending = controller.pairing_snapshot();
+        ble.now_us = static_cast<std::uint64_t>(ble_pairing::kInputTimeoutMs) * 1000U;
+        assert(controller.request_pairing_response(pending.pairing_id, secret) ==
+               ble_pairing::RespondResult::kNotPending);
+        assert(ble.inject_calls == 0 && ble.disconnect_calls == 1);
+        assert(controller.pairing_snapshot().last_result ==
+               ble_pairing::LastResult::kTimeout);
+        assert(controller.pairing_mailbox_zero_for_test());
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 73);
+        assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction, 73, 1));
+        assert(controller.process_one_for_test());
+        const auto pending = controller.pairing_snapshot();
+        assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 73));
+        assert(controller.request_pairing_response(pending.pairing_id, secret) ==
+               ble_pairing::RespondResult::kNotPending);
+        assert(ble.inject_calls == 0);
+        assert(controller.pairing_mailbox_zero_for_test());
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 74);
+        assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction, 74, 1));
+        assert(controller.process_one_for_test());
+        const auto pending = controller.pairing_snapshot();
+        ble.inject_result = -1;
+        assert(controller.request_pairing_response(pending.pairing_id, secret) ==
+               ble_pairing::RespondResult::kInjectionFailed);
+        assert(ble.inject_calls == 1 && ble.disconnect_calls == 1);
+        assert(controller.pairing_mailbox_zero_for_test());
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 75);
+        assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction, 75, 1));
+        assert(controller.process_one_for_test());
+        const auto pending = controller.pairing_snapshot();
+        assert(controller.request_ble_disable().action_result ==
+               ble_lifecycle::TransitionResult::kAccepted);
+        assert(controller.request_pairing_response(pending.pairing_id, secret) ==
+               ble_pairing::RespondResult::kNotPending);
+        assert(ble.inject_calls == 0);
+        assert(controller.pairing_mailbox_zero_for_test());
+    }
+}
+
 void test_security_event_ordering_and_existing_bond() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
@@ -1181,6 +1277,7 @@ int main() {
     test_retained_cycles_validate_without_duplicate_registration();
     test_ble_busy_has_no_stage_a_and_usb_detach_does_not_change_ble();
     test_pairing_input_response_and_initiation();
+    test_public_pairing_rpc_mailbox_status_and_races();
     test_security_event_ordering_and_existing_bond();
     test_timeout_repeat_store_and_disconnect_results();
     test_queue_burst_overflow_and_id_wrap_fail_closed();

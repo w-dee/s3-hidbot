@@ -6,8 +6,12 @@
 #include <unistd.h>
 
 #include "control_framing/control_framing.hpp"
+#include "bootloader_random.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "mbedtls/md.h"
+#include "secure_memory/secure_memory.hpp"
+#include "sensitive_request/sensitive_request.hpp"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
 #include "esp_log.h"
@@ -35,6 +39,24 @@ void fill_random(void *, std::uint8_t *output, std::size_t length) {
     // ESP-IDF v5.5.4 esp_fill_random() has no error return. The values are
     // protocol epoch markers, not authentication secrets.
     esp_fill_random(output, length);
+}
+
+bool fill_secure_random(void *, std::uint8_t *output, std::size_t length) {
+    // The UART RX task does not exist yet and BLE/RF is still lazy-uninitialized.
+    // ESP-IDF permits this bounded entropy-source window when RF and ADC users
+    // are absent.
+    bootloader_random_enable();
+    esp_fill_random(output, length);
+    bootloader_random_disable();
+    return true;
+}
+
+bool hmac_sha256(void *, const std::uint8_t *key, std::size_t key_length,
+                 const std::uint8_t *input, std::size_t input_length,
+                 std::uint8_t output[sensitive_request::kDigestBytes]) {
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    return info != nullptr &&
+           mbedtls_md_hmac(info, key, key_length, input, input_length, output) == 0;
 }
 
 bool write_protocol_frame(void *, const std::uint8_t *data, std::size_t length) {
@@ -78,6 +100,7 @@ void control_rx_task(void *) {
                                 static_cast<std::size_t>(bytes_read),
                                 consume_framing_event,
                                 nullptr);
+            secure_memory::zero(buffer.data(), static_cast<std::size_t>(bytes_read));
             // A callback can publish an authority epoch between two frames in
             // this same RX batch. Each request has its own epoch barrier;
             // this second pass makes cache/session cleanup prompt as well.
@@ -118,7 +141,9 @@ esp_err_t start(const control_protocol::Config *protocol_config) {
     configured_protocol.output_context = nullptr;
     configured_protocol.now = monotonic_now;
     configured_protocol.now_context = nullptr;
-    if (!s_protocol.initialize(configured_protocol, fill_random, nullptr)) {
+    if (!s_protocol.initialize(configured_protocol, fill_random, nullptr,
+                               fill_secure_random, nullptr, hmac_sha256,
+                               nullptr)) {
         return ESP_ERR_INVALID_ARG;
     }
 

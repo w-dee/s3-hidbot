@@ -81,7 +81,9 @@ python3 tools/test_release_workflows.py
 writer, documentation static guards, and the U5.4.1 read-only observer unit
 tests. `test-package.sh` is the release artifact validation entrypoint; it
 requires network access but no ESP-IDF.
-`test-native.sh` runs the four IDF-independent C++ suites.
+`test-native.sh` runs the IDF-independent C++ suites, including the deterministic
+sensitive-request HMAC layout, key-failure, digest-comparison, and memory-wipe
+checks.
 `test-control-protocol.sh` additionally compiles against the active ESP-IDF
 cJSON source and therefore requires the v5.5.4 environment.
 

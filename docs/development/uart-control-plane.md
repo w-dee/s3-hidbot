@@ -13,7 +13,8 @@ HID output routing, the safety-only `hid.release_all` command, and the public ab
 `protocol.hello`, `system.ping`, `system.info`, `usb.status`,
 `usb.exposure.status`, `usb.attach`, `usb.detach`, `hid.route.status`,
 `hid.route.set`, `hid.release_all`,
-`hid.keyboard.report`, and `hid.mouse.report`. There is still no keyboard
+`hid.keyboard.report`, `hid.mouse.report`, `ble.exposure.status`, `ble.enable`,
+`ble.disable`, `ble.pairing.status`, and `ble.pairing.respond`. There is still no keyboard
 helper, high-level keyboard/mouse automation, asynchronous event, BLE route,
 GPIO action, or reset command. Primitive report CLI commands are documented
 below and remain explicitly unsafe.
@@ -43,7 +44,46 @@ deadline and fail-closed wrap behavior. NimBLE callbacks enqueue only bounded,
 non-secret metadata into the fixed depth-8 control queue. Queue overflow is a
 recovery-required BLE lifecycle fault; ordinary store capacity, timeout,
 repeat-pairing, or peer failure disconnects without global recovery. This
-internal model still adds no UART command, capability, host API, or BLE route.
+internal model is exposed in Slice C by the firmware-only
+`ble.pairing-transaction-v1` capability and the `ble.pairing.status` and
+`ble.pairing.respond` commands. The full identity hello now has 13 unique
+capabilities. No host API, CLI, BLE route, or HID notification output is added.
+
+`ble.pairing.status` accepts omitted or empty params. Its exact result fields
+are `state`, `generation`, `connected`, `pairing_id`, `action`,
+`remaining_ms`, `encrypted`, `authenticated`, `bonded`,
+`secure_connections`, `key_size`, and `last_result`. The pairing ID, action
+`passkey_input`, and remaining time are non-null only in `waiting_input`.
+Status is reconciled in the executor owner before serialization. Public
+`bonded` means the current identity and policy have a project-verified
+persisted `OUR_SEC` plus `PEER_SEC` pair, never only NimBLE's transient bit.
+
+`ble.pairing.respond` requires exactly a nonzero uint32 `pairing_id` and a
+six-byte ASCII-decimal `passkey` string. Success means only that the current
+executor-owned transaction reached `ble_sm_inject_io()` and NimBLE accepted
+the injection. A no-longer-current tuple maps to
+`BLE_PAIRING_NOT_PENDING`; an attempted but rejected injection maps to
+`BLE_PAIRING_FAILED`. Neither response nor diagnostic output contains the
+passkey.
+
+The sensitive retry identity is:
+
+```text
+HMAC-SHA256(K,
+  ASCII("s3-hidbot/ble.pairing.respond/v1") ||
+  uint32_be(normalized_payload_length) ||
+  exact_framing_normalized_JSON_payload)
+```
+
+`K` is a 32-byte boot-lifetime RAM-only key generated before the UART receive
+task starts. On ESP32-S3, firmware temporarily enables the supported
+bootloader random entropy source, calls `esp_fill_random`, then disables that
+source. Failure to initialize this key prevents the UART control plane from
+starting, so pairing advertisement and secret-command acceptance fail closed.
+The retry cache stores the payload length and HMAC, not the raw sensitive
+request. The executor queue carries only a fixed mailbox token; the mailbox
+and all project-owned parser, framing, and NimBLE passkey temporaries are
+explicitly wiped after use.
 
 Native USB is hidden by default: boot initializes HID/runtime state and its
 lifecycle task, then starts the UART control plane without calling
@@ -198,7 +238,8 @@ initial capability list:
 ```text
   protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
   usb.exposure-control-v1, hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
-  hid.mouse-report-v1, firmware.identity-v1, hid.output-route-v1
+  hid.mouse-report-v1, firmware.identity-v1, hid.output-route-v1,
+  ble.exposure-control-v1, ble.pairing-transaction-v1
 ```
 
 For a successful hello, top-level `session` equals `result.session`. Both are
@@ -208,7 +249,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1","hid.output-route-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1","hid.output-route-v1","ble.exposure-control-v1","ble.pairing-transaction-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire

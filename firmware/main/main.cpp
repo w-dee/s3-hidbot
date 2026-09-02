@@ -217,6 +217,74 @@ control_protocol::BleExposureActionOutcome ble_action(
             .snapshot = make_ble_exposure_status(outcome.snapshot)};
 }
 
+control_protocol::BlePairingStatus ble_pairing_status(void *) {
+    const auto status = s_usb_exposure.request_pairing_status();
+    const auto state = [](ble_pairing::LiveState value) {
+        switch (value) {
+            case ble_pairing::LiveState::kSecuring:
+                return control_protocol::BlePairingState::kSecuring;
+            case ble_pairing::LiveState::kWaitingInput:
+                return control_protocol::BlePairingState::kWaitingInput;
+            case ble_pairing::LiveState::kIdle:
+            default:
+                return control_protocol::BlePairingState::kIdle;
+        }
+    };
+    const auto last_result = [](ble_pairing::LastResult value) {
+        using From = ble_pairing::LastResult;
+        using To = control_protocol::BlePairingLastResult;
+        switch (value) {
+            case From::kSucceeded: return To::kSucceeded;
+            case From::kSmpFailed: return To::kSmpFailed;
+            case From::kTimeout: return To::kTimeout;
+            case From::kPeerDisconnected: return To::kPeerDisconnected;
+            case From::kStoreFull: return To::kStoreFull;
+            case From::kStorage: return To::kStorage;
+            case From::kQueueOverflow: return To::kQueueOverflow;
+            case From::kRepeatPairing: return To::kRepeatPairing;
+            case From::kSecurityPolicy: return To::kSecurityPolicy;
+            case From::kNone:
+            default: return To::kNone;
+        }
+    };
+    const bool current_security = status.security.coherent &&
+                                  status.security.generation == status.generation &&
+                                  status.security.connected == status.connected;
+    return {
+        .available = status.available,
+        .state = state(status.pairing.live_state),
+        .generation = status.generation,
+        .connected = status.connected,
+        .input_pending = status.pairing.live_state ==
+                             ble_pairing::LiveState::kWaitingInput &&
+                         status.pairing.pairing_active,
+        .pairing_id = status.pairing.pairing_id,
+        .remaining_ms = status.remaining_ms,
+        .encrypted = current_security && status.security.encrypted,
+        .authenticated = current_security && status.security.authenticated,
+        .bonded = current_security &&
+                  status.security.project_verified_bond_persisted,
+        .secure_connections = current_security &&
+                              status.security.secure_connections,
+        .key_size = current_security ? status.security.key_size
+                                     : static_cast<std::uint8_t>(0),
+        .last_result = last_result(status.pairing.last_result),
+    };
+}
+
+control_protocol::BlePairingRespondResult ble_pairing_respond(
+    void *, const control_protocol::BlePairingRespondRequest &request) {
+    const auto result = s_usb_exposure.request_pairing_response(
+        request.pairing_id, request.passkey);
+    if (result == ble_pairing::RespondResult::kAccepted) {
+        return control_protocol::BlePairingRespondResult::kAccepted;
+    }
+    if (result == ble_pairing::RespondResult::kInjectionFailed) {
+        return control_protocol::BlePairingRespondResult::kInjectionFailed;
+    }
+    return control_protocol::BlePairingRespondResult::kNotPending;
+}
+
 control_protocol::BleExposureActionOutcome ble_enable(void *) {
     return ble_action(s_usb_exposure.request_ble_enable());
 }
@@ -652,6 +720,10 @@ extern "C" void app_main() {
         .ble_enable_context = nullptr,
         .ble_disable_provider = ble_disable,
         .ble_disable_context = nullptr,
+        .ble_pairing_status_provider = ble_pairing_status,
+        .ble_pairing_status_context = nullptr,
+        .ble_pairing_respond_provider = ble_pairing_respond,
+        .ble_pairing_respond_context = nullptr,
         .hid_route_status_provider = hid_route_status,
         .hid_route_status_context = nullptr,
         .hid_route_set_provider = hid_route_set,

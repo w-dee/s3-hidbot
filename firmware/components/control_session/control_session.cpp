@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "secure_memory/secure_memory.hpp"
+
 namespace control_session {
 namespace {
 
@@ -48,6 +50,8 @@ bool State::same_request(const char *cached,
 }
 
 void State::clear_normal_cache() {
+    secure_memory::zero(request_cache_.request, sizeof(request_cache_.request));
+    secure_memory::zero(request_cache_.digest.data(), request_cache_.digest.size());
     request_cache_ = RequestCache{};
 }
 
@@ -202,7 +206,36 @@ RequestCacheResult State::inspect_request(std::string_view session,
     if (id < request_cache_.id) {
         return RequestCacheResult::kIdStale;
     }
-    if (!same_request(request_cache_.request, request_cache_.request_length, request_bytes)) {
+    if (request_cache_.sensitive ||
+        !same_request(request_cache_.request, request_cache_.request_length, request_bytes)) {
+        return RequestCacheResult::kIdConflict;
+    }
+    if (cached_response != nullptr) {
+        *cached_response = &request_cache_.response;
+    }
+    return RequestCacheResult::kExactRetry;
+}
+
+RequestCacheResult State::inspect_sensitive_request(
+    std::string_view session, std::int32_t id, std::size_t payload_length,
+    const sensitive_request::Digest &digest, AuthorityEpoch current_epoch,
+    const ResponseFrame **cached_response) const {
+    if (cached_response != nullptr) {
+        *cached_response = nullptr;
+    }
+    if (!active_session_ || session_authority_epoch_ != current_epoch ||
+        !same_token(current_session_, session)) {
+        return RequestCacheResult::kSessionMismatch;
+    }
+    if (!request_cache_.valid || request_cache_.authority_epoch != current_epoch ||
+        id > request_cache_.id) {
+        return RequestCacheResult::kAcceptNew;
+    }
+    if (id < request_cache_.id) {
+        return RequestCacheResult::kIdStale;
+    }
+    if (!request_cache_.sensitive || request_cache_.request_length != payload_length ||
+        !sensitive_request::constant_time_equal(request_cache_.digest, digest)) {
         return RequestCacheResult::kIdConflict;
     }
     if (cached_response != nullptr) {
@@ -217,11 +250,41 @@ void State::cache_completed_request(std::int32_t id,
                                     const ResponseFrame &response) {
     request_cache_ = RequestCache{};
     request_cache_.valid = true;
+    request_cache_.sensitive = false;
     request_cache_.id = id;
     request_cache_.authority_epoch = authority_epoch;
     copy_request(request_cache_.request, &request_cache_.request_length, request_bytes);
     request_cache_.response = response;
 }
+
+void State::cache_completed_sensitive_request(
+    std::int32_t id, std::size_t payload_length,
+    const sensitive_request::Digest &digest, AuthorityEpoch authority_epoch,
+    const ResponseFrame &response) {
+    clear_normal_cache();
+    request_cache_.valid = true;
+    request_cache_.sensitive = true;
+    request_cache_.id = id;
+    request_cache_.request_length = payload_length;
+    request_cache_.digest = digest;
+    request_cache_.authority_epoch = authority_epoch;
+    request_cache_.response = response;
+}
+
+#ifdef CONTROL_SESSION_NATIVE_TEST
+State::RequestCacheSnapshot State::request_cache_snapshot_for_test() const {
+    bool raw_storage_zero = true;
+    for (const char byte : request_cache_.request) {
+        raw_storage_zero = raw_storage_zero && byte == 0;
+    }
+    return {.valid = request_cache_.valid,
+            .sensitive = request_cache_.sensitive,
+            .id = request_cache_.id,
+            .payload_length = request_cache_.request_length,
+            .raw_storage_zero = raw_storage_zero,
+            .digest = request_cache_.digest};
+}
+#endif
 
 void State::revoke_for_lifecycle_invalidation(AuthorityEpoch current_epoch) {
     if ((active_session_ && session_authority_epoch_ != current_epoch) ||

@@ -45,9 +45,19 @@ def main() -> int:
     assert "ble_pairing::kInputTimeoutMs" in transport
     assert "cJSON" not in transport
 
-    for forbidden in ("ble.pairing.status", "ble.pairing.respond",
-                      "ble.pairing-transaction-v1"):
-        assert forbidden not in protocol
+    for exposed in ("ble.pairing.status", "ble.pairing.respond",
+                    "ble.pairing-transaction-v1"):
+        assert exposed in protocol
+    assert protocol.count("ble.pairing-transaction-v1") == 2
+    assert "ble.pairing-control-v1" not in protocol
+    assert "ble.bond-store-v1" not in protocol
+
+    action = re.search(r"struct Action \{(.*?)\n    \};", executor_header, re.S)
+    assert action
+    assert "mailbox_token" in action.group(1)
+    assert not re.search(r"\b(passkey|secret)\b", action.group(1), re.I)
+    assert "secure_memory::zero(&pairing_mailbox_" in executor
+    assert "reconcile_pairing_deadline();" in executor
 
     project_ble = "\n".join(path.read_text() for path in
         (ROOT / "firmware/components").glob("ble_*/*.cpp"))

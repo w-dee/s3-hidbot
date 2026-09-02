@@ -2,17 +2,76 @@
 #include <array>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <openssl/sha.h>
+
+#include "cJSON.h"
 #include "control_framing/control_framing.hpp"
 #include "control_protocol/control_protocol.hpp"
 #include "firmware_identity/firmware_identity.hpp"
 #include "hid_runtime/hid_runtime.hpp"
 
 namespace {
+
+struct AllocationRecord {
+    void *storage = nullptr;
+    std::size_t length = 0;
+};
+std::vector<AllocationRecord> cjson_allocations;
+bool watch_parser_secret = false;
+bool parser_secret_present_at_free = false;
+bool watch_embedded_nul_secret = false;
+bool embedded_nul_secret_present_at_free = false;
+
+void *tracked_cjson_malloc(std::size_t length) {
+    void *storage = std::malloc(length);
+    if (storage != nullptr) cjson_allocations.push_back({storage, length});
+    return storage;
+}
+
+void tracked_cjson_free(void *storage) {
+    const auto found = std::find_if(
+        cjson_allocations.begin(), cjson_allocations.end(),
+        [storage](const AllocationRecord &record) {
+            return record.storage == storage;
+        });
+    if (found != cjson_allocations.end()) {
+        constexpr std::array<unsigned char, 6> sentinel{
+            '3', '1', '4', '1', '5', '9'};
+        if (watch_parser_secret && found->length >= sentinel.size()) {
+            const auto *bytes = static_cast<const unsigned char *>(storage);
+            for (std::size_t index = 0;
+                 index + sentinel.size() <= found->length; ++index) {
+                if (std::memcmp(bytes + index, sentinel.data(),
+                                sentinel.size()) == 0) {
+                    parser_secret_present_at_free = true;
+                }
+            }
+        }
+        constexpr std::array<unsigned char, 7> embedded_nul_sentinel{
+            '3', '1', 0, '4', '1', '5', '9'};
+        if (watch_embedded_nul_secret &&
+            found->length >= embedded_nul_sentinel.size()) {
+            const auto *bytes = static_cast<const unsigned char *>(storage);
+            for (std::size_t index = 0;
+                 index + embedded_nul_sentinel.size() <= found->length;
+                 ++index) {
+                if (std::memcmp(bytes + index, embedded_nul_sentinel.data(),
+                                embedded_nul_sentinel.size()) == 0) {
+                    embedded_nul_secret_present_at_free = true;
+                }
+            }
+        }
+        cjson_allocations.erase(found);
+    }
+    std::free(storage);
+}
 
 constexpr char kNonceA[] = "0123456789abcdef0123456789abcdef";
 constexpr char kNonceB[] = "fedcba9876543210fedcba9876543210";
@@ -88,7 +147,37 @@ struct RandomSource {
         }
         source->next = static_cast<std::uint8_t>(source->next + length);
     }
+
+    static bool secure_fill(void *context, std::uint8_t *output,
+                            std::size_t length) {
+        fill(context, output, length);
+        return true;
+    }
 };
+
+bool hmac_sha256(void *, const std::uint8_t *key, std::size_t key_length,
+                 const std::uint8_t *input, std::size_t input_length,
+                 std::uint8_t output[sensitive_request::kDigestBytes]) {
+    assert(key_length <= 64);
+    std::array<std::uint8_t, 64> inner_pad{};
+    std::array<std::uint8_t, 64> outer_pad{};
+    for (std::size_t index = 0; index < key_length; ++index) {
+        inner_pad[index] = key[index];
+        outer_pad[index] = key[index];
+    }
+    for (std::size_t index = 0; index < inner_pad.size(); ++index) {
+        inner_pad[index] ^= 0x36U;
+        outer_pad[index] ^= 0x5cU;
+    }
+    std::vector<std::uint8_t> inner(inner_pad.begin(), inner_pad.end());
+    inner.insert(inner.end(), input, input + input_length);
+    std::array<std::uint8_t, SHA256_DIGEST_LENGTH> inner_digest{};
+    SHA256(inner.data(), inner.size(), inner_digest.data());
+    std::vector<std::uint8_t> outer(outer_pad.begin(), outer_pad.end());
+    outer.insert(outer.end(), inner_digest.begin(), inner_digest.end());
+    SHA256(outer.data(), outer.size(), output);
+    return true;
+}
 
 struct StatusSource {
     control_protocol::UsbStatus status{false, false, false, false};
@@ -358,6 +447,30 @@ struct MouseSource {
     }
 };
 
+struct PairingSource {
+    control_protocol::BlePairingStatus status{};
+    control_protocol::BlePairingRespondResult respond_result =
+        control_protocol::BlePairingRespondResult::kAccepted;
+    control_protocol::BlePairingRespondRequest request{};
+    int status_calls = 0;
+    int respond_calls = 0;
+
+    static control_protocol::BlePairingStatus get(void *context) {
+        auto *source = static_cast<PairingSource *>(context);
+        ++source->status_calls;
+        return source->status;
+    }
+
+    static control_protocol::BlePairingRespondResult respond(
+        void *context,
+        const control_protocol::BlePairingRespondRequest &request) {
+        auto *source = static_cast<PairingSource *>(context);
+        ++source->respond_calls;
+        source->request = request;
+        return source->respond_result;
+    }
+};
+
 void increment_authority(void *context) {
     ++static_cast<AuthoritySource *>(context)->epoch;
 }
@@ -377,6 +490,7 @@ struct LeaseFixture {
     AuthoritySource authority;
     ExposureSource exposure;
     BleSource ble;
+    PairingSource pairing;
     RouteSource route;
     ReleaseSource release;
     int expired_callbacks = 0;
@@ -456,6 +570,10 @@ struct LeaseFixture {
             .ble_enable_context = &ble,
             .ble_disable_provider = BleSource::disable,
             .ble_disable_context = &ble,
+            .ble_pairing_status_provider = PairingSource::get,
+            .ble_pairing_status_context = &pairing,
+            .ble_pairing_respond_provider = PairingSource::respond,
+            .ble_pairing_respond_context = &pairing,
             .hid_route_status_provider = RouteSource::get,
             .hid_route_status_context = &route,
             .hid_route_set_provider = RouteSource::set,
@@ -479,7 +597,9 @@ struct LeaseFixture {
             .mouse_report_provider = nullptr,
             .mouse_report_context = nullptr,
         };
-        assert(protocol.initialize(config, RandomSource::fill, &random));
+        assert(protocol.initialize(config, RandomSource::fill, &random,
+                                   RandomSource::secure_fill, &random,
+                                   hmac_sha256, nullptr));
     }
 
     void payload(std::string_view json) {
@@ -495,6 +615,7 @@ struct Fixture {
     AuthoritySource authority;
     ExposureSource exposure;
     BleSource ble;
+    PairingSource pairing;
     RouteSource route;
     ReleaseSource release;
     KeyboardSource keyboard;
@@ -511,7 +632,9 @@ struct Fixture {
         }
         exposure.authority = &authority;
         route.authority = &authority;
-        assert(protocol.initialize(configuration(), RandomSource::fill, &random));
+        assert(protocol.initialize(configuration(), RandomSource::fill, &random,
+                                   RandomSource::secure_fill, &random,
+                                   hmac_sha256, nullptr));
     }
 
     control_protocol::Config configuration() {
@@ -536,6 +659,10 @@ struct Fixture {
             .ble_enable_context = &ble,
             .ble_disable_provider = BleSource::disable,
             .ble_disable_context = &ble,
+            .ble_pairing_status_provider = PairingSource::get,
+            .ble_pairing_status_context = &pairing,
+            .ble_pairing_respond_provider = PairingSource::respond,
+            .ble_pairing_respond_context = &pairing,
             .hid_route_status_provider = RouteSource::get,
             .hid_route_status_context = &route,
             .hid_route_set_provider = RouteSource::set,
@@ -568,6 +695,11 @@ struct Fixture {
 };
 
 void require_contains(const std::string &value, std::string_view expected) {
+    if (value.find(expected) == std::string::npos) {
+        std::fprintf(stderr, "missing [%.*s] in [%s]\n",
+                     static_cast<int>(expected.size()), expected.data(),
+                     value.c_str());
+    }
     assert(value.find(expected) != std::string::npos);
 }
 
@@ -656,6 +788,8 @@ void test_strict_envelope_and_framing() {
     const std::string hello = hello_request(1, kNonceA);
     control_framing::Transport transport;
     feed_wire(&transport, &fixture.protocol, "unrelated log\n@HIDBOT " + hello + "\r\n");
+    assert(transport.storage_zero_for_test());
+    assert(fixture.protocol.request_scratch_zero_for_test());
     require_contains(fixture.sink.last(), "\"ok\":true");
     const std::string session = extract_string(fixture.sink.last(), "session");
     require_top_level_session(fixture.sink.last(), session);
@@ -930,7 +1064,9 @@ void test_invalid_identity_rejected_at_protocol_initialization() {
         Fixture fixture(0, true);
         mutate(fixture.identity);
         control_protocol::Protocol rejected;
-        assert(!rejected.initialize(fixture.configuration(), RandomSource::fill, &fixture.random));
+        assert(!rejected.initialize(fixture.configuration(), RandomSource::fill,
+                                    &fixture.random, RandomSource::secure_fill,
+                                    &fixture.random, hmac_sha256, nullptr));
     };
 
     expect_rejected([](firmware_identity::Identity &identity) {
@@ -1445,7 +1581,7 @@ void test_hid_route_schema_frozen_retry_and_errors() {
     const std::string hello = fixture.sink.last();
     const std::string session = extract_string(hello, "session");
     assert(count_occurrences(hello, "\"hid.output-route-v1\"") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 12);
+    assert(count_occurrences(hello, "-v1\"") == 13);
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
 
     fixture.payload(request(2, session, "hid.route.status"));
@@ -1540,7 +1676,7 @@ void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
     const std::string session = extract_string(hello, "session");
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
     assert(count_occurrences(hello, "ble.exposure-control-v1") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 12);
+    assert(count_occurrences(hello, "-v1\"") == 13);
 
     fixture.payload(request(2, session, "ble.exposure.status"));
     const std::string cold = fixture.sink.last();
@@ -1588,9 +1724,230 @@ void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
     assert(busy.ble.status.generation == 0);
 }
 
+void test_ble_pairing_status_exact_schema() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string hello = fixture.sink.last();
+    const std::string session = extract_string(hello, "session");
+    assert(count_occurrences(hello, "ble.pairing-transaction-v1") == 1);
+    assert(hello.find("ble.pairing-control-v1") == std::string::npos);
+    assert(hello.find("ble.bond-store-v1") == std::string::npos);
+    assert(count_occurrences(hello, "-v1\"") == 13);
+
+    fixture.payload(request(2, session, "ble.pairing.status"));
+    require_contains(
+        fixture.sink.last(),
+        "\"result\":{\"state\":\"idle\",\"generation\":0,\"connected\":false,"
+        "\"pairing_id\":null,\"action\":null,\"remaining_ms\":null,"
+        "\"encrypted\":false,\"authenticated\":false,\"bonded\":false,"
+        "\"secure_connections\":false,\"key_size\":0,\"last_result\":\"none\"}");
+
+    fixture.pairing.status = {
+        .state = control_protocol::BlePairingState::kWaitingInput,
+        .generation = 7,
+        .connected = true,
+        .input_pending = true,
+        .pairing_id = 12,
+        .remaining_ms = 24000,
+        .last_result = control_protocol::BlePairingLastResult::kTimeout,
+    };
+    fixture.payload("{\"v\":1,\"id\":3,\"session\":\"" + session +
+                    "\",\"cmd\":\"ble.pairing.status\"}");
+    const std::string waiting = fixture.sink.last();
+    require_contains(waiting, "\"state\":\"waiting_input\",\"generation\":7");
+    require_contains(waiting, "\"pairing_id\":12,\"action\":\"passkey_input\",\"remaining_ms\":24000");
+    require_contains(waiting, "\"last_result\":\"timeout\"");
+
+    fixture.pairing.status = {
+        .state = control_protocol::BlePairingState::kIdle,
+        .generation = 8,
+        .connected = true,
+        .encrypted = true,
+        .authenticated = true,
+        .bonded = true,
+        .secure_connections = true,
+        .key_size = 16,
+        .last_result = control_protocol::BlePairingLastResult::kSucceeded,
+    };
+    fixture.payload(request(4, session, "ble.pairing.status"));
+    const std::string secured = fixture.sink.last();
+    require_contains(secured, "\"pairing_id\":null,\"action\":null,\"remaining_ms\":null");
+    require_contains(secured, "\"encrypted\":true,\"authenticated\":true,\"bonded\":true");
+    require_contains(secured, "\"secure_connections\":true,\"key_size\":16,\"last_result\":\"succeeded\"");
+
+    fixture.payload(request(5, session, "ble.pairing.status", "{\"extra\":1}"));
+    require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+
+    fixture.pairing.status = {
+        .state = control_protocol::BlePairingState::kSecuring,
+        .generation = 9,
+        .connected = true,
+    };
+    fixture.payload(request(6, session, "ble.pairing.status"));
+    require_contains(fixture.sink.last(),
+                     "\"state\":\"securing\",\"generation\":9,\"connected\":true");
+    require_contains(fixture.sink.last(),
+                     "\"pairing_id\":null,\"action\":null,\"remaining_ms\":null");
+
+    const std::array<std::pair<control_protocol::BlePairingLastResult,
+                               std::string_view>, 10>
+        last_results{{
+            {control_protocol::BlePairingLastResult::kNone, "none"},
+            {control_protocol::BlePairingLastResult::kSucceeded, "succeeded"},
+            {control_protocol::BlePairingLastResult::kSmpFailed, "smp_failed"},
+            {control_protocol::BlePairingLastResult::kTimeout, "timeout"},
+            {control_protocol::BlePairingLastResult::kPeerDisconnected,
+             "peer_disconnected"},
+            {control_protocol::BlePairingLastResult::kStoreFull, "store_full"},
+            {control_protocol::BlePairingLastResult::kStorage, "storage"},
+            {control_protocol::BlePairingLastResult::kQueueOverflow,
+             "queue_overflow"},
+            {control_protocol::BlePairingLastResult::kRepeatPairing,
+             "repeat_pairing"},
+            {control_protocol::BlePairingLastResult::kSecurityPolicy,
+             "security_policy"},
+        }};
+    std::int32_t status_id = 10;
+    for (const auto &[value, spelling] : last_results) {
+        fixture.pairing.status = {
+            .state = control_protocol::BlePairingState::kIdle,
+            .last_result = value,
+        };
+        fixture.payload(request(status_id++, session, "ble.pairing.status"));
+        require_contains(fixture.sink.last(),
+                         "\"last_result\":\"" + std::string(spelling) + "\"");
+    }
+
+    fixture.pairing.status.available = false;
+    fixture.payload(request(status_id, session, "ble.pairing.status"));
+    require_contains(fixture.sink.last(), "\"code\":\"INTERNAL_ERROR\"");
+}
+
+void test_ble_pairing_respond_parser_retry_and_errors() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+    const std::string accepted_request = request(
+        2, session, "ble.pairing.respond",
+        "{\"pairing_id\":12,\"passkey\":\"000123\"}");
+    fixture.payload(accepted_request);
+    const std::string accepted = fixture.sink.last();
+    require_contains(accepted, "\"result\":{\"accepted\":true,\"pairing_id\":12}");
+    assert(fixture.pairing.respond_calls == 1);
+    assert(fixture.pairing.request.pairing_id == 12);
+    assert(fixture.pairing.request.passkey ==
+           (std::array<char, 6>{'0', '0', '0', '1', '2', '3'}));
+    assert(fixture.protocol.request_scratch_zero_for_test());
+    const auto cache = fixture.protocol.request_cache_snapshot_for_test();
+    assert(cache.valid && cache.sensitive && cache.id == 2);
+    assert(cache.payload_length == accepted_request.size());
+    assert(cache.raw_storage_zero);
+
+    control_framing::Transport transport;
+    feed_wire(&transport, &fixture.protocol,
+              std::string(control_framing::kFramePrefix) + accepted_request + "\n");
+    assert(fixture.sink.last() == accepted);
+    assert(fixture.pairing.respond_calls == 1);
+    assert(transport.storage_zero_for_test());
+    assert(fixture.protocol.request_scratch_zero_for_test());
+    fixture.payload(request(2, session, "ble.pairing.respond",
+                            "{\"pairing_id\":12,\"passkey\":\"000124\"}"));
+    require_contains(fixture.sink.last(), "\"code\":\"REQUEST_ID_CONFLICT\"");
+    fixture.payload(request(2, session, "ble.pairing.respond",
+                            "{\"pairing_id\":13,\"passkey\":\"000123\"}"));
+    require_contains(fixture.sink.last(), "\"code\":\"REQUEST_ID_CONFLICT\"");
+    fixture.payload("{\"v\":1,\"id\":2,\"session\":\"" + session +
+                    "\", \"cmd\":\"ble.pairing.respond\",\"params\":{\"pairing_id\":12,\"passkey\":\"000123\"}}");
+    require_contains(fixture.sink.last(), "\"code\":\"REQUEST_ID_CONFLICT\"");
+    assert(fixture.pairing.respond_calls == 1);
+
+    auto expect_invalid = [](std::string_view params) {
+        Fixture invalid(0, true);
+        invalid.payload(hello_request(1, kNonceA));
+        const std::string invalid_session = extract_string(invalid.sink.last(), "session");
+        invalid.payload(request(2, invalid_session, "ble.pairing.respond", params));
+        require_contains(invalid.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+        assert(invalid.pairing.respond_calls == 0);
+        assert(invalid.protocol.request_scratch_zero_for_test());
+    };
+    expect_invalid("{\"pairing_id\":1,\"passkey\":123456}");
+    expect_invalid("{\"pairing_id\":1,\"passkey\":\"１２３４５６\"}");
+    expect_invalid("{\"pairing_id\":1,\"passkey\":\" 12345\"}");
+    expect_invalid("{\"pairing_id\":1,\"passkey\":\"12345\"}");
+    expect_invalid("{\"pairing_id\":1,\"passkey\":\"1234567\"}");
+    expect_invalid("{\"pairing_id\":1,\"passkey\":\"12345\\n\"}");
+    expect_invalid("{\"pairing_id\":1,\"passkey\":\"123456\",\"extra\":0}");
+    expect_invalid("{\"pairing_id\":1}");
+    expect_invalid("{\"pairing_id\":0,\"passkey\":\"123456\"}");
+    expect_invalid("{\"pairing_id\":-1,\"passkey\":\"123456\"}");
+    expect_invalid("{\"pairing_id\":1.5,\"passkey\":\"123456\"}");
+    expect_invalid("{\"pairing_id\":\"1\",\"passkey\":\"123456\"}");
+    expect_invalid("{\"pairing_id\":4294967296,\"passkey\":\"123456\"}");
+    for (std::string_view passkey : {"000000", "999999"}) {
+        Fixture valid(0, true);
+        valid.payload(hello_request(1, kNonceA));
+        const std::string valid_session = extract_string(valid.sink.last(), "session");
+        valid.payload(request(2, valid_session, "ble.pairing.respond",
+                              "{\"pairing_id\":4294967295,\"passkey\":\"" +
+                                  std::string(passkey) + "\"}"));
+        require_contains(valid.sink.last(), "\"accepted\":true");
+    }
+
+    for (const auto &[provider_result, code] : {
+             std::pair{control_protocol::BlePairingRespondResult::kNotPending,
+                       "BLE_PAIRING_NOT_PENDING"},
+             std::pair{control_protocol::BlePairingRespondResult::kInjectionFailed,
+                       "BLE_PAIRING_FAILED"},
+         }) {
+        Fixture failure(0, true);
+        failure.pairing.respond_result = provider_result;
+        failure.payload(hello_request(1, kNonceA));
+        const std::string failure_session = extract_string(failure.sink.last(), "session");
+        failure.payload(request(2, failure_session, "ble.pairing.respond",
+                                "{\"pairing_id\":1,\"passkey\":\"123456\"}"));
+        require_contains(failure.sink.last(), std::string("\"code\":\"") + code + "\"");
+        assert(failure.sink.last().find("123456") == std::string::npos);
+    }
+}
+
+void test_cjson_secret_is_wiped_before_free() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+    watch_parser_secret = true;
+    parser_secret_present_at_free = false;
+    fixture.payload(request(2, session, "ble.pairing.respond",
+                            "{\"pairing_id\":1,\"passkey\":\"314159\"}"));
+    watch_parser_secret = false;
+    assert(!parser_secret_present_at_free);
+    assert(fixture.pairing.respond_calls == 1);
+
+    watch_embedded_nul_secret = true;
+    embedded_nul_secret_present_at_free = false;
+    fixture.payload(request(3, session, "ble.pairing.respond",
+                            "{\"pairing_id\":1,\"passkey\":\"31\\u00004159\"}"));
+    watch_embedded_nul_secret = false;
+    require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    assert(!embedded_nul_secret_present_at_free);
+    assert(fixture.pairing.respond_calls == 1);
+}
+
+bool fail_secure_random(void *, std::uint8_t *, std::size_t) { return false; }
+
+void test_pairing_rng_failure_is_startup_fail_closed() {
+    Fixture fixture(0, true);
+    control_protocol::Protocol rejected;
+    assert(!rejected.initialize(fixture.configuration(), RandomSource::fill,
+                                &fixture.random, fail_secure_random, nullptr,
+                                hmac_sha256, nullptr));
+    assert(fixture.pairing.respond_calls == 0);
+}
+
 }  // namespace
 
 int main() {
+    cJSON_Hooks hooks{tracked_cjson_malloc, tracked_cjson_free};
+    cJSON_InitHooks(&hooks);
     test_strict_envelope_and_framing();
     test_nonce_session_and_hello_cache();
     test_request_cache_and_commands();
@@ -1608,6 +1965,10 @@ int main() {
     test_mouse_report_schema_result_and_cache();
     test_hid_route_schema_frozen_retry_and_errors();
     test_ble_exposure_schema_frozen_retry_and_authority_isolation();
+    test_ble_pairing_status_exact_schema();
+    test_ble_pairing_respond_parser_retry_and_errors();
+    test_cjson_secret_is_wiped_before_free();
+    test_pairing_rng_failure_is_startup_fail_closed();
     test_identity_hello_and_info_shapes();
     test_invalid_identity_rejected_at_protocol_initialization();
     return 0;

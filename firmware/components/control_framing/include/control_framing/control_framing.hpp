@@ -37,6 +37,10 @@ class Transport {
                  EventCallback callback,
                  void *context);
 
+#ifdef CONTROL_FRAMING_NATIVE_TEST
+    bool storage_zero_for_test() const;
+#endif
+
   private:
     enum class LineState : std::uint8_t {
         kSeekingPrefix,

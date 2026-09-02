@@ -8,8 +8,10 @@ trap 'rm -f "$temporary_directory/test_control_framing"; rmdir "$temporary_direc
 "${CXX:-c++}" \
   -std=c++20 -Wall -Wextra -Werror -pedantic \
   -I"$repository_root/firmware/components/control_framing/include" \
+  -I"$repository_root/firmware/components/secure_memory/include" \
   "$repository_root/tools/test_control_framing.cpp" \
   "$repository_root/firmware/components/control_framing/control_framing.cpp" \
+  "$repository_root/firmware/components/secure_memory/secure_memory.cpp" \
   -o "$temporary_directory/test_control_framing"
 "$temporary_directory/test_control_framing"
 echo "PASS: control framing and transport sync tests"

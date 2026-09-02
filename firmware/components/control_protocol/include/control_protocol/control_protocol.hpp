@@ -8,6 +8,7 @@
 #include "control_framing/control_framing.hpp"
 #include "control_session/control_session.hpp"
 #include "firmware_identity/firmware_identity.hpp"
+#include "sensitive_request/sensitive_request.hpp"
 
 namespace control_protocol {
 
@@ -120,6 +121,47 @@ struct BleExposureActionOutcome {
 };
 using BleExposureStatusProvider = BleExposureStatus (*)(void *context);
 using BleExposureActionProvider = BleExposureActionOutcome (*)(void *context);
+
+enum class BlePairingState : std::uint8_t { kIdle, kSecuring, kWaitingInput };
+enum class BlePairingLastResult : std::uint8_t {
+    kNone,
+    kSucceeded,
+    kSmpFailed,
+    kTimeout,
+    kPeerDisconnected,
+    kStoreFull,
+    kStorage,
+    kQueueOverflow,
+    kRepeatPairing,
+    kSecurityPolicy,
+};
+struct BlePairingStatus {
+    bool available = true;
+    BlePairingState state = BlePairingState::kIdle;
+    std::uint32_t generation = 0;
+    bool connected = false;
+    bool input_pending = false;
+    std::uint32_t pairing_id = 0;
+    std::uint32_t remaining_ms = 0;
+    bool encrypted = false;
+    bool authenticated = false;
+    bool bonded = false;
+    bool secure_connections = false;
+    std::uint8_t key_size = 0;
+    BlePairingLastResult last_result = BlePairingLastResult::kNone;
+};
+struct BlePairingRespondRequest {
+    std::uint32_t pairing_id = 0;
+    std::array<char, 6> passkey{};
+};
+enum class BlePairingRespondResult : std::uint8_t {
+    kAccepted,
+    kNotPending,
+    kInjectionFailed,
+};
+using BlePairingStatusProvider = BlePairingStatus (*)(void *context);
+using BlePairingRespondProvider = BlePairingRespondResult (*)(
+    void *context, const BlePairingRespondRequest &request);
 
 enum class OutputRoute : std::uint8_t {
     kNone,
@@ -249,6 +291,10 @@ struct Config {
     void *ble_enable_context;
     BleExposureActionProvider ble_disable_provider;
     void *ble_disable_context;
+    BlePairingStatusProvider ble_pairing_status_provider;
+    void *ble_pairing_status_context;
+    BlePairingRespondProvider ble_pairing_respond_provider;
+    void *ble_pairing_respond_context;
     HidRouteStatusProvider hid_route_status_provider;
     void *hid_route_status_context;
     HidRouteActionProvider hid_route_set_provider;
@@ -277,12 +323,22 @@ class Protocol {
   public:
     bool initialize(const Config &config,
                     control_session::RandomFill random_fill,
-                    void *random_context);
+                    void *random_context,
+                    sensitive_request::SecureRandomFill secure_random_fill,
+                    void *secure_random_context,
+                    sensitive_request::HmacSha256 hmac,
+                    void *hmac_context);
 
     void handle_framing_event(const control_framing::Event &event);
     void on_hid_lifecycle_invalidation();
     void on_hid_safety_failure();
     void service();
+
+#ifdef CONTROL_PROTOCOL_NATIVE_TEST
+    bool request_scratch_zero_for_test() const;
+    control_session::State::RequestCacheSnapshot
+    request_cache_snapshot_for_test() const;
+#endif
 
   private:
     void handle_frame(std::string_view payload);
@@ -296,6 +352,7 @@ class Protocol {
 
     Config config_{};
     control_session::State session_{};
+    sensitive_request::Identity sensitive_identity_{};
     bool initialized_ = false;
     bool lease_revoke_notified_ = false;
     // Protocol is consumed only by the UART RX task. Keeping these reusable

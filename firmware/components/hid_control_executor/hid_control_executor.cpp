@@ -3,8 +3,13 @@
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #endif
+
+#include <cstring>
+
+#include "secure_memory/secure_memory.hpp"
 
 namespace hid_control_executor {
 namespace {
@@ -21,6 +26,8 @@ std::uint8_t s_queue_bytes[kActionQueueDepth * sizeof(Controller::Action)]{};
 StaticTask_t s_task_storage;
 StackType_t s_task_stack[kLifecycleTaskStackDepth]{};
 QueueHandle_t s_action_queue = nullptr;
+StaticSemaphore_t s_pairing_rpc_completion_storage;
+SemaphoreHandle_t s_pairing_rpc_completion = nullptr;
 #endif
 
 }  // namespace
@@ -40,7 +47,9 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     s_action_queue = xQueueCreateStatic(kActionQueueDepth, sizeof(Action), s_queue_bytes,
                                         &s_queue_storage);
-    if (s_action_queue == nullptr ||
+    s_pairing_rpc_completion =
+        xSemaphoreCreateBinaryStatic(&s_pairing_rpc_completion_storage);
+    if (s_action_queue == nullptr || s_pairing_rpc_completion == nullptr ||
         xTaskCreateStatic(task_entry, "hid_control", kLifecycleTaskStackDepth,
                           this, kLifecycleTaskPriority, s_task_stack, &s_task_storage) == nullptr) {
         return false;
@@ -84,6 +93,8 @@ BleCommandOutcome Controller::request_ble_disable() {
     const auto before = ble_state_.snapshot();
     const ble_lifecycle::TransitionOutcome outcome = ble_state_.begin_disable();
     if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
+        wipe_pairing_mailbox();
+        pairing_deadline_us_ = 0;
         pairing_state_.disable();
         pairing_complete_seen_ = false;
         ble_backend_->cancel_pairing_timeout();
@@ -114,6 +125,69 @@ ble_lifecycle::Snapshot Controller::ble_snapshot() const {
 
 ble_pairing::Snapshot Controller::pairing_snapshot() const {
     return pairing_state_.snapshot();
+}
+
+PairingStatusSnapshot Controller::request_pairing_status() {
+    if (!initialized_ || ble_backend_ == nullptr ||
+        pairing_rpc_pending_.load(std::memory_order_acquire) != 0) {
+        return {};
+    }
+    std::uint32_t token = next_pairing_rpc_token_++;
+    if (token == 0) {
+        token = next_pairing_rpc_token_++;
+    }
+    pairing_rpc_pending_.store(token, std::memory_order_release);
+    const Action item{.kind = ActionKind::kPairingStatus,
+                      .mailbox_token = token};
+    if (!enqueue(item)) {
+        pairing_rpc_pending_.store(0, std::memory_order_release);
+        return {};
+    }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    while (pairing_rpc_pending_.load(std::memory_order_acquire) == token &&
+           process_one_for_test()) {
+    }
+#else
+    (void)xSemaphoreTake(s_pairing_rpc_completion, portMAX_DELAY);
+#endif
+    return pairing_rpc_status_;
+}
+
+ble_pairing::RespondResult Controller::request_pairing_response(
+    std::uint32_t pairing_id,
+    const std::array<char, 6> &six_digit_secret) {
+    if (!initialized_ || ble_backend_ == nullptr ||
+        pairing_rpc_pending_.load(std::memory_order_acquire) != 0) {
+        return ble_pairing::RespondResult::kNotPending;
+    }
+    const auto pending = pairing_state_.snapshot();
+    std::uint32_t token = next_pairing_rpc_token_++;
+    if (token == 0) {
+        token = next_pairing_rpc_token_++;
+    }
+    pairing_mailbox_.generation = pending.generation;
+    pairing_mailbox_.connection_handle = pending.connection_handle;
+    pairing_mailbox_.pairing_id = pairing_id;
+    pairing_mailbox_.secret = six_digit_secret;
+    pairing_mailbox_.token = token;
+    pairing_mailbox_.occupied = true;
+    pairing_rpc_result_ = ble_pairing::RespondResult::kNotPending;
+    pairing_rpc_pending_.store(token, std::memory_order_release);
+    const Action item{.kind = ActionKind::kPairingRespond,
+                      .mailbox_token = token};
+    if (!enqueue(item)) {
+        wipe_pairing_mailbox();
+        pairing_rpc_pending_.store(0, std::memory_order_release);
+        return ble_pairing::RespondResult::kNotPending;
+    }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    while (pairing_rpc_pending_.load(std::memory_order_acquire) == token &&
+           process_one_for_test()) {
+    }
+#else
+    (void)xSemaphoreTake(s_pairing_rpc_completion, portMAX_DELAY);
+#endif
+    return pairing_rpc_result_;
 }
 
 bool Controller::signal_ble_event(BleEvent event) {
@@ -282,6 +356,39 @@ void Controller::process(Action action) {
         return;
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
+    if (action.kind == ActionKind::kPairingStatus) {
+        if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
+            action.mailbox_token) {
+            return;
+        }
+        reconcile_pairing_deadline();
+        pairing_rpc_status_ = current_pairing_status();
+        complete_pairing_rpc(action.mailbox_token);
+        return;
+    }
+    if (action.kind == ActionKind::kPairingRespond) {
+        if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
+            action.mailbox_token) {
+            return;
+        }
+        std::array<char, 6> secret{};
+        const bool mailbox_current = pairing_mailbox_.occupied &&
+                                     pairing_mailbox_.token == action.mailbox_token;
+        const auto generation = pairing_mailbox_.generation;
+        const auto connection = pairing_mailbox_.connection_handle;
+        const auto pairing_id = pairing_mailbox_.pairing_id;
+        if (mailbox_current) {
+            secret = pairing_mailbox_.secret;
+        }
+        wipe_pairing_mailbox();
+        reconcile_pairing_deadline();
+        pairing_rpc_result_ = mailbox_current
+            ? respond_to_pairing(generation, connection, pairing_id, secret)
+            : ble_pairing::RespondResult::kNotPending;
+        secure_memory::zero(secret.data(), secret.size());
+        complete_pairing_rpc(action.mailbox_token);
+        return;
+    }
     if (action.kind == ActionKind::kBleEvent) {
         process_ble_event(action.ble_event);
         return;
@@ -470,6 +577,8 @@ bool Controller::consume_ble_overflow() {
     pairing_state_.fail_closed(current.generation,
                                ble_state_.connection_handle(),
                                ble_pairing::LastResult::kQueueOverflow);
+    pairing_deadline_us_ = 0;
+    wipe_pairing_mailbox();
     ble_backend_->cancel_pairing_timeout();
     ble_backend_->mark_security_unhealthy(current.generation);
     if (current.connected) {
@@ -493,6 +602,8 @@ void Controller::terminate_security_connection(ble_pairing::LastResult result,
         return;
     }
     const auto handle = ble_state_.connection_handle();
+    pairing_deadline_us_ = 0;
+    wipe_pairing_mailbox();
     (void)pairing_state_.complete(current.generation, handle, result);
     ble_backend_->cancel_pairing_timeout();
     ble_backend_->retire_security(current.generation, handle);
@@ -517,6 +628,8 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
                                              connection_handle)) {
         pairing_state_.complete(current.generation, connection_handle,
                                 ble_pairing::LastResult::kSucceeded);
+        pairing_deadline_us_ = 0;
+        wipe_pairing_mailbox();
         ble_backend_->cancel_pairing_timeout();
         return;
     }
@@ -533,6 +646,70 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
                                           false);
         }
     }
+}
+
+void Controller::reconcile_pairing_deadline() {
+    if (ble_backend_ == nullptr || pairing_deadline_us_ == 0) {
+        return;
+    }
+    const auto pending = pairing_state_.snapshot();
+    if (pending.live_state != ble_pairing::LiveState::kWaitingInput ||
+        !pending.pairing_active) {
+        pairing_deadline_us_ = 0;
+        wipe_pairing_mailbox();
+        return;
+    }
+    if (ble_backend_->monotonic_time_us() < pairing_deadline_us_) {
+        return;
+    }
+    if (pairing_state_.timeout(pending.generation, pending.connection_handle,
+                               pending.pairing_id)) {
+        pairing_deadline_us_ = 0;
+        wipe_pairing_mailbox();
+        terminate_security_connection(ble_pairing::LastResult::kTimeout, false);
+    }
+}
+
+PairingStatusSnapshot Controller::current_pairing_status() const {
+    PairingStatusSnapshot result{};
+    result.available = true;
+    result.pairing = pairing_state_.snapshot();
+    const auto lifecycle = ble_state_.snapshot();
+    result.generation = lifecycle.generation;
+    result.connected = lifecycle.connected;
+    if (ble_backend_ != nullptr) {
+        const auto security = ble_backend_->security_snapshot();
+        if (security.coherent && security.generation == lifecycle.generation &&
+            security.connected == lifecycle.connected) {
+            result.security = security;
+        }
+        if (result.pairing.live_state == ble_pairing::LiveState::kWaitingInput &&
+            result.pairing.pairing_active && pairing_deadline_us_ != 0) {
+            const std::uint64_t now = ble_backend_->monotonic_time_us();
+            if (now < pairing_deadline_us_) {
+                const std::uint64_t remaining = pairing_deadline_us_ - now;
+                result.remaining_ms = static_cast<std::uint32_t>(
+                    (remaining + 999U) / 1000U);
+            }
+        }
+    }
+    return result;
+}
+
+void Controller::wipe_pairing_mailbox() {
+    secure_memory::zero(&pairing_mailbox_, sizeof(pairing_mailbox_));
+}
+
+void Controller::complete_pairing_rpc(std::uint32_t token) {
+    std::uint32_t expected = token;
+    if (!pairing_rpc_pending_.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+#ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    (void)xSemaphoreGive(s_pairing_rpc_completion);
+#endif
 }
 
 ble_pairing::RespondResult Controller::respond_to_pairing(
@@ -554,12 +731,16 @@ ble_pairing::RespondResult Controller::respond_to_pairing(
         }
         value = value * 10U + static_cast<std::uint32_t>(digit - '0');
     }
-    if (ble_backend_->inject_passkey(connection_handle, value) != 0) {
+    const std::int32_t injection_result =
+        ble_backend_->inject_passkey(connection_handle, value);
+    secure_memory::zero(&value, sizeof(value));
+    if (injection_result != 0) {
         terminate_security_connection(ble_pairing::LastResult::kSmpFailed,
                                       false);
         return ble_pairing::RespondResult::kInjectionFailed;
     }
     pairing_state_.consume_response(generation, connection_handle, pairing_id);
+    pairing_deadline_us_ = 0;
     ble_backend_->cancel_pairing_timeout();
     return ble_pairing::RespondResult::kAccepted;
 }
@@ -593,6 +774,8 @@ void Controller::process_ble_event(BleEvent event) {
             if (ble_state_.observe_connect(event.generation,
                                            event.connection_handle)) {
                 pairing_complete_seen_ = false;
+                pairing_deadline_us_ = 0;
+                wipe_pairing_mailbox();
                 pairing_state_.begin_connection(event.generation,
                                                 event.connection_handle);
                 ble_backend_->begin_security(event.generation,
@@ -616,6 +799,8 @@ void Controller::process_ble_event(BleEvent event) {
                 return;
             }
             ble_backend_->cancel_pairing_timeout();
+            pairing_deadline_us_ = 0;
+            wipe_pairing_mailbox();
             pairing_complete_seen_ = false;
             (void)pairing_state_.disconnect(event.generation,
                                             event.connection_handle);
@@ -661,6 +846,8 @@ void Controller::process_ble_event(BleEvent event) {
         case BleEventKind::kReset: {
             const auto before_reset = ble_state_.snapshot();
             pairing_state_.reset();
+            pairing_deadline_us_ = 0;
+            wipe_pairing_mailbox();
             ble_backend_->cancel_pairing_timeout();
             ble_backend_->mark_security_unhealthy(event.generation);
             if (before_reset.connected) {
@@ -688,6 +875,8 @@ void Controller::process_ble_event(BleEvent event) {
                 const auto decision = pairing_state_.begin_passkey_input(
                     event.generation, event.connection_handle);
                 if (decision == ble_pairing::PasskeyActionResult::kStarted) {
+                    pairing_deadline_us_ = ble_backend_->monotonic_time_us() +
+                        static_cast<std::uint64_t>(ble_pairing::kInputTimeoutMs) * 1000U;
                     ble_backend_->arm_pairing_timeout(
                         event.generation, event.connection_handle,
                         pairing_state_.snapshot().pairing_id);
@@ -749,6 +938,8 @@ void Controller::process_ble_event(BleEvent event) {
             if (pairing_state_.timeout(event.generation,
                                        event.connection_handle,
                                        event.pairing_id)) {
+                pairing_deadline_us_ = 0;
+                wipe_pairing_mailbox();
                 terminate_security_connection(
                     ble_pairing::LastResult::kTimeout, false);
             }
@@ -798,6 +989,17 @@ void Controller::fail_next_enqueue_for_test() { fail_next_enqueue_ = true; }
 
 void Controller::set_next_pairing_id_for_test(std::uint32_t value) {
     pairing_state_.set_next_pairing_id_for_test(value);
+}
+
+bool Controller::pairing_mailbox_zero_for_test() const {
+    const auto *bytes =
+        reinterpret_cast<const unsigned char *>(&pairing_mailbox_);
+    for (std::size_t index = 0; index < sizeof(pairing_mailbox_); ++index) {
+        if (bytes[index] != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 #else
 void Controller::task_entry(void *context) {

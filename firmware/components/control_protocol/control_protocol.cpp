@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include "cJSON.h"
+#include "secure_memory/secure_memory.hpp"
 
 namespace control_protocol {
 namespace {
@@ -22,9 +23,9 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\",\"ble.exposure-control-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"ble.exposure-control-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -36,7 +37,7 @@ constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
 // Every formatter below writes to ResponseFrame::bytes. These conservative
 // bounds cover the largest identity-v1 protocol.hello and system.info responses
 // metadata, four 32-hex values (top-level session, result session, boot ID,
-// and client nonce), twelve capabilities, maximum int32 id, framing, and LF.
+// and client nonce), thirteen capabilities, maximum int32 id, framing, and LF.
 // vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
@@ -200,6 +201,21 @@ bool object_has_no_duplicate_keys(const cJSON *item) {
         }
     }
     return true;
+}
+
+void wipe_json_strings(cJSON *item) {
+    if (item == nullptr) {
+        return;
+    }
+    if (item->valuestring != nullptr) {
+        // cJSON strings may contain decoded NUL bytes, so strlen() is not a
+        // sufficient bound for secret erasure. valuestring is always a direct
+        // cJSON allocator result; wipe its complete allocation before delete.
+        secure_memory::zero_allocation(item->valuestring);
+    }
+    for (cJSON *child = item->child; child != nullptr; child = child->next) {
+        wipe_json_strings(child);
+    }
 }
 
 bool object_has_only_fields(const cJSON *object,
@@ -648,6 +664,128 @@ bool validate_hello_params(const cJSON *params, std::string_view *client_nonce) 
     return control_session::is_lower_hex_token(*client_nonce);
 }
 
+bool validate_pairing_respond_params(const cJSON *params,
+                                     BlePairingRespondRequest *request) {
+    static constexpr const char *kFields[] = {"pairing_id", "passkey"};
+    if (request == nullptr || !cJSON_IsObject(params) ||
+        !object_has_only_fields(params, kFields, 2) ||
+        cJSON_GetArraySize(params) != 2) {
+        return false;
+    }
+    const cJSON *pairing_id =
+        cJSON_GetObjectItemCaseSensitive(params, "pairing_id");
+    if (!is_integer_number(pairing_id) || pairing_id->valuedouble < 1 ||
+        pairing_id->valuedouble > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    std::string_view passkey;
+    if (!get_bounded_nonempty_string(params, "passkey", 6, &passkey) ||
+        passkey.size() != request->passkey.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < passkey.size(); ++index) {
+        if (passkey[index] < '0' || passkey[index] > '9') {
+            return false;
+        }
+        request->passkey[index] = passkey[index];
+    }
+    request->pairing_id = static_cast<std::uint32_t>(pairing_id->valuedouble);
+    return true;
+}
+
+const char *pairing_state_json(BlePairingState state) {
+    switch (state) {
+        case BlePairingState::kSecuring: return "securing";
+        case BlePairingState::kWaitingInput: return "waiting_input";
+        case BlePairingState::kIdle:
+        default: return "idle";
+    }
+}
+
+const char *pairing_last_result_json(BlePairingLastResult result) {
+    switch (result) {
+        case BlePairingLastResult::kSucceeded: return "succeeded";
+        case BlePairingLastResult::kSmpFailed: return "smp_failed";
+        case BlePairingLastResult::kTimeout: return "timeout";
+        case BlePairingLastResult::kPeerDisconnected: return "peer_disconnected";
+        case BlePairingLastResult::kStoreFull: return "store_full";
+        case BlePairingLastResult::kStorage: return "storage";
+        case BlePairingLastResult::kQueueOverflow: return "queue_overflow";
+        case BlePairingLastResult::kRepeatPairing: return "repeat_pairing";
+        case BlePairingLastResult::kSecurityPolicy: return "security_policy";
+        case BlePairingLastResult::kNone:
+        default: return "none";
+    }
+}
+
+bool make_pairing_status(control_session::ResponseFrame *frame,
+                         ResponseSession session, std::int32_t id,
+                         BlePairingStatus status) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
+    if (!status.available) {
+        return make_error(frame, session, true, id, "INTERNAL_ERROR",
+                          "pairing status is unavailable");
+    }
+    const bool waiting = status.state == BlePairingState::kWaitingInput;
+    if (waiting && (!status.input_pending || status.pairing_id == 0)) {
+        frame->length = 0;
+        return false;
+    }
+    if (!waiting) {
+        return format_frame(
+            frame,
+            "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+            "\"session\":%s,\"ok\":true,\"result\":{"
+            "\"state\":\"%s\",\"generation\":%lu,\"connected\":%s,"
+            "\"pairing_id\":null,\"action\":null,\"remaining_ms\":null,"
+            "\"encrypted\":%s,\"authenticated\":%s,\"bonded\":%s,"
+            "\"secure_connections\":%s,\"key_size\":%u,\"last_result\":\"%s\"}}\n",
+            static_cast<long>(id), session_field,
+            pairing_state_json(status.state),
+            static_cast<unsigned long>(status.generation),
+            json_bool(status.connected), json_bool(status.encrypted),
+            json_bool(status.authenticated), json_bool(status.bonded),
+            json_bool(status.secure_connections),
+            static_cast<unsigned>(status.key_size),
+            pairing_last_result_json(status.last_result));
+    }
+    return format_frame(
+        frame,
+        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+        "\"session\":%s,\"ok\":true,\"result\":{"
+        "\"state\":\"waiting_input\",\"generation\":%lu,\"connected\":%s,"
+        "\"pairing_id\":%lu,\"action\":\"passkey_input\",\"remaining_ms\":%lu,"
+        "\"encrypted\":%s,\"authenticated\":%s,\"bonded\":%s,"
+        "\"secure_connections\":%s,\"key_size\":%u,\"last_result\":\"%s\"}}\n",
+        static_cast<long>(id), session_field,
+        static_cast<unsigned long>(status.generation),
+        json_bool(status.connected), static_cast<unsigned long>(status.pairing_id),
+        static_cast<unsigned long>(status.remaining_ms), json_bool(status.encrypted),
+        json_bool(status.authenticated), json_bool(status.bonded),
+        json_bool(status.secure_connections), static_cast<unsigned>(status.key_size),
+        pairing_last_result_json(status.last_result));
+}
+
+bool make_pairing_respond(control_session::ResponseFrame *frame,
+                          ResponseSession session, std::int32_t id,
+                          std::uint32_t pairing_id) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"accepted\":true,\"pairing_id\":%lu}}\n",
+                        static_cast<long>(id), session_field,
+                        static_cast<unsigned long>(pairing_id));
+}
+
 bool validate_route_set_params(const cJSON *params, OutputRoute *route) {
     static constexpr const char *kFields[] = {"route"};
     std::string_view value;
@@ -827,12 +965,18 @@ bool make_mouse_error(control_session::ResponseFrame *frame,
 
 bool Protocol::initialize(const Config &config,
                           control_session::RandomFill random_fill,
-                          void *random_context) {
+                          void *random_context,
+                          sensitive_request::SecureRandomFill secure_random_fill,
+                          void *secure_random_context,
+                          sensitive_request::HmacSha256 hmac,
+                          void *hmac_context) {
     if (config.output == nullptr || config.usb_status_provider == nullptr ||
         config.usb_exposure_status_provider == nullptr || config.usb_attach_provider == nullptr ||
         config.usb_detach_provider == nullptr || config.hid_route_status_provider == nullptr ||
         config.ble_exposure_status_provider == nullptr || config.ble_enable_provider == nullptr ||
         config.ble_disable_provider == nullptr ||
+        config.ble_pairing_status_provider == nullptr ||
+        config.ble_pairing_respond_provider == nullptr ||
         config.hid_route_set_provider == nullptr || config.authority_epoch_provider == nullptr ||
         random_fill == nullptr ||
         !is_safe_metadata_string(config.metadata.project) ||
@@ -843,6 +987,11 @@ bool Protocol::initialize(const Config &config,
         return false;
     }
     config_ = config;
+    if (!sensitive_identity_.initialize(secure_random_fill,
+                                        secure_random_context, hmac,
+                                        hmac_context)) {
+        return false;
+    }
     session_.initialize(random_fill, random_context, config.now, config.now_context);
     control_transition_retry_cache_ = {};
     initialized_ = true;
@@ -963,10 +1112,18 @@ void Protocol::handle_frame(std::string_view payload) {
         if (make_error(&response, kUncorrelatableSession, false, 0, "MALFORMED_JSON", "request is not valid JSON")) {
             write_frame(response);
         }
+        secure_memory::zero(request_json_scratch_, payload.size() + 1);
         return;
     }
 
-    auto finish = [&root]() { cJSON_Delete(root); };
+    sensitive_request::Digest sensitive_digest{};
+    auto finish = [&]() {
+        wipe_json_strings(root);
+        cJSON_Delete(root);
+        root = nullptr;
+        secure_memory::zero(request_json_scratch_, payload.size() + 1);
+        secure_memory::zero(sensitive_digest.data(), sensitive_digest.size());
+    };
     if (!cJSON_IsObject(root) || !is_json_tree_bounded(root, 0) ||
         !object_has_no_duplicate_keys(root)) {
         auto &response = prepare_response_scratch();
@@ -1137,8 +1294,22 @@ void Protocol::handle_frame(std::string_view payload) {
     const control_session::AuthorityEpoch authority_epoch =
         config_.authority_epoch_provider(config_.authority_epoch_context);
     const control_session::ResponseFrame *cached_response = nullptr;
-    const control_session::RequestCacheResult cache_result =
-        session_.inspect_request(session, id, payload, authority_epoch, &cached_response);
+    const bool sensitive_command = command == "ble.pairing.respond";
+    if (sensitive_command && !sensitive_identity_.digest(payload, &sensitive_digest)) {
+        auto &response = prepare_response_scratch();
+        if (make_error(&response, kUncorrelatableSession, true, id,
+                       "INTERNAL_ERROR", "pairing request is unavailable")) {
+            write_frame(response);
+        }
+        finish();
+        return;
+    }
+    const control_session::RequestCacheResult cache_result = sensitive_command
+        ? session_.inspect_sensitive_request(session, id, payload.size(),
+                                             sensitive_digest, authority_epoch,
+                                             &cached_response)
+        : session_.inspect_request(session, id, payload, authority_epoch,
+                                   &cached_response);
     if (cache_result == control_session::RequestCacheResult::kSessionMismatch) {
         auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, true, id, "SESSION_MISMATCH", "request session is not active")) {
@@ -1281,6 +1452,47 @@ void Protocol::handle_frame(std::string_view payload) {
                 // response without revoking the active USB HID session.
                 completed = make_ble_exposure_status(&response, current_session,
                                                      id, action.snapshot);
+            }
+        }
+    } else if (command == "ble.pairing.status") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "ble.pairing.status accepts no params");
+        } else {
+            semantically_valid = true;
+            completed = make_pairing_status(
+                &response, current_session, id,
+                config_.ble_pairing_status_provider(
+                    config_.ble_pairing_status_context));
+        }
+    } else if (command == "ble.pairing.respond") {
+        BlePairingRespondRequest pairing_request{};
+        if (!validate_pairing_respond_params(params, &pairing_request)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "pairing response params are invalid");
+        } else {
+            semantically_valid = true;
+            const std::uint32_t pairing_id = pairing_request.pairing_id;
+            const BlePairingRespondResult result =
+                config_.ble_pairing_respond_provider(
+                    config_.ble_pairing_respond_context, pairing_request);
+            secure_memory::zero(&pairing_request, sizeof(pairing_request));
+            switch (result) {
+                case BlePairingRespondResult::kAccepted:
+                    completed = make_pairing_respond(&response, current_session,
+                                                     id, pairing_id);
+                    break;
+                case BlePairingRespondResult::kInjectionFailed:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_PAIRING_FAILED",
+                                           "pairing response was not accepted");
+                    break;
+                case BlePairingRespondResult::kNotPending:
+                default:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_PAIRING_NOT_PENDING",
+                                           "pairing input is not pending");
+                    break;
             }
         }
     } else if (command == "hid.route.status") {
@@ -1439,10 +1651,31 @@ void Protocol::handle_frame(std::string_view payload) {
     }
 
     if (cache_response) {
-        session_.cache_completed_request(id, payload, authority_epoch, response);
+        if (sensitive_command) {
+            session_.cache_completed_sensitive_request(
+                id, payload.size(), sensitive_digest, authority_epoch, response);
+        } else {
+            session_.cache_completed_request(id, payload, authority_epoch, response);
+        }
     }
     write_frame(response);
     finish();
 }
+
+#ifdef CONTROL_PROTOCOL_NATIVE_TEST
+bool Protocol::request_scratch_zero_for_test() const {
+    for (const char byte : request_json_scratch_) {
+        if (byte != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+control_session::State::RequestCacheSnapshot
+Protocol::request_cache_snapshot_for_test() const {
+    return session_.request_cache_snapshot_for_test();
+}
+#endif
 
 }  // namespace control_protocol

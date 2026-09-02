@@ -29,6 +29,7 @@ class Backend final : public hid_control_executor::BleBackend {
         std::uint16_t connection_handle) override;
     std::int32_t inject_passkey(std::uint16_t connection_handle,
                                 std::uint32_t passkey) override;
+    std::uint64_t monotonic_time_us() const override;
     void arm_pairing_timeout(ble_lifecycle::Generation generation,
                              std::uint16_t connection_handle,
                              std::uint32_t pairing_id) override;

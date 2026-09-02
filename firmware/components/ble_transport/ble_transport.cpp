@@ -14,6 +14,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
+#include "secure_memory/secure_memory.hpp"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "store/config/ble_store_config.h"
@@ -375,7 +376,14 @@ std::int32_t Backend::inject_passkey(std::uint16_t connection_handle,
     ble_sm_io input{};
     input.action = BLE_SM_IOACT_INPUT;
     input.passkey = passkey;
-    return ble_sm_inject_io(connection_handle, &input);
+    const std::int32_t result = ble_sm_inject_io(connection_handle, &input);
+    secure_memory::zero(&input, sizeof(input));
+    secure_memory::zero(&passkey, sizeof(passkey));
+    return result;
+}
+
+std::uint64_t Backend::monotonic_time_us() const {
+    return static_cast<std::uint64_t>(esp_timer_get_time());
 }
 
 void Backend::arm_pairing_timeout(ble_lifecycle::Generation generation,

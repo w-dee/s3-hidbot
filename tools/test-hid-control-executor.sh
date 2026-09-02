@@ -15,6 +15,7 @@ trap 'rm -f "$temporary_directory/test_hid_control_executor"; rmdir "$temporary_
   -I"$repository_root/firmware/components/ble_lifecycle/include" \
   -I"$repository_root/firmware/components/ble_pairing/include" \
   -I"$repository_root/firmware/components/ble_security/include" \
+  -I"$repository_root/firmware/components/secure_memory/include" \
   "$repository_root/tools/test_hid_control_executor.cpp" \
   "$repository_root/firmware/components/hid_control_executor/hid_control_executor.cpp" \
   "$repository_root/firmware/components/hid_runtime/hid_runtime.cpp" \
@@ -23,6 +24,7 @@ trap 'rm -f "$temporary_directory/test_hid_control_executor"; rmdir "$temporary_
   "$repository_root/firmware/components/ble_lifecycle/ble_lifecycle.cpp" \
   "$repository_root/firmware/components/ble_pairing/ble_pairing.cpp" \
   "$repository_root/firmware/components/ble_security/ble_security.cpp" \
+  "$repository_root/firmware/components/secure_memory/secure_memory.cpp" \
   -o "$temporary_directory/test_hid_control_executor"
 "$temporary_directory/test_hid_control_executor"
 echo "PASS: HID control executor tests"

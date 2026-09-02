@@ -53,9 +53,10 @@ def main() -> int:
         assert ".min_key_size = 16" in body.group(1)
     assert service.count(".att_flags = BLE_ATT_F_READ") == 2
     assert service.count(".min_key_size = 0") == 2
-    for forbidden in ("ble.pairing.status", "ble.pairing.respond",
-                      "ble.pairing-transaction-v1", "ble.pairing-control-v1",
-                      "ble.bond-store-v1"):
+    for exposed in ("ble.pairing.status", "ble.pairing.respond",
+                    "ble.pairing-transaction-v1"):
+        assert exposed in protocol
+    for forbidden in ("ble.pairing-control-v1", "ble.bond-store-v1"):
         assert forbidden not in protocol
 
     sources = "\n".join(path.read_text() for path in
