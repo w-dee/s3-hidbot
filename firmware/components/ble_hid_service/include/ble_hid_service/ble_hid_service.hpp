@@ -32,6 +32,7 @@ inline constexpr std::array<std::uint8_t, 116> kReportMap{
 class Database final : public hid_control_executor::BleDatabase {
   public:
     int register_database() override;
+    int validate_registered_database() override;
     void clear_peer_state() override;
     void on_subscribe(std::uint16_t attribute_handle, bool enabled) override;
 

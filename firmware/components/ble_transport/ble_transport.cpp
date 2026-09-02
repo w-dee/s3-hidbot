@@ -12,6 +12,8 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 namespace ble_transport {
 namespace {
@@ -63,6 +65,20 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     ble_hs_cfg.sm_mitm = 0;
     ble_hs_cfg.sm_sc = 0;
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    // Queue the mandatory standard server foundation before the project
+    // service. ble_gatts_start() consumes all queued definitions when the
+    // NimBLE host task starts.
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    result = ble_svc_gap_device_name_set(kDeviceName);
+    if (result == 0) {
+        result = ble_svc_gap_device_appearance_set(kHidAppearance);
+    }
+    if (result != 0) {
+        instance_ = nullptr;
+        sink_ = nullptr;
+        return result;
+    }
     const esp_timer_create_args_t timer_args{
         .callback = timeout_callback,
         .arg = this,
@@ -196,6 +212,13 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
 }
 
 std::int32_t Backend::start_advertising() {
+    if (!initialized_ || database_ == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const int database_result = database_->validate_registered_database();
+    if (database_result != 0) {
+        return database_result;
+    }
     ble_hs_adv_fields fields{};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.uuids16 = &s_hid_service_uuid;

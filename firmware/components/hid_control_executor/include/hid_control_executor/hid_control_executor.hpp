@@ -68,6 +68,9 @@ class BleDatabase {
   public:
     virtual ~BleDatabase() = default;
     virtual int register_database() = 0;
+    // Called only after the NimBLE GATT server has started. A zero result is
+    // required before any project HID advertisement may become visible.
+    virtual int validate_registered_database() = 0;
     virtual void clear_peer_state() = 0;
     virtual void on_subscribe(std::uint16_t attribute_handle, bool enabled) = 0;
 };

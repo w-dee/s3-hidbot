@@ -360,6 +360,15 @@ DIS/PnP ID, pairing/passkey control, bonding, and security-required attribute
 flags are absent. This is a HOGP-oriented scaffold, not a formal HOGP/security
 compliance claim.
 
+The NimBLE server also exposes the standard 0x1800 Generic Access service and
+0x1801 Generic Attribute service. GAP publishes the same `s3-hidbot` name and
+Generic HID appearance `0x03c0` as the advertisement; GATT provides the
+stack-standard Service Changed infrastructure. Before every project HID
+advertising attempt, firmware uses the live local GATT database to prove that
+0x1812 and its required characteristic handles were registered. A missing or
+incomplete project service fails the BLE lifecycle closed with no visible HID
+advertisement.
+
 Advertising is legacy connectable undirected with an exact 22-byte payload:
 Flags `0x06`, complete UUID list `0x1812`, Generic HID appearance `0x03c0`, and
 complete name `s3-hidbot`; no scan response is used. Interval is 40 ms. The

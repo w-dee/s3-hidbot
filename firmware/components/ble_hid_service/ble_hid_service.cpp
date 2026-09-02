@@ -28,6 +28,9 @@ ble_uuid16_t s_report_reference = BLE_UUID16_INIT(0x2908);
 
 std::uint16_t s_keyboard_value_handle = 0;
 std::uint16_t s_mouse_value_handle = 0;
+std::uint16_t s_information_value_handle = 0;
+std::uint16_t s_report_map_value_handle = 0;
+std::uint16_t s_control_point_value_handle = 0;
 Database *s_database = nullptr;
 
 void *target(AccessTarget value) {
@@ -60,15 +63,18 @@ ble_gatt_chr_def s_characteristics[] = {
     {.uuid = &s_hid_information.u,
      .access_cb = Database::access,
      .arg = target(AccessTarget::kInformation),
-     .flags = BLE_GATT_CHR_F_READ},
+     .flags = BLE_GATT_CHR_F_READ,
+     .val_handle = &s_information_value_handle},
     {.uuid = &s_report_map.u,
      .access_cb = Database::access,
      .arg = target(AccessTarget::kReportMap),
-     .flags = BLE_GATT_CHR_F_READ},
+     .flags = BLE_GATT_CHR_F_READ,
+     .val_handle = &s_report_map_value_handle},
     {.uuid = &s_control_point.u,
      .access_cb = Database::access,
      .arg = target(AccessTarget::kControlPoint),
-     .flags = BLE_GATT_CHR_F_WRITE_NO_RSP},
+     .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+     .val_handle = &s_control_point_value_handle},
     {.uuid = &s_report.u,
      .access_cb = Database::access,
      .arg = target(AccessTarget::kKeyboardReport),
@@ -111,6 +117,41 @@ int Database::register_database() {
         result = ble_gatts_add_svcs(s_services);
     }
     return result;
+}
+
+int Database::validate_registered_database() {
+    if (s_database != this) {
+        return BLE_HS_ENOENT;
+    }
+    std::uint16_t service_handle = 0;
+    int result = ble_gatts_find_svc(&s_hid_service.u, &service_handle);
+    if (result != 0 || service_handle == 0) {
+        return result != 0 ? result : BLE_HS_ENOENT;
+    }
+
+    struct RequiredCharacteristic {
+        const ble_uuid_t *uuid;
+        std::uint16_t assigned_handle;
+    };
+    const RequiredCharacteristic required[] = {
+        {&s_hid_information.u, s_information_value_handle},
+        {&s_report_map.u, s_report_map_value_handle},
+        {&s_control_point.u, s_control_point_value_handle},
+    };
+    for (const RequiredCharacteristic &characteristic : required) {
+        std::uint16_t found_handle = 0;
+        result = ble_gatts_find_chr(&s_hid_service.u, characteristic.uuid, nullptr,
+                                    &found_handle);
+        if (result != 0 || found_handle == 0 ||
+            found_handle != characteristic.assigned_handle) {
+            return result != 0 ? result : BLE_HS_ENOENT;
+        }
+    }
+    if (s_keyboard_value_handle == 0 || s_mouse_value_handle == 0 ||
+        s_keyboard_value_handle == s_mouse_value_handle) {
+        return BLE_HS_ENOENT;
+    }
+    return 0;
 }
 
 void Database::clear_peer_state() {

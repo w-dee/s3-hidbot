@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "firmware/components/ble_hid_service/include/ble_hid_service/ble_hid_service.hpp"
 SERVICE = ROOT / "firmware/components/ble_hid_service/ble_hid_service.cpp"
 TRANSPORT = ROOT / "firmware/components/ble_transport/ble_transport.cpp"
+EXECUTOR_HEADER = ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp"
+SDKCONFIG_DEFAULTS = ROOT / "firmware/sdkconfig.defaults"
 PROJECT_COMPONENTS = ROOT / "firmware/components"
 
 
@@ -18,6 +20,8 @@ def main() -> int:
     header = HEADER.read_text(encoding="utf-8")
     service = SERVICE.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
+    executor_header = EXECUTOR_HEADER.read_text(encoding="utf-8")
+    sdkconfig_defaults = SDKCONFIG_DEFAULTS.read_text(encoding="utf-8")
 
     report_body = re.search(r"kReportMap\{(.*?)\};", header, re.DOTALL)
     assert report_body is not None
@@ -48,6 +52,22 @@ def main() -> int:
     for security_flag in ("BLE_GATT_CHR_F_READ_ENC", "BLE_GATT_CHR_F_WRITE_ENC", "BLE_GATT_CHR_F_READ_AUTHEN", "BLE_GATT_CHR_F_WRITE_AUTHEN"):
         assert security_flag not in service
 
+    assert "validate_registered_database() override" in header
+    assert "virtual int validate_registered_database() = 0" in executor_header
+    assert "ble_gatts_find_svc(&s_hid_service.u" in service
+    for uuid in ("s_hid_information.u", "s_report_map.u", "s_control_point.u"):
+        assert f"{{&{uuid}," in service
+    for handle in (
+        "s_information_value_handle",
+        "s_report_map_value_handle",
+        "s_control_point_value_handle",
+        "s_keyboard_value_handle",
+        "s_mouse_value_handle",
+    ):
+        assert f"&{handle}" in service
+    assert "s_keyboard_value_handle == 0" in service
+    assert "s_mouse_value_handle == 0" in service
+
     project_ble_sources = "\n".join(
         path.read_text(encoding="utf-8")
         for path in PROJECT_COMPONENTS.glob("ble_*/*.cpp")
@@ -62,6 +82,20 @@ def main() -> int:
     assert "num_uuids16 = 1" in transport and "uuids16_is_complete = 1" in transport
     assert "appearance_is_present = 1" in transport and "name_is_complete = 1" in transport
     assert "ble_gap_adv_rsp_set_fields" not in transport
+    standard_gap = transport.index("ble_svc_gap_init();")
+    standard_gatt = transport.index("ble_svc_gatt_init();")
+    project_registration = transport.index("database->register_database()")
+    host_start = transport.index("nimble_port_freertos_init(host_task)")
+    assert standard_gap < standard_gatt < project_registration < host_start
+    assert standard_gatt < transport.index("ble_svc_gap_device_name_set(kDeviceName)")
+    assert standard_gatt < transport.index("ble_svc_gap_device_appearance_set(kHidAppearance)")
+    validation = transport.index("database_->validate_registered_database()")
+    advertising_fields = transport.index("ble_hs_adv_fields fields{}")
+    advertising_start = transport.index("ble_gap_adv_start(")
+    assert host_start < validation < advertising_fields < advertising_start
+    assert 'CONFIG_BT_NIMBLE_GAP_SERVICE=y' in sdkconfig_defaults
+    assert 'CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME="s3-hidbot"' in sdkconfig_defaults
+    assert "CONFIG_BT_NIMBLE_SVC_GAP_APPEARANCE=960" in sdkconfig_defaults
     # flags (3) + complete UUID (4) + appearance (4) + complete 9-byte name (11)
     assert 3 + 4 + 4 + 11 == 22 <= 31
 

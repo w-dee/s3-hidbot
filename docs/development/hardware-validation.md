@@ -238,6 +238,25 @@ notifications, disconnect/re-advertise, stack-retained disable, five cycles,
 and simultaneous USB exposure without route mutation. Pairing/bonding and BLE
 HID output remain out of scope.
 
+The first physical attempt at source revision
+`dac08c7dfd9819c4a3dbb6e38b06ec227b369e37` remains **FAIL / SERVICE DB
+MISMATCH**: BlueZ connected without pairing and reported services resolved,
+but exposed an empty service collection. The repair candidate must therefore
+prove the live local 0x1812 database before advertising and then repeat the
+entire physical gate; software validation does not overwrite that historical
+failure. Standard stack services 0x1800 (GAP) and 0x1801 (GATT, including
+Service Changed) are expected infrastructure and are not project service
+leakage. BAS, DIS/PnP ID, Protocol Mode, and Boot characteristics remain
+forbidden.
+
+BlueZ 5.72 exposed the live name, 0x1812 UUID, and appearance but not raw
+advertising Flags or AD-type completeness, while HCI monitor access was not
+available under the existing host permissions. A later requalification may
+record **RAW AD FLAGS/TYPE PHYSICAL OBSERVABILITY WAIVED / SOFTWARE CONTRACT
+VERIFIED** when those semantic live fields and the static encoded advertising
+contract both pass. No privileged host configuration is required for this
+waiver.
+
 Firmware logs project-owned internal 8-bit heap checkpoints at cold boot,
 immediately before first enable, advertising, connected,
 disconnect/re-advertising, and hidden idle; repeated hidden-idle checkpoints
