@@ -2499,6 +2499,7 @@ void test_store_full_remains_recoverable_and_readvertises() {
     assert(controller.pairing_snapshot().last_result ==
            ble_pairing::LastResult::kStoreFull);
     assert(!controller.ble_snapshot().recovery_required);
+    assert(!ble.persistent_store_failure_observed());
     assert(ble.disconnect_calls == 1);
     const int advertising_calls = ble.advertising_calls;
     assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 86));

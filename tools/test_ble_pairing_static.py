@@ -144,6 +144,11 @@ def main() -> int:
     disconnect_body = disconnect_call.group(1)
     assert disconnect_body.index("arm_timeout(") < \
         disconnect_body.index("ble_gap_terminate(")
+    arm_failure = re.search(
+        r"if \(timeout_result != ESP_OK\) \{\s*return timeout_result;\s*\}",
+        disconnect_body)
+    assert arm_failure
+    assert arm_failure.end() < disconnect_body.index("ble_gap_terminate(")
     assert "terminate_result == 0 || terminate_result == BLE_HS_EALREADY" in \
         disconnect_body
     assert disconnect_body.index("ble_gap_terminate(") < \
