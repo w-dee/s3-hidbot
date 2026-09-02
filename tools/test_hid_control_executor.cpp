@@ -32,6 +32,58 @@ struct FakeBackend final : hid_control_executor::Backend {
     };
 };
 
+struct FakeBleBackend final : hid_control_executor::BleBackend {
+    std::int32_t initialize(hid_control_executor::BleEventSink *event_sink,
+                            hid_control_executor::BleDatabase *,
+                            ble_lifecycle::Generation generation) override {
+        ++initialize_calls;
+        sink = event_sink;
+        active_generation = generation;
+        return initialize_result;
+    }
+    void set_generation(ble_lifecycle::Generation generation) override {
+        active_generation = generation;
+    }
+    std::int32_t start_advertising() override {
+        ++advertising_calls;
+        return advertising_result;
+    }
+    std::int32_t stop_advertising() override {
+        ++stop_calls;
+        return stop_result;
+    }
+    std::int32_t disconnect(std::uint16_t connection_handle) override {
+        ++disconnect_calls;
+        last_connection = connection_handle;
+        return disconnect_result;
+    }
+    bool event(hid_control_executor::BleEventKind kind,
+               std::uint16_t connection = ble_lifecycle::kNoConnection,
+               std::int32_t status = 0) {
+        return sink->signal_ble_event({.kind = kind,
+                                      .generation = active_generation,
+                                      .connection_handle = connection,
+                                      .status = status});
+    }
+    hid_control_executor::BleEventSink *sink = nullptr;
+    ble_lifecycle::Generation active_generation = 0;
+    std::uint16_t last_connection = ble_lifecycle::kNoConnection;
+    int initialize_calls = 0;
+    int advertising_calls = 0;
+    int stop_calls = 0;
+    int disconnect_calls = 0;
+    std::int32_t initialize_result = 0;
+    std::int32_t advertising_result = 0;
+    std::int32_t stop_result = 0;
+    std::int32_t disconnect_result = 0;
+};
+
+struct FakeBleDatabase final : hid_control_executor::BleDatabase {
+    int register_database() override { return 0; }
+    void clear_peer_state() override { ++clear_calls; }
+    int clear_calls = 0;
+};
+
 struct AcceptingExecutor final : usb_lifecycle::Executor {
     bool schedule(usb_lifecycle::ExecutorAction, usb_lifecycle::Snapshot) override {
         ++calls;
@@ -425,6 +477,110 @@ void test_unmount_preempts_route_action_and_guard_releases_once() {
     assert(!controller.process_one_for_test());
 }
 
+void test_ble_lifecycle_is_shared_serialized_and_transport_independent() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    const auto route_before = controller.route_snapshot();
+    const auto epoch_before = runtime.state_machine().authority_epoch();
+
+    const auto enable = controller.request_ble_enable();
+    assert(enable.action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(enable.snapshot.observed == ble_lifecycle::ObservedState::kEnabling);
+    assert(controller.active_operation_for_test() == ControlOperation::kBleEnable);
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kBusy);
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kBusy);
+    assert(controller.process_one_for_test());
+    assert(ble.initialize_calls == 1);
+    assert(ble.event(hid_control_executor::BleEventKind::kSync));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kAdvertising);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    assert(controller.route_snapshot().route.generation ==
+           route_before.route.generation);
+    assert(runtime.state_machine().authority_epoch() == epoch_before);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect, 42));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().connected);
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 42));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().advertising);
+    assert(controller.ble_snapshot().generation == 2);
+    assert(ble.advertising_calls == 2);
+    assert(database.clear_calls == 1);
+    assert(runtime.state_machine().authority_epoch() == epoch_before);
+}
+
+void test_ble_disable_expected_disconnect_and_retained_stack() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kSync));
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect, 11));
+    assert(controller.process_one_for_test());
+
+    const auto disable = controller.request_ble_disable();
+    assert(disable.action_result == ble_lifecycle::TransitionResult::kAccepted);
+    const auto disable_generation = disable.snapshot.generation;
+    assert(controller.process_one_for_test());
+    assert(ble.disconnect_calls == 1 && ble.last_connection == 11);
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 11));
+    assert(controller.process_one_for_test());
+    const auto idle = controller.ble_snapshot();
+    assert(idle.generation == disable_generation);
+    assert(idle.observed == ble_lifecycle::ObservedState::kIdle);
+    assert(idle.stack_ready && !idle.advertising && !idle.connected);
+    assert(ble.initialize_calls == 1);
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kNoOp);
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.initialize_calls == 1);
+}
+
+void test_ble_busy_has_no_stage_a_and_usb_detach_does_not_change_ble() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble));
+    const auto cold = controller.ble_snapshot();
+    assert(controller.reserve_operation_for_test(ControlOperation::kUsbDetach));
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kBusy);
+    assert(controller.ble_snapshot().generation == cold.generation);
+    assert(controller.ble_snapshot().desired == cold.desired);
+    controller.release_operation_for_test(ControlOperation::kUsbDetach);
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kSync));
+    assert(controller.process_one_for_test());
+    const auto exposed = controller.ble_snapshot();
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    runtime.state_machine().on_mount();
+    assert(action(controller.request_detach()) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().desired == exposed.desired);
+    assert(controller.ble_snapshot().generation == exposed.generation);
+    assert(controller.ble_snapshot().advertising);
+}
+
 }  // namespace
 
 int main() {
@@ -442,4 +598,7 @@ int main() {
     test_usb_detach_owner_blocks_route_without_duplicate_action();
     test_route_schedule_failure_terminalizes_none_and_releases_guard();
     test_unmount_preempts_route_action_and_guard_releases_once();
+    test_ble_lifecycle_is_shared_serialized_and_transport_independent();
+    test_ble_disable_expected_disconnect_and_retained_stack();
+    test_ble_busy_has_no_stage_a_and_usb_detach_does_not_change_ble();
 }

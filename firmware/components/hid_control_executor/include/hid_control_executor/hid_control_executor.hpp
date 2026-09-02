@@ -5,6 +5,7 @@
 
 #include "hid_route/hid_route.hpp"
 #include "hid_runtime/hid_runtime.hpp"
+#include "ble_lifecycle/ble_lifecycle.hpp"
 #include "usb_lifecycle/usb_lifecycle.hpp"
 
 namespace hid_control_executor {
@@ -13,9 +14,9 @@ enum class ControlOperation : std::uint8_t {
     kNone,
     kUsbAttach,
     kUsbDetach,
-    // U7.2A foundation-only placeholders; they execute no route/BLE work.
     kRouteChange,
-    kBleChange,
+    kBleEnable,
+    kBleDisable,
 };
 
 enum class BackendResultKind : std::uint8_t {
@@ -40,6 +41,47 @@ class Backend {
     virtual BackendResult uninstall() = 0;
 };
 
+enum class BleEventKind : std::uint8_t {
+    kSync,
+    kConnect,
+    kDisconnect,
+    kAdvertisingComplete,
+    kReset,
+    kTimeout,
+};
+
+struct BleEvent {
+    BleEventKind kind = BleEventKind::kSync;
+    ble_lifecycle::Generation generation = 0;
+    std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
+    std::int32_t status = 0;
+};
+
+class BleEventSink {
+  public:
+    virtual ~BleEventSink() = default;
+    // Callback-safe: implementations must use bounded, zero-wait signaling.
+    virtual bool signal_ble_event(BleEvent event) = 0;
+};
+
+class BleDatabase {
+  public:
+    virtual ~BleDatabase() = default;
+    virtual int register_database() = 0;
+    virtual void clear_peer_state() = 0;
+};
+
+class BleBackend {
+  public:
+    virtual ~BleBackend() = default;
+    virtual std::int32_t initialize(BleEventSink *sink, BleDatabase *database,
+                                    ble_lifecycle::Generation generation) = 0;
+    virtual void set_generation(ble_lifecycle::Generation generation) = 0;
+    virtual std::int32_t start_advertising() = 0;
+    virtual std::int32_t stop_advertising() = 0;
+    virtual std::int32_t disconnect(std::uint16_t connection_handle) = 0;
+};
+
 struct ExposureSnapshot {
     usb_lifecycle::Snapshot lifecycle{};
     hid_runtime::StatusSnapshot runtime{};
@@ -61,12 +103,22 @@ struct RouteCommandOutcome {
     hid_runtime::RouteStatusSnapshot snapshot{};
 };
 
-class Controller final : public usb_lifecycle::Executor {
+struct BleCommandOutcome {
+    ble_lifecycle::TransitionResult action_result =
+        ble_lifecycle::TransitionResult::kBusy;
+    bool snapshot_valid = false;
+    ble_lifecycle::Snapshot snapshot{};
+};
+
+class Controller final : public usb_lifecycle::Executor, public BleEventSink {
   public:
     enum class ActionKind : std::uint8_t {
         kUsbInstall,
         kUsbDetach,
         kRouteRelease,
+        kBleEnable,
+        kBleDisable,
+        kBleEvent,
     };
 
     struct Action {
@@ -74,20 +126,27 @@ class Controller final : public usb_lifecycle::Executor {
         usb_lifecycle::Snapshot lifecycle{};
         hid_route::Snapshot route{};
         ControlOperation operation = ControlOperation::kNone;
+        BleEvent ble_event{};
     };
 
-    bool initialize(hid_runtime::Runtime *runtime, Backend *backend);
+    bool initialize(hid_runtime::Runtime *runtime, Backend *backend,
+                    BleBackend *ble_backend = nullptr,
+                    BleDatabase *ble_database = nullptr);
 
     CommandOutcome request_attach();
     CommandOutcome request_detach();
     RouteCommandOutcome request_route(hid_route::OutputRoute desired);
     ExposureSnapshot snapshot() const;
     hid_runtime::RouteStatusSnapshot route_snapshot() const;
+    BleCommandOutcome request_ble_enable();
+    BleCommandOutcome request_ble_disable();
+    ble_lifecycle::Snapshot ble_snapshot() const;
 
     // usb_lifecycle::Executor. Calls originate in the UART/control task and
     // are stored in the shared fixed control-action queue.
     bool schedule(usb_lifecycle::ExecutorAction action,
                   usb_lifecycle::Snapshot snapshot) override;
+    bool signal_ble_event(BleEvent event) override;
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     bool process_one_for_test();
@@ -103,6 +162,10 @@ class Controller final : public usb_lifecycle::Executor {
     bool claim_operation(ControlOperation operation);
     void release_operation(ControlOperation operation);
     static ControlOperation operation_for(usb_lifecycle::ExecutorAction action);
+    void process_ble_event(BleEvent event);
+    void fail_ble(ble_lifecycle::Generation generation,
+                  ble_lifecycle::Operation operation, std::int32_t code,
+                  ControlOperation owner);
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     static void task_entry(void *context);
@@ -111,8 +174,12 @@ class Controller final : public usb_lifecycle::Executor {
 
     hid_runtime::Runtime *runtime_ = nullptr;
     Backend *backend_ = nullptr;
+    BleBackend *ble_backend_ = nullptr;
+    BleDatabase *ble_database_ = nullptr;
+    ble_lifecycle::StateMachine ble_state_{};
     bool initialized_ = false;
     std::atomic<ControlOperation> active_operation_{ControlOperation::kNone};
+    std::atomic_bool ble_event_overflow_{false};
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     Action native_queue_[2]{};

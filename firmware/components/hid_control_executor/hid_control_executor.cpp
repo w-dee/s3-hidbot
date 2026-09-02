@@ -25,7 +25,8 @@ QueueHandle_t s_action_queue = nullptr;
 
 }  // namespace
 
-bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend) {
+bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
+                            BleBackend *ble_backend, BleDatabase *ble_database) {
     if (initialized_) {
         return true;
     }
@@ -34,6 +35,8 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend) {
     }
     runtime_ = runtime;
     backend_ = backend;
+    ble_backend_ = ble_backend;
+    ble_database_ = ble_database;
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     s_action_queue = xQueueCreateStatic(kActionQueueDepth, sizeof(Action), s_queue_bytes,
                                         &s_queue_storage);
@@ -45,6 +48,66 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend) {
 #endif
     initialized_ = true;
     return true;
+}
+
+BleCommandOutcome Controller::request_ble_enable() {
+    constexpr ControlOperation operation = ControlOperation::kBleEnable;
+    if (!initialized_ || ble_backend_ == nullptr || !claim_operation(operation)) {
+        return {};
+    }
+    const ble_lifecycle::TransitionOutcome outcome = ble_state_.begin_enable();
+    if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
+        const Action item{.kind = ActionKind::kBleEnable,
+                          .operation = operation};
+        if (!enqueue(item)) {
+            ble_state_.complete_fault(outcome.snapshot.generation,
+                                      ble_lifecycle::Operation::kEnable, -1);
+            release_operation(operation);
+            return {};
+        }
+    } else {
+        release_operation(operation);
+    }
+    return {.action_result = outcome.action_result,
+            .snapshot_valid = outcome.snapshot_valid,
+            .snapshot = outcome.snapshot};
+}
+
+BleCommandOutcome Controller::request_ble_disable() {
+    constexpr ControlOperation operation = ControlOperation::kBleDisable;
+    if (!initialized_ || ble_backend_ == nullptr || !claim_operation(operation)) {
+        return {};
+    }
+    const ble_lifecycle::TransitionOutcome outcome = ble_state_.begin_disable();
+    if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
+        ble_backend_->set_generation(outcome.snapshot.generation);
+        const Action item{.kind = ActionKind::kBleDisable,
+                          .operation = operation};
+        if (!enqueue(item)) {
+            ble_state_.complete_fault(outcome.snapshot.generation,
+                                      ble_lifecycle::Operation::kDisable, -1);
+            release_operation(operation);
+            return {};
+        }
+    } else {
+        release_operation(operation);
+    }
+    return {.action_result = outcome.action_result,
+            .snapshot_valid = outcome.snapshot_valid,
+            .snapshot = outcome.snapshot};
+}
+
+ble_lifecycle::Snapshot Controller::ble_snapshot() const {
+    return ble_state_.snapshot();
+}
+
+bool Controller::signal_ble_event(BleEvent event) {
+    const Action item{.kind = ActionKind::kBleEvent, .ble_event = event};
+    if (enqueue(item)) {
+        return true;
+    }
+    ble_event_overflow_.store(true, std::memory_order_release);
+    return false;
 }
 
 ControlOperation Controller::operation_for(usb_lifecycle::ExecutorAction action) {
@@ -198,6 +261,70 @@ void Controller::process(Action action) {
         return;
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
+    if (action.kind == ActionKind::kBleEvent) {
+        process_ble_event(action.ble_event);
+        return;
+    }
+    if (action.kind == ActionKind::kBleEnable) {
+        const auto current = ble_state_.snapshot();
+        if (active_operation_.load(std::memory_order_acquire) != action.operation ||
+            current.desired != ble_lifecycle::DesiredExposure::kExposed ||
+            current.observed != ble_lifecycle::ObservedState::kEnabling) {
+            release_operation(action.operation);
+            return;
+        }
+        ble_backend_->set_generation(current.generation);
+        if (!current.stack_ready) {
+            const std::int32_t result = ble_backend_->initialize(
+                this, ble_database_, current.generation);
+            if (result != 0) {
+                fail_ble(current.generation, ble_lifecycle::Operation::kEnable,
+                         result, action.operation);
+            }
+            return;
+        }
+        const std::int32_t result = ble_backend_->start_advertising();
+        if (result == 0) {
+            ble_state_.complete_advertising(current.generation);
+            release_operation(action.operation);
+        } else {
+            fail_ble(current.generation, ble_lifecycle::Operation::kEnable, result,
+                     action.operation);
+        }
+        return;
+    }
+    if (action.kind == ActionKind::kBleDisable) {
+        const auto current = ble_state_.snapshot();
+        if (active_operation_.load(std::memory_order_acquire) != action.operation ||
+            current.desired != ble_lifecycle::DesiredExposure::kHidden ||
+            current.observed != ble_lifecycle::ObservedState::kDisabling) {
+            release_operation(action.operation);
+            return;
+        }
+        if (current.advertising) {
+            const std::int32_t result = ble_backend_->stop_advertising();
+            if (result != 0) {
+                fail_ble(current.generation, ble_lifecycle::Operation::kDisable,
+                         result, action.operation);
+                return;
+            }
+        }
+        if (current.connected) {
+            const std::int32_t result =
+                ble_backend_->disconnect(ble_state_.connection_handle());
+            if (result != 0) {
+                fail_ble(current.generation, ble_lifecycle::Operation::kDisable,
+                         result, action.operation);
+            }
+            return;
+        }
+        if (ble_database_ != nullptr) {
+            ble_database_->clear_peer_state();
+        }
+        ble_state_.complete_disable(current.generation);
+        release_operation(action.operation);
+        return;
+    }
     if (action.kind == ActionKind::kRouteRelease) {
         const hid_route::Snapshot route = state.route_snapshot();
         const usb_lifecycle::Snapshot lifecycle = state.usb_lifecycle_snapshot();
@@ -286,6 +413,107 @@ void Controller::process(Action action) {
         state.complete_usb_uninstall_failure(result.error_code);
     }
     release_operation(action.operation);
+}
+
+void Controller::fail_ble(ble_lifecycle::Generation generation,
+                          ble_lifecycle::Operation operation, std::int32_t code,
+                          ControlOperation owner) {
+    ble_state_.complete_fault(generation, operation, code);
+    if (ble_database_ != nullptr) {
+        ble_database_->clear_peer_state();
+    }
+    release_operation(owner);
+}
+
+void Controller::process_ble_event(BleEvent event) {
+    if (ble_backend_ == nullptr) {
+        return;
+    }
+    if (ble_event_overflow_.exchange(false, std::memory_order_acq_rel)) {
+        fail_ble(ble_state_.generation(), ble_lifecycle::Operation::kRuntime, -2,
+                 active_operation_.load(std::memory_order_acquire));
+        return;
+    }
+    switch (event.kind) {
+        case BleEventKind::kSync: {
+            if (!ble_state_.complete_sync(event.generation)) {
+                return;
+            }
+            const std::int32_t result = ble_backend_->start_advertising();
+            if (result == 0) {
+                ble_state_.complete_advertising(event.generation);
+                const ControlOperation owner =
+                    active_operation_.load(std::memory_order_acquire);
+                if (owner == ControlOperation::kBleEnable) {
+                    release_operation(owner);
+                }
+            } else {
+                fail_ble(event.generation, ble_lifecycle::Operation::kEnable,
+                         result, ControlOperation::kBleEnable);
+            }
+            return;
+        }
+        case BleEventKind::kConnect:
+            (void)ble_state_.observe_connect(event.generation,
+                                             event.connection_handle);
+            return;
+        case BleEventKind::kDisconnect: {
+            const bool expected = active_operation_.load(std::memory_order_acquire) ==
+                                  ControlOperation::kBleDisable;
+            if (!ble_state_.observe_disconnect(event.generation,
+                                               event.connection_handle, expected)) {
+                return;
+            }
+            if (ble_database_ != nullptr) {
+                ble_database_->clear_peer_state();
+            }
+            if (expected) {
+                ble_state_.complete_disable(event.generation);
+                release_operation(ControlOperation::kBleDisable);
+                return;
+            }
+            const auto generation = ble_state_.generation();
+            ble_backend_->set_generation(generation);
+            const std::int32_t result = ble_backend_->start_advertising();
+            if (result == 0) {
+                ble_state_.complete_advertising(generation);
+            } else {
+                fail_ble(generation, ble_lifecycle::Operation::kRuntime, result,
+                         ControlOperation::kNone);
+            }
+            return;
+        }
+        case BleEventKind::kAdvertisingComplete:
+            // A completion for an obsolete generation is ignored. An active
+            // exposed incarnation is restarted by the serialized owner.
+            if (event.generation == ble_state_.generation() &&
+                ble_state_.snapshot().desired ==
+                    ble_lifecycle::DesiredExposure::kExposed &&
+                !ble_state_.snapshot().connected) {
+                const std::int32_t result = ble_backend_->start_advertising();
+                if (result != 0) {
+                    fail_ble(event.generation, ble_lifecycle::Operation::kRuntime,
+                             result, ControlOperation::kNone);
+                }
+            }
+            return;
+        case BleEventKind::kReset: {
+            if (!ble_state_.begin_reset_recovery(event.generation, event.status)) {
+                if (ble_database_ != nullptr) {
+                    ble_database_->clear_peer_state();
+                }
+                release_operation(active_operation_.load(std::memory_order_acquire));
+                return;
+            }
+            const auto generation = ble_state_.generation();
+            ble_backend_->set_generation(generation);
+            return;
+        }
+        case BleEventKind::kTimeout:
+            fail_ble(event.generation, ble_lifecycle::Operation::kRuntime,
+                     event.status, active_operation_.load(std::memory_order_acquire));
+            return;
+    }
 }
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST

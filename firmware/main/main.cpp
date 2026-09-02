@@ -8,6 +8,7 @@
 #include "tinyusb_default_config.h"
 #include "hid_runtime/hid_runtime.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
+#include "ble_transport/ble_transport.hpp"
 #include "uart_control_transport/uart_control_transport.hpp"
 #include "firmware_identity/firmware_identity.hpp"
 #include "firmware_identity_adapter.hpp"
@@ -37,6 +38,7 @@ constexpr uint8_t kMouseStringIndex = 5;
 
 hid_runtime::Runtime s_hid_runtime;
 hid_control_executor::Controller s_usb_exposure;
+ble_transport::Backend s_ble_backend;
 firmware_identity::Identity s_firmware_identity;
 
 control_protocol::UsbStatus usb_status(void *) {
@@ -522,7 +524,8 @@ extern "C" void app_main() {
         std::abort();
     }
     s_hid_runtime.initialize();
-    if (!s_usb_exposure.initialize(&s_hid_runtime, &s_usb_backend)) {
+    if (!s_usb_exposure.initialize(&s_hid_runtime, &s_usb_backend,
+                                   &s_ble_backend)) {
         ESP_LOGE(kLogTag, "USB lifecycle task initialization failed");
         std::abort();
     }
