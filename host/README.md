@@ -28,9 +28,10 @@ installation flow is in the project
 ## CLI categories
 
 - Hardware-free validation: `verify-artifact ARTIFACT`.
-- UART read-only diagnostics: `hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, and
+- UART read-only diagnostics: `hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, `ble-exposure-status`, and
   `verify-firmware ARTIFACT`.
 - Explicit USB exposure control: `usb-attach` and `usb-detach`.
+- Explicit BLE exposure control: `ble-enable` and `ble-disable`.
 - Explicit HID output routing: `hid-route-status` and `hid-route-set none|usb`.
 - UART diagnostic with safety action: `self-test`.
 - Explicit safety recovery: `release-all`.
@@ -51,6 +52,13 @@ the old route but leaves USB mounted. `usb-detach` attempts safety all-up handli
 public driver uninstall but cannot prove host-observed release. A lifecycle
 result may retire control authority, so reconnect before later commands. The
 legacy `usb-status` command remains a basic readiness view.
+
+BLE is separately uninitialized and hidden at boot. `ble-enable` lazily starts
+BLE advertising and exposes a discoverable keyboard/mouse HID Service
+foundation; `ble-disable` returns it to hidden idle without changing USB or the
+selected HID route. USB and BLE can be exposed together. There is no BLE HID
+output or `ble` route in U7.3, and no pairing/passkey control, bonding, or
+formal HOGP/security compliance claim.
 
 ## Artifact and identity commands
 

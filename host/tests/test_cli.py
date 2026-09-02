@@ -73,6 +73,7 @@ class FakeTransport:
             "hid.keyboard-report-v1",
             "hid.mouse-report-v1",
             "hid.output-route-v1",
+            "ble.exposure-control-v1",
         ]
         self.info_result: object = {"project": "s3-hidbot"}
 
@@ -172,6 +173,25 @@ class FakeTransport:
                         "generation": 1 if route == "usb" else 0,
                         "transition": "stable",
                         "ready": route == "usb",
+                    },
+                )
+            )
+        elif value["cmd"] in {"ble.exposure.status", "ble.enable", "ble.disable"}:
+            observed = "uninitialized" if value["cmd"] == "ble.exposure.status" else (
+                "enabling" if value["cmd"] == "ble.enable" else "disabling"
+            )
+            self.chunks.append(
+                response(
+                    value["id"], TOKEN,
+                    result={
+                        "desired": "exposed" if value["cmd"] == "ble.enable" else "hidden",
+                        "observed": observed,
+                        "generation": 0 if value["cmd"] == "ble.exposure.status" else 1,
+                        "stack_ready": False,
+                        "advertising": False,
+                        "connected": False,
+                        "recovery_required": False,
+                        "last_error": None,
                     },
                 )
             )
@@ -521,6 +541,23 @@ class CliTests(unittest.TestCase):
             self.assertEqual(
                 self.wire_commands(calls), ["protocol.hello", wire_command]
             )
+
+    def test_ble_exposure_operator_commands_are_explicit(self) -> None:
+        for command, wire_command, observed in (
+            ("ble-exposure-status", "ble.exposure.status", "uninitialized"),
+            ("ble-enable", "ble.enable", "enabling"),
+            ("ble-disable", "ble.disable", "disabling"),
+        ):
+            code, output, errors, calls = self.run_cli(
+                ["--port", "dummy-port", "--json", command],
+                {"S3_HIDBOT_SERIAL": "env-port"},
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(errors, "")
+            value = json.loads(output)
+            self.assertEqual(value["observed"], observed)
+            self.assertNotIn("address", value)
+            self.assertEqual(self.wire_commands(calls), ["protocol.hello", wire_command])
 
     def test_self_test_runs_one_safe_session_in_wire_order(self) -> None:
         code, output, errors, calls = self.run_cli(

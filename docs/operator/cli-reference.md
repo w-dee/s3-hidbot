@@ -16,8 +16,9 @@ does not resolve a serial port or use them.
 | Category | Commands |
 | --- | --- |
 | Hardware-free validation | `verify-artifact ARTIFACT` |
-| UART read-only diagnostics | `hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, `verify-firmware ARTIFACT` |
+| UART read-only diagnostics | `hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, `ble-exposure-status`, `verify-firmware ARTIFACT` |
 | Explicit USB exposure control | `usb-attach`, `usb-detach` |
+| Explicit BLE exposure control | `ble-enable`, `ble-disable` |
 | Explicit HID output routing | `hid-route-status`, `hid-route-set none`, `hid-route-set usb` |
 | UART diagnostic with safety action | `self-test` |
 | Explicit safety recovery | `release-all` |
@@ -40,6 +41,9 @@ intentionally injects a key, button, or movement.
 | `hidbotctl usb-exposure-status` | UART + `usb.exposure-control-v1` | Observe the authoritative native USB lifecycle state. It accepts no parameters and does not install or uninstall anything. |
 | `hidbotctl usb-attach` | UART + `usb.exposure-control-v1` | Explicitly request a fresh public TinyUSB driver install. The immediate result is an accepted lifecycle snapshot, not mount, enumeration, or endpoint readiness proof. Establish a fresh session before later commands. |
 | `hidbotctl usb-detach` | UART + `usb.exposure-control-v1` | Explicitly request old-generation all-up safety handling followed by public TinyUSB driver uninstall. The immediate result does not prove host-observed release or completed removal. Establish a fresh session before later commands. |
+| `hidbotctl ble-exposure-status` | UART + `ble.exposure-control-v1` | Read the exact BLE exposure lifecycle snapshot without exposing an address, connection handle, CCCD, or security state. |
+| `hidbotctl ble-enable` | UART + `ble.exposure-control-v1` | Lazily initialize BLE on first use and request connectable HID Service advertising. It does not select an HID route. |
+| `hidbotctl ble-disable` | UART + `ble.exposure-control-v1` | Stop advertising/disconnect a peer and enter hidden idle while retaining the initialized stack. It does not change USB or its HID route/session. |
 | `hidbotctl hid-route-status` | UART + `hid.output-route-v1` | Read the coherent `desired`, `active`, `generation`, `transition`, and `ready` route snapshot. |
 | `hidbotctl hid-route-set none` | UART + `hid.output-route-v1` | Safely retire USB HID output while leaving USB exposure unchanged. An actual transition retires the session. |
 | `hidbotctl hid-route-set usb` | UART + `hid.output-route-v1` | Select an already mounted, safety-clear USB transport. Both endpoints must be ready. Establish a fresh session after an actual transition. |
@@ -65,6 +69,12 @@ does not attach native USB or select a route. USB may remain mounted with route
 `operation`/signed-`code` object. A true `recovery_required` means no automatic
 retry is attempted; reboot or manual operator intervention is required.
 `usb.status` stays wire-compatible as the legacy/basic readiness command.
+
+`ble-exposure-status` has exactly `desired`, `observed`, `generation`,
+`stack_ready`, `advertising`, `connected`, `recovery_required`, and
+`last_error`. BLE is uninitialized/non-advertising at cold boot. USB and BLE
+may be exposed simultaneously, but U7.3 has no BLE report output, `route=ble`,
+pairing/passkey control, bonding, or formal HOGP/security compliance claim.
 
 ## Artifact and firmware identity
 

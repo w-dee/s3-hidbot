@@ -69,10 +69,20 @@ class BleDatabase {
     virtual ~BleDatabase() = default;
     virtual int register_database() = 0;
     virtual void clear_peer_state() = 0;
+    virtual void on_subscribe(std::uint16_t attribute_handle, bool enabled) = 0;
 };
 
 class BleBackend {
   public:
+    enum class HeapCheckpoint : std::uint8_t {
+        kColdBoot,
+        kBeforeFirstEnable,
+        kAdvertising,
+        kConnected,
+        kReadvertising,
+        kHiddenIdle,
+    };
+
     virtual ~BleBackend() = default;
     virtual std::int32_t initialize(BleEventSink *sink, BleDatabase *database,
                                     ble_lifecycle::Generation generation) = 0;
@@ -80,6 +90,9 @@ class BleBackend {
     virtual std::int32_t start_advertising() = 0;
     virtual std::int32_t stop_advertising() = 0;
     virtual std::int32_t disconnect(std::uint16_t connection_handle) = 0;
+    virtual std::int32_t configure_connection(
+        std::uint16_t connection_handle) = 0;
+    virtual void record_heap_checkpoint(HeapCheckpoint checkpoint) = 0;
 };
 
 struct ExposureSnapshot {

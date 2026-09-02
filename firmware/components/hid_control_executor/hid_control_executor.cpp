@@ -47,6 +47,9 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
     }
 #endif
     initialized_ = true;
+    if (ble_backend_ != nullptr) {
+        ble_backend_->record_heap_checkpoint(BleBackend::HeapCheckpoint::kColdBoot);
+    }
     return true;
 }
 
@@ -275,6 +278,8 @@ void Controller::process(Action action) {
         }
         ble_backend_->set_generation(current.generation);
         if (!current.stack_ready) {
+            ble_backend_->record_heap_checkpoint(
+                BleBackend::HeapCheckpoint::kBeforeFirstEnable);
             const std::int32_t result = ble_backend_->initialize(
                 this, ble_database_, current.generation);
             if (result != 0) {
@@ -286,6 +291,8 @@ void Controller::process(Action action) {
         const std::int32_t result = ble_backend_->start_advertising();
         if (result == 0) {
             ble_state_.complete_advertising(current.generation);
+            ble_backend_->record_heap_checkpoint(
+                BleBackend::HeapCheckpoint::kAdvertising);
             release_operation(action.operation);
         } else {
             fail_ble(current.generation, ble_lifecycle::Operation::kEnable, result,
@@ -322,6 +329,8 @@ void Controller::process(Action action) {
             ble_database_->clear_peer_state();
         }
         ble_state_.complete_disable(current.generation);
+        ble_backend_->record_heap_checkpoint(
+            BleBackend::HeapCheckpoint::kHiddenIdle);
         release_operation(action.operation);
         return;
     }
@@ -442,6 +451,8 @@ void Controller::process_ble_event(BleEvent event) {
             const std::int32_t result = ble_backend_->start_advertising();
             if (result == 0) {
                 ble_state_.complete_advertising(event.generation);
+                ble_backend_->record_heap_checkpoint(
+                    BleBackend::HeapCheckpoint::kAdvertising);
                 const ControlOperation owner =
                     active_operation_.load(std::memory_order_acquire);
                 if (owner == ControlOperation::kBleEnable) {
@@ -454,8 +465,12 @@ void Controller::process_ble_event(BleEvent event) {
             return;
         }
         case BleEventKind::kConnect:
-            (void)ble_state_.observe_connect(event.generation,
-                                             event.connection_handle);
+            if (ble_state_.observe_connect(event.generation,
+                                           event.connection_handle)) {
+                (void)ble_backend_->configure_connection(event.connection_handle);
+                ble_backend_->record_heap_checkpoint(
+                    BleBackend::HeapCheckpoint::kConnected);
+            }
             return;
         case BleEventKind::kDisconnect: {
             const bool expected = active_operation_.load(std::memory_order_acquire) ==
@@ -469,6 +484,8 @@ void Controller::process_ble_event(BleEvent event) {
             }
             if (expected) {
                 ble_state_.complete_disable(event.generation);
+                ble_backend_->record_heap_checkpoint(
+                    BleBackend::HeapCheckpoint::kHiddenIdle);
                 release_operation(ControlOperation::kBleDisable);
                 return;
             }
@@ -477,6 +494,8 @@ void Controller::process_ble_event(BleEvent event) {
             const std::int32_t result = ble_backend_->start_advertising();
             if (result == 0) {
                 ble_state_.complete_advertising(generation);
+                ble_backend_->record_heap_checkpoint(
+                    BleBackend::HeapCheckpoint::kReadvertising);
             } else {
                 fail_ble(generation, ble_lifecycle::Operation::kRuntime, result,
                          ControlOperation::kNone);

@@ -2,6 +2,15 @@
 
 ## USB and HID boundary
 
+BLE exposure is an independent U7.3 control plane. It is uninitialized and
+non-advertising at boot; explicit enable may advertise/connect one peer, and
+disable retains the initialized stack in hidden idle. USB and BLE may be
+exposed together. BLE exposure never grants HID authority, never changes the
+USB route/session, and never emits keyboard or mouse notifications. Pairing,
+passkeys, bonding, and formal HOGP/security compliance remain deferred. A BLE
+`fault` with `recovery_required:true` requires reboot/human review rather than
+fabricated recovery.
+
 The CH343 USB-UART path controls and programs the fixture. The separate native
 USB-OTG path presents HID to a DUT host. Provisioning and identity verification
 need only CH343. VBUS sourcing, backfeed, general dual-cable power safety,

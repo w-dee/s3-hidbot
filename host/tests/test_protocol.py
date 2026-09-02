@@ -7,6 +7,8 @@ from hidbot.errors import CompatibilityError, ProtocolError
 from hidbot.protocol import (
     BASELINE_REQUIRED_CAPABILITIES,
     CompatibilityResult,
+    BleExposureDesired,
+    BleExposureObserved,
     FirmwareIdentity,
     OutputRoute,
     HelloResponse,
@@ -20,6 +22,7 @@ from hidbot.protocol import (
     build_hello_frame,
     parse_response,
     validate_release_all_result,
+    validate_ble_exposure_status,
     validate_hid_route_status,
     validate_keyboard_report_result,
     validate_mouse_report_result,
@@ -39,6 +42,32 @@ def frame_payload(value: object) -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_ble_exposure_status_is_exact_and_strict(self) -> None:
+        status = validate_ble_exposure_status(
+            {
+                "desired": "exposed",
+                "observed": "advertising",
+                "generation": 0xFFFF_FFFF,
+                "stack_ready": True,
+                "advertising": True,
+                "connected": False,
+                "recovery_required": False,
+                "last_error": None,
+            }
+        )
+        self.assertEqual(status.desired, BleExposureDesired.EXPOSED)
+        self.assertEqual(status.observed, BleExposureObserved.ADVERTISING)
+        for invalid in (
+            {},
+            {**status.__dict__, "address": "private"},
+            {**status.__dict__, "observed": "pairing"},
+            {**status.__dict__, "generation": -1},
+            {**status.__dict__, "advertising": True, "connected": True},
+            {**status.__dict__, "last_error": {"operation": "pair", "code": 1}},
+        ):
+            with self.assertRaises(ProtocolError):
+                validate_ble_exposure_status(invalid)
+
     def test_hid_route_builder_and_strict_status(self) -> None:
         self.assertEqual(
             build_hid_route_set_frame(3, TOKEN, OutputRoute.USB),

@@ -10,6 +10,7 @@ python_bin=${PYTHON_BIN:-python3}
 "$python_bin" "$repository_root/tools/test_firmware_identity_static.py"
 "$python_bin" "$repository_root/tools/test_default_hid_safety.py"
 "$python_bin" "$repository_root/tools/test_hid_runtime_static.py"
+"$python_bin" "$repository_root/tools/test_ble_hid_service_static.py"
 "$python_bin" "$repository_root/tools/test_uart_control_transport_static.py"
 "$python_bin" "$repository_root/tools/test_documentation.py"
 "$python_bin" "$repository_root/tools/test_operator_documentation.py"

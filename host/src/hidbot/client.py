@@ -20,6 +20,7 @@ from .errors import (
 from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
+    BleExposureStatus,
     HidRouteStatus,
     KeyboardReportResult,
     MouseReportResult,
@@ -34,6 +35,7 @@ from .protocol import (
     build_hello_frame,
     parse_response,
     validate_keyboard_report_result,
+    validate_ble_exposure_status,
     validate_hid_route_status,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
@@ -394,6 +396,29 @@ class Client:
 
         with self._lock:
             return self._usb_lifecycle_transition_locked("usb.detach")
+
+    def ble_exposure_status(self) -> BleExposureStatus:
+        """Return BLE transport exposure without changing HID authority."""
+
+        with self._lock:
+            self._require_capability_locked("ble.exposure-control-v1")
+            return validate_ble_exposure_status(
+                self._request_locked("ble.exposure.status")
+            )
+
+    def ble_enable(self) -> BleExposureStatus:
+        """Explicitly initialize/reuse BLE and begin advertising."""
+
+        with self._lock:
+            self._require_capability_locked("ble.exposure-control-v1")
+            return validate_ble_exposure_status(self._request_locked("ble.enable"))
+
+    def ble_disable(self) -> BleExposureStatus:
+        """Hide BLE while retaining an initialized stack for later reuse."""
+
+        with self._lock:
+            self._require_capability_locked("ble.exposure-control-v1")
+            return validate_ble_exposure_status(self._request_locked("ble.disable"))
 
     def hid_route_status(self) -> HidRouteStatus:
         """Return the coherent explicit HID output-route transaction state."""

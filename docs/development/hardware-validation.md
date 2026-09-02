@@ -228,6 +228,25 @@ is explicitly intended. The controlled Mouse-report diagnostic is build-time
 opt-in; default firmware does not configure GPIO0 or send HID reports in
 response to a BOOT-button press.
 
+## Deferred U7.3 BLE qualification gate
+
+Software implementation stops before this gate. A future explicitly
+authorized run must use the exact qualified feature artifact and must not infer
+success from software tests. It must confirm cold boot is non-advertising,
+explicit enable/service discovery, one connection, CCCD observation without
+notifications, disconnect/re-advertise, stack-retained disable, five cycles,
+and simultaneous USB exposure without route mutation. Pairing/bonding and BLE
+HID output remain out of scope.
+
+Firmware logs project-owned internal 8-bit heap checkpoints at cold boot,
+immediately before first enable, advertising, connected,
+disconnect/re-advertising, and hidden idle; repeated hidden-idle checkpoints
+provide the fifth-cycle evidence. Each reports free, minimum-ever-free, and
+largest block without an address or private identity. Review targets are at
+least 80 KiB free/32 KiB largest while advertising and 64 KiB free/24 KiB
+largest while connected. Until measured on the fixture these are **PENDING
+PHYSICAL MEASUREMENT**, never a software PASS.
+
 ## Related documents
 
 - [`codex-runbook.md`](codex-runbook.md) — review gates and contributor

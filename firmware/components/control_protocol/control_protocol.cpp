@@ -22,9 +22,9 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\",\"ble.exposure-control-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"ble.exposure-control-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -36,7 +36,7 @@ constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
 // Every formatter below writes to ResponseFrame::bytes. These conservative
 // bounds cover the largest identity-v1 protocol.hello and system.info responses
 // metadata, four 32-hex values (top-level session, result session, boot ID,
-// and client nonce), eleven capabilities, maximum int32 id, framing, and LF.
+// and client nonce), twelve capabilities, maximum int32 id, framing, and LF.
 // vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
@@ -67,6 +67,9 @@ static_assert(kMaximumUsbExposureResponseBytes <= control_session::kMaxResponseB
 constexpr std::size_t kMaximumHidRouteResponseBytes =
     kPrefixLength + 220 + control_session::kTokenHexLength + 1;
 static_assert(kMaximumHidRouteResponseBytes <= control_session::kMaxResponseBytes);
+constexpr std::size_t kMaximumBleExposureResponseBytes =
+    kPrefixLength + 300 + control_session::kTokenHexLength + 1;
+static_assert(kMaximumBleExposureResponseBytes <= control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
     return value != nullptr && std::strlen(value) <= maximum_length;
@@ -478,6 +481,71 @@ bool make_usb_exposure_status(control_session::ResponseFrame *frame,
                         static_cast<long>(status.last_error.code));
 }
 
+const char *ble_exposure_desired_json(BleExposureDesired desired) {
+    return desired == BleExposureDesired::kExposed ? "exposed" : "hidden";
+}
+
+const char *ble_exposure_observed_json(BleExposureObserved observed) {
+    switch (observed) {
+        case BleExposureObserved::kEnabling: return "enabling";
+        case BleExposureObserved::kIdle: return "idle";
+        case BleExposureObserved::kAdvertising: return "advertising";
+        case BleExposureObserved::kConnected: return "connected";
+        case BleExposureObserved::kDisabling: return "disabling";
+        case BleExposureObserved::kFault: return "fault";
+        case BleExposureObserved::kUninitialized:
+        default: return "uninitialized";
+    }
+}
+
+const char *ble_exposure_operation_json(BleExposureOperation operation) {
+    switch (operation) {
+        case BleExposureOperation::kEnable: return "enable";
+        case BleExposureOperation::kDisable: return "disable";
+        case BleExposureOperation::kRuntime:
+        default: return "runtime";
+    }
+}
+
+bool make_ble_exposure_status(control_session::ResponseFrame *frame,
+                              ResponseSession session, std::int32_t id,
+                              BleExposureStatus status) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) {
+        frame->length = 0;
+        return false;
+    }
+    if (!status.last_error.present) {
+        return format_frame(frame,
+                            "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                            "\"session\":%s,\"ok\":true,\"result\":{"
+                            "\"desired\":\"%s\",\"observed\":\"%s\",\"generation\":%lu,"
+                            "\"stack_ready\":%s,\"advertising\":%s,\"connected\":%s,"
+                            "\"recovery_required\":%s,\"last_error\":null}}\n",
+                            static_cast<long>(id), session_field,
+                            ble_exposure_desired_json(status.desired),
+                            ble_exposure_observed_json(status.observed),
+                            static_cast<unsigned long>(status.generation),
+                            json_bool(status.stack_ready), json_bool(status.advertising),
+                            json_bool(status.connected), json_bool(status.recovery_required));
+    }
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"desired\":\"%s\",\"observed\":\"%s\",\"generation\":%lu,"
+                        "\"stack_ready\":%s,\"advertising\":%s,\"connected\":%s,"
+                        "\"recovery_required\":%s,\"last_error\":{"
+                        "\"operation\":\"%s\",\"code\":%ld}}}\n",
+                        static_cast<long>(id), session_field,
+                        ble_exposure_desired_json(status.desired),
+                        ble_exposure_observed_json(status.observed),
+                        static_cast<unsigned long>(status.generation),
+                        json_bool(status.stack_ready), json_bool(status.advertising),
+                        json_bool(status.connected), json_bool(status.recovery_required),
+                        ble_exposure_operation_json(status.last_error.operation),
+                        static_cast<long>(status.last_error.code));
+}
+
 const char *output_route_json(OutputRoute route) {
     return route == OutputRoute::kUsb ? "usb" : "none";
 }
@@ -763,6 +831,8 @@ bool Protocol::initialize(const Config &config,
     if (config.output == nullptr || config.usb_status_provider == nullptr ||
         config.usb_exposure_status_provider == nullptr || config.usb_attach_provider == nullptr ||
         config.usb_detach_provider == nullptr || config.hid_route_status_provider == nullptr ||
+        config.ble_exposure_status_provider == nullptr || config.ble_enable_provider == nullptr ||
+        config.ble_disable_provider == nullptr ||
         config.hid_route_set_provider == nullptr || config.authority_epoch_provider == nullptr ||
         random_fill == nullptr ||
         !is_safe_metadata_string(config.metadata.project) ||
@@ -1174,6 +1244,43 @@ void Protocol::handle_frame(std::string_view payload) {
                     finish();
                     return;
                 }
+            }
+        }
+    } else if (command == "ble.exposure.status") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "ble.exposure.status accepts no params");
+        } else {
+            semantically_valid = true;
+            completed = make_ble_exposure_status(
+                &response, current_session, id,
+                config_.ble_exposure_status_provider(
+                    config_.ble_exposure_status_context));
+        }
+    } else if (command == "ble.enable" || command == "ble.disable") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       command == "ble.enable" ? "ble.enable accepts no params"
+                                               : "ble.disable accepts no params");
+        } else {
+            semantically_valid = true;
+            const BleExposureActionOutcome action =
+                command == "ble.enable"
+                    ? config_.ble_enable_provider(config_.ble_enable_context)
+                    : config_.ble_disable_provider(config_.ble_disable_context);
+            if (action.action_result == BleExposureActionResult::kBusy) {
+                completed = make_error(&response, current_session, true, id,
+                                       "HID_BUSY", "control transition is active");
+            } else if (!action.snapshot_valid) {
+                completed = make_error(&response, current_session, true, id,
+                                       "INTERNAL_ERROR",
+                                       "BLE lifecycle snapshot is unavailable");
+            } else {
+                // BLE exposure is not HID output authority. The normal
+                // epoch-scoped retry cache preserves this frozen Stage-A
+                // response without revoking the active USB HID session.
+                completed = make_ble_exposure_status(&response, current_session,
+                                                     id, action.snapshot);
             }
         }
     } else if (command == "hid.route.status") {

@@ -64,6 +64,7 @@ def hello_response(
             "hid.keyboard-report-v1",
             "hid.mouse-report-v1",
             "hid.output-route-v1",
+            "ble.exposure-control-v1",
         ]
     return response(
         request_id,
@@ -223,6 +224,47 @@ class ClientTests(unittest.TestCase):
                 method()
         self.assertEqual(client.session, TOKEN)
         self.assertEqual(transport.writes, [])
+
+    def test_ble_exposure_is_typed_capability_gated_and_keeps_session(self) -> None:
+        status = {
+            "desired": "exposed",
+            "observed": "enabling",
+            "generation": 1,
+            "stack_ready": False,
+            "advertising": False,
+            "connected": False,
+            "recovery_required": False,
+            "last_error": None,
+        }
+
+        def on_write(transport: FakeTransport, data: bytes) -> None:
+            if data == TRANSPORT_SYNC:
+                return
+            value = request_object(data)
+            if value["cmd"] == "protocol.hello":
+                transport.chunks.append(
+                    hello_response(value["id"], value["params"]["client_nonce"])
+                )
+            elif value["cmd"] in {"ble.exposure.status", "ble.enable", "ble.disable"}:
+                self.assertEqual(value["params"], {})
+                transport.chunks.append(response(value["id"], TOKEN, result=status))
+
+        transport = FakeTransport(on_write)
+        client = self.make_client(transport)
+        client.connect()
+        self.assertEqual(client.ble_exposure_status().generation, 1)
+        self.assertEqual(client.ble_enable().observed.value, "enabling")
+        self.assertEqual(client.ble_disable().desired.value, "exposed")
+        self.assertEqual(client.session, TOKEN)
+
+        missing_transport = FakeTransport()
+        missing = self.make_client(missing_transport)
+        missing._session = TOKEN
+        missing._capabilities = tuple(BASELINE_REQUIRED_CAPABILITIES)
+        for method in (missing.ble_exposure_status, missing.ble_enable, missing.ble_disable):
+            with self.assertRaises(CompatibilityError):
+                method()
+        self.assertEqual(missing_transport.writes, [])
 
     def test_hid_route_primitives_are_typed_strict_and_capability_gated(self) -> None:
         route_status = {

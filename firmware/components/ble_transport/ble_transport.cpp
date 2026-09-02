@@ -3,6 +3,8 @@
 #include <cstring>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
@@ -19,6 +21,10 @@ constexpr std::uint16_t kAdvertisingInterval = 64;  // 40 ms in 0.625-ms units.
 constexpr std::uint64_t kSyncTimeoutUs = 10'000'000;
 constexpr std::uint64_t kDisconnectTimeoutUs = 5'000'000;
 constexpr std::int32_t kLifecycleTimeoutError = -3;
+constexpr std::uint16_t kConnectionIntervalMin = 12;  // 15 ms.
+constexpr std::uint16_t kConnectionIntervalMax = 24;  // 30 ms.
+constexpr std::uint16_t kSupervisionTimeout = 400;    // 4 s.
+constexpr char kLogTag[] = "ble_transport";
 ble_uuid16_t s_hid_service_uuid = BLE_UUID16_INIT(0x1812);
 }  // namespace
 
@@ -34,6 +40,7 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
         return ESP_ERR_INVALID_STATE;
     }
     sink_ = sink;
+    database_ = database;
     generation_.store(generation, std::memory_order_release);
     instance_ = this;
     // Never erase NVS as an initialization fallback; unrelated data must not
@@ -176,6 +183,12 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 hid_control_executor::BleEventKind::kAdvertisingComplete,
                 ble_lifecycle::kNoConnection, event->adv_complete.reason);
             break;
+        case BLE_GAP_EVENT_SUBSCRIBE:
+            if (backend->database_ != nullptr) {
+                backend->database_->on_subscribe(event->subscribe.attr_handle,
+                                                 event->subscribe.cur_notify != 0);
+            }
+            break;
         default:
             break;
     }
@@ -215,6 +228,30 @@ std::int32_t Backend::disconnect(std::uint16_t connection_handle) {
         arm_timeout(kDisconnectTimeoutUs);
     }
     return result;
+}
+
+std::int32_t Backend::configure_connection(std::uint16_t connection_handle) {
+    ble_gap_upd_params parameters{};
+    parameters.itvl_min = kConnectionIntervalMin;
+    parameters.itvl_max = kConnectionIntervalMax;
+    parameters.latency = 0;
+    parameters.supervision_timeout = kSupervisionTimeout;
+    parameters.min_ce_len = 0;
+    parameters.max_ce_len = 0;
+    return ble_gap_update_params(connection_handle, &parameters);
+}
+
+void Backend::record_heap_checkpoint(HeapCheckpoint checkpoint) {
+    static constexpr const char *kLabels[] = {
+        "cold-boot", "before-first-enable", "advertising",
+        "connected", "readvertising", "hidden-idle",
+    };
+    constexpr std::uint32_t capabilities = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    ESP_LOGI(kLogTag, "heap checkpoint=%s free=%u minimum=%u largest=%u",
+             kLabels[static_cast<std::size_t>(checkpoint)],
+             static_cast<unsigned>(heap_caps_get_free_size(capabilities)),
+             static_cast<unsigned>(heap_caps_get_minimum_free_size(capabilities)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(capabilities)));
 }
 
 }  // namespace ble_transport

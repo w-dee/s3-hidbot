@@ -33,6 +33,7 @@ from .provisioning_workflow import (
 from .serial_transport import PySerialTransport
 from .provisioning import stage_and_verify_firmware_bundle
 from .protocol import (
+    BleExposureStatus,
     HidRouteStatus,
     KeyboardReportResult,
     MouseReportResult,
@@ -192,6 +193,9 @@ def _parser() -> argparse.ArgumentParser:
         ("usb-exposure-status", "show explicit native USB exposure lifecycle state"),
         ("usb-attach", "explicitly install and expose native USB HID"),
         ("usb-detach", "safely hide and uninstall native USB HID"),
+        ("ble-exposure-status", "show explicit BLE exposure lifecycle state"),
+        ("ble-enable", "explicitly initialize/reuse BLE and advertise"),
+        ("ble-disable", "hide BLE while retaining the initialized stack"),
         ("hid-route-status", "show the explicit HID output route"),
         ("hid-route-set", "select none or USB as the HID output route"),
         ("release-all", "perform the safe all-up recovery operation"),
@@ -314,6 +318,9 @@ def _result_value(command: str, result: object) -> object:
         return asdict(result)
     if command in {"usb-attach", "usb-detach", "usb-exposure-status"}:
         assert isinstance(result, UsbExposureStatus)
+        return asdict(result)
+    if command in {"ble-exposure-status", "ble-enable", "ble-disable"}:
+        assert isinstance(result, BleExposureStatus)
         return asdict(result)
     if command in {"hid-route-status", "hid-route-set"}:
         assert isinstance(result, HidRouteStatus)
@@ -623,6 +630,12 @@ def main(
                 result = client.usb_attach()
             elif args.command == "usb-detach":
                 result = client.usb_detach()
+            elif args.command == "ble-exposure-status":
+                result = client.ble_exposure_status()
+            elif args.command == "ble-enable":
+                result = client.ble_enable()
+            elif args.command == "ble-disable":
+                result = client.ble_disable()
             elif args.command == "hid-route-status":
                 result = client.hid_route_status()
             elif args.command == "hid-route-set":

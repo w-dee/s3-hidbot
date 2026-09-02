@@ -18,6 +18,14 @@ helper, high-level keyboard/mouse automation, asynchronous event, BLE route,
 GPIO action, or reset command. Primitive report CLI commands are documented
 below and remain explicitly unsafe.
 
+U7.3 adds `ble.exposure.status`, `ble.enable`, and `ble.disable` under
+`ble.exposure-control-v1`; protocol remains 1 and the full identity hello has
+12 unique capabilities. BLE is uninitialized/non-advertising at boot and lazy
+initialization occurs only after accepted enable. Normal disable retains the
+stack in hidden idle. BLE lifecycle generation is independent of USB route and
+session authority, so simultaneous USB and BLE exposure is valid and neither
+transport's exposure command mutates the other's desired state.
+
 Native USB is hidden by default: boot initializes HID/runtime state and its
 lifecycle task, then starts the UART control plane without calling
 `tinyusb_driver_install()`. CH343 UART is the bootstrap path. Only the
@@ -324,6 +332,40 @@ must not treat `boot_id` or the control session as firmware identity.
   never submits a HID report. Its four-field schema is retained for legacy
   compatibility and does not describe desired exposure, install state, or
   recovery.
+
+## Explicit BLE exposure control
+
+The three BLE commands accept only omitted or empty-object params. Their exact
+result has no additional fields:
+
+```json
+{"desired":"hidden|exposed","observed":"uninitialized|enabling|idle|advertising|connected|disabling|fault","generation":0,"stack_ready":false,"advertising":false,"connected":false,"recovery_required":false,"last_error":null}
+```
+
+`last_error`, when present, contains exactly `operation` (`enable`, `disable`,
+or `runtime`) and signed integer `code`. Addresses, handles, MTU, CCCD, and
+pairing/security data are never public. Accepted transitions return a frozen
+Stage-A snapshot and use the existing normal retry cache. Ordinary BLE
+enable/disable does not invalidate a USB HID session. `hid.route.set` still
+accepts only `none|usb`; BLE connection/subscription does not make HID ready.
+
+The project-owned 0x1812 database is a discoverable BLE HID Service foundation:
+HID Information bytes `11 01 00 00` mean HID 1.11, country 0, and no remote
+wake/normally-connectable flag; the Report Map defines keyboard Report ID 1
+(8-byte logical input) and mouse Report ID 2 (5-byte logical input). Both input
+reports read neutral zeros and expose CCCD/Report Reference, but U7.3 has no
+notification call path. HID Control Point `0`/`1` changes only BLE-local
+suspend state. Protocol Mode, boot characteristics, BAS, fabricated battery,
+DIS/PnP ID, pairing/passkey control, bonding, and security-required attribute
+flags are absent. This is a HOGP-oriented scaffold, not a formal HOGP/security
+compliance claim.
+
+Advertising is legacy connectable undirected with an exact 22-byte payload:
+Flags `0x06`, complete UUID list `0x1812`, Generic HID appearance `0x03c0`, and
+complete name `s3-hidbot`; no scan response is used. Interval is 40 ms. The
+single connection is offered 15–30 ms interval, latency 0, and 4 s supervision
+timeout. NimBLE chooses a public identity if available or a supported static
+random identity; it is never returned over UART.
 
 ## Explicit USB exposure control
 

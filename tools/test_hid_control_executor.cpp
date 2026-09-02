@@ -57,6 +57,15 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         last_connection = connection_handle;
         return disconnect_result;
     }
+    std::int32_t configure_connection(std::uint16_t connection_handle) override {
+        ++configure_connection_calls;
+        last_configured_connection = connection_handle;
+        return configure_connection_result;
+    }
+    void record_heap_checkpoint(HeapCheckpoint checkpoint) override {
+        ++heap_checkpoint_calls;
+        last_heap_checkpoint = checkpoint;
+    }
     bool event(hid_control_executor::BleEventKind kind,
                std::uint16_t connection = ble_lifecycle::kNoConnection,
                std::int32_t status = 0) {
@@ -68,19 +77,25 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     hid_control_executor::BleEventSink *sink = nullptr;
     ble_lifecycle::Generation active_generation = 0;
     std::uint16_t last_connection = ble_lifecycle::kNoConnection;
+    std::uint16_t last_configured_connection = ble_lifecycle::kNoConnection;
     int initialize_calls = 0;
     int advertising_calls = 0;
     int stop_calls = 0;
     int disconnect_calls = 0;
+    int configure_connection_calls = 0;
+    int heap_checkpoint_calls = 0;
     std::int32_t initialize_result = 0;
     std::int32_t advertising_result = 0;
     std::int32_t stop_result = 0;
     std::int32_t disconnect_result = 0;
+    std::int32_t configure_connection_result = 0;
+    HeapCheckpoint last_heap_checkpoint = HeapCheckpoint::kColdBoot;
 };
 
 struct FakeBleDatabase final : hid_control_executor::BleDatabase {
     int register_database() override { return 0; }
     void clear_peer_state() override { ++clear_calls; }
+    void on_subscribe(std::uint16_t, bool) override {}
     int clear_calls = 0;
 };
 
@@ -484,6 +499,9 @@ void test_ble_lifecycle_is_shared_serialized_and_transport_independent() {
     FakeBleDatabase database;
     hid_control_executor::Controller controller;
     assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(ble.heap_checkpoint_calls == 1);
+    assert(ble.last_heap_checkpoint ==
+           hid_control_executor::BleBackend::HeapCheckpoint::kColdBoot);
     const auto route_before = controller.route_snapshot();
     const auto epoch_before = runtime.state_machine().authority_epoch();
 
@@ -496,6 +514,8 @@ void test_ble_lifecycle_is_shared_serialized_and_transport_independent() {
            hid_runtime::RouteTransitionResult::kBusy);
     assert(controller.process_one_for_test());
     assert(ble.initialize_calls == 1);
+    assert(ble.last_heap_checkpoint ==
+           hid_control_executor::BleBackend::HeapCheckpoint::kBeforeFirstEnable);
     assert(ble.event(hid_control_executor::BleEventKind::kSync));
     assert(controller.process_one_for_test());
     assert(controller.ble_snapshot().observed ==
@@ -508,11 +528,17 @@ void test_ble_lifecycle_is_shared_serialized_and_transport_independent() {
     assert(ble.event(hid_control_executor::BleEventKind::kConnect, 42));
     assert(controller.process_one_for_test());
     assert(controller.ble_snapshot().connected);
+    assert(ble.configure_connection_calls == 1);
+    assert(ble.last_configured_connection == 42);
+    assert(ble.last_heap_checkpoint ==
+           hid_control_executor::BleBackend::HeapCheckpoint::kConnected);
     assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 42));
     assert(controller.process_one_for_test());
     assert(controller.ble_snapshot().advertising);
     assert(controller.ble_snapshot().generation == 2);
     assert(ble.advertising_calls == 2);
+    assert(ble.last_heap_checkpoint ==
+           hid_control_executor::BleBackend::HeapCheckpoint::kReadvertising);
     assert(database.clear_calls == 1);
     assert(runtime.state_machine().authority_epoch() == epoch_before);
 }

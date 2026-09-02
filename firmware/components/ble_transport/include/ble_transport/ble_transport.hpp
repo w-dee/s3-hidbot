@@ -21,6 +21,9 @@ class Backend final : public hid_control_executor::BleBackend {
     std::int32_t start_advertising() override;
     std::int32_t stop_advertising() override;
     std::int32_t disconnect(std::uint16_t connection_handle) override;
+    std::int32_t configure_connection(
+        std::uint16_t connection_handle) override;
+    void record_heap_checkpoint(HeapCheckpoint checkpoint) override;
 
     static void on_sync();
     static void on_reset(int reason);
@@ -36,6 +39,7 @@ class Backend final : public hid_control_executor::BleBackend {
 
     static Backend *instance_;
     hid_control_executor::BleEventSink *sink_ = nullptr;
+    hid_control_executor::BleDatabase *database_ = nullptr;
     std::atomic<ble_lifecycle::Generation> generation_{0};
     std::uint8_t own_address_type_ = 0;
     bool initialized_ = false;

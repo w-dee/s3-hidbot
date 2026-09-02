@@ -3,6 +3,10 @@
 from .client import Client, HelloResult
 from .protocol import (
     CompatibilityResult,
+    BleExposureDesired,
+    BleExposureLastError,
+    BleExposureObserved,
+    BleExposureStatus,
     FirmwareIdentity,
     KeyboardReportResult,
     MouseReportResult,
@@ -34,6 +38,10 @@ __all__ = [
     "MouseReportResult",
     "UsbExposureLastError",
     "UsbExposureStatus",
+    "BleExposureDesired",
+    "BleExposureObserved",
+    "BleExposureLastError",
+    "BleExposureStatus",
     "FirmwareIdentity",
     "SystemInfo",
     "CompatibilityResult",

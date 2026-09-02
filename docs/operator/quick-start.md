@@ -161,3 +161,14 @@ This is an intentional U7.2B migration. The old sequence was `usb-attach`, wait
 for mount, then send HID. The U7.2B sequence is `usb-attach`, wait for mount,
 observe `HID_NOT_READY` for HID while the route is none, run
 `hid-route-set usb`, establish a fresh hello session, and only then send HID.
+
+## BLE exposure after a separate authorized hardware gate
+
+U7.3 BLE is uninitialized and non-advertising at boot. On development firmware
+that advertises `ble.exposure-control-v1`, `hidbotctl --json ble-enable`
+requests lazy BLE startup; poll `hidbotctl --json ble-exposure-status` for
+`advertising` or `connected`. `hidbotctl --json ble-disable` returns an
+initialized stack to hidden `idle`. These commands do not select an HID route
+or invalidate an active USB route/session, so USB and BLE may remain exposed
+together. Do not expect BLE keyboard/mouse output, pairing/passkey control,
+bonding, or formal HOGP/security compliance from U7.3.

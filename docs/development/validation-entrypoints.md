@@ -47,6 +47,17 @@ command; it never uploads or publishes an artifact.
 
 ## Entrypoints
 
+U7.3 adds deterministic `tools/test-ble-lifecycle.sh`,
+`tools/test-ble-hid-subscription.sh`, and
+`tools/test_ble_hid_service_static.py` coverage. They verify lifecycle and
+stale-event behavior, subscription capture without route/notification side
+effects, the exact static GATT/report-map/advertising contract, and absence of
+future BLE services/security flags. These are included by `test-native.sh`,
+`test-static.sh`, and therefore canonical `test-nonhardware.sh`. An ESP-IDF
+target build remains mandatory because the service database and NimBLE APIs
+are target-linked. None of these checks performs radio, serial, or hardware
+access.
+
 Run these commands from the repository root:
 
 ```text

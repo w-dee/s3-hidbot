@@ -2,7 +2,7 @@
 
 ## Normative rules for agents and scripts
 
-1. Read-only UART diagnostics (`hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, and
+1. Read-only UART diagnostics (`hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, `ble-exposure-status`, and
    `verify-firmware`) may run without unsafe-HID authorization once the fixture
    is in scope.
 2. `usb-attach` and `usb-detach` are explicit lifecycle operations, never an
@@ -28,6 +28,10 @@
     3–7, provenance doubt, serial ambiguity, unknown dual-cable topology, or
     HID uncertainty, `host_release_uncertain`, or `recovery_required`.
 13. Never commit or share machine-local serial paths or local configuration.
+14. Treat `ble-enable` and `ble-disable` as BLE exposure only. They do not
+    select or revoke the USB HID route/session, and `route=ble` remains invalid.
+15. U7.3 permits simultaneous USB and BLE exposure but never BLE HID output;
+    do not infer report delivery from advertising, connection, or subscription.
 
 See [safety and recovery](safety-and-recovery.md) for the required bounded
 responses and [CLI reference](cli-reference.md) for exact syntax.

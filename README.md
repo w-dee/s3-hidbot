@@ -63,6 +63,15 @@ uncertainty remains fail-closed across a later attach. v0.1.0 is historical
 always-exposed behavior; it cannot expose a future U7.1B firmware because it
 does not advertise `usb.exposure-control-v1`.
 
+Development firmware also has an explicit BLE exposure foundation. BLE is
+uninitialized and non-advertising at boot; `ble-enable` lazily starts the
+BLE-only NimBLE stack and advertises the project-owned, discoverable HID
+Service database to at most one peer. `ble-disable` hides BLE while retaining
+the initialized stack for later reuse. USB and BLE may be exposed
+simultaneously, but U7.3 never routes HID reports to BLE: `route=ble` remains
+invalid and no keyboard or mouse notification is emitted. Pairing/passkey
+control, bonding, and formal HOGP/security compliance remain deferred.
+
 `flash-firmware` is destructive provisioning. It programs only a verified,
 supported plan and returns success only after an exact runtime identity match.
 

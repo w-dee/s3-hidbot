@@ -1,7 +1,7 @@
 idf_component_register(
-    SRCS "ble_transport.cpp"
+    SRCS "ble_hid_service.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES bt nvs_flash esp_timer heap log hid_control_executor ble_lifecycle
+    REQUIRES bt hid_control_executor
 )
 
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)

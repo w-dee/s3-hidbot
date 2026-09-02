@@ -193,6 +193,57 @@ struct ExposureSource {
     }
 };
 
+struct BleSource {
+    control_protocol::BleExposureStatus status{};
+    control_protocol::BleExposureActionResult enable_result =
+        control_protocol::BleExposureActionResult::kAccepted;
+    control_protocol::BleExposureActionResult disable_result =
+        control_protocol::BleExposureActionResult::kAccepted;
+    bool advance_before_return = false;
+    int enable_calls = 0;
+    int disable_calls = 0;
+
+    static control_protocol::BleExposureStatus get(void *context) {
+        return static_cast<BleSource *>(context)->status;
+    }
+    static control_protocol::BleExposureActionOutcome enable(void *context) {
+        auto *source = static_cast<BleSource *>(context);
+        ++source->enable_calls;
+        if (source->enable_result == control_protocol::BleExposureActionResult::kBusy) {
+            return {};
+        }
+        if (source->enable_result == control_protocol::BleExposureActionResult::kAccepted) {
+            ++source->status.generation;
+            source->status.desired = control_protocol::BleExposureDesired::kExposed;
+            source->status.observed = control_protocol::BleExposureObserved::kEnabling;
+        }
+        const auto accepted = source->status;
+        if (source->advance_before_return) {
+            source->status.stack_ready = true;
+            source->status.advertising = true;
+            source->status.observed = control_protocol::BleExposureObserved::kAdvertising;
+        }
+        return {.action_result = source->enable_result,
+                .snapshot_valid = true,
+                .snapshot = accepted};
+    }
+    static control_protocol::BleExposureActionOutcome disable(void *context) {
+        auto *source = static_cast<BleSource *>(context);
+        ++source->disable_calls;
+        if (source->disable_result == control_protocol::BleExposureActionResult::kBusy) {
+            return {};
+        }
+        if (source->disable_result == control_protocol::BleExposureActionResult::kAccepted) {
+            ++source->status.generation;
+            source->status.desired = control_protocol::BleExposureDesired::kHidden;
+            source->status.observed = control_protocol::BleExposureObserved::kDisabling;
+        }
+        return {.action_result = source->disable_result,
+                .snapshot_valid = true,
+                .snapshot = source->status};
+    }
+};
+
 struct RouteSource {
     control_protocol::HidRouteStatus status{};
     control_protocol::HidRouteActionResult result =
@@ -325,6 +376,7 @@ struct LeaseFixture {
     LeaseClock clock;
     AuthoritySource authority;
     ExposureSource exposure;
+    BleSource ble;
     RouteSource route;
     ReleaseSource release;
     int expired_callbacks = 0;
@@ -398,6 +450,12 @@ struct LeaseFixture {
             .usb_attach_context = &exposure,
             .usb_detach_provider = ExposureSource::detach,
             .usb_detach_context = &exposure,
+            .ble_exposure_status_provider = BleSource::get,
+            .ble_exposure_status_context = &ble,
+            .ble_enable_provider = BleSource::enable,
+            .ble_enable_context = &ble,
+            .ble_disable_provider = BleSource::disable,
+            .ble_disable_context = &ble,
             .hid_route_status_provider = RouteSource::get,
             .hid_route_status_context = &route,
             .hid_route_set_provider = RouteSource::set,
@@ -436,6 +494,7 @@ struct Fixture {
     StatusSource status;
     AuthoritySource authority;
     ExposureSource exposure;
+    BleSource ble;
     RouteSource route;
     ReleaseSource release;
     KeyboardSource keyboard;
@@ -471,6 +530,12 @@ struct Fixture {
             .usb_attach_context = &exposure,
             .usb_detach_provider = ExposureSource::detach,
             .usb_detach_context = &exposure,
+            .ble_exposure_status_provider = BleSource::get,
+            .ble_exposure_status_context = &ble,
+            .ble_enable_provider = BleSource::enable,
+            .ble_enable_context = &ble,
+            .ble_disable_provider = BleSource::disable,
+            .ble_disable_context = &ble,
             .hid_route_status_provider = RouteSource::get,
             .hid_route_status_context = &route,
             .hid_route_set_provider = RouteSource::set,
@@ -813,6 +878,7 @@ void test_identity_hello_and_info_shapes() {
              "protocol.hello-v1", "system.ping-v1", "system.info-v1",
              "usb.status-v1", "usb.exposure-control-v1", "hid.lease-v1", "hid.release-all-v1",
              "hid.keyboard-report-v1", "hid.mouse-report-v1", "firmware.identity-v1",
+             "hid.output-route-v1", "ble.exposure-control-v1",
          }) {
         assert(count_occurrences(hello, std::string("\"") + std::string(capability) + "\"") == 1);
     }
@@ -1379,7 +1445,7 @@ void test_hid_route_schema_frozen_retry_and_errors() {
     const std::string hello = fixture.sink.last();
     const std::string session = extract_string(hello, "session");
     assert(count_occurrences(hello, "\"hid.output-route-v1\"") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 11);
+    assert(count_occurrences(hello, "-v1\"") == 12);
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
 
     fixture.payload(request(2, session, "hid.route.status"));
@@ -1467,6 +1533,61 @@ void test_hid_route_schema_frozen_retry_and_errors() {
     }
 }
 
+void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string hello = fixture.sink.last();
+    const std::string session = extract_string(hello, "session");
+    assert(hello.size() <= kMaxLogicalMachineFrameBytes);
+    assert(count_occurrences(hello, "ble.exposure-control-v1") == 1);
+    assert(count_occurrences(hello, "-v1\"") == 12);
+
+    fixture.payload(request(2, session, "ble.exposure.status"));
+    const std::string cold = fixture.sink.last();
+    require_contains(cold,
+        "\"result\":{\"desired\":\"hidden\",\"observed\":\"uninitialized\","
+        "\"generation\":0,\"stack_ready\":false,\"advertising\":false,"
+        "\"connected\":false,\"recovery_required\":false,\"last_error\":null}");
+    assert(cold.find("address") == std::string::npos);
+    assert(cold.find("passkey") == std::string::npos);
+    assert(cold.find("bond") == std::string::npos);
+    assert(cold.find("encrypted") == std::string::npos);
+
+    fixture.ble.advance_before_return = true;
+    const std::string enable_request = request(3, session, "ble.enable");
+    const auto authority_before = fixture.authority.epoch;
+    fixture.payload(enable_request);
+    const std::string accepted = fixture.sink.last();
+    require_contains(accepted, "\"desired\":\"exposed\",\"observed\":\"enabling\"");
+    require_contains(accepted, "\"generation\":1,\"stack_ready\":false");
+    assert(fixture.ble.status.observed ==
+           control_protocol::BleExposureObserved::kAdvertising);
+    assert(fixture.authority.epoch == authority_before);
+    fixture.payload(enable_request);
+    assert(fixture.sink.last() == accepted);
+    assert(fixture.ble.enable_calls == 1);
+
+    fixture.payload(request(4, session, "system.ping"));
+    require_contains(fixture.sink.last(), "\"pong\":true");
+    fixture.payload(request(5, session, "ble.exposure.status"));
+    require_contains(fixture.sink.last(), "\"observed\":\"advertising\"");
+
+    fixture.payload(request(6, session, "ble.disable", "{\"unexpected\":true}"));
+    require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    assert(fixture.ble.disable_calls == 0);
+    fixture.payload(request(7, session, "ble.disable"));
+    require_contains(fixture.sink.last(), "\"observed\":\"disabling\"");
+    assert(fixture.authority.epoch == authority_before);
+
+    Fixture busy;
+    busy.payload(hello_request(1, kNonceA));
+    const std::string busy_session = extract_string(busy.sink.last(), "session");
+    busy.ble.enable_result = control_protocol::BleExposureActionResult::kBusy;
+    busy.payload(request(2, busy_session, "ble.enable"));
+    require_contains(busy.sink.last(), "\"code\":\"HID_BUSY\"");
+    assert(busy.ble.status.generation == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1486,6 +1607,7 @@ int main() {
     test_keyboard_report_schema_result_and_cache();
     test_mouse_report_schema_result_and_cache();
     test_hid_route_schema_frozen_retry_and_errors();
+    test_ble_exposure_schema_frozen_retry_and_authority_isolation();
     test_identity_hello_and_info_shapes();
     test_invalid_identity_rejected_at_protocol_initialization();
     return 0;

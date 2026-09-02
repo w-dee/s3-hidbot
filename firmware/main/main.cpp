@@ -9,6 +9,7 @@
 #include "hid_runtime/hid_runtime.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
 #include "ble_transport/ble_transport.hpp"
+#include "ble_hid_service/ble_hid_service.hpp"
 #include "uart_control_transport/uart_control_transport.hpp"
 #include "firmware_identity/firmware_identity.hpp"
 #include "firmware_identity_adapter.hpp"
@@ -39,6 +40,7 @@ constexpr uint8_t kMouseStringIndex = 5;
 hid_runtime::Runtime s_hid_runtime;
 hid_control_executor::Controller s_usb_exposure;
 ble_transport::Backend s_ble_backend;
+ble_hid_service::Database s_ble_hid_database;
 firmware_identity::Identity s_firmware_identity;
 
 control_protocol::UsbStatus usb_status(void *) {
@@ -143,6 +145,84 @@ control_protocol::UsbExposureActionOutcome usb_detach(void *) {
         default:
             return {};
     }
+}
+
+control_protocol::BleExposureStatus make_ble_exposure_status(
+    const ble_lifecycle::Snapshot &snapshot) {
+    const auto observed = [](ble_lifecycle::ObservedState value) {
+        switch (value) {
+            case ble_lifecycle::ObservedState::kEnabling:
+                return control_protocol::BleExposureObserved::kEnabling;
+            case ble_lifecycle::ObservedState::kIdle:
+                return control_protocol::BleExposureObserved::kIdle;
+            case ble_lifecycle::ObservedState::kAdvertising:
+                return control_protocol::BleExposureObserved::kAdvertising;
+            case ble_lifecycle::ObservedState::kConnected:
+                return control_protocol::BleExposureObserved::kConnected;
+            case ble_lifecycle::ObservedState::kDisabling:
+                return control_protocol::BleExposureObserved::kDisabling;
+            case ble_lifecycle::ObservedState::kFault:
+                return control_protocol::BleExposureObserved::kFault;
+            case ble_lifecycle::ObservedState::kUninitialized:
+            default:
+                return control_protocol::BleExposureObserved::kUninitialized;
+        }
+    };
+    const auto operation = [](ble_lifecycle::Operation value) {
+        switch (value) {
+            case ble_lifecycle::Operation::kEnable:
+                return control_protocol::BleExposureOperation::kEnable;
+            case ble_lifecycle::Operation::kDisable:
+                return control_protocol::BleExposureOperation::kDisable;
+            case ble_lifecycle::Operation::kRuntime:
+            default:
+                return control_protocol::BleExposureOperation::kRuntime;
+        }
+    };
+    return {
+        .desired = snapshot.desired == ble_lifecycle::DesiredExposure::kExposed
+                       ? control_protocol::BleExposureDesired::kExposed
+                       : control_protocol::BleExposureDesired::kHidden,
+        .observed = observed(snapshot.observed),
+        .generation = snapshot.generation,
+        .stack_ready = snapshot.stack_ready,
+        .advertising = snapshot.advertising,
+        .connected = snapshot.connected,
+        .recovery_required = snapshot.recovery_required,
+        .last_error = {.present = snapshot.last_error.present,
+                       .operation = operation(snapshot.last_error.operation),
+                       .code = snapshot.last_error.code},
+    };
+}
+
+control_protocol::BleExposureStatus ble_exposure_status(void *) {
+    return make_ble_exposure_status(s_usb_exposure.ble_snapshot());
+}
+
+control_protocol::BleExposureActionOutcome ble_action(
+    hid_control_executor::BleCommandOutcome outcome) {
+    const auto result = [](ble_lifecycle::TransitionResult value) {
+        switch (value) {
+            case ble_lifecycle::TransitionResult::kAccepted:
+                return control_protocol::BleExposureActionResult::kAccepted;
+            case ble_lifecycle::TransitionResult::kNoOp:
+                return control_protocol::BleExposureActionResult::kNoOp;
+            case ble_lifecycle::TransitionResult::kBusy:
+            default:
+                return control_protocol::BleExposureActionResult::kBusy;
+        }
+    };
+    return {.action_result = result(outcome.action_result),
+            .snapshot_valid = outcome.snapshot_valid,
+            .snapshot = make_ble_exposure_status(outcome.snapshot)};
+}
+
+control_protocol::BleExposureActionOutcome ble_enable(void *) {
+    return ble_action(s_usb_exposure.request_ble_enable());
+}
+
+control_protocol::BleExposureActionOutcome ble_disable(void *) {
+    return ble_action(s_usb_exposure.request_ble_disable());
 }
 
 control_protocol::HidRouteStatus make_hid_route_status(
@@ -525,7 +605,7 @@ extern "C" void app_main() {
     }
     s_hid_runtime.initialize();
     if (!s_usb_exposure.initialize(&s_hid_runtime, &s_usb_backend,
-                                   &s_ble_backend)) {
+                                   &s_ble_backend, &s_ble_hid_database)) {
         ESP_LOGE(kLogTag, "USB lifecycle task initialization failed");
         std::abort();
     }
@@ -566,6 +646,12 @@ extern "C" void app_main() {
         .usb_attach_context = nullptr,
         .usb_detach_provider = usb_detach,
         .usb_detach_context = nullptr,
+        .ble_exposure_status_provider = ble_exposure_status,
+        .ble_exposure_status_context = nullptr,
+        .ble_enable_provider = ble_enable,
+        .ble_enable_context = nullptr,
+        .ble_disable_provider = ble_disable,
+        .ble_disable_context = nullptr,
         .hid_route_status_provider = hid_route_status,
         .hid_route_status_context = nullptr,
         .hid_route_set_provider = hid_route_set,

@@ -86,6 +86,41 @@ struct UsbExposureActionOutcome {
 using UsbExposureStatusProvider = UsbExposureStatus (*)(void *context);
 using UsbExposureActionProvider = UsbExposureActionOutcome (*)(void *context);
 
+enum class BleExposureDesired : std::uint8_t { kHidden, kExposed };
+enum class BleExposureObserved : std::uint8_t {
+    kUninitialized,
+    kEnabling,
+    kIdle,
+    kAdvertising,
+    kConnected,
+    kDisabling,
+    kFault,
+};
+enum class BleExposureOperation : std::uint8_t { kEnable, kDisable, kRuntime };
+struct BleExposureLastError {
+    bool present = false;
+    BleExposureOperation operation = BleExposureOperation::kRuntime;
+    std::int32_t code = 0;
+};
+struct BleExposureStatus {
+    BleExposureDesired desired = BleExposureDesired::kHidden;
+    BleExposureObserved observed = BleExposureObserved::kUninitialized;
+    std::uint32_t generation = 0;
+    bool stack_ready = false;
+    bool advertising = false;
+    bool connected = false;
+    bool recovery_required = false;
+    BleExposureLastError last_error{};
+};
+enum class BleExposureActionResult : std::uint8_t { kAccepted, kNoOp, kBusy };
+struct BleExposureActionOutcome {
+    BleExposureActionResult action_result = BleExposureActionResult::kBusy;
+    bool snapshot_valid = false;
+    BleExposureStatus snapshot{};
+};
+using BleExposureStatusProvider = BleExposureStatus (*)(void *context);
+using BleExposureActionProvider = BleExposureActionOutcome (*)(void *context);
+
 enum class OutputRoute : std::uint8_t {
     kNone,
     kUsb,
@@ -208,6 +243,12 @@ struct Config {
     void *usb_attach_context;
     UsbExposureActionProvider usb_detach_provider;
     void *usb_detach_context;
+    BleExposureStatusProvider ble_exposure_status_provider;
+    void *ble_exposure_status_context;
+    BleExposureActionProvider ble_enable_provider;
+    void *ble_enable_context;
+    BleExposureActionProvider ble_disable_provider;
+    void *ble_disable_context;
     HidRouteStatusProvider hid_route_status_provider;
     void *hid_route_status_context;
     HidRouteActionProvider hid_route_set_provider;

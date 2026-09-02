@@ -53,6 +53,7 @@ OPTIONAL_CAPABILITIES = frozenset(
         "hid.mouse-report-v1",
         "firmware.identity-v1",
         "hid.output-route-v1",
+        "ble.exposure-control-v1",
     }
 )
 KNOWN_OPTIONAL_CAPABILITIES = OPTIONAL_CAPABILITIES
@@ -172,6 +173,41 @@ class UsbExposureStatus:
     host_release_uncertain: bool
     recovery_required: bool
     last_error: UsbExposureLastError | None
+
+
+class BleExposureDesired(str, Enum):
+    HIDDEN = "hidden"
+    EXPOSED = "exposed"
+
+
+class BleExposureObserved(str, Enum):
+    UNINITIALIZED = "uninitialized"
+    ENABLING = "enabling"
+    IDLE = "idle"
+    ADVERTISING = "advertising"
+    CONNECTED = "connected"
+    DISABLING = "disabling"
+    FAULT = "fault"
+
+
+@dataclass(frozen=True)
+class BleExposureLastError:
+    operation: Literal["enable", "disable", "runtime"]
+    code: int
+
+
+@dataclass(frozen=True)
+class BleExposureStatus:
+    """Strict ble.exposure-control-v1 transport lifecycle snapshot."""
+
+    desired: BleExposureDesired
+    observed: BleExposureObserved
+    generation: int
+    stack_ready: bool
+    advertising: bool
+    connected: bool
+    recovery_required: bool
+    last_error: BleExposureLastError | None
 
 
 class OutputRoute(str, Enum):
@@ -625,6 +661,63 @@ def validate_usb_exposure_status(value: Any) -> UsbExposureStatus:
         mouse_ready=value["mouse_ready"],
         safety_pending=value["safety_pending"],
         host_release_uncertain=value["host_release_uncertain"],
+        recovery_required=value["recovery_required"],
+        last_error=last_error,
+    )
+
+
+def validate_ble_exposure_status(value: Any) -> BleExposureStatus:
+    fields = {
+        "desired",
+        "observed",
+        "generation",
+        "stack_ready",
+        "advertising",
+        "connected",
+        "recovery_required",
+        "last_error",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProtocolError("ble.exposure.status result fields are invalid")
+    try:
+        desired = BleExposureDesired(value["desired"])
+        observed = BleExposureObserved(value["observed"])
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("BLE exposure lifecycle state is invalid") from exc
+    generation = value["generation"]
+    if type(generation) is not int or not 0 <= generation <= MAX_USB_GENERATION:
+        raise ProtocolError("BLE exposure generation is invalid")
+    bool_fields = ("stack_ready", "advertising", "connected", "recovery_required")
+    if any(type(value[name]) is not bool for name in bool_fields):
+        raise ProtocolError("BLE exposure boolean state is invalid")
+    if observed is BleExposureObserved.UNINITIALIZED and (
+        value["stack_ready"] or value["advertising"] or value["connected"]
+    ):
+        raise ProtocolError("BLE uninitialized state is incoherent")
+    if value["advertising"] and value["connected"]:
+        raise ProtocolError("BLE cannot advertise and be connected simultaneously")
+    raw_error = value["last_error"]
+    last_error: BleExposureLastError | None = None
+    if raw_error is not None:
+        if not isinstance(raw_error, dict) or set(raw_error) != {"operation", "code"}:
+            raise ProtocolError("BLE exposure last_error fields are invalid")
+        operation = raw_error["operation"]
+        code = raw_error["code"]
+        if operation not in {"enable", "disable", "runtime"}:
+            raise ProtocolError("BLE exposure last_error operation is invalid")
+        if type(code) is not int or not -(2**31) <= code <= 2**31 - 1:
+            raise ProtocolError("BLE exposure last_error code is invalid")
+        last_error = BleExposureLastError(
+            operation=cast(Literal["enable", "disable", "runtime"], operation),
+            code=code,
+        )
+    return BleExposureStatus(
+        desired=desired,
+        observed=observed,
+        generation=generation,
+        stack_ready=value["stack_ready"],
+        advertising=value["advertising"],
+        connected=value["connected"],
         recovery_required=value["recovery_required"],
         last_error=last_error,
     )
