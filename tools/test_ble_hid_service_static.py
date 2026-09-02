@@ -98,6 +98,20 @@ def main() -> int:
         assert f"BLE_GAP_SUBSCRIBE_REASON_{reason}" in transport
     assert "database_->on_subscribe" not in transport
     assert "BleEventKind::kSubscription" in transport
+    assert "CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1" in sdkconfig_defaults
+    orphan = re.search(
+        r"Backend::terminate_orphan_connection\((.*?)\n\}", transport, re.DOTALL
+    )
+    assert orphan is not None
+    assert "ble_gap_terminate(connection_handle" in orphan.group(1)
+    signal = re.search(
+        r"bool Controller::signal_ble_event\(BleEvent event\) \{(.*?)\n\}",
+        (ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp").read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    assert signal is not None
+    assert "event.kind == BleEventKind::kConnect" in signal.group(1)
+    assert "terminate_orphan_connection(" in signal.group(1)
     assert "submit_ble_keyboard" not in main
     assert "submit_ble_mouse" not in main
     assert "hid.output-route-v2" not in control_protocol

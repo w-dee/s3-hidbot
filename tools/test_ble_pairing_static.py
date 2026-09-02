@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> int:
     executor_header = (ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp").read_text()
     executor = (ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp").read_text()
+    transport_header = (ROOT / "firmware/components/ble_transport/include/ble_transport/ble_transport.hpp").read_text()
     transport = (ROOT / "firmware/components/ble_transport/ble_transport.cpp").read_text()
     pairing_header = (ROOT / "firmware/components/ble_pairing/include/ble_pairing/ble_pairing.hpp").read_text()
     protocol = (ROOT / "firmware/components/control_protocol/control_protocol.cpp").read_text()
@@ -35,6 +36,8 @@ def main() -> int:
     assert "mark_ble_event_overflow(event);" in executor
     assert "overflow_authority_.compare_exchange_weak(" in executor
     assert "ble_event_overflow_pending(lifecycle.generation)" in executor
+    assert "ble_lifecycle_handoff_failure_.store(true" in executor
+    assert "reconcile_ble_lifecycle_handoff_failure()" in executor
     for obsolete in ("std::atomic_bool ble_event_overflow_{",
                      "overflow_generation_", "overflow_connection_"):
         assert obsolete not in executor_header
@@ -59,6 +62,8 @@ def main() -> int:
     assert "persistent_store_failure_observed()" in process.group(1)
     assert "commit_persistent_store_failure(" in process.group(1)
     assert process.group(1).index("persistent_store_failure_observed()") < \
+        process.group(1).index("reconcile_ble_lifecycle_handoff_failure()")
+    assert process.group(1).index("reconcile_ble_lifecycle_handoff_failure()") < \
         process.group(1).index("consume_ble_overflow()")
     fatal_commit = re.search(
         r"void Controller::commit_persistent_store_failure\((.*?)"
@@ -68,6 +73,34 @@ def main() -> int:
     assert "apply_persistent_store_failure(" in fatal_commit.group(1)
     assert "fail_ble(" in fatal_commit.group(1)
     assert "persistent_store_failure_committed_ = true" in fatal_commit.group(1)
+
+    sync = re.search(
+        r"void Backend::on_sync\(\) \{(.*?)\n\}", transport, re.S)
+    assert sync
+    assert sync.group(1).index("instance_->signal(") < \
+        sync.group(1).index("signal_ble_lifecycle_handoff_failure()") < \
+        sync.group(1).index("instance_->cancel_timeout(")
+    assert "LifecycleTimeoutPurpose::kSync" in sync.group(1)
+    reset = re.search(
+        r"void Backend::on_reset\(int reason\) \{(.*?)\n\}", transport, re.S)
+    assert reset
+    assert "!published || timeout_result != ESP_OK" in reset.group(1)
+    assert "signal_ble_lifecycle_handoff_failure()" in reset.group(1)
+    timeout = re.search(
+        r"void Backend::timeout_callback\(void \*context\) \{(.*?)\n\}",
+        transport, re.S)
+    assert timeout
+    assert "timeout_purpose_.exchange(" in timeout.group(1)
+    assert timeout.group(1).index("backend->signal(") < \
+        timeout.group(1).index("signal_ble_lifecycle_handoff_failure()")
+    disconnect = re.search(
+        r"case BLE_GAP_EVENT_DISCONNECT:(.*?)break;", transport, re.S)
+    assert disconnect
+    assert disconnect.group(1).index("backend->signal(") < \
+        disconnect.group(1).index("backend->cancel_timeout(")
+    assert "LifecycleTimeoutPurpose::kDisconnect" in disconnect.group(1)
+    assert "std::atomic<LifecycleTimeoutPurpose>::is_always_lock_free" in \
+        transport_header
 
     disable_request = re.search(
         r"BleCommandOutcome Controller::request_ble_disable\(\) \{(.*?)"

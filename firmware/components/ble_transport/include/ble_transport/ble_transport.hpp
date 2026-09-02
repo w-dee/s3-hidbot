@@ -23,6 +23,8 @@ class Backend final : public hid_control_executor::BleBackend {
     std::int32_t start_advertising() override;
     std::int32_t stop_advertising() override;
     std::int32_t disconnect(std::uint16_t connection_handle) override;
+    std::int32_t terminate_orphan_connection(
+        std::uint16_t connection_handle) override;
     std::int32_t configure_connection(
         std::uint16_t connection_handle) override;
     std::int32_t initiate_security(
@@ -60,13 +62,20 @@ class Backend final : public hid_control_executor::BleBackend {
     static int on_gap_event(struct ble_gap_event *event, void *context);
 
   private:
+    enum class LifecycleTimeoutPurpose : std::uint8_t {
+        kNone,
+        kSync,
+        kDisconnect,
+    };
+
     bool signal(hid_control_executor::BleEventKind kind,
                 std::uint16_t connection_handle, std::int32_t status);
     static void host_task(void *context);
     static void timeout_callback(void *context);
     static void pairing_timeout_callback(void *context);
-    void arm_timeout(std::uint64_t microseconds);
-    void cancel_timeout();
+    std::int32_t arm_timeout(std::uint64_t microseconds,
+                             LifecycleTimeoutPurpose purpose);
+    void cancel_timeout(LifecycleTimeoutPurpose purpose);
     void observe_store_failure(ble_security::StoreFailureKind kind,
                                std::int32_t status,
                                bool persistent_store_unhealthy,
@@ -94,6 +103,9 @@ class Backend final : public hid_control_executor::BleBackend {
     std::uint8_t own_address_type_ = 0;
     bool initialized_ = false;
     esp_timer_handle_t timeout_timer_ = nullptr;
+    static_assert(std::atomic<LifecycleTimeoutPurpose>::is_always_lock_free);
+    std::atomic<LifecycleTimeoutPurpose> timeout_purpose_{
+        LifecycleTimeoutPurpose::kNone};
     esp_timer_handle_t pairing_timer_ = nullptr;
     std::atomic<ble_lifecycle::Generation> pairing_timer_generation_{0};
     std::atomic<std::uint16_t> pairing_timer_connection_{

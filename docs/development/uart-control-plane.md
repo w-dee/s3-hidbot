@@ -89,6 +89,24 @@ or carry it into a later authority. Overflow remains a fail-closed,
 recovery-required BLE lifecycle fault. StoreFull itself remains local and does
 not set the boot-global persistent-store latch, although losing its detailed
 event to queue overflow invokes the independent generic recovery policy. The
+Reset/Sync ownership transfer has a separate boot-lifetime, lock-free failure
+latch because the NimBLE backend can legitimately publish the post-Reset
+generation before the executor consumes the retired-generation Reset event. A
+failed Reset, Sync, or one-shot lifecycle-timeout enqueue sets this latch before
+the Sync watchdog is cancelled. A lock-free timer-purpose discriminator ensures
+that Sync and Disconnect callbacks cancel only their own watchdog, and a
+Disconnect callback does so only after its event is queued. The next executor
+boundary commits one
+recovery-required queue fault and suppresses all later BLE callback actions
+until reboot. Thus a lost Sync or terminal timeout cannot strand the lifecycle
+in `enabling`, stale ordinary Sync events cannot complete a newer generation,
+and generation wrap does not hide the handoff failure. A successful Connect
+whose event cannot enter the queue is not adopted as executor peer state. The
+Connect callback immediately requests termination of its exact NimBLE handle;
+the configured one-connection limit and absence of deferred handle state
+prevent that teardown from reaching a later peer. Logical queue-overflow
+recovery remains authoritative even if the termination request is rejected or
+the resulting orphan Disconnect event is itself stale. The
 compiled notification adapter uses
 `ble_gatts_notify_custom()` with exact 8-byte keyboard and 5-byte mouse values;
 acceptance means only local NimBLE stack acceptance. It has no UART command,

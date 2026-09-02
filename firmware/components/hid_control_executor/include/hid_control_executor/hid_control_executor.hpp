@@ -139,6 +139,12 @@ class BleEventSink {
     virtual ~BleEventSink() = default;
     // Callback-safe: implementations must use bounded, zero-wait signaling.
     virtual bool signal_ble_event(BleEvent event) = 0;
+    // Called only after a Reset, post-Reset Sync, or one-shot lifecycle timeout
+    // event could not enter the fixed queue. This is a durable fail-closed
+    // handoff, not a generic event authority, so a backend generation that
+    // legitimately leads the executor cannot be mistaken for an arbitrary
+    // future generic overflow.
+    virtual void signal_ble_lifecycle_handoff_failure() = 0;
 };
 
 class BleDatabase {
@@ -174,6 +180,10 @@ class BleBackend {
     virtual std::int32_t start_advertising() = 0;
     virtual std::int32_t stop_advertising() = 0;
     virtual std::int32_t disconnect(std::uint16_t connection_handle) = 0;
+    // Callback-safe immediate teardown for a successful physical Connect whose
+    // event could not be delivered. The executor never adopts this connection.
+    virtual std::int32_t terminate_orphan_connection(
+        std::uint16_t connection_handle) = 0;
     virtual std::int32_t configure_connection(
         std::uint16_t connection_handle) = 0;
     virtual std::int32_t initiate_security(
@@ -302,6 +312,7 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     bool schedule(usb_lifecycle::ExecutorAction action,
                   usb_lifecycle::Snapshot snapshot) override;
     bool signal_ble_event(BleEvent event) override;
+    void signal_ble_lifecycle_handoff_failure() override;
 
     // Internal U7.4A seams. They are not wired to UART, public HID commands,
     // or route selection. Submission callers must already be executing in
@@ -348,6 +359,8 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     void mark_ble_event_overflow(BleEvent event);
     bool ble_event_overflow_pending(
         ble_lifecycle::Generation generation) const;
+    bool reconcile_ble_lifecycle_handoff_failure();
+    void fail_current_ble_queue_overflow();
     bool consume_ble_overflow();
     void reconcile_pairing_deadline();
     PairingStatusSnapshot current_pairing_status() const;
@@ -386,6 +399,12 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     static_assert(std::atomic_bool::is_always_lock_free);
     std::atomic<ble_lifecycle::Generation> overflow_authority_{0};
     std::atomic_bool overflow_authority_zero_{false};
+    // Reset/Sync is a lifecycle ownership transfer: the backend may already
+    // own the next generation while the executor still owns the retired one.
+    // A failed publication is therefore a separate boot-lifetime fail-closed
+    // latch, not another generation mailbox. It is monotonic until reboot.
+    std::atomic_bool ble_lifecycle_handoff_failure_{false};
+    bool ble_lifecycle_handoff_failure_committed_ = false;
     // Executor-owned acknowledgment of the boot-lifetime backend latch.
     // The callback-side latch itself remains monotonic and authoritative.
     bool persistent_store_failure_committed_ = false;

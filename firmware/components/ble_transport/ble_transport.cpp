@@ -143,9 +143,14 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
             return database_result;
         }
     }
+    result = arm_timeout(kSyncTimeoutUs, LifecycleTimeoutPurpose::kSync);
+    if (result != ESP_OK) {
+        instance_ = nullptr;
+        sink_ = nullptr;
+        return result;
+    }
     initialized_ = true;
     nimble_port_freertos_init(host_task);
-    arm_timeout(kSyncTimeoutUs);
     return 0;
 }
 
@@ -160,10 +165,19 @@ void Backend::host_task(void *) { nimble_port_run(); }
 
 void Backend::timeout_callback(void *context) {
     auto *backend = static_cast<Backend *>(context);
-    if (backend != nullptr) {
-        (void)backend->signal(hid_control_executor::BleEventKind::kTimeout,
-                              ble_lifecycle::kNoConnection,
-                              kLifecycleTimeoutError);
+    if (backend != nullptr &&
+        backend->timeout_purpose_.exchange(
+            LifecycleTimeoutPurpose::kNone, std::memory_order_acq_rel) !=
+            LifecycleTimeoutPurpose::kNone) {
+        const bool published = backend->signal(
+            hid_control_executor::BleEventKind::kTimeout,
+            ble_lifecycle::kNoConnection, kLifecycleTimeoutError);
+        if (!published && backend->sink_ != nullptr) {
+            // A one-shot timer has no remaining fallback after this callback.
+            // Preserve its terminal observation even if the backend generation
+            // legitimately leads the executor across a Reset handoff.
+            backend->sink_->signal_ble_lifecycle_handoff_failure();
+        }
     }
 }
 
@@ -183,14 +197,32 @@ void Backend::pairing_timeout_callback(void *context) {
     }
 }
 
-void Backend::arm_timeout(std::uint64_t microseconds) {
-    cancel_timeout();
-    (void)esp_timer_start_once(timeout_timer_, microseconds);
-}
-
-void Backend::cancel_timeout() {
+std::int32_t Backend::arm_timeout(std::uint64_t microseconds,
+                                  LifecycleTimeoutPurpose purpose) {
+    timeout_purpose_.store(LifecycleTimeoutPurpose::kNone,
+                           std::memory_order_release);
     if (timeout_timer_ != nullptr && esp_timer_is_active(timeout_timer_)) {
         (void)esp_timer_stop(timeout_timer_);
+    }
+    timeout_purpose_.store(purpose, std::memory_order_release);
+    const esp_err_t result = esp_timer_start_once(timeout_timer_, microseconds);
+    if (result != ESP_OK) {
+        LifecycleTimeoutPurpose expected = purpose;
+        (void)timeout_purpose_.compare_exchange_strong(
+            expected, LifecycleTimeoutPurpose::kNone,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    return result;
+}
+
+void Backend::cancel_timeout(LifecycleTimeoutPurpose purpose) {
+    LifecycleTimeoutPurpose expected = purpose;
+    if (timeout_purpose_.compare_exchange_strong(
+            expected, LifecycleTimeoutPurpose::kNone,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        if (timeout_timer_ != nullptr && esp_timer_is_active(timeout_timer_)) {
+            (void)esp_timer_stop(timeout_timer_);
+        }
     }
 }
 
@@ -209,15 +241,23 @@ void Backend::on_sync() {
     if (instance_ == nullptr) {
         return;
     }
-    instance_->cancel_timeout();
     int result = ble_hs_util_ensure_addr(0);
     if (result == 0) {
         result = ble_hs_id_infer_auto(0, &instance_->own_address_type_);
     }
-    (void)instance_->signal(result == 0
-                                ? hid_control_executor::BleEventKind::kSync
-                                : hid_control_executor::BleEventKind::kTimeout,
-                            ble_lifecycle::kNoConnection, result);
+    if (instance_->sink_ == nullptr) {
+        return;
+    }
+    const bool published = instance_->signal(
+        result == 0 ? hid_control_executor::BleEventKind::kSync
+                    : hid_control_executor::BleEventKind::kTimeout,
+        ble_lifecycle::kNoConnection, result);
+    if (!published) {
+        instance_->sink_->signal_ble_lifecycle_handoff_failure();
+    }
+    // The queued event or monotonic failure latch now owns progress. Never
+    // destroy the timer fallback before one of those durable paths exists.
+    instance_->cancel_timeout(LifecycleTimeoutPurpose::kSync);
 }
 
 void Backend::on_reset(int reason) {
@@ -233,14 +273,18 @@ void Backend::on_reset(int reason) {
         instance_->current_connection_.store(ble_lifecycle::kNoConnection,
                                              std::memory_order_release);
         instance_->identity_resolved_.store(false, std::memory_order_release);
-        instance_->arm_timeout(kSyncTimeoutUs);
+        const std::int32_t timeout_result = instance_->arm_timeout(
+            kSyncTimeoutUs, LifecycleTimeoutPurpose::kSync);
         if (instance_->sink_ != nullptr) {
-            (void)instance_->sink_->signal_ble_event({
+            const bool published = instance_->sink_->signal_ble_event({
                 .kind = hid_control_executor::BleEventKind::kReset,
                 .generation = retired,
                 .connection_handle = ble_lifecycle::kNoConnection,
                 .status = reason,
             });
+            if (!published || timeout_result != ESP_OK) {
+                instance_->sink_->signal_ble_lifecycle_handoff_failure();
+            }
         }
     }
 }
@@ -259,10 +303,15 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 event->connect.conn_handle, event->connect.status);
             break;
         case BLE_GAP_EVENT_DISCONNECT:
-            backend->cancel_timeout();
-            (void)backend->signal(hid_control_executor::BleEventKind::kDisconnect,
-                                  event->disconnect.conn.conn_handle,
-                                  event->disconnect.reason);
+            // Transfer progress ownership to the queued event before removing
+            // the disconnect watchdog. If publication fails, leaving the
+            // watchdog armed provides another bounded terminal observation.
+            if (backend->signal(hid_control_executor::BleEventKind::kDisconnect,
+                                event->disconnect.conn.conn_handle,
+                                event->disconnect.reason)) {
+                backend->cancel_timeout(
+                    LifecycleTimeoutPurpose::kDisconnect);
+            }
             break;
         case BLE_GAP_EVENT_ENC_CHANGE:
             (void)backend->signal(
@@ -394,10 +443,21 @@ std::int32_t Backend::stop_advertising() { return ble_gap_adv_stop(); }
 std::int32_t Backend::disconnect(std::uint16_t connection_handle) {
     const int result =
         ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
-    if (result == 0) {
-        arm_timeout(kDisconnectTimeoutUs);
+    if (result != 0) {
+        return result;
     }
-    return result;
+    return arm_timeout(kDisconnectTimeoutUs,
+                       LifecycleTimeoutPurpose::kDisconnect);
+}
+
+std::int32_t Backend::terminate_orphan_connection(
+    std::uint16_t connection_handle) {
+    // NimBLE invokes GAP callbacks without the host mutex held. This call
+    // issues the HCI Disconnect request without synchronously delivering the
+    // later application Disconnect event. With
+    // CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1, the request occurs before any later
+    // connection can reuse the callback-provided handle.
+    return ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
 std::int32_t Backend::configure_connection(std::uint16_t connection_handle) {

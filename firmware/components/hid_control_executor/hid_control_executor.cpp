@@ -120,6 +120,7 @@ BleHidPeerSnapshot Controller::ble_hid_peer_snapshot() const {
 
 bool Controller::ble_link_ready() const {
     if (ble_backend_ == nullptr || ble_database_ == nullptr ||
+        ble_lifecycle_handoff_failure_.load(std::memory_order_acquire) ||
         !ble_hid_peer_.active || ble_hid_peer_.suspended ||
         !ble_hid_peer_.keyboard_notify_enabled ||
         !ble_hid_peer_.mouse_notify_enabled) {
@@ -218,7 +219,21 @@ bool Controller::signal_ble_event(BleEvent event) {
         return true;
     }
     mark_ble_event_overflow(event);
+    if (event.kind == BleEventKind::kConnect && event.status == 0 &&
+        event.connection_handle != ble_lifecycle::kNoConnection &&
+        ble_backend_ != nullptr) {
+        // This runs synchronously in the successful GAP Connect callback. The
+        // physical link exists, but the executor did not adopt it because its
+        // event could not enter the queue. Terminate the exact callback handle;
+        // logical recovery remains governed by generic overflow handling.
+        (void)ble_backend_->terminate_orphan_connection(
+            event.connection_handle);
+    }
     return false;
+}
+
+void Controller::signal_ble_lifecycle_handoff_failure() {
+    ble_lifecycle_handoff_failure_.store(true, std::memory_order_release);
 }
 
 ControlOperation Controller::operation_for(usb_lifecycle::ExecutorAction action) {
@@ -377,6 +392,7 @@ bool Controller::ble_hid_interface_ready(
     BleHidWorkIdentity identity, BleHidInterface interface) const {
     if (!current_ble_hid_identity(identity, interface) ||
         ble_backend_ == nullptr || ble_database_ == nullptr ||
+        ble_lifecycle_handoff_failure_.load(std::memory_order_acquire) ||
         ble_hid_peer_.suspended) {
         return false;
     }
@@ -494,6 +510,15 @@ void Controller::process(Action action) {
                 : ble_security::StoreFailureKind::kWrite;
         commit_persistent_store_failure(
             kind, detailed ? action.ble_event.status : -3);
+    }
+    const bool lifecycle_handoff_failed =
+        reconcile_ble_lifecycle_handoff_failure();
+    // The handoff latch is boot-lifetime authoritative once set. Drop every
+    // queued BLE callback after its fault commit so an old Reset cannot revive
+    // the lifecycle into Enabling after the only Sync/timeout path was lost.
+    if (lifecycle_handoff_failed && action.kind == ActionKind::kBleEvent) {
+        (void)consume_ble_overflow();
+        return;
     }
     if (consume_ble_overflow() && action.kind == ActionKind::kBleEvent) {
         return;
@@ -825,6 +850,63 @@ bool Controller::ble_event_overflow_pending(
                      generation;
 }
 
+void Controller::fail_current_ble_queue_overflow() {
+    // A UART Stage-A transition can advance the lifecycle concurrently with
+    // this executor boundary. The handoff failure is boot-lifetime truth, so
+    // retry against the newly current generation instead of acknowledging a
+    // fault that lost that race.
+    while (true) {
+        const auto current = ble_state_.snapshot();
+        if (current.generation != ble_state_.generation()) {
+            continue;
+        }
+        const auto handle = ble_state_.connection_handle();
+        pairing_state_.fail_closed(current.generation, handle,
+                                   ble_pairing::LastResult::kQueueOverflow);
+        pairing_deadline_us_ = 0;
+        wipe_pairing_mailbox();
+        ble_backend_->cancel_pairing_timeout();
+        ble_backend_->mark_security_unhealthy(current.generation);
+        if (current.connected) {
+            (void)ble_backend_->disconnect(handle);
+        }
+        const auto active = active_operation_.load(std::memory_order_acquire);
+        const auto ble_owner =
+            current.observed == ble_lifecycle::ObservedState::kEnabling &&
+                    active == ControlOperation::kBleEnable
+                ? ControlOperation::kBleEnable
+                : current.observed ==
+                              ble_lifecycle::ObservedState::kDisabling &&
+                          active == ControlOperation::kBleDisable
+                      ? ControlOperation::kBleDisable
+                      : ControlOperation::kNone;
+        fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -2,
+                 ble_owner);
+        const auto terminal = ble_state_.snapshot();
+        if (terminal.generation == current.generation &&
+            terminal.observed == ble_lifecycle::ObservedState::kFault &&
+            terminal.recovery_required) {
+            return;
+        }
+    }
+}
+
+bool Controller::reconcile_ble_lifecycle_handoff_failure() {
+    if (!ble_lifecycle_handoff_failure_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!ble_lifecycle_handoff_failure_committed_) {
+        // Persistent-store fatal truth was reconciled first and retains its
+        // stronger Storage diagnosis. Otherwise commit QueueOverflow exactly
+        // once against whichever lifecycle authority is current now.
+        if (!persistent_store_failure_committed_) {
+            fail_current_ble_queue_overflow();
+        }
+        ble_lifecycle_handoff_failure_committed_ = true;
+    }
+    return true;
+}
+
 bool Controller::consume_ble_overflow() {
     if (ble_backend_ == nullptr) {
         return false;
@@ -851,7 +933,8 @@ bool Controller::consume_ble_overflow() {
             // The boot-global fatal store latch is reconciled first and has
             // already retired this authority more strongly. Do not replace
             // its retained storage diagnosis with the generic queue result.
-            if (persistent_store_failure_committed_) {
+            if (persistent_store_failure_committed_ ||
+                ble_lifecycle_handoff_failure_committed_) {
                 clear_authority();
                 return true;
             }

@@ -74,8 +74,18 @@ producer/consumer CAS interleaving, including generation-zero wrap. Dropped
 CCCD-disable and Control Point
 Suspend events inhibit readiness immediately, before the executor performs the
 single idempotent recovery fault. A stale producer can neither replace a
-current sticky token nor poison a newer lifecycle generation. These checks are
-included by `test-native.sh`, `test-static.sh`, and therefore canonical
+current sticky token nor poison a newer lifecycle generation. Reset/Sync
+handoff tests fill the final queue slot with the retired-generation Reset, drop
+the post-Reset Sync, and prove the monotonic handoff-failure latch reaches a
+recovery fault rather than permanent enabling. Normal, stale, repeated-reset,
+dropped lifecycle-timeout, timeout-ownership, and generation-wrap cases are
+also guarded. Dropped-Connect
+tests prove immediate exact-handle orphan termination, no false peer adoption,
+harmless orphan Disconnect processing, and retained logical fail-close when
+the termination API rejects the request. The target/static contract fixes
+production cardinality at one BLE connection and verifies the ESP-IDF v5.5.4
+callback-side termination call remains direct and non-deferred. These checks
+are included by `test-native.sh`, `test-static.sh`, and therefore canonical
 `test-nonhardware.sh`. An ESP-IDF target build remains mandatory because the
 service database, mbuf allocation, and NimBLE notification API are
 target-linked. None of these checks performs radio, serial, or hardware
