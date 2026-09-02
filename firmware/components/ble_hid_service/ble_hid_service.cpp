@@ -73,19 +73,26 @@ ble_gatt_chr_def s_characteristics[] = {
     {.uuid = &s_control_point.u,
      .access_cb = Database::access,
      .arg = target(AccessTarget::kControlPoint),
-     .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+     .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_AUTHEN,
+     .min_key_size = 16,
      .val_handle = &s_control_point_value_handle},
     {.uuid = &s_report.u,
      .access_cb = Database::access,
      .arg = target(AccessTarget::kKeyboardReport),
      .descriptors = s_keyboard_descriptors,
-     .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+     .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_AUTHEN |
+              BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN |
+              BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR,
+     .min_key_size = 16,
      .val_handle = &s_keyboard_value_handle},
     {.uuid = &s_report.u,
      .access_cb = Database::access,
      .arg = target(AccessTarget::kMouseReport),
      .descriptors = s_mouse_descriptors,
-     .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+     .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_AUTHEN |
+              BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN |
+              BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR,
+     .min_key_size = 16,
      .val_handle = &s_mouse_value_handle},
     {},
 };

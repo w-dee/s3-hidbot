@@ -26,6 +26,14 @@ stack in hidden idle. BLE lifecycle generation is independent of USB route and
 session authority, so simultaneous USB and BLE exposure is valid and neither
 transport's exposure command mutates the other's desired state.
 
+U7.5A fixes the internal BLE security prerequisite at authenticated passkey
+input, bonding, 16-byte keys, Secure Connections with authenticated legacy
+fallback, and a three-bond persistent NVS store. Capacity exhaustion is
+fail-closed and never evicts an existing bond. Project bond readiness requires
+an identity-qualified reread of both NimBLE `OUR_SEC` and `PEER_SEC` records;
+the NimBLE bonded bit alone is insufficient. This foundation adds no UART
+pairing command or capability and is not yet connected to HID output routing.
+
 Native USB is hidden by default: boot initializes HID/runtime state and its
 lifecycle task, then starts the UART control plane without calling
 `tinyusb_driver_install()`. CH343 UART is the bootstrap path. Only the

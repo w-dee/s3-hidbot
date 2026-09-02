@@ -7,6 +7,8 @@
 #include "esp_log.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
+#include "host/ble_sm.h"
+#include "host/ble_store.h"
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
@@ -14,6 +16,9 @@
 #include "nvs_flash.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#include "store/config/ble_store_config.h"
+
+extern "C" void ble_store_config_init(void);
 
 namespace ble_transport {
 namespace {
@@ -61,10 +66,34 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     }
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
-    ble_hs_cfg.sm_bonding = 0;
-    ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 0;
-    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_KEYBOARD_ONLY;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 1;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_sc_only = 0;
+    ble_hs_cfg.sm_sec_lvl = 3;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
+    ble_hs_cfg.sm_their_key_dist =
+        BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+
+    // Install the supported NimBLE store, then interpose only enough to
+    // observe failures. Every wrapper delegates to the saved implementation
+    // exactly once and never examines or logs secret material.
+    ble_store_config_init();
+    original_store_read_ = ble_hs_cfg.store_read_cb;
+    original_store_write_ = ble_hs_cfg.store_write_cb;
+    original_store_delete_ = ble_hs_cfg.store_delete_cb;
+    if (original_store_read_ == nullptr || original_store_write_ == nullptr ||
+        original_store_delete_ == nullptr) {
+        instance_ = nullptr;
+        sink_ = nullptr;
+        return ESP_ERR_INVALID_STATE;
+    }
+    ble_hs_cfg.store_read_cb = store_read;
+    ble_hs_cfg.store_write_cb = store_write;
+    ble_hs_cfg.store_delete_cb = store_delete;
+    ble_hs_cfg.store_status_cb = store_status;
+    ble_hs_cfg.store_status_arg = this;
     // Queue the mandatory standard server foundation before the project
     // service. ble_gatts_start() consumes all queued definitions when the
     // NimBLE host task starts.
@@ -163,6 +192,10 @@ void Backend::on_reset(int reason) {
         // so a following sync callback already carries the new identity.
         const auto retired = instance_->generation_.fetch_add(
             1, std::memory_order_acq_rel);
+        instance_->security_.mark_lifecycle_unhealthy(retired);
+        instance_->current_connection_.store(ble_lifecycle::kNoConnection,
+                                             std::memory_order_release);
+        instance_->identity_resolved_.store(false, std::memory_order_release);
         instance_->arm_timeout(kSyncTimeoutUs);
         if (instance_->sink_ != nullptr) {
             (void)instance_->sink_->signal_ble_event({
@@ -182,6 +215,17 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
     }
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0) {
+                const auto generation =
+                    backend->generation_.load(std::memory_order_acquire);
+                backend->current_connection_.store(event->connect.conn_handle,
+                                                   std::memory_order_release);
+                backend->identity_resolved_.store(false,
+                                                  std::memory_order_release);
+                backend->security_.begin_connection(
+                    generation, event->connect.conn_handle);
+                backend->refresh_security(event->connect.conn_handle);
+            }
             (void)backend->signal(
                 event->connect.status == 0
                     ? hid_control_executor::BleEventKind::kConnect
@@ -190,10 +234,44 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
             break;
         case BLE_GAP_EVENT_DISCONNECT:
             backend->cancel_timeout();
+            backend->security_.retire_connection(
+                backend->generation_.load(std::memory_order_acquire),
+                event->disconnect.conn.conn_handle);
+            backend->current_connection_.store(ble_lifecycle::kNoConnection,
+                                               std::memory_order_release);
+            backend->identity_resolved_.store(false,
+                                              std::memory_order_release);
             (void)backend->signal(hid_control_executor::BleEventKind::kDisconnect,
                                   event->disconnect.conn.conn_handle,
                                   event->disconnect.reason);
             break;
+        case BLE_GAP_EVENT_ENC_CHANGE:
+            backend->refresh_security(event->enc_change.conn_handle);
+            break;
+        case BLE_GAP_EVENT_IDENTITY_RESOLVED:
+            backend->refresh_security(event->identity_resolved.conn_handle,
+                                      true);
+            break;
+        case BLE_GAP_EVENT_PARING_COMPLETE:
+            // NimBLE v5.5.4 emits this after SMP key exchange. Its SMP path
+            // does not propagate all store-write failures, so reread both
+            // security records rather than trusting the bonded bit.
+            backend->refresh_security(event->pairing_complete.conn_handle);
+            break;
+        case BLE_GAP_EVENT_AUTHORIZE: {
+            ble_gap_conn_desc descriptor{};
+            const bool accepted =
+                ble_gap_conn_find(event->authorize.conn_handle, &descriptor) ==
+                    0 &&
+                descriptor.sec_state.encrypted &&
+                descriptor.sec_state.authenticated &&
+                descriptor.sec_state.key_size ==
+                    ble_security::kRequiredKeySize;
+            event->authorize.out_response =
+                accepted ? BLE_GAP_AUTHORIZE_ACCEPT
+                         : BLE_GAP_AUTHORIZE_REJECT;
+            break;
+        }
         case BLE_GAP_EVENT_ADV_COMPLETE:
             (void)backend->signal(
                 hid_control_executor::BleEventKind::kAdvertisingComplete,
@@ -275,6 +353,139 @@ void Backend::record_heap_checkpoint(HeapCheckpoint checkpoint) {
              static_cast<unsigned>(heap_caps_get_free_size(capabilities)),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(capabilities)),
              static_cast<unsigned>(heap_caps_get_largest_free_block(capabilities)));
+}
+
+ble_security::Snapshot Backend::security_snapshot() const {
+    return security_.snapshot();
+}
+
+bool Backend::security_ready_for_hid(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) const {
+    return security_.security_ready_for_hid(generation, connection_handle);
+}
+
+void Backend::refresh_security(std::uint16_t connection_handle,
+                               bool identity_resolved_event) {
+    const auto generation = generation_.load(std::memory_order_acquire);
+    if (current_connection_.load(std::memory_order_acquire) !=
+        connection_handle) {
+        return;
+    }
+
+    ble_gap_conn_desc descriptor{};
+    if (ble_gap_conn_find(connection_handle, &descriptor) != 0) {
+        return;
+    }
+    if (identity_resolved_event) {
+        identity_resolved_.store(true, std::memory_order_release);
+    }
+    const bool ota_is_rpa = descriptor.peer_ota_addr.type == BLE_ADDR_RANDOM &&
+                            (descriptor.peer_ota_addr.val[5] & 0xc0U) == 0x40U;
+    const bool identity_resolved =
+        identity_resolved_.load(std::memory_order_acquire) || !ota_is_rpa ||
+        ble_addr_cmp(&descriptor.peer_id_addr, &descriptor.peer_ota_addr) != 0;
+
+    ble_store_key_sec key{};
+    key.peer_addr = descriptor.peer_id_addr;
+    ble_store_value_sec our{};
+    ble_store_value_sec peer{};
+    const int our_result = ble_store_read_our_sec(&key, &our);
+    const int peer_result = ble_store_read_peer_sec(&key, &peer);
+    const auto record = [&key](int result,
+                               const ble_store_value_sec &value) {
+        return ble_security::StoredSecurityRecord{
+            .found = result == 0,
+            .identity_matches =
+                result == 0 && ble_addr_cmp(&key.peer_addr, &value.peer_addr) == 0,
+            .ltk_present = result == 0 && value.ltk_present != 0,
+            .authenticated = result == 0 && value.authenticated != 0,
+            .secure_connections = result == 0 && value.sc != 0,
+            .key_size = result == 0 ? value.key_size : std::uint8_t{0},
+        };
+    };
+    security_.apply_verification(
+        generation, connection_handle,
+        {.encrypted = descriptor.sec_state.encrypted != 0,
+         .authenticated = descriptor.sec_state.authenticated != 0,
+         .nimble_bonded = descriptor.sec_state.bonded != 0,
+         .secure_connections =
+             our_result == 0 && peer_result == 0 && our.sc != 0 && peer.sc != 0,
+         .identity_resolved = identity_resolved,
+         .key_size = static_cast<std::uint8_t>(descriptor.sec_state.key_size)},
+        {.our = record(our_result, our), .peer = record(peer_result, peer)});
+}
+
+void Backend::observe_store_failure(ble_security::StoreFailureKind kind,
+                                    std::int32_t status,
+                                    bool persistent_store_unhealthy,
+                                    std::uint16_t connection_handle) {
+    security_.observe_store_failure(
+        generation_.load(std::memory_order_acquire),
+        connection_handle, kind, status, persistent_store_unhealthy);
+}
+
+int Backend::store_read(int object_type, const union ble_store_key *key,
+                        union ble_store_value *value) {
+    if (instance_ == nullptr || instance_->original_store_read_ == nullptr) {
+        return BLE_HS_EINVAL;
+    }
+    return instance_->original_store_read_(object_type, key, value);
+}
+
+int Backend::store_write(int object_type,
+                         const union ble_store_value *value) {
+    if (instance_ == nullptr || instance_->original_store_write_ == nullptr) {
+        return BLE_HS_EINVAL;
+    }
+    const int result = instance_->original_store_write_(object_type, value);
+    if (result != 0) {
+        instance_->observe_store_failure(
+            result == BLE_HS_ESTORE_CAP
+                ? ble_security::StoreFailureKind::kCapacityFull
+                : ble_security::StoreFailureKind::kWrite,
+            result, result != BLE_HS_ESTORE_CAP,
+            instance_->current_connection_.load(std::memory_order_acquire));
+    }
+    return result;
+}
+
+int Backend::store_delete(int object_type, const union ble_store_key *key) {
+    if (instance_ == nullptr || instance_->original_store_delete_ == nullptr) {
+        return BLE_HS_EINVAL;
+    }
+    const int result = instance_->original_store_delete_(object_type, key);
+    if (result != 0) {
+        instance_->observe_store_failure(
+            ble_security::StoreFailureKind::kDelete, result, true,
+            instance_->current_connection_.load(std::memory_order_acquire));
+    }
+    return result;
+}
+
+int Backend::store_status(struct ble_store_status_event *event, void *argument) {
+    auto *backend = static_cast<Backend *>(argument);
+    if (backend == nullptr || event == nullptr) {
+        return BLE_HS_ESTORE_CAP;
+    }
+    switch (event->event_code) {
+        case BLE_STORE_EVENT_FULL:
+            backend->observe_store_failure(
+                ble_security::StoreFailureKind::kCapacityFull,
+                BLE_HS_ESTORE_CAP, false, event->full.conn_handle);
+            break;
+        case BLE_STORE_EVENT_OVERFLOW:
+            backend->observe_store_failure(
+                ble_security::StoreFailureKind::kCapacityFull,
+                BLE_HS_ESTORE_CAP, false,
+                backend->current_connection_.load(std::memory_order_acquire));
+            break;
+        default:
+            break;
+    }
+    // A nonzero response tells NimBLE that no room was made. Never invoke the
+    // round-robin helper and never evict an existing bond.
+    return BLE_HS_ESTORE_CAP;
 }
 
 }  // namespace ble_transport

@@ -28,6 +28,8 @@ grep -Fq "target: esp32s3" "$repository_root/firmware/dependencies.lock"
 config_env="$repository_root/firmware/build/config.env"
 test -f "$config_env"
 grep -Fq '"IDF_TARGET": "esp32s3"' "$config_env"
+"${PYTHON_BIN:-python3}" "$repository_root/tools/validate_ble_security_sdkconfig.py" \
+    "$repository_root/firmware/sdkconfig"
 if git -C "$repository_root" ls-files --error-unmatch \
     firmware/build firmware/managed_components >/dev/null 2>&1; then
     echo "generated firmware artifacts must not be tracked" >&2
