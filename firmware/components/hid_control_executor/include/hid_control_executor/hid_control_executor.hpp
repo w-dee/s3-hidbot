@@ -315,6 +315,8 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     bool process_one_for_test();
+    bool dequeue_one_for_test(Action &action);
+    void process_for_test(Action action);
     ControlOperation active_operation_for_test() const;
     bool reserve_operation_for_test(ControlOperation operation);
     void release_operation_for_test(ControlOperation operation);
@@ -333,6 +335,8 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     void fail_ble(ble_lifecycle::Generation generation,
                   ble_lifecycle::Operation operation, std::int32_t code,
                   ControlOperation owner);
+    void commit_persistent_store_failure(
+        ble_security::StoreFailureKind kind, std::int32_t status);
     void terminate_security_connection(ble_pairing::LastResult result,
                                        bool fatal);
     void reconcile_security(std::uint16_t connection_handle,
@@ -370,6 +374,9 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     std::atomic<ble_lifecycle::Generation> overflow_generation_{0};
     std::atomic<std::uint16_t> overflow_connection_{
         ble_lifecycle::kNoConnection};
+    // Executor-owned acknowledgment of the boot-lifetime backend latch.
+    // The callback-side latch itself remains monotonic and authoritative.
+    bool persistent_store_failure_committed_ = false;
     bool pairing_complete_seen_ = false;
     std::uint64_t pairing_deadline_us_ = 0;
     struct PairingMailbox {

@@ -475,6 +475,23 @@ void Controller::process(Action action) {
         release_operation(action.operation);
         return;
     }
+    // The backend latch is boot-lifetime global truth, unlike the
+    // generation/connection-scoped overflow mailbox. Reconcile it before
+    // consuming an overflow identity so disable Stage A or disconnect cannot
+    // make a lost detailed storage event stale.
+    if (ble_backend_ != nullptr &&
+        ble_backend_->persistent_store_failure_observed()) {
+        const bool detailed =
+            action.kind == ActionKind::kBleEvent &&
+            action.ble_event.kind == BleEventKind::kStorageFailure;
+        const auto kind =
+            detailed && action.ble_event.store_failure_kind ==
+                            ble_security::StoreFailureKind::kDelete
+                ? ble_security::StoreFailureKind::kDelete
+                : ble_security::StoreFailureKind::kWrite;
+        commit_persistent_store_failure(
+            kind, detailed ? action.ble_event.status : -3);
+    }
     if (consume_ble_overflow() && action.kind == ActionKind::kBleEvent) {
         return;
     }
@@ -695,6 +712,39 @@ void Controller::fail_ble(ble_lifecycle::Generation generation,
         clear_ble_hid_peer();
     }
     release_operation(owner);
+}
+
+void Controller::commit_persistent_store_failure(
+    ble_security::StoreFailureKind kind, std::int32_t status) {
+    if (persistent_store_failure_committed_ || ble_backend_ == nullptr) {
+        return;
+    }
+    persistent_store_failure_committed_ = true;
+    ble_backend_->apply_persistent_store_failure(kind, status);
+    const auto current = ble_state_.snapshot();
+    const auto handle = ble_state_.connection_handle();
+    pairing_deadline_us_ = 0;
+    wipe_pairing_mailbox();
+    pairing_complete_seen_ = false;
+    pairing_state_.fail_closed(current.generation, handle,
+                               ble_pairing::LastResult::kStorage);
+    ble_backend_->cancel_pairing_timeout();
+    const auto security = ble_backend_->security_snapshot();
+    if (security.coherent && security.connected) {
+        ble_backend_->retire_security(security.generation,
+                                      security.connection_handle);
+    }
+    if (current.connected) {
+        (void)ble_backend_->disconnect(handle);
+    }
+    const auto active = active_operation_.load(std::memory_order_acquire);
+    const auto owner =
+        active == ControlOperation::kBleEnable ||
+                active == ControlOperation::kBleDisable
+            ? active
+            : ControlOperation::kNone;
+    fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -3,
+             owner);
 }
 
 bool Controller::consume_ble_overflow() {
@@ -1106,32 +1156,7 @@ void Controller::process_ble_event(BleEvent event) {
                         ble_security::StoreFailureKind::kDelete
                     ? ble_security::StoreFailureKind::kDelete
                     : ble_security::StoreFailureKind::kWrite;
-            ble_backend_->apply_persistent_store_failure(kind, event.status);
-            const auto current = ble_state_.snapshot();
-            const auto handle = ble_state_.connection_handle();
-            pairing_deadline_us_ = 0;
-            wipe_pairing_mailbox();
-            pairing_complete_seen_ = false;
-            pairing_state_.fail_closed(current.generation, handle,
-                                       ble_pairing::LastResult::kStorage);
-            ble_backend_->cancel_pairing_timeout();
-            const auto security = ble_backend_->security_snapshot();
-            if (security.coherent && security.connected) {
-                ble_backend_->retire_security(security.generation,
-                                              security.connection_handle);
-            }
-            if (current.connected) {
-                (void)ble_backend_->disconnect(handle);
-            }
-            const auto active =
-                active_operation_.load(std::memory_order_acquire);
-            const auto owner =
-                active == ControlOperation::kBleEnable ||
-                        active == ControlOperation::kBleDisable
-                    ? active
-                    : ControlOperation::kNone;
-            fail_ble(current.generation, ble_lifecycle::Operation::kRuntime,
-                     -3, owner);
+            commit_persistent_store_failure(kind, event.status);
             return;
         }
         case BleEventKind::kSubscription: {
@@ -1165,16 +1190,26 @@ void Controller::process_ble_event(BleEvent event) {
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
 bool Controller::process_one_for_test() {
-    if (native_count_ == 0) {
+    Action action{};
+    if (!dequeue_one_for_test(action)) {
         return false;
     }
-    const Action action = native_queue_[native_head_];
-    native_head_ = static_cast<std::uint8_t>(
-        (native_head_ + 1U) % kActionQueueDepth);
-    --native_count_;
     process(action);
     return true;
 }
+
+bool Controller::dequeue_one_for_test(Action &action) {
+    if (native_count_ == 0) {
+        return false;
+    }
+    action = native_queue_[native_head_];
+    native_head_ = static_cast<std::uint8_t>(
+        (native_head_ + 1U) % kActionQueueDepth);
+    --native_count_;
+    return true;
+}
+
+void Controller::process_for_test(Action action) { process(action); }
 
 ControlOperation Controller::active_operation_for_test() const {
     return active_operation_.load(std::memory_order_acquire);

@@ -1262,7 +1262,7 @@ void test_disable_request_defers_security_retirement_to_executor() {
     assert(!controller.ble_link_ready());
 }
 
-void test_fatal_storage_commit_survives_disable_retirement() {
+void test_fatal_storage_latch_preempts_disable_retirement() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
     FakeBleBackend ble;
@@ -1289,15 +1289,16 @@ void test_fatal_storage_commit_survives_disable_retirement() {
         hid_control_executor::BleEventKind::kStorageFailure, generation,
         connection, -31));
 
-    // Disable is first in the serialized queue and retires the old identity.
+    // The first executor boundary reconciles the sticky fatal truth before a
+    // queued disable can finish as healthy hidden/idle.
     assert(controller.process_one_for_test());
     assert(!ble.security.snapshot().connected);
     assert(!controller.ble_link_ready());
     assert(!controller.ble_hid_peer_snapshot().active);
-    assert(!controller.ble_snapshot().recovery_required);
+    assert(controller.ble_snapshot().recovery_required);
+    assert(ble.apply_persistent_store_failure_calls == global_applies + 1);
 
-    // The delayed fatal event is subsystem-global and cannot be rejected as
-    // stale merely because disable already retired its originating identity.
+    // The delayed detailed event is harmless and does not commit twice.
     assert(controller.process_one_for_test());
     const auto failed = controller.ble_snapshot();
     assert(failed.desired == ble_lifecycle::DesiredExposure::kHidden);
@@ -1312,7 +1313,7 @@ void test_fatal_storage_commit_survives_disable_retirement() {
            ble_lifecycle::TransitionResult::kBusy);
 }
 
-void test_fatal_storage_commit_survives_disconnect_retirement() {
+void test_fatal_storage_latch_preempts_disconnect_retirement() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
     FakeBleBackend ble;
@@ -1334,14 +1335,16 @@ void test_fatal_storage_commit_survives_disconnect_retirement() {
         connection, -32));
     const int advertising_calls = ble.advertising_calls;
 
-    // Disconnect retires the connection first. The callback latch prevents
-    // the normal re-advertise path while the fatal event is still queued.
+    // The first executor boundary reconciles fatal truth before disconnect
+    // processing can begin any normal readvertise path.
     assert(controller.process_one_for_test());
     assert(!ble.security.snapshot().connected);
     assert(!controller.ble_link_ready());
     assert(ble.advertising_calls == advertising_calls);
-    assert(!controller.ble_snapshot().recovery_required);
+    assert(controller.ble_snapshot().recovery_required);
+    assert(ble.apply_persistent_store_failure_calls == 1);
 
+    // The queued detailed event is idempotent.
     assert(controller.process_one_for_test());
     const auto failed = controller.ble_snapshot();
     assert(failed.desired == ble_lifecycle::DesiredExposure::kExposed);
@@ -1350,6 +1353,162 @@ void test_fatal_storage_commit_survives_disconnect_retirement() {
     assert(ble.apply_persistent_store_failure_calls == 1);
     assert(ble.persistent_store_failure_observed());
     assert(ble.advertising_calls == advertising_calls);
+}
+
+void fill_queue_with_stale_security_events(
+    FakeBleBackend &ble, ble_lifecycle::Generation generation,
+    std::uint16_t connection, std::size_t count) {
+    for (std::size_t index = 0; index < count; ++index) {
+        assert(ble.event_for_generation(
+            hid_control_executor::BleEventKind::kEncryptionChange,
+            generation - 1U, connection, 0));
+    }
+}
+
+void test_fatal_storage_overflow_survives_disable_generation_advance() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 87;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.ble_link_ready());
+
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!ble.event(hid_control_executor::BleEventKind::kStorageFailure,
+                      connection, -41));
+    assert(ble.persistent_store_failure_observed());
+    assert(!controller.ble_link_ready());
+
+    // Model the SMP execution window after xQueueReceive frees one slot but
+    // before the executor processes that action. UART disable Stage A can run
+    // concurrently on the other core and advance the lifecycle generation.
+    hid_control_executor::Controller::Action deferred{};
+    assert(controller.dequeue_one_for_test(deferred));
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.ble_snapshot().generation == generation + 1U);
+    controller.process_for_test(deferred);
+
+    const auto failed = controller.ble_snapshot();
+    assert(failed.desired == ble_lifecycle::DesiredExposure::kHidden);
+    assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failed.recovery_required && !failed.advertising && !failed.connected);
+    assert(ble.apply_persistent_store_failure_calls == 1);
+    assert(!ble.security.snapshot().store_healthy);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(!controller.ble_link_ready());
+
+    while (controller.process_one_for_test()) {
+    }
+    const auto terminal = controller.ble_snapshot();
+    assert(terminal.observed == ble_lifecycle::ObservedState::kFault);
+    assert(terminal.recovery_required);
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kBusy);
+}
+
+void test_fatal_storage_overflow_survives_disconnect() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 88;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                     connection));
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth - 1U);
+    assert(!ble.event(hid_control_executor::BleEventKind::kStorageFailure,
+                      connection, -42));
+
+    assert(controller.process_one_for_test());
+    const auto failed = controller.ble_snapshot();
+    assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failed.recovery_required && !failed.advertising && !failed.connected);
+    assert(ble.apply_persistent_store_failure_calls == 1);
+    assert(ble.persistent_store_failure_observed());
+    assert(!ble.security.snapshot().store_healthy);
+    assert(!controller.ble_link_ready());
+}
+
+void test_fatal_storage_without_connection_preempts_enable_and_is_idempotent() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kSync));
+    assert(controller.process_one_for_test());
+    assert(!controller.ble_snapshot().connected);
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    const auto hidden = controller.ble_snapshot();
+    assert(hidden.desired == ble_lifecycle::DesiredExposure::kHidden);
+    assert(hidden.observed == ble_lifecycle::ObservedState::kIdle);
+
+    fill_queue_with_stale_security_events(
+        ble, hidden.generation, ble_lifecycle::kNoConnection,
+        hid_control_executor::Controller::kActionQueueDepth);
+    assert(!ble.event(hid_control_executor::BleEventKind::kStorageFailure,
+                      ble_lifecycle::kNoConnection, -43));
+    hid_control_executor::Controller::Action deferred{};
+    assert(controller.dequeue_one_for_test(deferred));
+    const int advertising_calls = ble.advertising_calls;
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    controller.process_for_test(deferred);
+    const auto failed = controller.ble_snapshot();
+    assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failed.recovery_required && !failed.advertising && !failed.connected);
+    assert(ble.apply_persistent_store_failure_calls == 1);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+
+    while (controller.process_one_for_test()) {
+    }
+    assert(ble.advertising_calls == advertising_calls);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kStorageFailure,
+                     ble_lifecycle::kNoConnection, -44));
+    assert(controller.process_one_for_test());
+    assert(ble.apply_persistent_store_failure_calls == 1);
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kFault);
+    assert(controller.ble_snapshot().recovery_required);
+}
+
+void test_store_full_does_not_trigger_global_fatal_reconciliation() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 89;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    assert(ble.event(hid_control_executor::BleEventKind::kStoreFull,
+                     connection, -45));
+    assert(controller.process_one_for_test());
+    assert(!ble.persistent_store_failure_observed());
+    assert(ble.apply_persistent_store_failure_calls == 0);
+    assert(!controller.ble_snapshot().recovery_required);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kStoreFull);
 }
 
 void test_store_full_retirement_does_not_poison_future_peer() {
@@ -2216,8 +2375,12 @@ int main() {
     test_store_failure_immediately_inhibits_stale_verification();
     test_store_failure_identity_reuse_is_fenced();
     test_disable_request_defers_security_retirement_to_executor();
-    test_fatal_storage_commit_survives_disable_retirement();
-    test_fatal_storage_commit_survives_disconnect_retirement();
+    test_fatal_storage_latch_preempts_disable_retirement();
+    test_fatal_storage_latch_preempts_disconnect_retirement();
+    test_fatal_storage_overflow_survives_disable_generation_advance();
+    test_fatal_storage_overflow_survives_disconnect();
+    test_fatal_storage_without_connection_preempts_enable_and_is_idempotent();
+    test_store_full_does_not_trigger_global_fatal_reconciliation();
     test_store_full_retirement_does_not_poison_future_peer();
     test_internal_ble_notification_adapter_and_result_model();
     test_pairing_input_response_and_initiation();

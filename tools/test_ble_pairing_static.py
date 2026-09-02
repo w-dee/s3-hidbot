@@ -34,6 +34,24 @@ def main() -> int:
     assert "xQueueSend(s_action_queue, &item, 0)" in executor
     assert "ble_event_overflow_.store(true" in executor
 
+    process = re.search(
+        r"void Controller::process\(Action action\) \{(.*?)"
+        r"\n\}\n\nvoid Controller::fail_ble",
+        executor, re.S)
+    assert process
+    assert "persistent_store_failure_observed()" in process.group(1)
+    assert "commit_persistent_store_failure(" in process.group(1)
+    assert process.group(1).index("persistent_store_failure_observed()") < \
+        process.group(1).index("consume_ble_overflow()")
+    fatal_commit = re.search(
+        r"void Controller::commit_persistent_store_failure\((.*?)"
+        r"\n\}\n\nbool Controller::consume_ble_overflow",
+        executor, re.S)
+    assert fatal_commit
+    assert "apply_persistent_store_failure(" in fatal_commit.group(1)
+    assert "fail_ble(" in fatal_commit.group(1)
+    assert "persistent_store_failure_committed_ = true" in fatal_commit.group(1)
+
     disable_request = re.search(
         r"BleCommandOutcome Controller::request_ble_disable\(\) \{(.*?)"
         r"\n\}\n\nble_lifecycle::Snapshot Controller::ble_snapshot",

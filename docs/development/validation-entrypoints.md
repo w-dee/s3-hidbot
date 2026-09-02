@@ -61,7 +61,13 @@ order fatal-store delivery after disable or disconnect retirement. Those fatal
 events still commit global recovery faults and block re-advertising, whereas a
 stale StoreFull remains local and cannot poison a future same-handle peer. A
 static guard rejects compound-security mutation from the disable request path
-or direct production owners outside the BLE backend wrapper. These are included
+or direct production owners outside the BLE backend wrapper. The boot-lifetime
+fatal-store latch is reconciled before generation-scoped overflow handling at
+every executor processing boundary. Deterministic SMP-order tests dequeue an
+action, advance disable generation, and then resume executor processing to prove
+that a lost detailed fatal event still commits one idempotent global fault;
+queue-full disconnect, no-connection fatal, repeated fatal, and StoreFull
+contrast cases cover the other fallback boundaries. These are included
 by `test-native.sh`, `test-static.sh`, and therefore canonical
 `test-nonhardware.sh`. An ESP-IDF target build remains mandatory because the
 service database, mbuf allocation, and NimBLE notification API are

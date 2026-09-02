@@ -69,8 +69,11 @@ a reused handle. StoreFull remains connection-local and exact-identity fenced;
 a fatal persistent-store failure is subsystem-global, inhibits every later
 connection until reboot, and is committed as a recovery-required lifecycle
 fault even if disable or disconnect retired its originating identity first.
-The global callback latch also blocks every re-advertise path until that queued
-fault is committed. Compound security snapshots use a single-writer/read-many
+The global callback latch also blocks every re-advertise path and is reconciled
+idempotently before generation-scoped overflow processing at each executor
+boundary. It therefore remains authoritative when the detailed fatal event is
+lost to a full queue or a concurrent disable advances generation. Compound
+security snapshots use a single-writer/read-many
 sequence counter: executor serialization supplies the one writer and concurrent
 status/HID readers retry incoherent observations. The fixed control queue is
 depth 12; overflow remains a fail-closed,
