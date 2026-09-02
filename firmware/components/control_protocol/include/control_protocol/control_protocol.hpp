@@ -207,11 +207,11 @@ class Protocol {
     void handle_frame(std::string_view payload);
     control_session::ResponseFrame &prepare_response_scratch();
     bool write_frame(const control_session::ResponseFrame &frame) const;
-    bool replay_lifecycle_retry(std::string_view session, std::int32_t id,
-                                std::string_view payload);
-    void cache_lifecycle_retry(std::string_view session, std::int32_t id,
-                               std::string_view payload,
-                               const control_session::ResponseFrame &response);
+    bool replay_control_transition_retry(std::string_view session, std::int32_t id,
+                                         std::string_view payload);
+    void cache_control_transition_retry(
+        std::string_view session, std::int32_t id, std::string_view payload,
+        const control_session::ResponseFrame &response);
 
     Config config_{};
     control_session::State session_{};
@@ -222,14 +222,14 @@ class Protocol {
     // and response buffers on that task's stack.
     char request_json_scratch_[control_session::kMaxRequestBytes + 1]{};
     control_session::ResponseFrame response_scratch_{};
-    struct LifecycleRetryCache {
+    struct ControlTransitionRetryCache {
         bool active = false;
         std::int32_t id = 0;
         std::array<char, control_session::kTokenStorageBytes> session{};
         std::array<char, control_session::kMaxRequestBytes + 1> payload{};
         std::size_t payload_length = 0;
         control_session::ResponseFrame response{};
-    } lifecycle_retry_cache_{};
+    } control_transition_retry_cache_{};
 };
 
 }  // namespace control_protocol

@@ -449,6 +449,177 @@ usb_lifecycle::Snapshot StateMachine::usb_lifecycle_snapshot() const {
 
 hid_route::Snapshot StateMachine::route_snapshot() const { return route_.snapshot(); }
 
+bool StateMachine::route_usb_ready(const hid_route::Snapshot &route,
+                                   const usb_lifecycle::Snapshot &lifecycle,
+                                   const StatusSnapshot &runtime) const {
+    return route.coherent && !route.invalidation_pending &&
+           route.desired == hid_route::OutputRoute::kUsb &&
+           route.active == hid_route::OutputRoute::kUsb &&
+           route.transition == hid_route::Transition::kStable &&
+           lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed &&
+           lifecycle.observed == usb_lifecycle::ObservedState::kMounted &&
+           runtime.mounted && !runtime.suspended && runtime.keyboard_ready &&
+           runtime.mouse_ready && !any_safety_required() &&
+           !lifecycle.safety_pending && !lifecycle.host_release_uncertain &&
+           !lifecycle.recovery_required;
+}
+
+RouteStatusSnapshot StateMachine::route_status_snapshot() const {
+    constexpr unsigned kMaxAttempts = 3;
+    hid_route::Snapshot fallback = route_.snapshot();
+    for (unsigned attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        const hid_route::Snapshot route_before = route_.snapshot();
+        const usb_lifecycle::Snapshot lifecycle_before = usb_lifecycle_.snapshot();
+        const StatusSnapshot runtime_before = status();
+        const usb_lifecycle::Snapshot lifecycle_after = usb_lifecycle_.snapshot();
+        const StatusSnapshot runtime_after = status();
+        const hid_route::Snapshot route_after = route_.snapshot();
+        fallback = route_after;
+        const bool route_stable = route_before.coherent && route_after.coherent &&
+                                  route_before.desired == route_after.desired &&
+                                  route_before.active == route_after.active &&
+                                  route_before.generation == route_after.generation &&
+                                  route_before.transition == route_after.transition &&
+                                  route_before.invalidation_pending ==
+                                      route_after.invalidation_pending;
+        const bool lifecycle_stable =
+            lifecycle_before.desired == lifecycle_after.desired &&
+            lifecycle_before.observed == lifecycle_after.observed &&
+            lifecycle_before.generation == lifecycle_after.generation &&
+            lifecycle_before.safety_pending == lifecycle_after.safety_pending &&
+            lifecycle_before.host_release_uncertain ==
+                lifecycle_after.host_release_uncertain &&
+            lifecycle_before.recovery_required == lifecycle_after.recovery_required;
+        const bool runtime_stable =
+            runtime_before.mounted == runtime_after.mounted &&
+            runtime_before.suspended == runtime_after.suspended &&
+            runtime_before.keyboard_ready == runtime_after.keyboard_ready &&
+            runtime_before.mouse_ready == runtime_after.mouse_ready;
+        if (route_stable && lifecycle_stable && runtime_stable) {
+            return RouteStatusSnapshot{
+                .route = route_after,
+                .ready = route_usb_ready(route_after, lifecycle_after, runtime_after),
+            };
+        }
+    }
+    return RouteStatusSnapshot{.route = fallback, .ready = false};
+}
+
+void StateMachine::retire_unsafe_route_authority() {
+    cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
+    authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+RouteTransitionOutcome StateMachine::request_route_usb() {
+    const RouteStatusSnapshot before = route_status_snapshot();
+    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
+    if (before.route.desired == hid_route::OutputRoute::kUsb &&
+        before.route.active == hid_route::OutputRoute::kUsb &&
+        before.route.transition == hid_route::Transition::kStable) {
+        const RouteTransitionResult result =
+            before.ready ? RouteTransitionResult::kNoOp
+            : lifecycle.safety_pending || lifecycle.host_release_uncertain
+                ? RouteTransitionResult::kSafetyPending
+                : RouteTransitionResult::kNotReady;
+        return RouteTransitionOutcome{.action_result = result,
+                                      .snapshot_valid = true,
+                                      .snapshot = before};
+    }
+    if (!before.route.coherent || before.route.invalidation_pending ||
+        before.route.desired != hid_route::OutputRoute::kNone ||
+        before.route.active != hid_route::OutputRoute::kNone ||
+        before.route.transition != hid_route::Transition::kStable) {
+        return {};
+    }
+    const StatusSnapshot runtime = status();
+    if (lifecycle.safety_pending || lifecycle.host_release_uncertain ||
+        any_safety_required()) {
+        return RouteTransitionOutcome{.action_result = RouteTransitionResult::kSafetyPending,
+                                      .snapshot_valid = true,
+                                      .snapshot = before};
+    }
+    if (lifecycle.desired != usb_lifecycle::DesiredExposure::kExposed ||
+        lifecycle.observed != usb_lifecycle::ObservedState::kMounted ||
+        lifecycle.recovery_required || !runtime.mounted || runtime.suspended ||
+        !runtime.keyboard_ready || !runtime.mouse_ready) {
+        return RouteTransitionOutcome{.action_result = RouteTransitionResult::kNotReady,
+                                      .snapshot_valid = true,
+                                      .snapshot = before};
+    }
+    retire_unsafe_route_authority();
+    if (!route_.commit_usb_if_none()) {
+        return RouteTransitionOutcome{.action_result = RouteTransitionResult::kNotReady,
+                                      .snapshot_valid = true,
+                                      .snapshot = route_status_snapshot()};
+    }
+    return RouteTransitionOutcome{.action_result = RouteTransitionResult::kAccepted,
+                                  .snapshot_valid = true,
+                                  .snapshot = route_status_snapshot()};
+}
+
+RouteTransitionOutcome StateMachine::request_route_none() {
+    const RouteStatusSnapshot before = route_status_snapshot();
+    if (before.route.desired == hid_route::OutputRoute::kNone &&
+        before.route.active == hid_route::OutputRoute::kNone &&
+        before.route.transition == hid_route::Transition::kStable) {
+        return RouteTransitionOutcome{.action_result = RouteTransitionResult::kNoOp,
+                                      .snapshot_valid = true,
+                                      .snapshot = before};
+    }
+    if (!before.route.coherent || before.route.invalidation_pending ||
+        before.route.desired != hid_route::OutputRoute::kUsb ||
+        before.route.active != hid_route::OutputRoute::kUsb ||
+        before.route.transition != hid_route::Transition::kStable) {
+        return {};
+    }
+
+    hid_route::Snapshot stage_a{};
+    if (!route_.begin_usb_release(&stage_a)) {
+        return {};
+    }
+    retire_unsafe_route_authority();
+    bool requires_safety = false;
+    for (const Interface interface : {Interface::kKeyboard, Interface::kMouse}) {
+        InterfaceState &interface_state = state(interface);
+        const bool needs_safety =
+            !known_all_up(interface) ||
+            interface_state.in_flight.load(std::memory_order_acquire) ||
+            interface_state.host_state_uncertain.load(std::memory_order_acquire);
+        if (needs_safety) {
+            requires_safety = true;
+            interface_state.safety_required.store(true, std::memory_order_release);
+            interface_state.host_state_uncertain.store(true, std::memory_order_release);
+        }
+        interface_state.in_flight.store(false, std::memory_order_release);
+        std::uint8_t expected = kSlotReady;
+        interface_state.slot_state.compare_exchange_strong(
+            expected, kSlotCanceled, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    const RouteStatusSnapshot accepted{.route = stage_a, .ready = false};
+    if (!requires_safety) {
+        usb_lifecycle_.mark_release_confirmed();
+        (void)route_.complete_usb_release_if_matches(stage_a);
+    }
+    return RouteTransitionOutcome{.action_result = RouteTransitionResult::kAccepted,
+                                  .snapshot_valid = true,
+                                  .async_required = requires_safety,
+                                  .snapshot = accepted};
+}
+
+void StateMachine::terminalize_route_release_schedule_failure(
+    hid_route::Snapshot stage_a) {
+    mark_lifecycle_detach_uncertain(attach_generation());
+    (void)route_.complete_usb_release_if_matches(stage_a);
+}
+
+void StateMachine::complete_route_release(hid_route::Snapshot stage_a) {
+    (void)route_.complete_usb_release_if_matches(stage_a);
+}
+
 UsbGeneration StateMachine::attach_generation() const {
     return usb_lifecycle_.generation();
 }
@@ -1061,6 +1232,39 @@ LifecycleSafetyResult StateMachine::begin_lifecycle_detach_safety() {
     const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
     if (lifecycle.desired != usb_lifecycle::DesiredExposure::kHidden ||
         lifecycle.observed != usb_lifecycle::ObservedState::kDetaching) {
+        return LifecycleSafetyResult::kUncertain;
+    }
+
+    bool requires_all_up = false;
+    for (const Interface interface : {Interface::kKeyboard, Interface::kMouse}) {
+        InterfaceState &interface_state = state(interface);
+        const bool known_clean = known_all_up(interface) &&
+                                 !interface_state.in_flight.load(std::memory_order_acquire) &&
+                                 !interface_state.host_state_uncertain.load(std::memory_order_acquire);
+        if (!known_clean) {
+            requires_all_up = true;
+            interface_state.safety_required.store(true, std::memory_order_release);
+        }
+    }
+    if (!requires_all_up) {
+        usb_lifecycle_.mark_release_confirmed();
+        return LifecycleSafetyResult::kClean;
+    }
+    request_release_all();
+    return LifecycleSafetyResult::kPending;
+}
+
+LifecycleSafetyResult StateMachine::begin_route_release_safety(
+    hid_route::Snapshot stage_a) {
+    const hid_route::Snapshot current = route_.snapshot();
+    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
+    if (!current.coherent || current.invalidation_pending ||
+        current.desired != hid_route::OutputRoute::kNone ||
+        current.active != hid_route::OutputRoute::kUsb ||
+        current.transition != hid_route::Transition::kReleasing ||
+        current.generation != stage_a.generation ||
+        lifecycle.desired != usb_lifecycle::DesiredExposure::kExposed ||
+        lifecycle.observed != usb_lifecycle::ObservedState::kMounted) {
         return LifecycleSafetyResult::kUncertain;
     }
 
@@ -2013,6 +2217,36 @@ LifecycleSafetyResult Runtime::run_lifecycle_detach_safety() {
         // again after the first endpoint's completion allows keyboard and
         // mouse all-up to resolve independently without a polling sleep.
         (void)ulTaskNotifyTake(pdTRUE, kLifecycleSafetyWaitTicks - elapsed);
+    }
+    lifecycle_safety_waiter_.store(nullptr, std::memory_order_release);
+    if (state_machine_.lifecycle_detach_safety_clean()) {
+        return LifecycleSafetyResult::kClean;
+    }
+    state_machine_.mark_lifecycle_detach_uncertain(old_generation);
+    return LifecycleSafetyResult::kUncertain;
+}
+
+LifecycleSafetyResult Runtime::run_route_release_safety(
+    hid_route::Snapshot stage_a) {
+    const UsbGeneration old_generation = state_machine_.attach_generation();
+    const LifecycleSafetyResult start =
+        state_machine_.begin_route_release_safety(stage_a);
+    if (start != LifecycleSafetyResult::kPending) {
+        if (start != LifecycleSafetyResult::kClean) {
+            state_machine_.mark_lifecycle_detach_uncertain(old_generation);
+        }
+        return start;
+    }
+
+    constexpr TickType_t kRouteSafetyWaitTicks = pdMS_TO_TICKS(250);
+    lifecycle_safety_waiter_.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+    const TickType_t wait_start = xTaskGetTickCount();
+    while (!state_machine_.lifecycle_detach_safety_clean()) {
+        const TickType_t elapsed = xTaskGetTickCount() - wait_start;
+        if (elapsed >= kRouteSafetyWaitTicks) {
+            break;
+        }
+        (void)ulTaskNotifyTake(pdTRUE, kRouteSafetyWaitTicks - elapsed);
     }
     lifecycle_safety_waiter_.store(nullptr, std::memory_order_release);
     if (state_machine_.lifecycle_detach_safety_clean()) {

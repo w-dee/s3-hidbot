@@ -54,11 +54,24 @@ struct CommandOutcome {
     ExposureSnapshot snapshot{};
 };
 
+struct RouteCommandOutcome {
+    hid_runtime::RouteTransitionResult action_result =
+        hid_runtime::RouteTransitionResult::kBusy;
+    bool snapshot_valid = false;
+    hid_runtime::RouteStatusSnapshot snapshot{};
+};
+
 class Controller final : public usb_lifecycle::Executor {
   public:
+    enum class ActionKind : std::uint8_t {
+        kUsbInstall,
+        kUsbDetach,
+        kRouteRelease,
+    };
+
     struct Action {
-        usb_lifecycle::ExecutorAction kind = usb_lifecycle::ExecutorAction::kInstall;
-        usb_lifecycle::Snapshot snapshot{};
+        ActionKind kind = ActionKind::kUsbInstall;
+        usb_lifecycle::Snapshot lifecycle{};
         hid_route::Snapshot route{};
         ControlOperation operation = ControlOperation::kNone;
     };
@@ -67,7 +80,9 @@ class Controller final : public usb_lifecycle::Executor {
 
     CommandOutcome request_attach();
     CommandOutcome request_detach();
+    RouteCommandOutcome request_route(hid_route::OutputRoute desired);
     ExposureSnapshot snapshot() const;
+    hid_runtime::RouteStatusSnapshot route_snapshot() const;
 
     // usb_lifecycle::Executor. Calls originate in the UART/control task and
     // are stored in the shared fixed control-action queue.
@@ -84,6 +99,7 @@ class Controller final : public usb_lifecycle::Executor {
 
   private:
     void process(Action action);
+    bool enqueue(Action action);
     bool claim_operation(ControlOperation operation);
     void release_operation(ControlOperation operation);
     static ControlOperation operation_for(usb_lifecycle::ExecutorAction action);

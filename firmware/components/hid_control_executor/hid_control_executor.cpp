@@ -120,19 +120,44 @@ ExposureSnapshot Controller::snapshot() const {
     };
 }
 
-bool Controller::schedule(usb_lifecycle::ExecutorAction action,
-                          usb_lifecycle::Snapshot snapshot) {
-    const ControlOperation operation = operation_for(action);
-    // The request entry point must own the cross-domain guard before USB
-    // lifecycle Stage-A. Scheduling only verifies inherited ownership.
-    if (!initialized_ ||
-        active_operation_.load(std::memory_order_acquire) != operation) {
-        return false;
+hid_runtime::RouteStatusSnapshot Controller::route_snapshot() const {
+    return runtime_ == nullptr ? hid_runtime::RouteStatusSnapshot{}
+                               : runtime_->state_machine().route_status_snapshot();
+}
+
+RouteCommandOutcome Controller::request_route(hid_route::OutputRoute desired) {
+    constexpr ControlOperation operation = ControlOperation::kRouteChange;
+    if (!initialized_ || desired == hid_route::OutputRoute::kBle ||
+        !claim_operation(operation)) {
+        return {};
     }
-    const Action item{.kind = action,
-                      .snapshot = snapshot,
-                      .route = runtime_->state_machine().route_snapshot(),
-                      .operation = operation};
+    hid_runtime::RouteTransitionOutcome outcome =
+        desired == hid_route::OutputRoute::kUsb
+            ? runtime_->state_machine().request_route_usb()
+            : runtime_->state_machine().request_route_none();
+    if (outcome.action_result == hid_runtime::RouteTransitionResult::kAccepted &&
+        outcome.async_required) {
+        const Action item{
+            .kind = ActionKind::kRouteRelease,
+            .lifecycle = runtime_->state_machine().usb_lifecycle_snapshot(),
+            .route = outcome.snapshot.route,
+            .operation = operation,
+        };
+        if (!enqueue(item)) {
+            runtime_->state_machine().terminalize_route_release_schedule_failure(
+                outcome.snapshot.route);
+            release_operation(operation);
+            return {};
+        }
+    } else {
+        release_operation(operation);
+    }
+    return RouteCommandOutcome{.action_result = outcome.action_result,
+                               .snapshot_valid = outcome.snapshot_valid,
+                               .snapshot = outcome.snapshot};
+}
+
+bool Controller::enqueue(Action item) {
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     if (fail_next_enqueue_) {
         fail_next_enqueue_ = false;
@@ -145,11 +170,26 @@ bool Controller::schedule(usb_lifecycle::ExecutorAction action,
     ++native_count_;
     return true;
 #else
-    if (xQueueSend(s_action_queue, &item, 0) == pdPASS) {
-        return true;
-    }
-    return false;
+    return xQueueSend(s_action_queue, &item, 0) == pdPASS;
 #endif
+}
+
+bool Controller::schedule(usb_lifecycle::ExecutorAction action,
+                          usb_lifecycle::Snapshot snapshot) {
+    const ControlOperation operation = operation_for(action);
+    // The request entry point must own the cross-domain guard before USB
+    // lifecycle Stage-A. Scheduling only verifies inherited ownership.
+    if (!initialized_ ||
+        active_operation_.load(std::memory_order_acquire) != operation) {
+        return false;
+    }
+    const Action item{.kind = action == usb_lifecycle::ExecutorAction::kInstall
+                                  ? ActionKind::kUsbInstall
+                                  : ActionKind::kUsbDetach,
+                      .lifecycle = snapshot,
+                      .route = runtime_->state_machine().route_snapshot(),
+                      .operation = operation};
+    return enqueue(item);
 }
 
 void Controller::process(Action action) {
@@ -158,22 +198,55 @@ void Controller::process(Action action) {
         return;
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
+    if (action.kind == ActionKind::kRouteRelease) {
+        const hid_route::Snapshot route = state.route_snapshot();
+        const usb_lifecycle::Snapshot lifecycle = state.usb_lifecycle_snapshot();
+        const bool expected_route = route.coherent && !route.invalidation_pending &&
+                                    route.desired == hid_route::OutputRoute::kNone &&
+                                    route.active == hid_route::OutputRoute::kUsb &&
+                                    route.transition == hid_route::Transition::kReleasing &&
+                                    route.generation == action.route.generation;
+        const bool expected_transport =
+            lifecycle.generation == action.lifecycle.generation &&
+            lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed &&
+            lifecycle.observed == usb_lifecycle::ObservedState::kMounted;
+        if (active_operation_.load(std::memory_order_acquire) != action.operation ||
+            !expected_route || !expected_transport) {
+            if (expected_route) {
+                state.terminalize_route_release_schedule_failure(action.route);
+            }
+            release_operation(action.operation);
+            return;
+        }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+        const hid_runtime::LifecycleSafetyResult safety =
+            state.begin_route_release_safety(action.route);
+        if (safety != hid_runtime::LifecycleSafetyResult::kClean) {
+            state.mark_lifecycle_detach_uncertain(action.lifecycle.generation);
+        }
+#else
+        (void)runtime_->run_route_release_safety(action.route);
+#endif
+        state.complete_route_release(action.route);
+        release_operation(action.operation);
+        return;
+    }
     const usb_lifecycle::Snapshot current = state.usb_lifecycle_snapshot();
     const bool expected_lifecycle_state =
-        action.kind == usb_lifecycle::ExecutorAction::kInstall
+        action.kind == ActionKind::kUsbInstall
             ? current.desired == usb_lifecycle::DesiredExposure::kExposed &&
                   current.observed == usb_lifecycle::ObservedState::kAttaching
             : current.desired == usb_lifecycle::DesiredExposure::kHidden &&
                   current.observed == usb_lifecycle::ObservedState::kDetaching;
     if (active_operation_.load(std::memory_order_acquire) != action.operation ||
         !expected_lifecycle_state ||
-        current.desired != action.snapshot.desired ||
-        current.observed != action.snapshot.observed ||
-        current.generation != action.snapshot.generation) {
+        current.desired != action.lifecycle.desired ||
+        current.observed != action.lifecycle.observed ||
+        current.generation != action.lifecycle.generation) {
         release_operation(action.operation);
         return;
     }
-    if (action.kind == usb_lifecycle::ExecutorAction::kInstall) {
+    if (action.kind == ActionKind::kUsbInstall) {
         const BackendResult result = backend_->install();
         switch (result.kind) {
             case BackendResultKind::kSuccess:
@@ -198,7 +271,7 @@ void Controller::process(Action action) {
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     const hid_runtime::LifecycleSafetyResult safety = state.begin_lifecycle_detach_safety();
     if (safety != hid_runtime::LifecycleSafetyResult::kClean) {
-        state.mark_lifecycle_detach_uncertain(action.snapshot.generation);
+        state.mark_lifecycle_detach_uncertain(action.lifecycle.generation);
     }
 #else
     (void)runtime_->run_lifecycle_detach_safety();

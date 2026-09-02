@@ -721,7 +721,7 @@ bool Protocol::initialize(const Config &config,
     }
     config_ = config;
     session_.initialize(random_fill, random_context, config.now, config.now_context);
-    lifecycle_retry_cache_ = {};
+    control_transition_retry_cache_ = {};
     initialized_ = true;
     lease_revoke_notified_ = false;
     return true;
@@ -737,9 +737,9 @@ control_session::ResponseFrame &Protocol::prepare_response_scratch() {
     return response_scratch_;
 }
 
-bool Protocol::replay_lifecycle_retry(std::string_view session, std::int32_t id,
-                                      std::string_view payload) {
-    const LifecycleRetryCache &cached = lifecycle_retry_cache_;
+bool Protocol::replay_control_transition_retry(std::string_view session, std::int32_t id,
+                                               std::string_view payload) {
+    const ControlTransitionRetryCache &cached = control_transition_retry_cache_;
     if (!cached.active || cached.id != id || cached.payload_length != payload.size() ||
         session.size() != control_session::kTokenHexLength ||
         std::memcmp(cached.session.data(), session.data(), session.size()) != 0 ||
@@ -749,20 +749,20 @@ bool Protocol::replay_lifecycle_retry(std::string_view session, std::int32_t id,
     return write_frame(cached.response);
 }
 
-void Protocol::cache_lifecycle_retry(std::string_view session, std::int32_t id,
-                                     std::string_view payload,
-                                     const control_session::ResponseFrame &response) {
+void Protocol::cache_control_transition_retry(
+    std::string_view session, std::int32_t id, std::string_view payload,
+    const control_session::ResponseFrame &response) {
     if (session.size() != control_session::kTokenHexLength ||
         payload.size() > control_session::kMaxRequestBytes || response.length == 0) {
         return;
     }
-    lifecycle_retry_cache_ = {};
-    lifecycle_retry_cache_.id = id;
-    std::memcpy(lifecycle_retry_cache_.session.data(), session.data(), session.size());
-    std::memcpy(lifecycle_retry_cache_.payload.data(), payload.data(), payload.size());
-    lifecycle_retry_cache_.payload_length = payload.size();
-    lifecycle_retry_cache_.response = response;
-    lifecycle_retry_cache_.active = true;
+    control_transition_retry_cache_ = {};
+    control_transition_retry_cache_.id = id;
+    std::memcpy(control_transition_retry_cache_.session.data(), session.data(), session.size());
+    std::memcpy(control_transition_retry_cache_.payload.data(), payload.data(), payload.size());
+    control_transition_retry_cache_.payload_length = payload.size();
+    control_transition_retry_cache_.response = response;
+    control_transition_retry_cache_.active = true;
 }
 
 void Protocol::on_hid_lifecycle_invalidation() {
@@ -962,7 +962,7 @@ void Protocol::handle_frame(std::string_view payload) {
         // A successful fresh handshake supersedes any lifecycle retry proof
         // tied to the former session. Lifecycle invalidation itself must not
         // clear that proof: accepted attach/detach retries occur after it.
-        lifecycle_retry_cache_ = {};
+        control_transition_retry_cache_ = {};
         lease_revoke_notified_ = false;
         write_frame(response);
         finish();
@@ -1003,7 +1003,7 @@ void Protocol::handle_frame(std::string_view payload) {
     // transition. Their exact retry is therefore retained separately from the
     // normal epoch-scoped request cache and must replay identical bytes only.
     if ((command == "usb.attach" || command == "usb.detach") &&
-        replay_lifecycle_retry(session, id, payload)) {
+        replay_control_transition_retry(session, id, payload)) {
         finish();
         return;
     }
@@ -1112,7 +1112,7 @@ void Protocol::handle_frame(std::string_view payload) {
                     // this exact response before revoking the session so the
                     // one permitted same-ID retry remains byte-identical even
                     // after asynchronous install/uninstall progress.
-                    cache_lifecycle_retry(session, id, payload, response);
+                    cache_control_transition_retry(session, id, payload, response);
                     session_.revoke_for_lifecycle_invalidation(
                         config_.authority_epoch_provider(config_.authority_epoch_context));
                     lease_revoke_notified_ = false;

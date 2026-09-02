@@ -139,14 +139,14 @@ void invalidate_route_before_submit(hid_runtime::StateMachine *state) {
 void test_route_generation_is_independent_and_gates_stale_unsafe_work() {
     hid_runtime::StateMachine state;
     Sink sink;
-    assert(state.route_snapshot().route == hid_route::OutputRoute::kNone);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
     assert(state.route_snapshot().generation == 0);
 
     expose(state);
-    assert(state.route_snapshot().route == hid_route::OutputRoute::kNone);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     const hid_route::Snapshot usb_route = state.route_snapshot();
-    assert(usb_route.route == hid_route::OutputRoute::kUsb);
+    assert(usb_route.active == hid_route::OutputRoute::kUsb);
     assert(usb_route.generation == 1);
     state.set_ready(hid_runtime::Interface::kMouse, true);
 
@@ -156,7 +156,7 @@ void test_route_generation_is_independent_and_gates_stale_unsafe_work() {
     state.set_before_submit_hook_for_test(nullptr);
     assert(sink.calls == 0);
     const hid_route::Snapshot invalidated = state.route_snapshot();
-    assert(invalidated.route == hid_route::OutputRoute::kNone);
+    assert(invalidated.active == hid_route::OutputRoute::kNone);
     assert(invalidated.generation == usb_route.generation + 1);
     assert(!state.queue_mouse_report(0, 1, 0, 0, 0));
 }
@@ -356,7 +356,7 @@ void test_attach_boundary_blocks_stale_hidden_reconciliation() {
     assert(!state.usb_lifecycle_snapshot().safety_pending);
     state.set_ready(hid_runtime::Interface::kKeyboard, true);
     state.set_ready(hid_runtime::Interface::kMouse, true);
-    assert(state.route_snapshot().route == hid_route::OutputRoute::kUsb);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb);
 }
 
 void test_later_attach_after_clean_hidden_release_has_no_stale_work() {
@@ -377,7 +377,7 @@ void test_later_attach_after_clean_hidden_release_has_no_stale_work() {
     assert(sink.calls == 0);
     assert(!state.release_requested_for_test());
     assert(!state.usb_lifecycle_snapshot().safety_pending);
-    assert(state.route_snapshot().route == hid_route::OutputRoute::kUsb);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb);
 }
 
 void test_uncertainty_is_not_zero_work_terminalized() {
@@ -1143,7 +1143,7 @@ void test_detach_invalidates_route_only_after_old_route_safety() {
     assert(sink.calls == 1 && sink.instance == 0 && sink.report[2] == 115);
 
     assert(action(state.request_usb_detach(executor)) == usb_lifecycle::TransitionResult::kAccepted);
-    assert(state.route_snapshot().route == hid_route::OutputRoute::kUsb);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb);
     assert(state.begin_lifecycle_detach_safety() == hid_runtime::LifecycleSafetyResult::kPending);
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 2 && sink.instance == 0 && sink.report[0] == 0 && sink.report[2] == 0);
@@ -1152,9 +1152,98 @@ void test_detach_invalidates_route_only_after_old_route_safety() {
 
     state.complete_usb_detach_route_invalidation(old_route);
     const hid_route::Snapshot invalidated = state.route_snapshot();
-    assert(invalidated.route == hid_route::OutputRoute::kNone);
+    assert(invalidated.active == hid_route::OutputRoute::kNone);
     assert(invalidated.generation == old_route.generation + 1);
     assert(state.begin_usb_uninstall() == old_usb_generation + 1);
+}
+
+void test_route_zero_work_round_trip_is_coherent_and_keeps_usb_exposed() {
+    hid_runtime::StateMachine state;
+    ready(state);
+    const auto usb_before = state.route_status_snapshot();
+    assert(usb_before.ready);
+    assert(usb_before.route.active == hid_route::OutputRoute::kUsb);
+    const auto authority_before = state.authority_epoch();
+
+    const auto release = state.request_route_none();
+    assert(release.action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    assert(release.snapshot_valid && !release.async_required);
+    assert(release.snapshot.route.desired == hid_route::OutputRoute::kNone);
+    assert(release.snapshot.route.active == hid_route::OutputRoute::kUsb);
+    assert(release.snapshot.route.transition == hid_route::Transition::kReleasing);
+    assert(!release.snapshot.ready);
+    assert(state.authority_epoch() == authority_before + 1);
+
+    const auto none = state.route_status_snapshot();
+    assert(none.route.desired == hid_route::OutputRoute::kNone);
+    assert(none.route.active == hid_route::OutputRoute::kNone);
+    assert(none.route.transition == hid_route::Transition::kStable);
+    assert(none.route.generation == release.snapshot.route.generation + 1);
+    assert(!none.ready);
+    const auto lifecycle = state.usb_lifecycle_snapshot();
+    assert(lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed);
+    assert(lifecycle.observed == usb_lifecycle::ObservedState::kMounted);
+
+    const auto none_noop = state.request_route_none();
+    assert(none_noop.action_result == hid_runtime::RouteTransitionResult::kNoOp);
+    assert(none_noop.snapshot.route.generation == none.route.generation);
+
+    const auto select = state.request_route_usb();
+    assert(select.action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    assert(select.snapshot.route.active == hid_route::OutputRoute::kUsb);
+    assert(select.snapshot.route.generation == none.route.generation + 1);
+    assert(select.snapshot.ready);
+    const auto usb_noop = state.request_route_usb();
+    assert(usb_noop.action_result == hid_runtime::RouteTransitionResult::kNoOp);
+    assert(usb_noop.snapshot.route.generation == select.snapshot.route.generation);
+}
+
+void test_route_held_key_release_uses_old_route_before_none_commit() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    const std::array<std::uint8_t, 6> f24 = {115, 0, 0, 0, 0, 0};
+    assert(state.queue_keyboard_report(0, f24));
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1 && sink.report[2] == 115);
+    assert(state.report_complete(0));
+
+    const auto release = state.request_route_none();
+    assert(release.action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    assert(release.async_required);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb);
+    assert(state.begin_route_release_safety(release.snapshot.route) ==
+           hid_runtime::LifecycleSafetyResult::kPending);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2 && sink.instance == 0);
+    assert(sink.report[0] == 0 && sink.report[2] == 0);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb);
+    assert(state.report_complete(0));
+    assert(state.lifecycle_detach_safety_clean());
+    state.complete_route_release(release.snapshot.route);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+    assert(state.usb_lifecycle_snapshot().observed ==
+           usb_lifecycle::ObservedState::kMounted);
+}
+
+void test_route_release_callback_preemption_fails_closed() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    const std::array<std::uint8_t, 6> f24 = {115, 0, 0, 0, 0, 0};
+    assert(state.queue_keyboard_report(0, f24));
+    state.execute(Sink::submit, &sink);
+    assert(state.report_complete(0));
+    const auto release = state.request_route_none();
+    assert(release.async_required);
+
+    state.on_suspend();
+    const auto none = state.route_snapshot();
+    assert(none.active == hid_route::OutputRoute::kNone);
+    assert(none.transition == hid_route::Transition::kStable);
+    assert(!state.queue_keyboard_report(0, f24));
+    assert(state.begin_route_release_safety(release.snapshot.route) ==
+           hid_runtime::LifecycleSafetyResult::kUncertain);
 }
 
 }  // namespace
@@ -1197,5 +1286,8 @@ int main() {
     test_internal_detach_preserves_uncertainty_until_explicit_recovery();
     test_hidden_uncertainty_is_never_zero_work_terminalized();
     test_detach_invalidates_route_only_after_old_route_safety();
+    test_route_zero_work_round_trip_is_coherent_and_keeps_usb_exposed();
+    test_route_held_key_release_uses_old_route_before_none_commit();
+    test_route_release_callback_preemption_fails_closed();
     return 0;
 }

@@ -51,6 +51,26 @@ struct UsbTransitionOutcome {
     StatusSnapshot runtime{};
 };
 
+enum class RouteTransitionResult : std::uint8_t {
+    kAccepted,
+    kNoOp,
+    kBusy,
+    kNotReady,
+    kSafetyPending,
+};
+
+struct RouteStatusSnapshot {
+    hid_route::Snapshot route{};
+    bool ready = false;
+};
+
+struct RouteTransitionOutcome {
+    RouteTransitionResult action_result = RouteTransitionResult::kBusy;
+    bool snapshot_valid = false;
+    bool async_required = false;
+    RouteStatusSnapshot snapshot{};
+};
+
 struct KeyboardState {
     std::uint8_t modifiers = 0;
     std::array<std::uint8_t, 6> keycodes{};
@@ -251,11 +271,17 @@ class StateMachine {
     UsbTransitionOutcome request_usb_detach(usb_lifecycle::Executor &executor);
     usb_lifecycle::Snapshot usb_lifecycle_snapshot() const;
     hid_route::Snapshot route_snapshot() const;
+    RouteStatusSnapshot route_status_snapshot() const;
+    RouteTransitionOutcome request_route_usb();
+    RouteTransitionOutcome request_route_none();
+    void terminalize_route_release_schedule_failure(hid_route::Snapshot stage_a);
+    void complete_route_release(hid_route::Snapshot stage_a);
 
     // Project-owned, lifecycle-only safety operation. It intentionally does
     // not create a public hid.release_all cache identity. While detaching it
     // is the sole permitted old-generation HID work.
     LifecycleSafetyResult begin_lifecycle_detach_safety();
+    LifecycleSafetyResult begin_route_release_safety(hid_route::Snapshot stage_a);
     bool lifecycle_detach_safety_clean() const;
     void mark_lifecycle_detach_uncertain(UsbGeneration old_generation);
     void on_driver_uninstalled();
@@ -393,6 +419,10 @@ class StateMachine {
     bool mounted_and_active(Interface interface) const;
     bool compatibility_usb_route_can_select() const;
     void apply_u7_1b_compatibility_route();
+    void retire_unsafe_route_authority();
+    bool route_usb_ready(const hid_route::Snapshot &route,
+                         const usb_lifecycle::Snapshot &lifecycle,
+                         const StatusSnapshot &runtime) const;
     bool unsafe_route_active(RouteGeneration generation, HidTransport transport) const;
     bool safety_transport_active(Interface interface) const;
     bool any_safety_required() const;
@@ -507,6 +537,7 @@ class Runtime {
     void request_release_all();
     ReleaseAllResult release_all();
     LifecycleSafetyResult run_lifecycle_detach_safety();
+    LifecycleSafetyResult run_route_release_safety(hid_route::Snapshot stage_a);
     void on_driver_uninstalled();
     void service_sof();
     void on_report_complete(std::uint8_t instance,
