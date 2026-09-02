@@ -10,7 +10,7 @@ namespace hid_control_executor {
 namespace {
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
-constexpr std::size_t kActionQueueDepth = 2;
+constexpr std::size_t kActionQueueDepth = 8;
 constexpr std::uint32_t kLifecycleTaskStackBytes = 4096;
 constexpr std::size_t kLifecycleTaskStackDepth =
     kLifecycleTaskStackBytes / sizeof(StackType_t);
@@ -81,8 +81,16 @@ BleCommandOutcome Controller::request_ble_disable() {
     if (!initialized_ || ble_backend_ == nullptr || !claim_operation(operation)) {
         return {};
     }
+    const auto before = ble_state_.snapshot();
     const ble_lifecycle::TransitionOutcome outcome = ble_state_.begin_disable();
     if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
+        pairing_state_.disable();
+        pairing_complete_seen_ = false;
+        ble_backend_->cancel_pairing_timeout();
+        if (before.connected) {
+            ble_backend_->retire_security(before.generation,
+                                          ble_state_.connection_handle());
+        }
         ble_backend_->set_generation(outcome.snapshot.generation);
         const Action item{.kind = ActionKind::kBleDisable,
                           .operation = operation};
@@ -104,11 +112,18 @@ ble_lifecycle::Snapshot Controller::ble_snapshot() const {
     return ble_state_.snapshot();
 }
 
+ble_pairing::Snapshot Controller::pairing_snapshot() const {
+    return pairing_state_.snapshot();
+}
+
 bool Controller::signal_ble_event(BleEvent event) {
     const Action item{.kind = ActionKind::kBleEvent, .ble_event = event};
     if (enqueue(item)) {
         return true;
     }
+    overflow_generation_.store(event.generation, std::memory_order_relaxed);
+    overflow_connection_.store(event.connection_handle,
+                               std::memory_order_relaxed);
     ble_event_overflow_.store(true, std::memory_order_release);
     return false;
 }
@@ -229,10 +244,10 @@ bool Controller::enqueue(Action item) {
         fail_next_enqueue_ = false;
         return false;
     }
-    if (native_count_ == 2) {
+    if (native_count_ == 8) {
         return false;
     }
-    native_queue_[(native_head_ + native_count_) % 2] = item;
+    native_queue_[(native_head_ + native_count_) % 8] = item;
     ++native_count_;
     return true;
 #else
@@ -261,6 +276,9 @@ bool Controller::schedule(usb_lifecycle::ExecutorAction action,
 void Controller::process(Action action) {
     if (runtime_ == nullptr || backend_ == nullptr) {
         release_operation(action.operation);
+        return;
+    }
+    if (consume_ble_overflow() && action.kind == ActionKind::kBleEvent) {
         return;
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
@@ -434,13 +452,120 @@ void Controller::fail_ble(ble_lifecycle::Generation generation,
     release_operation(owner);
 }
 
-void Controller::process_ble_event(BleEvent event) {
-    if (ble_backend_ == nullptr) {
+bool Controller::consume_ble_overflow() {
+    if (!ble_event_overflow_.exchange(false, std::memory_order_acq_rel) ||
+        ble_backend_ == nullptr) {
+        return false;
+    }
+    const auto current = ble_state_.snapshot();
+    const auto generation =
+        overflow_generation_.load(std::memory_order_acquire);
+    const auto connection =
+        overflow_connection_.load(std::memory_order_acquire);
+    if (generation != current.generation ||
+        (connection != ble_lifecycle::kNoConnection && current.connected &&
+         connection != ble_state_.connection_handle())) {
+        return false;
+    }
+    pairing_state_.fail_closed(current.generation,
+                               ble_state_.connection_handle(),
+                               ble_pairing::LastResult::kQueueOverflow);
+    ble_backend_->cancel_pairing_timeout();
+    ble_backend_->mark_security_unhealthy(current.generation);
+    if (current.connected) {
+        (void)ble_backend_->disconnect(ble_state_.connection_handle());
+    }
+    const auto active = active_operation_.load(std::memory_order_acquire);
+    const auto ble_owner =
+        active == ControlOperation::kBleEnable ||
+                active == ControlOperation::kBleDisable
+            ? active
+            : ControlOperation::kNone;
+    fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -2,
+             ble_owner);
+    return true;
+}
+
+void Controller::terminate_security_connection(ble_pairing::LastResult result,
+                                               bool fatal) {
+    const auto current = ble_state_.snapshot();
+    if (!current.connected || ble_backend_ == nullptr) {
         return;
     }
-    if (ble_event_overflow_.exchange(false, std::memory_order_acq_rel)) {
-        fail_ble(ble_state_.generation(), ble_lifecycle::Operation::kRuntime, -2,
-                 active_operation_.load(std::memory_order_acquire));
+    const auto handle = ble_state_.connection_handle();
+    (void)pairing_state_.complete(current.generation, handle, result);
+    ble_backend_->cancel_pairing_timeout();
+    ble_backend_->retire_security(current.generation, handle);
+    (void)ble_backend_->disconnect(handle);
+    if (fatal) {
+        ble_backend_->mark_security_unhealthy(current.generation);
+        fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -3,
+                 ControlOperation::kNone);
+    }
+}
+
+void Controller::reconcile_security(std::uint16_t connection_handle,
+                                    bool pairing_complete_seen) {
+    const auto current = ble_state_.snapshot();
+    if (!current.connected || current.generation != ble_state_.generation() ||
+        connection_handle != ble_state_.connection_handle()) {
+        return;
+    }
+    pairing_complete_seen_ = pairing_complete_seen_ || pairing_complete_seen;
+    ble_backend_->refresh_security(connection_handle);
+    if (ble_backend_->security_ready_for_hid(current.generation,
+                                             connection_handle)) {
+        pairing_state_.complete(current.generation, connection_handle,
+                                ble_pairing::LastResult::kSucceeded);
+        ble_backend_->cancel_pairing_timeout();
+        return;
+    }
+    const auto security = ble_backend_->security_snapshot();
+    if (pairing_complete_seen_ && security.coherent && security.connected &&
+        security.encrypted && security.identity_resolved &&
+        security.store_healthy) {
+        if (!security.authenticated ||
+            security.key_size != ble_security::kRequiredKeySize) {
+            terminate_security_connection(
+                ble_pairing::LastResult::kSecurityPolicy, false);
+        } else if (!security.project_verified_bond_persisted) {
+            terminate_security_connection(ble_pairing::LastResult::kStorage,
+                                          false);
+        }
+    }
+}
+
+ble_pairing::RespondResult Controller::respond_to_pairing(
+    ble_lifecycle::Generation generation, std::uint16_t connection_handle,
+    std::uint32_t pairing_id,
+    const std::array<char, 6> &six_digit_secret) {
+    if (!initialized_ || ble_backend_ == nullptr) {
+        return ble_pairing::RespondResult::kNotPending;
+    }
+    auto result = pairing_state_.validate_response(
+        generation, connection_handle, pairing_id);
+    if (result != ble_pairing::RespondResult::kAccepted) {
+        return result;
+    }
+    std::uint32_t value = 0;
+    for (const char digit : six_digit_secret) {
+        if (digit < '0' || digit > '9') {
+            return ble_pairing::RespondResult::kInvalidSecret;
+        }
+        value = value * 10U + static_cast<std::uint32_t>(digit - '0');
+    }
+    if (ble_backend_->inject_passkey(connection_handle, value) != 0) {
+        terminate_security_connection(ble_pairing::LastResult::kSmpFailed,
+                                      false);
+        return ble_pairing::RespondResult::kInjectionFailed;
+    }
+    pairing_state_.consume_response(generation, connection_handle, pairing_id);
+    ble_backend_->cancel_pairing_timeout();
+    return ble_pairing::RespondResult::kAccepted;
+}
+
+void Controller::process_ble_event(BleEvent event) {
+    if (ble_backend_ == nullptr) {
         return;
     }
     switch (event.kind) {
@@ -467,9 +592,20 @@ void Controller::process_ble_event(BleEvent event) {
         case BleEventKind::kConnect:
             if (ble_state_.observe_connect(event.generation,
                                            event.connection_handle)) {
+                pairing_complete_seen_ = false;
+                pairing_state_.begin_connection(event.generation,
+                                                event.connection_handle);
+                ble_backend_->begin_security(event.generation,
+                                             event.connection_handle);
                 (void)ble_backend_->configure_connection(event.connection_handle);
                 ble_backend_->record_heap_checkpoint(
                     BleBackend::HeapCheckpoint::kConnected);
+                const std::int32_t result =
+                    ble_backend_->initiate_security(event.connection_handle);
+                if (result != 0) {
+                    terminate_security_connection(
+                        ble_pairing::LastResult::kSmpFailed, false);
+                }
             }
             return;
         case BleEventKind::kDisconnect: {
@@ -479,6 +615,12 @@ void Controller::process_ble_event(BleEvent event) {
                                                event.connection_handle, expected)) {
                 return;
             }
+            ble_backend_->cancel_pairing_timeout();
+            pairing_complete_seen_ = false;
+            (void)pairing_state_.disconnect(event.generation,
+                                            event.connection_handle);
+            ble_backend_->retire_security(event.generation,
+                                          event.connection_handle);
             if (ble_database_ != nullptr) {
                 ble_database_->clear_peer_state();
             }
@@ -517,6 +659,15 @@ void Controller::process_ble_event(BleEvent event) {
             }
             return;
         case BleEventKind::kReset: {
+            const auto before_reset = ble_state_.snapshot();
+            pairing_state_.reset();
+            ble_backend_->cancel_pairing_timeout();
+            ble_backend_->mark_security_unhealthy(event.generation);
+            if (before_reset.connected) {
+                ble_backend_->retire_security(event.generation,
+                                              ble_state_.connection_handle());
+            }
+            pairing_complete_seen_ = false;
             if (!ble_state_.begin_reset_recovery(event.generation, event.status)) {
                 if (ble_database_ != nullptr) {
                     ble_database_->clear_peer_state();
@@ -532,6 +683,90 @@ void Controller::process_ble_event(BleEvent event) {
             fail_ble(event.generation, ble_lifecycle::Operation::kRuntime,
                      event.status, active_operation_.load(std::memory_order_acquire));
             return;
+        case BleEventKind::kPasskeyAction: {
+            if (event.status == 1) {
+                const auto decision = pairing_state_.begin_passkey_input(
+                    event.generation, event.connection_handle);
+                if (decision == ble_pairing::PasskeyActionResult::kStarted) {
+                    ble_backend_->arm_pairing_timeout(
+                        event.generation, event.connection_handle,
+                        pairing_state_.snapshot().pairing_id);
+                } else if (decision ==
+                           ble_pairing::PasskeyActionResult::kIdExhausted) {
+                    terminate_security_connection(
+                        ble_pairing::LastResult::kSecurityPolicy, true);
+                }
+            } else {
+                const auto decision = pairing_state_.reject_unsupported_action(
+                    event.generation, event.connection_handle);
+                if (decision ==
+                    ble_pairing::PasskeyActionResult::kUnsupported) {
+                    terminate_security_connection(
+                        ble_pairing::LastResult::kSecurityPolicy, false);
+                }
+            }
+            return;
+        }
+        case BleEventKind::kEncryptionChange:
+            if (event.generation != ble_state_.generation() ||
+                event.connection_handle != ble_state_.connection_handle()) {
+                return;
+            }
+            if (event.status != 0) {
+                terminate_security_connection(
+                    ble_pairing::LastResult::kSmpFailed, false);
+                return;
+            }
+            reconcile_security(event.connection_handle, false);
+            return;
+        case BleEventKind::kPairingComplete:
+            if (event.generation != ble_state_.generation() ||
+                event.connection_handle != ble_state_.connection_handle()) {
+                return;
+            }
+            if (event.status != 0) {
+                terminate_security_connection(
+                    ble_pairing::LastResult::kSmpFailed, false);
+                return;
+            }
+            reconcile_security(event.connection_handle, true);
+            return;
+        case BleEventKind::kIdentityResolved:
+            if (event.generation == ble_state_.generation() &&
+                event.connection_handle == ble_state_.connection_handle()) {
+                ble_backend_->refresh_security(event.connection_handle, true);
+                reconcile_security(event.connection_handle, false);
+            }
+            return;
+        case BleEventKind::kRepeatPairing:
+            if (event.generation == ble_state_.generation() &&
+                event.connection_handle == ble_state_.connection_handle()) {
+                terminate_security_connection(
+                    ble_pairing::LastResult::kRepeatPairing, false);
+            }
+            return;
+        case BleEventKind::kPairingTimeout:
+            if (pairing_state_.timeout(event.generation,
+                                       event.connection_handle,
+                                       event.pairing_id)) {
+                terminate_security_connection(
+                    ble_pairing::LastResult::kTimeout, false);
+            }
+            return;
+        case BleEventKind::kStoreFull:
+            if (event.generation == ble_state_.generation() &&
+                event.connection_handle == ble_state_.connection_handle()) {
+                terminate_security_connection(
+                    ble_pairing::LastResult::kStoreFull, false);
+            }
+            return;
+        case BleEventKind::kStorageFailure:
+            if (event.generation == ble_state_.generation() &&
+                event.connection_handle == ble_state_.connection_handle()) {
+                terminate_security_connection(
+                    ble_pairing::LastResult::kStorage, true);
+            }
+            return;
     }
 }
 
@@ -541,7 +776,7 @@ bool Controller::process_one_for_test() {
         return false;
     }
     const Action action = native_queue_[native_head_];
-    native_head_ = static_cast<std::uint8_t>((native_head_ + 1) % 2);
+    native_head_ = static_cast<std::uint8_t>((native_head_ + 1) % 8);
     --native_count_;
     process(action);
     return true;
@@ -560,6 +795,10 @@ void Controller::release_operation_for_test(ControlOperation operation) {
 }
 
 void Controller::fail_next_enqueue_for_test() { fail_next_enqueue_ = true; }
+
+void Controller::set_next_pairing_id_for_test(std::uint32_t value) {
+    pairing_state_.set_next_pairing_id_for_test(value);
+}
 #else
 void Controller::task_entry(void *context) {
     static_cast<Controller *>(context)->task_loop();

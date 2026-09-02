@@ -119,6 +119,17 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     if (result != ESP_OK) {
         return result;
     }
+    const esp_timer_create_args_t pairing_timer_args{
+        .callback = pairing_timeout_callback,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ble_pairing",
+        .skip_unhandled_events = true,
+    };
+    result = esp_timer_create(&pairing_timer_args, &pairing_timer_);
+    if (result != ESP_OK) {
+        return result;
+    }
     if (database != nullptr) {
         const int database_result = database->register_database();
         if (database_result != 0) {
@@ -145,6 +156,22 @@ void Backend::timeout_callback(void *context) {
         (void)backend->signal(hid_control_executor::BleEventKind::kTimeout,
                               ble_lifecycle::kNoConnection,
                               kLifecycleTimeoutError);
+    }
+}
+
+void Backend::pairing_timeout_callback(void *context) {
+    auto *backend = static_cast<Backend *>(context);
+    if (backend != nullptr && backend->sink_ != nullptr) {
+        (void)backend->sink_->signal_ble_event({
+            .kind = hid_control_executor::BleEventKind::kPairingTimeout,
+            .generation = backend->pairing_timer_generation_.load(
+                std::memory_order_acquire),
+            .connection_handle = backend->pairing_timer_connection_.load(
+                std::memory_order_acquire),
+            .status = 0,
+            .pairing_id = backend->pairing_timer_id_.load(
+                std::memory_order_acquire),
+        });
     }
 }
 
@@ -192,7 +219,6 @@ void Backend::on_reset(int reason) {
         // so a following sync callback already carries the new identity.
         const auto retired = instance_->generation_.fetch_add(
             1, std::memory_order_acq_rel);
-        instance_->security_.mark_lifecycle_unhealthy(retired);
         instance_->current_connection_.store(ble_lifecycle::kNoConnection,
                                              std::memory_order_release);
         instance_->identity_resolved_.store(false, std::memory_order_release);
@@ -215,17 +241,6 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
     }
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
-            if (event->connect.status == 0) {
-                const auto generation =
-                    backend->generation_.load(std::memory_order_acquire);
-                backend->current_connection_.store(event->connect.conn_handle,
-                                                   std::memory_order_release);
-                backend->identity_resolved_.store(false,
-                                                  std::memory_order_release);
-                backend->security_.begin_connection(
-                    generation, event->connect.conn_handle);
-                backend->refresh_security(event->connect.conn_handle);
-            }
             (void)backend->signal(
                 event->connect.status == 0
                     ? hid_control_executor::BleEventKind::kConnect
@@ -234,30 +249,39 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
             break;
         case BLE_GAP_EVENT_DISCONNECT:
             backend->cancel_timeout();
-            backend->security_.retire_connection(
-                backend->generation_.load(std::memory_order_acquire),
-                event->disconnect.conn.conn_handle);
-            backend->current_connection_.store(ble_lifecycle::kNoConnection,
-                                               std::memory_order_release);
-            backend->identity_resolved_.store(false,
-                                              std::memory_order_release);
             (void)backend->signal(hid_control_executor::BleEventKind::kDisconnect,
                                   event->disconnect.conn.conn_handle,
                                   event->disconnect.reason);
             break;
         case BLE_GAP_EVENT_ENC_CHANGE:
-            backend->refresh_security(event->enc_change.conn_handle);
+            (void)backend->signal(
+                hid_control_executor::BleEventKind::kEncryptionChange,
+                event->enc_change.conn_handle, event->enc_change.status);
             break;
         case BLE_GAP_EVENT_IDENTITY_RESOLVED:
-            backend->refresh_security(event->identity_resolved.conn_handle,
-                                      true);
+            (void)backend->signal(
+                hid_control_executor::BleEventKind::kIdentityResolved,
+                event->identity_resolved.conn_handle, 0);
             break;
         case BLE_GAP_EVENT_PARING_COMPLETE:
-            // NimBLE v5.5.4 emits this after SMP key exchange. Its SMP path
-            // does not propagate all store-write failures, so reread both
-            // security records rather than trusting the bonded bit.
-            backend->refresh_security(event->pairing_complete.conn_handle);
+            (void)backend->signal(
+                hid_control_executor::BleEventKind::kPairingComplete,
+                event->pairing_complete.conn_handle,
+                event->pairing_complete.status);
             break;
+        case BLE_GAP_EVENT_PASSKEY_ACTION:
+            // The queue receives only the action classification; no passkey
+            // or other secret is copied from or into callback state.
+            (void)backend->signal(
+                hid_control_executor::BleEventKind::kPasskeyAction,
+                event->passkey.conn_handle,
+                event->passkey.params.action == BLE_SM_IOACT_INPUT ? 1 : 0);
+            break;
+        case BLE_GAP_EVENT_REPEAT_PAIRING:
+            (void)backend->signal(
+                hid_control_executor::BleEventKind::kRepeatPairing,
+                event->repeat_pairing.conn_handle, 0);
+            return BLE_GAP_REPEAT_PAIRING_IGNORE;
         case BLE_GAP_EVENT_AUTHORIZE: {
             ble_gap_conn_desc descriptor{};
             const bool accepted =
@@ -342,6 +366,61 @@ std::int32_t Backend::configure_connection(std::uint16_t connection_handle) {
     return ble_gap_update_params(connection_handle, &parameters);
 }
 
+std::int32_t Backend::initiate_security(std::uint16_t connection_handle) {
+    return ble_gap_security_initiate(connection_handle);
+}
+
+std::int32_t Backend::inject_passkey(std::uint16_t connection_handle,
+                                     std::uint32_t passkey) {
+    ble_sm_io input{};
+    input.action = BLE_SM_IOACT_INPUT;
+    input.passkey = passkey;
+    return ble_sm_inject_io(connection_handle, &input);
+}
+
+void Backend::arm_pairing_timeout(ble_lifecycle::Generation generation,
+                                  std::uint16_t connection_handle,
+                                  std::uint32_t pairing_id) {
+    cancel_pairing_timeout();
+    pairing_timer_generation_.store(generation, std::memory_order_relaxed);
+    pairing_timer_connection_.store(connection_handle,
+                                    std::memory_order_relaxed);
+    pairing_timer_id_.store(pairing_id, std::memory_order_release);
+    (void)esp_timer_start_once(pairing_timer_,
+                               static_cast<std::uint64_t>(
+                                   ble_pairing::kInputTimeoutMs) * 1000U);
+}
+
+void Backend::cancel_pairing_timeout() {
+    if (pairing_timer_ != nullptr && esp_timer_is_active(pairing_timer_)) {
+        (void)esp_timer_stop(pairing_timer_);
+    }
+    pairing_timer_id_.store(0, std::memory_order_release);
+}
+
+void Backend::begin_security(ble_lifecycle::Generation generation,
+                             std::uint16_t connection_handle) {
+    current_connection_.store(connection_handle, std::memory_order_release);
+    identity_resolved_.store(false, std::memory_order_release);
+    security_.begin_connection(generation, connection_handle);
+}
+
+void Backend::retire_security(ble_lifecycle::Generation generation,
+                              std::uint16_t connection_handle) {
+    security_.retire_connection(generation, connection_handle);
+    if (current_connection_.load(std::memory_order_acquire) ==
+        connection_handle) {
+        current_connection_.store(ble_lifecycle::kNoConnection,
+                                  std::memory_order_release);
+        identity_resolved_.store(false, std::memory_order_release);
+    }
+}
+
+void Backend::mark_security_unhealthy(
+    ble_lifecycle::Generation generation) {
+    security_.mark_lifecycle_unhealthy(generation);
+}
+
 void Backend::record_heap_checkpoint(HeapCheckpoint checkpoint) {
     static constexpr const char *kLabels[] = {
         "cold-boot", "before-first-enable", "advertising",
@@ -423,6 +502,10 @@ void Backend::observe_store_failure(ble_security::StoreFailureKind kind,
     security_.observe_store_failure(
         generation_.load(std::memory_order_acquire),
         connection_handle, kind, status, persistent_store_unhealthy);
+    (void)signal(persistent_store_unhealthy
+                     ? hid_control_executor::BleEventKind::kStorageFailure
+                     : hid_control_executor::BleEventKind::kStoreFull,
+                 connection_handle, status);
 }
 
 int Backend::store_read(int object_type, const union ble_store_key *key,

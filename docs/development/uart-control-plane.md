@@ -34,6 +34,17 @@ an identity-qualified reread of both NimBLE `OUR_SEC` and `PEER_SEC` records;
 the NimBLE bonded bit alone is insufficient. This foundation adds no UART
 pairing command or capability and is not yet connected to HID output routing.
 
+The internal Slice B controller serializes security work on the existing HID
+control executor. Its only live states are `idle`, `securing`, and
+`waiting_input`; completion and failure are retained separately as a bounded
+sticky last result. A boot-local nonzero monotonic pairing ID fences a pending
+input action by BLE generation and connection handle, with a 25-second input
+deadline and fail-closed wrap behavior. NimBLE callbacks enqueue only bounded,
+non-secret metadata into the fixed depth-8 control queue. Queue overflow is a
+recovery-required BLE lifecycle fault; ordinary store capacity, timeout,
+repeat-pairing, or peer failure disconnects without global recovery. This
+internal model still adds no UART command, capability, host API, or BLE route.
+
 Native USB is hidden by default: boot initializes HID/runtime state and its
 lifecycle task, then starts the UART control plane without calling
 `tinyusb_driver_install()`. CH343 UART is the bootstrap path. Only the

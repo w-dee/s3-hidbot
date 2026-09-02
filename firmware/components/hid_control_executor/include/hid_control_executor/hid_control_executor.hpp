@@ -1,8 +1,11 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
+#include "ble_pairing/ble_pairing.hpp"
+#include "ble_security/ble_security.hpp"
 #include "hid_route/hid_route.hpp"
 #include "hid_runtime/hid_runtime.hpp"
 #include "ble_lifecycle/ble_lifecycle.hpp"
@@ -48,6 +51,14 @@ enum class BleEventKind : std::uint8_t {
     kAdvertisingComplete,
     kReset,
     kTimeout,
+    kPasskeyAction,
+    kEncryptionChange,
+    kPairingComplete,
+    kIdentityResolved,
+    kRepeatPairing,
+    kPairingTimeout,
+    kStoreFull,
+    kStorageFailure,
 };
 
 struct BleEvent {
@@ -55,6 +66,7 @@ struct BleEvent {
     ble_lifecycle::Generation generation = 0;
     std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
     std::int32_t status = 0;
+    std::uint32_t pairing_id = 0;
 };
 
 class BleEventSink {
@@ -95,6 +107,26 @@ class BleBackend {
     virtual std::int32_t disconnect(std::uint16_t connection_handle) = 0;
     virtual std::int32_t configure_connection(
         std::uint16_t connection_handle) = 0;
+    virtual std::int32_t initiate_security(
+        std::uint16_t connection_handle) = 0;
+    virtual std::int32_t inject_passkey(std::uint16_t connection_handle,
+                                       std::uint32_t passkey) = 0;
+    virtual void arm_pairing_timeout(ble_lifecycle::Generation generation,
+                                     std::uint16_t connection_handle,
+                                     std::uint32_t pairing_id) = 0;
+    virtual void cancel_pairing_timeout() = 0;
+    virtual void begin_security(ble_lifecycle::Generation generation,
+                                std::uint16_t connection_handle) = 0;
+    virtual void refresh_security(std::uint16_t connection_handle,
+                                  bool identity_resolved_event = false) = 0;
+    virtual void retire_security(ble_lifecycle::Generation generation,
+                                 std::uint16_t connection_handle) = 0;
+    virtual void mark_security_unhealthy(
+        ble_lifecycle::Generation generation) = 0;
+    virtual ble_security::Snapshot security_snapshot() const = 0;
+    virtual bool security_ready_for_hid(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) const = 0;
     virtual void record_heap_checkpoint(HeapCheckpoint checkpoint) = 0;
 };
 
@@ -157,6 +189,14 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     BleCommandOutcome request_ble_enable();
     BleCommandOutcome request_ble_disable();
     ble_lifecycle::Snapshot ble_snapshot() const;
+    ble_pairing::Snapshot pairing_snapshot() const;
+
+    // Internal executor-owned seam. It is deliberately not connected to the
+    // UART protocol; callers must already run in the serialized owner context.
+    ble_pairing::RespondResult respond_to_pairing(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle, std::uint32_t pairing_id,
+        const std::array<char, 6> &six_digit_secret);
 
     // usb_lifecycle::Executor. Calls originate in the UART/control task and
     // are stored in the shared fixed control-action queue.
@@ -170,6 +210,7 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     bool reserve_operation_for_test(ControlOperation operation);
     void release_operation_for_test(ControlOperation operation);
     void fail_next_enqueue_for_test();
+    void set_next_pairing_id_for_test(std::uint32_t value);
 #endif
 
   private:
@@ -182,6 +223,11 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     void fail_ble(ble_lifecycle::Generation generation,
                   ble_lifecycle::Operation operation, std::int32_t code,
                   ControlOperation owner);
+    void terminate_security_connection(ble_pairing::LastResult result,
+                                       bool fatal);
+    void reconcile_security(std::uint16_t connection_handle,
+                            bool pairing_complete_seen);
+    bool consume_ble_overflow();
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     static void task_entry(void *context);
@@ -193,12 +239,17 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     BleBackend *ble_backend_ = nullptr;
     BleDatabase *ble_database_ = nullptr;
     ble_lifecycle::StateMachine ble_state_{};
+    ble_pairing::StateMachine pairing_state_{};
     bool initialized_ = false;
     std::atomic<ControlOperation> active_operation_{ControlOperation::kNone};
     std::atomic_bool ble_event_overflow_{false};
+    std::atomic<ble_lifecycle::Generation> overflow_generation_{0};
+    std::atomic<std::uint16_t> overflow_connection_{
+        ble_lifecycle::kNoConnection};
+    bool pairing_complete_seen_ = false;
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
-    Action native_queue_[2]{};
+    Action native_queue_[8]{};
     std::uint8_t native_head_ = 0;
     std::uint8_t native_count_ = 0;
     bool fail_next_enqueue_ = false;
