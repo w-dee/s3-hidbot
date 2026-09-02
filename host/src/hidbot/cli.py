@@ -33,13 +33,17 @@ from .provisioning_workflow import (
 from .serial_transport import PySerialTransport
 from .provisioning import stage_and_verify_firmware_bundle
 from .protocol import (
+    BLE_PAIRING_TRANSACTION_CAPABILITY,
     BleExposureStatus,
+    BlePairingRespondResult,
+    BlePairingStatus,
     HidRouteStatus,
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
     UsbExposureStatus,
     OutputRoute,
+    validate_ble_pairing_respond_inputs,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
     validate_system_info,
@@ -121,6 +125,55 @@ def _raw_hid_integer(value: str) -> int:
         ) from exc
 
 
+def _pairing_id(value: str) -> int:
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a decimal uint32 pairing ID") from exc
+    if not 1 <= parsed <= 0xFFFF_FFFF:
+        raise argparse.ArgumentTypeError("must be in 1..4294967295")
+    return parsed
+
+
+def _read_pairing_passkey() -> str:
+    """Read from the controlling terminal with echo disabled and no stdin fallback."""
+
+    try:
+        import termios
+
+        tty_input = open("/dev/tty", "r", encoding="utf-8", buffering=1)
+        try:
+            tty_output = open("/dev/tty", "w", encoding="utf-8", buffering=1)
+        except OSError:
+            tty_input.close()
+            raise
+    except (ImportError, OSError) as exc:
+        raise ProtocolError("a controlling TTY is required for pairing passkey input") from exc
+    with tty_input, tty_output:
+        try:
+            original = termios.tcgetattr(tty_input.fileno())
+            hidden = list(original)
+            hidden[3] &= ~termios.ECHO
+            termios.tcsetattr(tty_input.fileno(), termios.TCSAFLUSH, hidden)
+            try:
+                tty_output.write("Passkey (6 digits): ")
+                tty_output.flush()
+                value = tty_input.readline()
+            finally:
+                termios.tcsetattr(tty_input.fileno(), termios.TCSAFLUSH, original)
+                tty_output.write("\n")
+                tty_output.flush()
+        except (OSError, termios.error) as exc:
+            raise ProtocolError("secure controlling-TTY input is unavailable") from exc
+    if value == "":
+        raise ProtocolError("pairing passkey input was not received")
+    if value.endswith("\n"):
+        value = value[:-1]
+    if value.endswith("\r"):
+        value = value[:-1]
+    return value
+
+
 def _add_global_options(
     parser: argparse.ArgumentParser,
     *,
@@ -196,6 +249,8 @@ def _parser() -> argparse.ArgumentParser:
         ("ble-exposure-status", "show explicit BLE exposure lifecycle state"),
         ("ble-enable", "explicitly initialize/reuse BLE and advertise"),
         ("ble-disable", "hide BLE while retaining the initialized stack"),
+        ("ble-pairing-status", "show the current BLE pairing transaction"),
+        ("ble-pairing-respond", "respond to one BLE pairing transaction"),
         ("hid-route-status", "show the explicit HID output route"),
         ("hid-route-set", "select none or USB as the HID output route"),
         ("release-all", "perform the safe all-up recovery operation"),
@@ -232,6 +287,14 @@ def _parser() -> argparse.ArgumentParser:
                 "route",
                 choices=[route.value for route in OutputRoute],
                 help="explicit HID output route",
+            )
+        if name == "ble-pairing-respond":
+            command.add_argument(
+                "--pairing-id",
+                type=_pairing_id,
+                required=True,
+                metavar="ID",
+                help="nonzero pairing transaction ID from ble-pairing-status",
             )
         if name in {"verify-artifact", "verify-firmware", "flash-firmware"}:
             command.add_argument(
@@ -321,6 +384,16 @@ def _result_value(command: str, result: object) -> object:
         return asdict(result)
     if command in {"ble-exposure-status", "ble-enable", "ble-disable"}:
         assert isinstance(result, BleExposureStatus)
+        return asdict(result)
+    if command == "ble-pairing-status":
+        assert isinstance(result, BlePairingStatus)
+        value = asdict(result)
+        value["state"] = result.state.value
+        value["action"] = result.action.value if result.action is not None else None
+        value["last_result"] = result.last_result.value
+        return value
+    if command == "ble-pairing-respond":
+        assert isinstance(result, BlePairingRespondResult)
         return asdict(result)
     if command in {"hid-route-status", "hid-route-set"}:
         assert isinstance(result, HidRouteStatus)
@@ -544,6 +617,20 @@ def _print_result(command: str, result: object, *, as_json: bool, output: TextIO
         print(f"lease_ms: {value['lease_ms']}", file=output)
         print(f"capabilities: {', '.join(value['capabilities'])}", file=output)
         return
+    if command == "ble-pairing-status":
+        assert isinstance(value, dict)
+        print(f"state: {value['state']}", file=output)
+        if value["pairing_id"] is not None:
+            print(f"pairing_id: {value['pairing_id']}", file=output)
+            print(f"remaining_ms: {value['remaining_ms']}", file=output)
+        print(f"connected: {value['connected']}", file=output)
+        print(f"encrypted: {value['encrypted']}", file=output)
+        print(f"authenticated: {value['authenticated']}", file=output)
+        print(f"bonded: {value['bonded']}", file=output)
+        print(f"secure_connections: {value['secure_connections']}", file=output)
+        print(f"key_size: {value['key_size']}", file=output)
+        print(f"last_result: {value['last_result']}", file=output)
+        return
     print(json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True), file=output)
 
 
@@ -570,12 +657,19 @@ def main(
     provisioning_workflow_runner: Callable[..., ProvisioningWorkflowResult] = run_post_flash_provisioning,
     output: TextIO | None = None,
     error_output: TextIO | None = None,
+    passkey_reader: Callable[[], str] | None = None,
 ) -> int:
     output = sys.stdout if output is None else output
     error_output = sys.stderr if error_output is None else error_output
     parser = _parser()
     try:
-        args = parser.parse_args(argv)
+        raw_arguments = tuple(sys.argv[1:] if argv is None else argv)
+        if any(
+            argument == "--passkey" or argument.startswith("--passkey=")
+            for argument in raw_arguments
+        ):
+            parser.error("passkey must be entered at the controlling-TTY prompt")
+        args = parser.parse_args(raw_arguments)
         _validate_hid_arguments(args, parser)
         _validate_flash_arguments(args, parser)
         artifact_identity = (
@@ -636,6 +730,25 @@ def main(
                 result = client.ble_enable()
             elif args.command == "ble-disable":
                 result = client.ble_disable()
+            elif args.command == "ble-pairing-status":
+                result = client.ble_pairing_status()
+            elif args.command == "ble-pairing-respond":
+                if BLE_PAIRING_TRANSACTION_CAPABILITY not in hello.capabilities:
+                    raise CompatibilityError(
+                        f"peer does not advertise {BLE_PAIRING_TRANSACTION_CAPABILITY}"
+                    )
+                passkey = (
+                    _read_pairing_passkey()
+                    if passkey_reader is None
+                    else passkey_reader()
+                )
+                try:
+                    validate_ble_pairing_respond_inputs(args.pairing_id, passkey)
+                    result = client.ble_pairing_respond(args.pairing_id, passkey)
+                finally:
+                    # Python strings are immutable; release the CLI's local
+                    # reference immediately after the single Client call.
+                    passkey = ""
             elif args.command == "hid-route-status":
                 result = client.hid_route_status()
             elif args.command == "hid-route-set":

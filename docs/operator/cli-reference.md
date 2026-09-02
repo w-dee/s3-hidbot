@@ -19,6 +19,7 @@ does not resolve a serial port or use them.
 | UART read-only diagnostics | `hello`, `ping`, `info`, `usb-status`, `usb-exposure-status`, `ble-exposure-status`, `verify-firmware ARTIFACT` |
 | Explicit USB exposure control | `usb-attach`, `usb-detach` |
 | Explicit BLE exposure control | `ble-enable`, `ble-disable` |
+| Explicit BLE pairing control | `ble-pairing-status`, `ble-pairing-respond --pairing-id ID` |
 | Explicit HID output routing | `hid-route-status`, `hid-route-set none`, `hid-route-set usb` |
 | UART diagnostic with safety action | `self-test` |
 | Explicit safety recovery | `release-all` |
@@ -44,6 +45,8 @@ intentionally injects a key, button, or movement.
 | `hidbotctl ble-exposure-status` | UART + `ble.exposure-control-v1` | Read the exact BLE exposure lifecycle snapshot without exposing an address, connection handle, CCCD, or security state. |
 | `hidbotctl ble-enable` | UART + `ble.exposure-control-v1` | Lazily initialize BLE on first use and request connectable HID Service advertising. It does not select an HID route. |
 | `hidbotctl ble-disable` | UART + `ble.exposure-control-v1` | Stop advertising/disconnect a peer and enter hidden idle while retaining the initialized stack. It does not change USB or its HID route/session. |
+| `hidbotctl ble-pairing-status` | UART + `ble.pairing-transaction-v1` | Read one strict pairing transaction snapshot. It does not poll, connect, or pair automatically. |
+| `hidbotctl ble-pairing-respond --pairing-id ID` | UART + controlling TTY + `ble.pairing-transaction-v1` | Prompt without echo for one six-ASCII-digit passkey and submit it to the exact nonzero pairing ID. There is deliberately no passkey argv, environment, config-file, or stdin-pipe mode. |
 | `hidbotctl hid-route-status` | UART + `hid.output-route-v1` | Read the coherent `desired`, `active`, `generation`, `transition`, and `ready` route snapshot. |
 | `hidbotctl hid-route-set none` | UART + `hid.output-route-v1` | Safely retire USB HID output while leaving USB exposure unchanged. An actual transition retires the session. |
 | `hidbotctl hid-route-set usb` | UART + `hid.output-route-v1` | Select an already mounted, safety-clear USB transport. Both endpoints must be ready. Establish a fresh session after an actual transition. |
@@ -73,8 +76,22 @@ retry is attempted; reboot or manual operator intervention is required.
 `ble-exposure-status` has exactly `desired`, `observed`, `generation`,
 `stack_ready`, `advertising`, `connected`, `recovery_required`, and
 `last_error`. BLE is uninitialized/non-advertising at cold boot. USB and BLE
-may be exposed simultaneously, but U7.3 has no BLE report output, `route=ble`,
-pairing/passkey control, bonding, or formal HOGP/security compliance claim.
+may be exposed simultaneously, but there is no BLE report output, `route=ble`,
+bond administration, or formal HOGP/security compliance claim.
+
+The pairing workflow is deliberately manual: query `ble-pairing-status`, note
+its non-null `pairing_id`, run `ble-pairing-respond --pairing-id ID`, enter the
+passkey at the no-echo controlling-terminal prompt, then query status again.
+The prompt is written directly to the controlling terminal, including in
+`--json` mode, so stdout remains one machine-readable result. Without a
+controlling TTY the command fails before sending `ble.pairing.respond` and
+never reads ordinary stdin.
+
+This avoids passkey exposure in argv and shell history. The host does not
+intentionally log or retain the passkey beyond the request/retry lifetime, but
+immutable Python `str` and `bytes` objects cannot be guaranteed zeroized.
+Typed API callers own the lifetime of their original passkey string; no claim
+is made about interpreter allocator, pyserial, or kernel copies.
 
 ## Artifact and firmware identity
 

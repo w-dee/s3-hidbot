@@ -28,6 +28,9 @@ MAX_SOURCE_REVISION_BYTES = 40
 MAX_APP_ELF_SHA256_BYTES = 64
 MAX_BUILD_PROFILE_BYTES = 31
 MAX_USB_GENERATION = 0xFFFF_FFFF
+MAX_UINT32 = 0xFFFF_FFFF
+MAX_BLE_KEY_SIZE = 16
+BLE_PAIRING_TRANSACTION_CAPABILITY = "ble.pairing-transaction-v1"
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 SOURCE_REVISION_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_SOURCE_REVISION_BYTES}}}\Z")
 APP_ELF_SHA256_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_APP_ELF_SHA256_BYTES}}}\Z")
@@ -54,6 +57,7 @@ OPTIONAL_CAPABILITIES = frozenset(
         "firmware.identity-v1",
         "hid.output-route-v1",
         "ble.exposure-control-v1",
+        BLE_PAIRING_TRANSACTION_CAPABILITY,
     }
 )
 KNOWN_OPTIONAL_CAPABILITIES = OPTIONAL_CAPABILITIES
@@ -208,6 +212,53 @@ class BleExposureStatus:
     connected: bool
     recovery_required: bool
     last_error: BleExposureLastError | None
+
+
+class BlePairingState(str, Enum):
+    IDLE = "idle"
+    SECURING = "securing"
+    WAITING_INPUT = "waiting_input"
+
+
+class BlePairingAction(str, Enum):
+    PASSKEY_INPUT = "passkey_input"
+
+
+class BlePairingLastResult(str, Enum):
+    NONE = "none"
+    SUCCEEDED = "succeeded"
+    SMP_FAILED = "smp_failed"
+    TIMEOUT = "timeout"
+    PEER_DISCONNECTED = "peer_disconnected"
+    STORE_FULL = "store_full"
+    STORAGE = "storage"
+    QUEUE_OVERFLOW = "queue_overflow"
+    REPEAT_PAIRING = "repeat_pairing"
+    SECURITY_POLICY = "security_policy"
+
+
+@dataclass(frozen=True)
+class BlePairingStatus:
+    """Strict ble.pairing-transaction-v1 transaction snapshot."""
+
+    state: BlePairingState
+    generation: int
+    connected: bool
+    pairing_id: int | None
+    action: BlePairingAction | None
+    remaining_ms: int | None
+    encrypted: bool
+    authenticated: bool
+    bonded: bool
+    secure_connections: bool
+    key_size: int
+    last_result: BlePairingLastResult
+
+
+@dataclass(frozen=True)
+class BlePairingRespondResult:
+    accepted: bool
+    pairing_id: int
 
 
 class OutputRoute(str, Enum):
@@ -408,6 +459,36 @@ def build_hid_route_set_frame(
             "session": session,
             "cmd": "hid.route.set",
             "params": {"route": route.value},
+        }
+    )
+
+
+def validate_ble_pairing_respond_inputs(pairing_id: int, passkey: str) -> None:
+    if type(pairing_id) is not int or not 1 <= pairing_id <= MAX_UINT32:
+        raise ProtocolError("BLE pairing ID is invalid")
+    if (
+        type(passkey) is not str
+        or len(passkey) != 6
+        or any(character < "0" or character > "9" for character in passkey)
+    ):
+        raise ProtocolError("BLE pairing passkey must be exactly six ASCII digits")
+
+
+def build_ble_pairing_respond_frame(
+    request_id: int, session: str, pairing_id: int, passkey: str
+) -> bytes:
+    if type(request_id) is not int or not 0 <= request_id <= MAX_ID:
+        raise ProtocolError("request id is invalid")
+    if not isinstance(session, str) or TOKEN_PATTERN.fullmatch(session) is None:
+        raise ProtocolError("session is invalid")
+    validate_ble_pairing_respond_inputs(pairing_id, passkey)
+    return _serialize_request(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "session": session,
+            "cmd": "ble.pairing.respond",
+            "params": {"pairing_id": pairing_id, "passkey": passkey},
         }
     )
 
@@ -721,6 +802,98 @@ def validate_ble_exposure_status(value: Any) -> BleExposureStatus:
         recovery_required=value["recovery_required"],
         last_error=last_error,
     )
+
+
+def validate_ble_pairing_status(value: Any) -> BlePairingStatus:
+    fields = {
+        "state",
+        "generation",
+        "connected",
+        "pairing_id",
+        "action",
+        "remaining_ms",
+        "encrypted",
+        "authenticated",
+        "bonded",
+        "secure_connections",
+        "key_size",
+        "last_result",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProtocolError("ble.pairing.status result fields are invalid")
+    try:
+        state = BlePairingState(value["state"])
+        last_result = BlePairingLastResult(value["last_result"])
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("BLE pairing state is invalid") from exc
+    generation = value["generation"]
+    pairing_id = value["pairing_id"]
+    remaining_ms = value["remaining_ms"]
+    key_size = value["key_size"]
+    if type(generation) is not int or not 0 <= generation <= MAX_UINT32:
+        raise ProtocolError("BLE pairing generation is invalid")
+    if pairing_id is not None and (
+        type(pairing_id) is not int or not 1 <= pairing_id <= MAX_UINT32
+    ):
+        raise ProtocolError("BLE pairing ID is invalid")
+    if remaining_ms is not None and (
+        type(remaining_ms) is not int or not 0 <= remaining_ms <= MAX_UINT32
+    ):
+        raise ProtocolError("BLE pairing remaining time is invalid")
+    if type(key_size) is not int or not 0 <= key_size <= MAX_BLE_KEY_SIZE:
+        raise ProtocolError("BLE pairing key size is invalid")
+    bool_fields = (
+        "connected",
+        "encrypted",
+        "authenticated",
+        "bonded",
+        "secure_connections",
+    )
+    if any(type(value[name]) is not bool for name in bool_fields):
+        raise ProtocolError("BLE pairing boolean state is invalid")
+    raw_action = value["action"]
+    if raw_action is None:
+        action = None
+    else:
+        try:
+            action = BlePairingAction(raw_action)
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError("BLE pairing action is invalid") from exc
+    if state is BlePairingState.WAITING_INPUT:
+        if (
+            pairing_id is None
+            or action is not BlePairingAction.PASSKEY_INPUT
+            or remaining_ms is None
+        ):
+            raise ProtocolError("BLE pairing waiting-input fields are incoherent")
+    elif pairing_id is not None or action is not None or remaining_ms is not None:
+        raise ProtocolError("BLE pairing inactive fields must be null")
+    return BlePairingStatus(
+        state=state,
+        generation=generation,
+        connected=value["connected"],
+        pairing_id=pairing_id,
+        action=action,
+        remaining_ms=remaining_ms,
+        encrypted=value["encrypted"],
+        authenticated=value["authenticated"],
+        bonded=value["bonded"],
+        secure_connections=value["secure_connections"],
+        key_size=key_size,
+        last_result=last_result,
+    )
+
+
+def validate_ble_pairing_respond_result(value: Any) -> BlePairingRespondResult:
+    if not isinstance(value, dict) or set(value) != {"accepted", "pairing_id"}:
+        raise ProtocolError("ble.pairing.respond result fields are invalid")
+    accepted = value["accepted"]
+    pairing_id = value["pairing_id"]
+    if accepted is not True:
+        raise ProtocolError("BLE pairing response acceptance is invalid")
+    if type(pairing_id) is not int or not 1 <= pairing_id <= MAX_UINT32:
+        raise ProtocolError("BLE pairing response ID is invalid")
+    return BlePairingRespondResult(accepted=True, pairing_id=pairing_id)
 
 
 def validate_hid_route_status(value: Any) -> HidRouteStatus:

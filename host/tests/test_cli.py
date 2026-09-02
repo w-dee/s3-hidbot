@@ -28,7 +28,11 @@ from hidbot.provisioning_workflow import (
     VerificationPhaseClassification,
     VerificationPhaseResult,
 )
-from hidbot.protocol import FirmwareIdentity, SystemInfo
+from hidbot.protocol import (
+    BLE_PAIRING_TRANSACTION_CAPABILITY,
+    FirmwareIdentity,
+    SystemInfo,
+)
 
 
 TOKEN = "0123456789abcdef0123456789abcdef"
@@ -76,6 +80,7 @@ class FakeTransport:
             "ble.exposure-control-v1",
         ]
         self.info_result: object = {"project": "s3-hidbot"}
+        self.pairing_error: dict[str, str] | None = None
 
     def open(self) -> None:
         self.calls.append(("open",))
@@ -195,6 +200,43 @@ class FakeTransport:
                     },
                 )
             )
+        elif value["cmd"] == "ble.pairing.status":
+            self.chunks.append(
+                response(
+                    value["id"],
+                    TOKEN,
+                    result={
+                        "state": "waiting_input",
+                        "generation": 3,
+                        "connected": True,
+                        "pairing_id": 27,
+                        "action": "passkey_input",
+                        "remaining_ms": 25_000,
+                        "encrypted": False,
+                        "authenticated": False,
+                        "bonded": False,
+                        "secure_connections": False,
+                        "key_size": 0,
+                        "last_result": "none",
+                    },
+                )
+            )
+        elif value["cmd"] == "ble.pairing.respond":
+            if self.pairing_error is not None:
+                self.chunks.append(
+                    response(value["id"], TOKEN, error=self.pairing_error)
+                )
+            else:
+                self.chunks.append(
+                    response(
+                        value["id"],
+                        TOKEN,
+                        result={
+                            "accepted": True,
+                            "pairing_id": value["params"]["pairing_id"],
+                        },
+                    )
+                )
         elif value["cmd"] in {"hid.keyboard.report", "hid.mouse.report"}:
             params = value["params"]
             if value["cmd"] == "hid.keyboard.report":
@@ -223,6 +265,7 @@ class CliTests(unittest.TestCase):
         argv: list[str],
         env: dict[str, str] | None = None,
         configure_transport: Callable[[FakeTransport], None] | None = None,
+        passkey_reader: Callable[[], str] | None = None,
     ) -> tuple[int, str, str, list[tuple[object, ...]]]:
         calls: list[tuple[object, ...]] = []
         transport = FakeTransport(calls)
@@ -241,6 +284,7 @@ class CliTests(unittest.TestCase):
             transport_factory=factory,
             output=output,
             error_output=errors,
+            passkey_reader=passkey_reader,
         )
         return code, output.getvalue(), errors.getvalue(), calls
 
@@ -558,6 +602,179 @@ class CliTests(unittest.TestCase):
             self.assertEqual(value["observed"], observed)
             self.assertNotIn("address", value)
             self.assertEqual(self.wire_commands(calls), ["protocol.hello", wire_command])
+
+    def test_ble_pairing_status_human_and_json_are_strict_results(self) -> None:
+        def enable_pairing(transport: FakeTransport) -> None:
+            transport.hello_capabilities.append(BLE_PAIRING_TRANSACTION_CAPABILITY)
+
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "ble-pairing-status"],
+            configure_transport=enable_pairing,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        for line in (
+            "state: waiting_input",
+            "pairing_id: 27",
+            "remaining_ms: 25000",
+            "encrypted: False",
+            "authenticated: False",
+            "bonded: False",
+            "secure_connections: False",
+            "key_size: 0",
+            "last_result: none",
+        ):
+            self.assertIn(line, output)
+        self.assertEqual(
+            self.wire_commands(calls), ["protocol.hello", "ble.pairing.status"]
+        )
+
+        code, output, errors, _ = self.run_cli(
+            ["--port", "dummy-port", "--json", "ble-pairing-status"],
+            configure_transport=enable_pairing,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(json.loads(output)["pairing_id"], 27)
+
+    def test_ble_pairing_respond_reads_secret_outside_argv(self) -> None:
+        secret = "000123"
+
+        def enable_pairing(transport: FakeTransport) -> None:
+            transport.hello_capabilities.append(BLE_PAIRING_TRANSACTION_CAPABILITY)
+
+        code, output, errors, calls = self.run_cli(
+            [
+                "--port",
+                "dummy-port",
+                "--json",
+                "ble-pairing-respond",
+                "--pairing-id",
+                "27",
+            ],
+            configure_transport=enable_pairing,
+            passkey_reader=lambda: secret,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {"accepted": True, "pairing_id": 27})
+        self.assertEqual(errors, "")
+        self.assertNotIn(secret, output + errors)
+        pairing_write = next(
+            call[1]
+            for call in calls
+            if call[0] == "write" and b"ble.pairing.respond" in call[1]
+        )
+        self.assertEqual(
+            json.loads(pairing_write[len(FRAME_PREFIX) : -1])["params"],
+            {"pairing_id": 27, "passkey": secret},
+        )
+
+    def test_pairing_capability_and_input_failures_send_no_pairing_request(self) -> None:
+        reader_called = False
+
+        def reader() -> str:
+            nonlocal reader_called
+            reader_called = True
+            return "000123"
+
+        code, output, errors, calls = self.run_cli(
+            [
+                "--port",
+                "dummy-port",
+                "ble-pairing-respond",
+                "--pairing-id",
+                "1",
+            ],
+            passkey_reader=reader,
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(output, "")
+        self.assertFalse(reader_called)
+        self.assertIn(BLE_PAIRING_TRANSACTION_CAPABILITY, errors)
+        self.assertEqual(self.wire_commands(calls), ["protocol.hello"])
+
+        def enable_pairing(transport: FakeTransport) -> None:
+            transport.hello_capabilities.append(BLE_PAIRING_TRANSACTION_CAPABILITY)
+
+        code, output, errors, calls = self.run_cli(
+            [
+                "--port",
+                "dummy-port",
+                "ble-pairing-respond",
+                "--pairing-id",
+                "1",
+            ],
+            configure_transport=enable_pairing,
+            passkey_reader=lambda: "12 456",
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(output, "")
+        self.assertNotIn("12 456", errors)
+        self.assertEqual(self.wire_commands(calls), ["protocol.hello"])
+
+    def test_pairing_no_controlling_tty_has_no_stdin_fallback_or_request(self) -> None:
+        def enable_pairing(transport: FakeTransport) -> None:
+            transport.hello_capabilities.append(BLE_PAIRING_TRANSACTION_CAPABILITY)
+
+        with patch("builtins.open", side_effect=OSError("no controlling tty")):
+            code, output, errors, calls = self.run_cli(
+                [
+                    "--port",
+                    "dummy-port",
+                    "ble-pairing-respond",
+                    "--pairing-id",
+                    "1",
+                ],
+                configure_transport=enable_pairing,
+            )
+        self.assertEqual(code, 4)
+        self.assertEqual(output, "")
+        self.assertIn("controlling TTY", errors)
+        self.assertEqual(self.wire_commands(calls), ["protocol.hello"])
+
+    def test_pairing_remote_error_does_not_disclose_passkey(self) -> None:
+        secret = "000123"
+
+        def configure(transport: FakeTransport) -> None:
+            transport.hello_capabilities.append(BLE_PAIRING_TRANSACTION_CAPABILITY)
+            transport.pairing_error = {
+                "code": "BLE_PAIRING_FAILED",
+                "message": f"rejected {secret}",
+            }
+
+        code, output, errors, calls = self.run_cli(
+            [
+                "--port",
+                "dummy-port",
+                "ble-pairing-respond",
+                "--pairing-id",
+                "27",
+            ],
+            configure_transport=configure,
+            passkey_reader=lambda: secret,
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(output, "")
+        self.assertNotIn(secret, errors)
+        self.assertEqual(
+            self.wire_commands(calls), ["protocol.hello", "ble.pairing.respond"]
+        )
+
+    def test_pairing_passkey_is_not_a_cli_option(self) -> None:
+        code, errors, calls = self.run_parser_error(
+            [
+                "--port",
+                "dummy-port",
+                "ble-pairing-respond",
+                "--pairing-id",
+                "27",
+                "--passkey",
+                "000123",
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertNotIn("000123", errors)
+        self.assertEqual(calls, [])
 
     def test_self_test_runs_one_safe_session_in_wire_order(self) -> None:
         code, output, errors, calls = self.run_cli(

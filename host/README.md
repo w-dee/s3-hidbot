@@ -32,6 +32,8 @@ installation flow is in the project
   `verify-firmware ARTIFACT`.
 - Explicit USB exposure control: `usb-attach` and `usb-detach`.
 - Explicit BLE exposure control: `ble-enable` and `ble-disable`.
+- Explicit BLE pairing control: `ble-pairing-status` and
+  `ble-pairing-respond --pairing-id ID`.
 - Explicit HID output routing: `hid-route-status` and `hid-route-set none|usb`.
 - UART diagnostic with safety action: `self-test`.
 - Explicit safety recovery: `release-all`.
@@ -57,8 +59,24 @@ BLE is separately uninitialized and hidden at boot. `ble-enable` lazily starts
 BLE advertising and exposes a discoverable keyboard/mouse HID Service
 foundation; `ble-disable` returns it to hidden idle without changing USB or the
 selected HID route. USB and BLE can be exposed together. There is no BLE HID
-output or `ble` route in U7.3, and no pairing/passkey control, bonding, or
-formal HOGP/security compliance claim.
+output or `ble` route yet, and the pairing controls do not provide bond
+administration or a formal HOGP/security compliance claim.
+
+Pairing is an explicit operator transaction:
+
+1. Run `hidbotctl ble-pairing-status` and note the current `pairing_id`.
+2. Run `hidbotctl ble-pairing-respond --pairing-id ID` with that ID.
+3. Enter the six-digit passkey at the controlling-terminal prompt; input echo
+   is disabled and the passkey is never accepted through argv, environment, a
+   config file, or ordinary stdin.
+4. Run `hidbotctl ble-pairing-status` again to inspect the result.
+
+The CLI avoids shell-history/argv exposure, and the library does not
+intentionally log or retain the passkey beyond the one request and its exact
+transport retries. Python strings and bytes are immutable, however, so they
+cannot be guaranteed zeroized. Typed API callers remain responsible for the
+lifetime of their original passkey `str`; pyserial, interpreter allocator, and
+kernel copies are outside the library's erasure guarantees.
 
 ## Artifact and identity commands
 

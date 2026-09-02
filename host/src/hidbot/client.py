@@ -20,7 +20,10 @@ from .errors import (
 from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
+    BLE_PAIRING_TRANSACTION_CAPABILITY,
     BleExposureStatus,
+    BlePairingRespondResult,
+    BlePairingStatus,
     HidRouteStatus,
     KeyboardReportResult,
     MouseReportResult,
@@ -29,6 +32,7 @@ from .protocol import (
     OutputRoute,
     Response,
     build_keyboard_report_frame,
+    build_ble_pairing_respond_frame,
     build_hid_route_set_frame,
     build_mouse_report_frame,
     build_command_frame,
@@ -36,6 +40,9 @@ from .protocol import (
     parse_response,
     validate_keyboard_report_result,
     validate_ble_exposure_status,
+    validate_ble_pairing_respond_inputs,
+    validate_ble_pairing_respond_result,
+    validate_ble_pairing_status,
     validate_hid_route_status,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
@@ -317,7 +324,14 @@ class Client:
         if capability not in self._capabilities:
             raise CompatibilityError(f"peer does not advertise {capability}")
 
-    def _request_frame_locked(self, request_id: int, session: str, frame: bytes) -> object:
+    def _request_frame_locked(
+        self,
+        request_id: int,
+        session: str,
+        frame: bytes,
+        *,
+        remote_error_message: str | None = None,
+    ) -> object:
         # This frame is immutable for every retry attempt.
         diagnostics: tuple[str, ...] = ()
         unmatched_count = 0
@@ -336,7 +350,9 @@ class Client:
                 assert response.session == session
                 raise RemoteError(
                     response.error.code,
-                    response.error.message,
+                    response.error.message
+                    if remote_error_message is None
+                    else remote_error_message,
                     request_id=request_id,
                     session=session,
                 )
@@ -419,6 +435,46 @@ class Client:
         with self._lock:
             self._require_capability_locked("ble.exposure-control-v1")
             return validate_ble_exposure_status(self._request_locked("ble.disable"))
+
+    def ble_pairing_status(self) -> BlePairingStatus:
+        """Return one strict pairing transaction snapshot without polling."""
+
+        with self._lock:
+            self._require_capability_locked(BLE_PAIRING_TRANSACTION_CAPABILITY)
+            return validate_ble_pairing_status(
+                self._request_locked("ble.pairing.status")
+            )
+
+    def ble_pairing_respond(
+        self, pairing_id: int, passkey: str
+    ) -> BlePairingRespondResult:
+        """Submit one six-digit response to the exact pending pairing ID.
+
+        The caller owns the immutable ``passkey`` string. The client serializes
+        once, reuses those exact frame bytes for transport retries, and retains
+        no request cache after this method returns.
+        """
+
+        validate_ble_pairing_respond_inputs(pairing_id, passkey)
+        with self._lock:
+            self._require_capability_locked(BLE_PAIRING_TRANSACTION_CAPABILITY)
+            request_id, session = self._allocate_request_id_locked()
+            frame = build_ble_pairing_respond_frame(
+                request_id, session, pairing_id, passkey
+            )
+            try:
+                return validate_ble_pairing_respond_result(
+                    self._request_frame_locked(
+                        request_id,
+                        session,
+                        frame,
+                        remote_error_message="pairing response failed",
+                    )
+                )
+            finally:
+                # bytes are immutable and cannot be zeroized. Drop the only
+                # client-owned frame reference immediately after termination.
+                del frame
 
     def hid_route_status(self) -> HidRouteStatus:
         """Return the coherent explicit HID output-route transaction state."""

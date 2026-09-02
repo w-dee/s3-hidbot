@@ -47,7 +47,9 @@ repeat-pairing, or peer failure disconnects without global recovery. This
 internal model is exposed in Slice C by the firmware-only
 `ble.pairing-transaction-v1` capability and the `ble.pairing.status` and
 `ble.pairing.respond` commands. The full identity hello now has 13 unique
-capabilities. No host API, CLI, BLE route, or HID notification output is added.
+capabilities. Slice D adds the strictly typed host API and explicit no-echo
+CLI for those frozen commands, without a firmware change. No BLE route or HID
+notification output is added.
 
 `ble.pairing.status` accepts omitted or empty params. Its exact result fields
 are `state`, `generation`, `connected`, `pairing_id`, `action`,
@@ -706,6 +708,7 @@ as unknown/session-lost.
 After `connect()`/hello, the host client exposes `ping()`, `info()`,
 `usb_status()`, optional `usb_exposure_status()`, `usb_attach()`, and
 `usb_detach()`, optional `hid_route_status()` and `hid_route_set()`, the
+optional one-shot `ble_pairing_status()` and `ble_pairing_respond()` methods,
 safety-only `Client.release_all()` API, and the explicit
 `Client.keyboard_report()` and `Client.mouse_report()` primitive APIs. The CLI
 also exposes `usb-exposure-status`, `usb-attach`, `usb-detach`,
@@ -739,6 +742,7 @@ failures become `TransportError`; request deadline expiry remains
 
 The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`,
 `usb-status`, `usb-exposure-status`, explicit `usb-attach` and `usb-detach`,
+explicit `ble-pairing-status` and `ble-pairing-respond --pairing-id ID`,
 explicit `hid-route-status` and `hid-route-set none|usb`,
 and the safe `self-test` control-plane diagnostic through the diagnostic
 client methods, the safety recovery command `release-all` through
@@ -757,6 +761,16 @@ stderr. Exit codes are 0 success, 2 configuration/input, 3 transport, 4
 protocol/compatibility/session, 5 remote command, 6 timeout, and 7 for a
 completed `verify-firmware` comparison that is a mismatch or has unavailable
 identity.
+
+Pairing response input is read only from the controlling terminal with echo
+disabled; there is no passkey argv, environment, configuration, or ordinary
+stdin fallback. The CLI drops its local immutable string reference after one
+validated call. The client serializes once and keeps the same immutable frame
+only through terminal success, remote error, or retry exhaustion, then drops
+its reference. It does not intentionally log the request or secret. Python
+caller strings and immutable byte copies cannot be reliably zeroized, so API
+callers own their original string lifetime and no erasure claim covers CPython
+allocator remnants, pyserial copies, or kernel buffers.
 
 `hidbotctl verify-artifact ARTIFACT` validates either an archive or extracted
 bundle directory with the canonical artifact verifier, then renders the
