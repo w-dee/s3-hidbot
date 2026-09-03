@@ -435,6 +435,7 @@ class StateMachine {
     void publish_release_request_only_for_test();
     bool release_requested_for_test() const;
     std::uint32_t release_request_epoch_for_test() const;
+    void set_release_epoch_for_test(std::uint32_t release_epoch);
 #endif
 
   private:

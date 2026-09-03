@@ -3252,6 +3252,22 @@ void test_u74c_disconnect_expiry_race_and_release_action_reuse() {
     assert(fixture.ble.disconnect_calls == 1);
 }
 
+void test_u74c_release_epoch_wrap_has_exact_zero_owner() {
+    ReadyBleRouteFixture fixture(136);
+    fixture.runtime.state_machine().set_release_epoch_for_test(UINT32_MAX);
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    const auto identity =
+        fixture.controller.ble_route_release_identity_for_test();
+    assert(identity.release_epoch == 0);
+    assert(fixture.controller.expire_ble_route_release_grace_for_test());
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.ble.disconnect_calls == 1);
+    observe_exact_route_disconnect(fixture);
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+}
+
 void test_u74c_lease_overflow_and_disable_retirement_paths() {
     {
         ReadyBleRouteFixture fixture(127);
@@ -4241,6 +4257,7 @@ int main() {
     test_u74c_spontaneous_disconnect_and_stale_grace_are_fenced();
     test_u74c_disconnect_before_first_release_wake_releases_owner();
     test_u74c_disconnect_expiry_race_and_release_action_reuse();
+    test_u74c_release_epoch_wrap_has_exact_zero_owner();
     test_u74c_lease_overflow_and_disable_retirement_paths();
     test_u74c_ble_completion_preserves_independent_usb_uncertainty();
     test_pairing_input_response_and_initiation();

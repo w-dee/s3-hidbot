@@ -996,6 +996,10 @@ bool StateMachine::release_requested_for_test() const {
 std::uint32_t StateMachine::release_request_epoch_for_test() const {
     return release_request_epoch_.load(std::memory_order_acquire);
 }
+
+void StateMachine::set_release_epoch_for_test(std::uint32_t release_epoch) {
+    release_epoch_.store(release_epoch, std::memory_order_release);
+}
 #endif
 
 bool StateMachine::mounted_and_active(Interface interface) const {
