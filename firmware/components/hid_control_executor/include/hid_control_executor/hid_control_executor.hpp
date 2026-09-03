@@ -449,7 +449,7 @@ class Controller final : public usb_lifecycle::Executor,
                                   BleHidInterface interface) const;
     void submit_ble_safety_release(BleRouteReleaseIdentity identity);
     void start_ble_route_disconnect(BleRouteReleaseIdentity identity);
-    void note_ble_route_disconnect_started(
+    void note_ble_route_disconnect_result(
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle, std::int32_t result);
     void complete_ble_route_release_on_disconnect(BleEvent event);

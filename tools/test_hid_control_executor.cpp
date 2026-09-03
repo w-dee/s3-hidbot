@@ -3088,6 +3088,32 @@ void test_u74c_release_rejection_and_disconnect_failure_are_bounded() {
         assert(fixture.runtime.state_machine().route_snapshot().active ==
                hid_route::OutputRoute::kNone);
     }
+    {
+        ReadyBleRouteFixture fixture(135);
+        begin_explicit_ble_route_retirement(fixture);
+        fixture.ble.disconnect_result = -88;
+        // A stronger current-authority overflow attempts teardown while grace
+        // is active. Its failed initiation owns the terminal outcome.
+        for (std::size_t index = 0;
+             index < hid_control_executor::Controller::kActionQueueDepth;
+             ++index) {
+            assert(fixture.controller.signal_ble_event({
+                .kind = hid_control_executor::BleEventKind::kEncryptionChange,
+                .generation = fixture.generation - 1U,
+                .connection_handle = fixture.connection,
+            }));
+        }
+        assert(!queue_control_point(
+            fixture.controller, fixture.generation, fixture.connection,
+            fixture.database.handles.control_point_value, true));
+        assert(fixture.controller.process_wake_cycle_for_test());
+        assert(fixture.ble.disconnect_calls == 1);
+        assert(fixture.controller.ble_snapshot().recovery_required);
+        assert(!fixture.controller.expire_ble_route_release_grace_for_test());
+        assert(fixture.ble.disconnect_calls == 1);
+        assert(fixture.runtime.state_machine().route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
+    }
 }
 
 void test_u74c_grace_queue_full_has_sticky_progress() {

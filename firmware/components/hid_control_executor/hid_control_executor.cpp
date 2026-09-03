@@ -800,10 +800,10 @@ void Controller::start_ble_route_disconnect(
     ble_route_release_owner_ = ControlOperation::kNone;
 }
 
-void Controller::note_ble_route_disconnect_started(
+void Controller::note_ble_route_disconnect_result(
     ble_lifecycle::Generation generation, std::uint16_t connection_handle,
     std::int32_t result) {
-    if (result != 0 || runtime_ == nullptr) {
+    if (runtime_ == nullptr) {
         return;
     }
     const auto release =
@@ -825,7 +825,19 @@ void Controller::note_ble_route_disconnect_started(
     };
     cancel_ble_route_release_grace(identity);
     ble_route_release_ = identity;
-    ble_route_release_phase_ = BleRouteReleasePhase::kDisconnecting;
+    ble_route_release_phase_ = result == 0
+                                   ? BleRouteReleasePhase::kDisconnecting
+                                   : BleRouteReleasePhase::kFault;
+    if (result != 0) {
+        ControlOperation owner = ble_route_release_owner_;
+        if (owner == ControlOperation::kNone &&
+            active_operation_.load(std::memory_order_acquire) ==
+                ControlOperation::kRouteChange) {
+            owner = ControlOperation::kRouteChange;
+        }
+        release_operation(owner);
+        ble_route_release_owner_ = ControlOperation::kNone;
+    }
 }
 
 void Controller::cancel_ble_route_release_grace(
@@ -1348,8 +1360,8 @@ void Controller::commit_persistent_store_failure(
     if (current.connected) {
         const std::int32_t disconnect_result =
             ble_backend_->disconnect(handle);
-        note_ble_route_disconnect_started(current.generation, handle,
-                                          disconnect_result);
+        note_ble_route_disconnect_result(current.generation, handle,
+                                         disconnect_result);
     }
     const auto active = active_operation_.load(std::memory_order_acquire);
     const auto owner =
@@ -1532,8 +1544,8 @@ void Controller::fail_current_ble_queue_overflow() {
         if (current.connected) {
             const std::int32_t disconnect_result =
                 ble_backend_->disconnect(handle);
-            note_ble_route_disconnect_started(current.generation, handle,
-                                              disconnect_result);
+            note_ble_route_disconnect_result(current.generation, handle,
+                                             disconnect_result);
         }
         const auto active = active_operation_.load(std::memory_order_acquire);
         const auto ble_owner =
@@ -1614,8 +1626,8 @@ bool Controller::consume_ble_overflow() {
                 const auto handle = ble_state_.connection_handle();
                 const std::int32_t disconnect_result =
                     ble_backend_->disconnect(handle);
-                note_ble_route_disconnect_started(current.generation, handle,
-                                                  disconnect_result);
+                note_ble_route_disconnect_result(current.generation, handle,
+                                                 disconnect_result);
             }
             const auto active =
                 active_operation_.load(std::memory_order_acquire);
@@ -1690,8 +1702,8 @@ void Controller::terminate_security_connection(ble_pairing::LastResult result,
     ble_backend_->cancel_pairing_timeout();
     ble_backend_->retire_security(current.generation, handle);
     const std::int32_t disconnect_result = ble_backend_->disconnect(handle);
-    note_ble_route_disconnect_started(current.generation, handle,
-                                      disconnect_result);
+    note_ble_route_disconnect_result(current.generation, handle,
+                                     disconnect_result);
     if (fatal) {
         ble_backend_->mark_security_unhealthy(current.generation);
         fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -3,
