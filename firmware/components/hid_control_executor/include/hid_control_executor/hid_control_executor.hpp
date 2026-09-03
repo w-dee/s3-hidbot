@@ -263,6 +263,11 @@ class BleBackend {
     virtual std::int32_t start_advertising() = 0;
     virtual std::int32_t stop_advertising() = 0;
     virtual std::int32_t disconnect(std::uint16_t connection_handle) = 0;
+    // This classification is consumed only by the exact, executor-owned
+    // security teardown path. Other disconnect callers retain their existing
+    // fail-closed treatment of every nonzero initiation result.
+    virtual bool security_teardown_already_disconnected(
+        std::int32_t disconnect_result) const = 0;
     virtual std::int32_t arm_ble_route_release_grace(
         BleRouteReleaseIdentity identity) = 0;
     virtual void cancel_ble_route_release_grace(
@@ -488,6 +493,9 @@ class Controller final : public usb_lifecycle::Executor,
     bool pairing_mailbox_zero_for_test() const;
     bool expire_ble_route_release_grace_for_test();
     BleRouteReleaseIdentity ble_route_release_identity_for_test() const;
+    bool reconcile_security_disconnect_absent_for_test(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle);
 #endif
 
   private:
@@ -499,6 +507,10 @@ class Controller final : public usb_lifecycle::Executor,
     void release_operation(ControlOperation operation);
     static ControlOperation operation_for(usb_lifecycle::ExecutorAction action);
     void process_ble_event(BleEvent event);
+    bool reconcile_ble_disconnect(BleEvent event, bool expected);
+    bool reconcile_security_disconnect_absent(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle);
     void fail_ble(ble_lifecycle::Generation generation,
                   ble_lifecycle::Operation operation, std::int32_t code,
                   ControlOperation owner);

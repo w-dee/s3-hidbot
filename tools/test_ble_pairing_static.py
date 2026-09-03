@@ -154,6 +154,12 @@ def main() -> int:
     assert disconnect_body.index("ble_gap_terminate(") < \
         disconnect_body.index(
             "cancel_timeout(LifecycleTimeoutPurpose::kDisconnect)")
+    terminal_classifier = re.search(
+        r"bool Backend::security_teardown_already_disconnected\(.*?\) const \{"
+        r"(.*?)\n\}", transport, re.S)
+    assert terminal_classifier
+    assert "disconnect_result == BLE_HS_ENOTCONN" in \
+        terminal_classifier.group(1)
     arm = re.search(
         r"std::int32_t Backend::arm_timeout\(.*?\) \{(.*?)\n\}",
         transport, re.S)
@@ -175,8 +181,38 @@ def main() -> int:
         executor, re.S)
     assert teardown
     assert "const std::int32_t disconnect_result" in teardown.group(1)
+    assert "security_teardown_already_disconnected(" in teardown.group(1)
+    assert "reconcile_security_disconnect_absent(" in teardown.group(1)
     assert "else if (disconnect_result != 0)" in teardown.group(1)
     assert "fail_ble(" in teardown.group(1)
+
+    absent = re.search(
+        r"bool Controller::reconcile_security_disconnect_absent\(.*?\) \{"
+        r"(.*?)\n\}", executor, re.S)
+    assert absent
+    for required in (
+        "current.generation != generation",
+        "generation != ble_state_.generation()",
+        "!current.connected",
+        "DesiredExposure::kExposed",
+        "ObservedState::kConnected",
+        "connection_handle != ble_state_.connection_handle()",
+        "reconcile_ble_disconnect(",
+    ):
+        assert required in absent.group(1)
+
+    shared_disconnect = re.search(
+        r"bool Controller::reconcile_ble_disconnect\(.*?\) \{(.*?)\n\}",
+        executor, re.S)
+    assert shared_disconnect
+    for required in (
+        "ble_state_.observe_disconnect(",
+        "complete_ble_route_release_on_disconnect(event)",
+        "pairing_state_.disconnect(",
+        "retire_security(",
+        "clear_ble_hid_peer()",
+    ):
+        assert required in shared_disconnect.group(1)
 
     disable_request = re.search(
         r"BleCommandOutcome Controller::request_ble_disable\(\) \{(.*?)"

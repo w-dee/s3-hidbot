@@ -282,6 +282,16 @@ not modify a host OS pairing database. A host that retains its own record may
 require a separately authorized host-side lifecycle action before pairing can
 succeed again.
 
+An exact current security teardown treats NimBLE `BLE_HS_ENOTCONN` as proof
+that its physical connection is already absent. The executor rechecks the BLE
+generation, connection handle, and connected lifecycle state before using the
+same disconnect-retirement path as a real callback. A late callback and an old
+generation whose numeric handle has been reused are therefore harmless. This
+does not change other disconnect callers or make any other nonzero initiation
+result successful. Connection-lifecycle recovery is not reported as
+`BLE_BOND_STORAGE`; that public error remains reserved for persistent-store
+trust failures.
+
 Normal stop-and-wait retry caching applies to `ble.bond.remove`: the same
 session, request ID, authority epoch, and exact serialized request bytes replay
 the frozen successful response without invoking storage a second time. A

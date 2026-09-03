@@ -24,6 +24,8 @@ class Backend final : public hid_control_executor::BleBackend {
     std::int32_t start_advertising() override;
     std::int32_t stop_advertising() override;
     std::int32_t disconnect(std::uint16_t connection_handle) override;
+    bool security_teardown_already_disconnected(
+        std::int32_t disconnect_result) const override;
     std::int32_t arm_ble_route_release_grace(
         hid_control_executor::BleRouteReleaseIdentity identity) override;
     void cancel_ble_route_release_grace(

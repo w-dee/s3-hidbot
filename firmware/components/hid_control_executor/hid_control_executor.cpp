@@ -1268,12 +1268,11 @@ void Controller::process(Action action) {
             return;
         }
         const auto lifecycle = ble_state_.snapshot();
-        if (!lifecycle.stack_ready) {
-            bond_list_rpc_result_ = {};
-        } else if (lifecycle.recovery_required ||
-                   ble_backend_->persistent_store_failure_observed()) {
+        if (ble_backend_->persistent_store_failure_observed()) {
             bond_list_rpc_result_ = {
                 .kind = BleBondListResultKind::kStorageFailure};
+        } else if (!lifecycle.stack_ready || lifecycle.recovery_required) {
+            bond_list_rpc_result_ = {};
         } else {
             bond_list_rpc_result_ = ble_backend_->list_bonds();
         }
@@ -1289,14 +1288,13 @@ void Controller::process(Action action) {
         const BondId bond_id = bond_remove_mailbox_;
         bond_remove_mailbox_ = {};
         const auto lifecycle = ble_state_.snapshot();
-        if (!lifecycle.stack_ready) {
-            bond_remove_rpc_result_ = {
-                .kind = BleBondRemoveResultKind::kNotReady,
-                .bond_id = bond_id};
-        } else if (lifecycle.recovery_required ||
-                   ble_backend_->persistent_store_failure_observed()) {
+        if (ble_backend_->persistent_store_failure_observed()) {
             bond_remove_rpc_result_ = {
                 .kind = BleBondRemoveResultKind::kStorageFailure,
+                .bond_id = bond_id};
+        } else if (!lifecycle.stack_ready) {
+            bond_remove_rpc_result_ = {
+                .kind = BleBondRemoveResultKind::kNotReady,
                 .bond_id = bond_id};
         } else if (!bond_remove_eligible()) {
             bond_remove_rpc_result_ = {
@@ -1903,12 +1901,18 @@ void Controller::terminate_security_connection(ble_pairing::LastResult result,
     ble_backend_->cancel_pairing_timeout();
     ble_backend_->retire_security(current.generation, handle);
     const std::int32_t disconnect_result = ble_backend_->disconnect(handle);
+    const bool already_disconnected =
+        !fatal && ble_backend_->security_teardown_already_disconnected(
+                      disconnect_result);
     note_ble_route_disconnect_result(current.generation, handle,
-                                     disconnect_result);
+                                     already_disconnected ? 0
+                                                          : disconnect_result);
     if (fatal) {
         ble_backend_->mark_security_unhealthy(current.generation);
         fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -3,
                  ControlOperation::kNone);
+    } else if (already_disconnected) {
+        (void)reconcile_security_disconnect_absent(current.generation, handle);
     } else if (disconnect_result != 0) {
         // The peer authority was revoked above, but without a successfully
         // established Disconnect operation there is no completion or watchdog
@@ -1917,6 +1921,24 @@ void Controller::terminate_security_connection(ble_pairing::LastResult result,
         fail_ble(current.generation, ble_lifecycle::Operation::kRuntime,
                  disconnect_result, ControlOperation::kNone);
     }
+}
+
+bool Controller::reconcile_security_disconnect_absent(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) {
+    const auto current = ble_state_.snapshot();
+    if (current.generation != generation ||
+        generation != ble_state_.generation() || !current.connected ||
+        current.desired != ble_lifecycle::DesiredExposure::kExposed ||
+        current.observed != ble_lifecycle::ObservedState::kConnected ||
+        connection_handle != ble_state_.connection_handle()) {
+        return false;
+    }
+    return reconcile_ble_disconnect(
+        {.kind = BleEventKind::kDisconnect,
+         .generation = generation,
+         .connection_handle = connection_handle},
+        false);
 }
 
 void Controller::reconcile_security(std::uint16_t connection_handle,
@@ -2125,6 +2147,48 @@ ble_pairing::RespondResult Controller::respond_to_pairing(
     return ble_pairing::RespondResult::kAccepted;
 }
 
+bool Controller::reconcile_ble_disconnect(BleEvent event, bool expected) {
+    if (!ble_state_.observe_disconnect(event.generation,
+                                       event.connection_handle, expected)) {
+        return false;
+    }
+    // The same exact physical-loss proof completes any already-releasing BLE
+    // route. This call is idempotent when the queued Disconnect path already
+    // performed the route transition before entering process_ble_event().
+    complete_ble_route_release_on_disconnect(event);
+    ble_backend_->cancel_pairing_timeout();
+    pairing_deadline_us_ = 0;
+    wipe_pairing_mailbox();
+    pairing_complete_seen_ = false;
+    (void)pairing_state_.disconnect(event.generation,
+                                    event.connection_handle);
+    ble_backend_->retire_security(event.generation,
+                                  event.connection_handle);
+    clear_ble_hid_peer();
+    if (expected) {
+        ble_state_.complete_disable(event.generation);
+        ble_backend_->record_heap_checkpoint(
+            BleBackend::HeapCheckpoint::kHiddenIdle);
+        release_operation(ControlOperation::kBleDisable);
+        return true;
+    }
+    if (ble_backend_->persistent_store_failure_observed()) {
+        return true;
+    }
+    const auto generation = ble_state_.generation();
+    ble_backend_->set_generation(generation);
+    const std::int32_t result = ble_backend_->start_advertising();
+    if (result == 0) {
+        ble_state_.complete_advertising(generation);
+        ble_backend_->record_heap_checkpoint(
+            BleBackend::HeapCheckpoint::kReadvertising);
+    } else {
+        fail_ble(generation, ble_lifecycle::Operation::kRuntime, result,
+                 ControlOperation::kNone);
+    }
+    return true;
+}
+
 void Controller::process_ble_event(BleEvent event) {
     if (ble_backend_ == nullptr) {
         return;
@@ -2178,40 +2242,7 @@ void Controller::process_ble_event(BleEvent event) {
         case BleEventKind::kDisconnect: {
             const bool expected = active_operation_.load(std::memory_order_acquire) ==
                                   ControlOperation::kBleDisable;
-            if (!ble_state_.observe_disconnect(event.generation,
-                                               event.connection_handle, expected)) {
-                return;
-            }
-            ble_backend_->cancel_pairing_timeout();
-            pairing_deadline_us_ = 0;
-            wipe_pairing_mailbox();
-            pairing_complete_seen_ = false;
-            (void)pairing_state_.disconnect(event.generation,
-                                            event.connection_handle);
-            ble_backend_->retire_security(event.generation,
-                                          event.connection_handle);
-            clear_ble_hid_peer();
-            if (expected) {
-                ble_state_.complete_disable(event.generation);
-                ble_backend_->record_heap_checkpoint(
-                    BleBackend::HeapCheckpoint::kHiddenIdle);
-                release_operation(ControlOperation::kBleDisable);
-                return;
-            }
-            if (ble_backend_->persistent_store_failure_observed()) {
-                return;
-            }
-            const auto generation = ble_state_.generation();
-            ble_backend_->set_generation(generation);
-            const std::int32_t result = ble_backend_->start_advertising();
-            if (result == 0) {
-                ble_state_.complete_advertising(generation);
-                ble_backend_->record_heap_checkpoint(
-                    BleBackend::HeapCheckpoint::kReadvertising);
-            } else {
-                fail_ble(generation, ble_lifecycle::Operation::kRuntime, result,
-                         ControlOperation::kNone);
-            }
+            (void)reconcile_ble_disconnect(event, expected);
             return;
         }
         case BleEventKind::kAdvertisingComplete:
@@ -2502,6 +2533,13 @@ bool Controller::expire_ble_route_release_grace_for_test() {
 BleRouteReleaseIdentity
 Controller::ble_route_release_identity_for_test() const {
     return ble_route_release_;
+}
+
+bool Controller::reconcile_security_disconnect_absent_for_test(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) {
+    return reconcile_security_disconnect_absent(generation,
+                                                connection_handle);
 }
 #else
 void Controller::task_entry(void *context) {

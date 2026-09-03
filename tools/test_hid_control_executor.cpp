@@ -77,6 +77,10 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         last_connection = connection_handle;
         return disconnect_result;
     }
+    bool security_teardown_already_disconnected(
+        std::int32_t result) const override {
+        return result == already_disconnected_result;
+    }
     std::int32_t arm_ble_route_release_grace(
         hid_control_executor::BleRouteReleaseIdentity identity) override {
         ++arm_route_release_grace_calls;
@@ -345,6 +349,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     std::int32_t advertising_result = 0;
     std::int32_t stop_result = 0;
     std::int32_t disconnect_result = 0;
+    std::int32_t already_disconnected_result = 7;
     std::int32_t route_release_grace_result = 0;
     std::int32_t orphan_terminate_result = 0;
     std::int32_t configure_connection_result = 0;
@@ -4577,6 +4582,174 @@ void test_smp_and_repeat_pairing_disconnect_failures_terminalize_recovery() {
     }
 }
 
+void test_security_teardown_already_disconnected_reconciles_exact_peer() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 113;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    ble.disconnect_result = ble.already_disconnected_result;
+    ble.bond_list_result = {
+        .kind = hid_control_executor::BleBondListResultKind::kSuccess,
+        .healthy = true};
+
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     connection, -1));
+    assert(controller.process_one_for_test());
+
+    const auto disconnected = controller.ble_snapshot();
+    assert(disconnected.generation != generation);
+    assert(disconnected.observed ==
+           ble_lifecycle::ObservedState::kAdvertising);
+    assert(disconnected.advertising && !disconnected.connected);
+    assert(!disconnected.recovery_required && !disconnected.last_error.present);
+    const auto pairing = controller.pairing_snapshot();
+    assert(pairing.live_state == ble_pairing::LiveState::kIdle);
+    assert(pairing.last_result == ble_pairing::LastResult::kSmpFailed);
+    assert(pairing.connection_handle == ble_lifecycle::kNoConnection);
+    assert(!controller.ble_hid_peer_snapshot().active);
+    assert(!controller.ble_link_ready());
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(ble.disconnect_calls == 1);
+    assert(ble.advertising_calls == 2);  // Existing reconnect policy only.
+
+    // A stale-key failure that ended in ENOTCONN is not a storage fault.
+    assert(controller.request_bond_list().kind ==
+           hid_control_executor::BleBondListResultKind::kSuccess);
+    assert(ble.bond_list_calls == 1);
+
+    // Explicit disable still reaches the hidden terminal idle state without
+    // requiring a synthetic or late physical Disconnect callback.
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    const auto idle = controller.ble_snapshot();
+    assert(idle.observed == ble_lifecycle::ObservedState::kIdle);
+    assert(idle.desired == ble_lifecycle::DesiredExposure::kHidden);
+    assert(!idle.connected && !idle.advertising && !idle.recovery_required);
+}
+
+void test_security_teardown_normal_and_failed_disconnect_results() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        constexpr std::uint16_t connection = 114;
+        connect_ble(runtime, usb, ble, database, controller, connection);
+        const auto generation = controller.ble_snapshot().generation;
+
+        assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                         connection, -1));
+        assert(controller.process_one_for_test());
+        assert(controller.ble_snapshot().generation == generation);
+        assert(controller.ble_snapshot().connected);
+        assert(!controller.ble_snapshot().recovery_required);
+        assert(ble.disconnect_calls == 1);
+
+        assert(ble.event_for_generation(
+            hid_control_executor::BleEventKind::kDisconnect,
+            generation, connection));
+        assert(controller.process_one_for_test());
+        assert(!controller.ble_snapshot().connected);
+        assert(!controller.ble_snapshot().recovery_required);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        constexpr std::uint16_t connection = 115;
+        connect_ble(runtime, usb, ble, database, controller, connection);
+        ble.disconnect_result = -96;
+
+        assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                         connection, -1));
+        assert(controller.process_one_for_test());
+        const auto failed = controller.ble_snapshot();
+        assert(failed.observed == ble_lifecycle::ObservedState::kFault);
+        assert(failed.recovery_required && !failed.connected);
+        assert(failed.last_error.present && failed.last_error.code == -96);
+        assert(!ble.persistent_store_failure_observed());
+
+        // Generic lifecycle recovery is not mislabeled as persistent Storage.
+        assert(controller.request_bond_list().kind ==
+               hid_control_executor::BleBondListResultKind::kNotReady);
+        assert(controller.request_bond_remove(executor_bond_id('e')).kind ==
+               hid_control_executor::BleBondRemoveResultKind::kBusy);
+    }
+}
+
+void test_already_disconnected_identity_late_event_and_handle_reuse_fences() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 116;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto old_generation = controller.ble_snapshot().generation;
+
+    // Neither an old generation nor a different handle can retire the peer.
+    assert(!controller.reconcile_security_disconnect_absent_for_test(
+        old_generation - 1U, connection));
+    assert(!controller.reconcile_security_disconnect_absent_for_test(
+        old_generation, connection + 1U));
+    assert(controller.ble_snapshot().generation == old_generation);
+    assert(controller.ble_snapshot().connected);
+
+    assert(controller.reconcile_security_disconnect_absent_for_test(
+        old_generation, connection));
+    const auto terminal = controller.ble_snapshot();
+    assert(terminal.generation != old_generation);
+    assert(!terminal.connected && !terminal.recovery_required);
+    const int advertising_after_terminal = ble.advertising_calls;
+
+    // A callback queued before the synchronous absence result is now stale.
+    assert(ble.event_for_generation(
+        hid_control_executor::BleEventKind::kDisconnect,
+        old_generation, connection));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().generation == terminal.generation);
+    assert(!controller.ble_snapshot().connected);
+    assert(ble.advertising_calls == advertising_after_terminal);
+
+    // The numeric handle may be reused only under the newer generation. Old
+    // teardown evidence cannot touch that adopted peer.
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect,
+                     connection));
+    assert(controller.process_one_for_test());
+    const auto reused = controller.ble_snapshot();
+    assert(reused.generation == terminal.generation && reused.connected);
+    assert(!controller.reconcile_security_disconnect_absent_for_test(
+        old_generation, connection));
+    assert(controller.ble_snapshot().generation == reused.generation);
+    assert(controller.ble_snapshot().connected);
+}
+
+void test_already_disconnected_completes_releasing_ble_route() {
+    ReadyBleRouteFixture fixture(117);
+    fixture.ble.disconnect_result = fixture.ble.already_disconnected_result;
+
+    assert(fixture.ble.event(
+        hid_control_executor::BleEventKind::kEncryptionChange,
+        fixture.connection, -1));
+    assert(fixture.controller.process_one_for_test());
+
+    const auto route = fixture.runtime.state_machine().route_snapshot();
+    assert(route.desired == hid_route::OutputRoute::kNone);
+    assert(route.active == hid_route::OutputRoute::kNone);
+    assert(route.transition == hid_route::Transition::kStable);
+    assert(!fixture.controller.ble_snapshot().recovery_required);
+    assert(!fixture.controller.ble_snapshot().connected);
+}
+
 void test_queue_burst_overflow_and_id_wrap_fail_closed() {
     static_assert(hid_control_executor::Controller::kActionQueueDepth == 12);
     static_assert(sizeof(hid_control_executor::BleHidPeerSnapshot) == 16);
@@ -5121,6 +5294,10 @@ int main() {
     test_store_full_disconnect_failure_terminalizes_recovery();
     test_pairing_timeout_disconnect_failure_terminalizes_recovery();
     test_smp_and_repeat_pairing_disconnect_failures_terminalize_recovery();
+    test_security_teardown_already_disconnected_reconciles_exact_peer();
+    test_security_teardown_normal_and_failed_disconnect_results();
+    test_already_disconnected_identity_late_event_and_handle_reuse_fences();
+    test_already_disconnected_completes_releasing_ble_route();
     test_queue_burst_overflow_and_id_wrap_fail_closed();
     test_policy_persistence_disconnect_disable_and_bounded_burst();
     test_bond_administration_serialization_and_safety_policy();

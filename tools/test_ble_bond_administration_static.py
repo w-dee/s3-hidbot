@@ -133,6 +133,21 @@ def main() -> int:
     assert process_remove
     assert process_remove.group(1).index("bond_remove_eligible()") < process_remove.group(1).index("remove_bond(bond_id)")
     assert "persistent_store_failure_observed()" in process_remove.group(1)
+    assert process_remove.group(1).index(
+        "persistent_store_failure_observed()") < process_remove.group(1).index(
+            "!lifecycle.stack_ready")
+    assert "lifecycle.recovery_required" not in process_remove.group(1)
+
+    process_list = re.search(
+        r"if \(action.kind == ActionKind::kBondList\) \{(.*?)\n    \}",
+        executor,
+        re.S,
+    )
+    assert process_list
+    assert process_list.group(1).index(
+        "persistent_store_failure_observed()") < process_list.group(1).index(
+            "lifecycle.recovery_required")
+    assert "BleBondListResultKind::kStorageFailure" in process_list.group(1)
     assert "ControlOperation::kBondAdministration" in executor
     assert "ble_bond_list_provider" in main_cpp
     assert "ble_bond_remove_provider" in main_cpp

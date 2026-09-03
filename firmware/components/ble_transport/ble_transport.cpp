@@ -640,6 +640,11 @@ std::int32_t Backend::disconnect(std::uint16_t connection_handle) {
     return terminate_result;
 }
 
+bool Backend::security_teardown_already_disconnected(
+    std::int32_t disconnect_result) const {
+    return disconnect_result == BLE_HS_ENOTCONN;
+}
+
 std::int32_t Backend::arm_ble_route_release_grace(
     hid_control_executor::BleRouteReleaseIdentity identity) {
     if (route_release_timer_ == nullptr ||

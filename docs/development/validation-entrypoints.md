@@ -163,6 +163,14 @@ key/address material. The ESP-IDF target build remains required for the real
 NimBLE store and NVS callback linkage. These checks do not access Bluetooth
 radio, BlueZ, serial, `.envrc`, or hardware.
 
+The focused U7.5B teardown regression additionally distinguishes NimBLE
+`BLE_HS_ENOTCONN` from an initiation failure only for an exact current
+security-teardown generation and connection. It exercises ordinary success,
+other-error fail-close, stale generation, wrong handle, late Disconnect,
+numeric-handle reuse, route retirement, non-storage stale-key failure, and a
+genuine persistent-store failure. Other disconnect callers retain their
+existing nonzero-result policy.
+
 Run these commands from the repository root:
 
 ```text
