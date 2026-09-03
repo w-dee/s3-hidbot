@@ -145,7 +145,8 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         if (identity_resolved_event) security_link.identity_resolved = true;
         security.apply_verification(active_generation, connection_handle,
                                     security_link, security_persisted);
-        if (security.security_ready_for_hid(active_generation,
+        if (adopt_stored_schema_during_security_refresh &&
+            security.security_ready_for_hid(active_generation,
                                             connection_handle)) {
             gatt_schema_current = stored_gatt_schema_current;
         }
@@ -343,6 +344,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     std::uint64_t now_us = 0;
     bool stored_gatt_schema_current = true;
     bool gatt_schema_current = false;
+    bool adopt_stored_schema_during_security_refresh = true;
     std::uint16_t service_changed_handle = 40;
     ble_lifecycle::Generation last_gatt_refresh_generation = 0;
     ble_lifecycle::Generation last_gatt_persist_generation = 0;
@@ -1561,9 +1563,11 @@ void test_gatt_cache_legacy_refresh_read_persist_and_current_reconnect() {
     subscribe_composite(controller, database, next_generation, next_connection,
                         hid_control_executor::BleSubscriptionReason::kRestore);
     make_security_ready(ble);
+    ble.adopt_stored_schema_during_security_refresh = false;
     assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
                      next_connection));
     assert(controller.process_one_for_test());
+    assert(ble.gatt_schema_status_calls == 2);
     assert(controller.ble_link_ready());
     assert(queue_service_changed_subscription(
         controller, next_generation, next_connection,
@@ -1691,6 +1695,19 @@ void test_gatt_cache_identity_disconnect_and_subscription_fencing() {
     // The still-stale reconnect gets one new bounded attempt when its restored
     // Service Changed subscription is observed.
     assert(queue_service_changed_subscription(
+        controller, generation_a, reused_connection,
+        ble.service_changed_handle, true));
+    assert(controller.process_one_for_test());
+    assert(queue_service_changed_subscription(
+        controller, generation_b, reused_connection,
+        static_cast<std::uint16_t>(ble.service_changed_handle + 1U), true));
+    assert(controller.process_one_for_test());
+    assert(queue_service_changed_subscription(
+        controller, generation_b, reused_connection + 1U,
+        ble.service_changed_handle, true));
+    assert(controller.process_one_for_test());
+    assert(ble.gatt_cache_refresh_calls == 0);
+    assert(queue_service_changed_subscription(
         controller, generation_b, reused_connection,
         ble.service_changed_handle, true));
     assert(controller.process_one_for_test());
@@ -1698,6 +1715,29 @@ void test_gatt_cache_identity_disconnect_and_subscription_fencing() {
 }
 
 void test_gatt_cache_persistence_failures_follow_store_policy() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        constexpr std::uint16_t connection = 153;
+        ble.stored_gatt_schema_current = false;
+        ble.gatt_schema_status_result = {
+            .kind = hid_control_executor::GattSchemaStoreResultKind::
+                kStorageFailure,
+            .status = -30,
+        };
+        connect_ble(runtime, usb, ble, database, controller, connection);
+        make_security_ready(ble);
+        assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                         connection));
+        assert(controller.process_one_for_test());
+        assert(ble.apply_persistent_store_failure_calls == 1);
+        assert(controller.ble_snapshot().recovery_required);
+        assert(!controller.ble_link_ready());
+        assert(ble.persist_gatt_schema_calls == 0);
+    }
     for (const auto kind : {
              hid_control_executor::GattSchemaStoreResultKind::kCapacityFull,
              hid_control_executor::GattSchemaStoreResultKind::kStorageFailure}) {
