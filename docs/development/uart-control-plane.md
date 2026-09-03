@@ -133,6 +133,37 @@ compiled notification adapter uses
 acceptance means only local NimBLE stack acceptance. It has no UART command,
 BLE route, delayed retry, or peer-delivery claim in U7.4A.
 
+U7.4B connects that adapter to the existing fixed HID report tickets through
+an internal-only BLE route. Activation is an executor-owned operation accepted
+only while the exact current BLE generation, connection, registered keyboard
+and mouse characteristic handles, composite CCCD state, Control Point state,
+security verification, persistent store, lifecycle, and fallback state are
+ready. The public `hid.output-route-v1` contract remains exactly `none` or
+`usb`: this slice adds no BLE UART value, host enum, CLI choice, hidden
+command, or route-v2 capability.
+
+Each BLE ticket is permanently bound to its HID authority epoch, route
+generation, BLE generation, exact connection, report-kind characteristic
+handle, report kind, and ticket identity. The serialized control executor
+validates this identity on admission, and the runtime and BLE adapter validate
+it again immediately before the single notification call. Route `none`
+submits nowhere, USB submits only through the TinyUSB SOF path, and the
+internal BLE route submits only through the notification adapter. A successful
+BLE result means `stack_accepted` by the local NimBLE/ATT/HCI path, not peer or
+host delivery.
+
+Normal BLE reports are never retained or retried. In particular, failed
+relative mouse X/Y/wheel/pan values are discarded rather than accumulated,
+merged, inverted, or replayed. A stale or not-ready item is terminal, and a
+resource failure or stack rejection retires the narrow HID/route authority and
+marks the affected state uncertain. Callback-side generation-fenced inhibits
+prevent a readiness-losing event queued behind a report from allowing that
+earlier report to submit. The executor then retires the active internal route;
+later CCCD restoration, Exit Suspend, security recovery, or reconnect can
+restore link readiness but never restores route authority automatically.
+U7.4C still owns BLE all-up, grace, disconnect, and stable-none retirement
+semantics, while U7.4D owns any future public BLE route API.
+
 `ble.pairing.status` accepts omitted or empty params. Its exact result fields
 are `state`, `generation`, `connected`, `pairing_id`, `action`,
 `remaining_ms`, `encrypted`, `authenticated`, `bonded`,

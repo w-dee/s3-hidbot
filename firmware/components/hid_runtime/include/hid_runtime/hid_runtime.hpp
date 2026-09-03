@@ -194,16 +194,54 @@ using UsbGeneration = usb_lifecycle::Generation;
 using RouteGeneration = hid_route::Generation;
 using HidTicketId = std::uint32_t;
 
+inline constexpr std::uint16_t kNoBleConnection = 0xffff;
+
+struct BleRouteActivation {
+    AuthorityEpoch expected_authority_epoch = 0;
+    RouteGeneration expected_route_generation = 0;
+    std::uint32_t ble_generation = 0;
+    std::uint16_t connection_handle = kNoBleConnection;
+    std::uint16_t keyboard_characteristic_handle = 0;
+    std::uint16_t mouse_characteristic_handle = 0;
+};
+
+struct BleRouteAuthoritySnapshot {
+    AuthorityEpoch authority_epoch = 0;
+    RouteGeneration route_generation = 0;
+    std::uint32_t ble_generation = 0;
+    std::uint16_t connection_handle = kNoBleConnection;
+    std::uint16_t keyboard_characteristic_handle = 0;
+    std::uint16_t mouse_characteristic_handle = 0;
+    bool active = false;
+    bool coherent = true;
+};
+
 // Every queued or in-flight HID item is permanently bound to one output route
 // and transport. It is never rerouted or replayed under another identity.
 struct HidWorkToken {
     AuthorityEpoch authority_epoch = 0;
     RouteGeneration route_generation = 0;
     HidTransport transport = HidTransport::kUsb;
-    UsbGeneration transport_generation = 0;
+    std::uint32_t transport_generation = 0;
     HidTicketId ticket_id = 0;
     std::uint32_t release_epoch = 0;
+    std::uint16_t connection_handle = kNoBleConnection;
+    std::uint16_t characteristic_handle = 0;
+    ReportKind report_kind = ReportKind::kUnsafeKeyboard;
 };
+
+enum class BleSubmitResult : std::uint8_t {
+    kStackAccepted,
+    kNotReady,
+    kStale,
+    kResourceFailure,
+    kStackRejected,
+};
+
+using BleSubmitFn = BleSubmitResult (*)(void *context, Interface interface,
+                                        HidWorkToken token,
+                                        const std::uint8_t *report,
+                                        std::uint16_t length);
 
 using SubmitFn = bool (*)(void *context, std::uint8_t instance,
                           const std::uint8_t *report, std::uint16_t length);
@@ -252,9 +290,10 @@ struct ReleaseAllResult {
     ReleaseAllInterfaceState mouse = ReleaseAllInterfaceState::kPending;
 };
 
-// TinyUSB-independent state and mailbox core. Producers may run from the
-// control/application task; execute() is called only from the TinyUSB task.
-// The fixed one-slot-per-interface mailbox never allocates or blocks.
+// Transport-independent state and fixed-ticket core. Producers may run from
+// the control/application task. USB execute() remains TinyUSB-task-owned;
+// BLE tickets are claimed only by the serialized control executor. Neither
+// path allocates or keeps report history.
 class StateMachine {
   public:
     StateMachine();
@@ -274,6 +313,11 @@ class StateMachine {
     RouteStatusSnapshot route_status_snapshot() const;
     RouteTransitionOutcome request_route_usb();
     RouteTransitionOutcome request_route_none();
+    RouteTransitionOutcome request_route_ble(BleRouteActivation activation);
+    BleRouteAuthoritySnapshot ble_route_authority_snapshot() const;
+    bool retire_ble_route_if_matches(BleRouteAuthoritySnapshot expected,
+                                     bool report_state_uncertain = false,
+                                     Interface uncertain_interface = Interface::kKeyboard);
     void terminalize_route_release_schedule_failure(hid_route::Snapshot stage_a);
     void complete_route_release(hid_route::Snapshot stage_a);
 
@@ -301,16 +345,17 @@ class StateMachine {
     HidWorkToken in_flight_token(Interface interface) const;
     AuthorityEpoch authority_epoch() const;
 
-    // Unsafe reports are accepted only while mounted, ready, and safety-clear.
-    // A rejected report is discarded and is never replayed later.
+    // Unsafe reports are accepted only while their selected transport
+    // authority is current and safety-clear. Rejected work is discarded and
+    // never replayed later.
     bool queue_keyboard_report(std::uint8_t modifiers,
                                const std::array<std::uint8_t, 6> &keycodes);
     bool queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                             std::int8_t vertical, std::int8_t horizontal);
 
-    // Public keyboard reports use a dedicated fixed-size ticket.  The
-    // control task publishes the payload and the TinyUSB SOF executor claims
-    // and resolves it without ever reading a partially-written report.
+    // Public keyboard reports use a dedicated fixed-size ticket. The selected
+    // USB SOF or BLE control executor claims and resolves it without ever
+    // reading a partially-written report.
     KeyboardReportBeginResult begin_keyboard_report(
         std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes);
     KeyboardReportSnapshot keyboard_report_snapshot() const;
@@ -328,6 +373,11 @@ class StateMachine {
     bool cancel_mouse_report();
     void finalize_mouse_report();
 
+    HidWorkToken published_report_token(Interface interface) const;
+    bool ble_work_token_current(Interface interface, HidWorkToken token) const;
+    bool process_ble_report(Interface interface, HidWorkToken token,
+                            BleSubmitFn submit, void *context);
+
     // Internal safety primitive. It may be called repeatedly; only interfaces
     // with held or uncertain host state require an all-up report.
     void request_release_all();
@@ -336,7 +386,7 @@ class StateMachine {
     void finalize_release_all();
     void cancel_queued(Interface interface);
 
-    // TinyUSB-task executor and completion notifications.
+    // TinyUSB-task USB executor and completion notifications.
     void execute(SubmitFn submit, void *context);
     bool report_complete(std::uint8_t instance,
                          const std::uint8_t *report = nullptr,
@@ -422,6 +472,11 @@ class StateMachine {
                          const usb_lifecycle::Snapshot &lifecycle,
                          const StatusSnapshot &runtime) const;
     bool unsafe_route_active(RouteGeneration generation, HidTransport transport) const;
+    bool unsafe_work_current(Interface interface, HidWorkToken token) const;
+    void publish_ble_route_authority(BleRouteActivation activation,
+                                     AuthorityEpoch authority_epoch,
+                                     RouteGeneration route_generation);
+    void clear_ble_route_authority();
     bool safety_transport_active(Interface interface) const;
     bool any_safety_required() const;
     void publish_release_request();
@@ -467,6 +522,8 @@ class StateMachine {
         std::atomic<HidTransport> transport{HidTransport::kUsb};
         std::atomic<HidTicketId> ticket_id{0};
         std::atomic<std::uint32_t> release_epoch{0};
+        std::uint16_t connection_handle = kNoBleConnection;
+        std::uint16_t characteristic_handle = 0;
         std::atomic<KeyboardReportTicketOutcome> outcome{KeyboardReportTicketOutcome::kNone};
         std::uint8_t report[8]{};
     };
@@ -479,6 +536,8 @@ class StateMachine {
         std::atomic<HidTransport> transport{HidTransport::kUsb};
         std::atomic<HidTicketId> ticket_id{0};
         std::atomic<std::uint32_t> release_epoch{0};
+        std::uint16_t connection_handle = kNoBleConnection;
+        std::uint16_t characteristic_handle = 0;
         std::atomic<MouseReportTicketOutcome> outcome{MouseReportTicketOutcome::kNone};
         std::uint8_t report[5]{};
     };
@@ -490,6 +549,7 @@ class StateMachine {
     static_assert(std::atomic<UsbGeneration>::is_always_lock_free);
     static_assert(std::atomic<RouteGeneration>::is_always_lock_free);
     static_assert(std::atomic<HidTicketId>::is_always_lock_free);
+    static_assert(std::atomic<std::uint16_t>::is_always_lock_free);
     usb_lifecycle::StateMachine usb_lifecycle_{};
     hid_route::StateMachine route_{};
     std::atomic<HidTicketId> next_ticket_id_{1};
@@ -501,6 +561,14 @@ class StateMachine {
     std::atomic<std::uint8_t> status_bits_{0};  // mounted, suspended, kbd-ready, mouse-ready
     std::atomic_bool release_requested_{false};
     std::atomic_bool unavailable_release_reconciler_active_{false};
+    std::atomic<std::uint32_t> ble_route_sequence_{0};
+    std::atomic<AuthorityEpoch> ble_route_authority_epoch_{0};
+    std::atomic<RouteGeneration> ble_route_generation_{0};
+    std::atomic<std::uint32_t> ble_route_transport_generation_{0};
+    std::atomic<std::uint16_t> ble_route_connection_{kNoBleConnection};
+    std::atomic<std::uint16_t> ble_route_keyboard_handle_{0};
+    std::atomic<std::uint16_t> ble_route_mouse_handle_{0};
+    std::atomic_bool ble_route_active_{false};
     InterfaceState interfaces_[2]{};
     ReleaseAllTicket release_ticket_{};
     KeyboardReportTicket keyboard_ticket_{};
@@ -532,6 +600,11 @@ class Runtime {
         std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes);
     MouseReportResult mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                                    std::int8_t vertical, std::int8_t horizontal);
+    // Completes an already-published fixed ticket. The BLE control executor
+    // uses this same bounded result bridge after scheduling the ticket token.
+    KeyboardReportResult complete_keyboard_report(
+        KeyboardReportBeginResult begin);
+    MouseReportResult complete_mouse_report(MouseReportBeginResult begin);
     void request_release_all();
     ReleaseAllResult release_all();
     LifecycleSafetyResult run_lifecycle_detach_safety();

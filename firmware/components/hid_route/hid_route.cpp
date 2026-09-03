@@ -66,7 +66,10 @@ bool StateMachine::try_enter_writer() {
 
 void StateMachine::leave_writer() { writer_active_.store(false, std::memory_order_release); }
 
-bool StateMachine::commit_usb_if_none() {
+bool StateMachine::commit_if_none(OutputRoute route) {
+    if (route != OutputRoute::kUsb && route != OutputRoute::kBle) {
+        return false;
+    }
     if (!try_enter_writer()) {
         return false;
     }
@@ -97,8 +100,8 @@ bool StateMachine::commit_usb_if_none() {
         (void)invalidate();
         return false;
     }
-    desired_.store(static_cast<std::uint8_t>(OutputRoute::kUsb), std::memory_order_release);
-    active_.store(static_cast<std::uint8_t>(OutputRoute::kUsb), std::memory_order_release);
+    desired_.store(static_cast<std::uint8_t>(route), std::memory_order_release);
+    active_.store(static_cast<std::uint8_t>(route), std::memory_order_release);
     transition_.store(static_cast<std::uint8_t>(Transition::kStable), std::memory_order_release);
     end_publication();
     leave_writer();
@@ -107,6 +110,14 @@ bool StateMachine::commit_usb_if_none() {
         return false;
     }
     return true;
+}
+
+bool StateMachine::commit_usb_if_none() {
+    return commit_if_none(OutputRoute::kUsb);
+}
+
+bool StateMachine::commit_ble_if_none() {
+    return commit_if_none(OutputRoute::kBle);
 }
 
 bool StateMachine::begin_usb_release(Snapshot *stage_a) {

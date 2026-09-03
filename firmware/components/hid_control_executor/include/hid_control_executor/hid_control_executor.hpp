@@ -271,6 +271,7 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
         kBleEvent,
         kPairingStatus,
         kPairingRespond,
+        kBleHidReport,
     };
 
     struct Action {
@@ -279,6 +280,8 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
         hid_route::Snapshot route{};
         ControlOperation operation = ControlOperation::kNone;
         BleEvent ble_event{};
+        hid_runtime::Interface hid_interface = hid_runtime::Interface::kKeyboard;
+        hid_runtime::HidWorkToken hid_work{};
         std::uint32_t mailbox_token = 0;
     };
 
@@ -289,6 +292,23 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     CommandOutcome request_attach();
     CommandOutcome request_detach();
     RouteCommandOutcome request_route(hid_route::OutputRoute desired);
+    // Internal-only U7.4B route seam. It is intentionally absent from UART,
+    // host, and CLI surfaces and must run in the serialized owner context.
+    RouteCommandOutcome activate_ble_route_internal();
+#ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    hid_runtime::KeyboardReportResult keyboard_report(
+        std::uint8_t modifiers,
+        const std::array<std::uint8_t, 6> &keycodes);
+    hid_runtime::MouseReportResult mouse_report(
+        std::uint8_t buttons, std::int8_t x, std::int8_t y,
+        std::int8_t vertical, std::int8_t horizontal);
+#endif
+    hid_runtime::KeyboardReportBeginResult queue_ble_keyboard_report(
+        std::uint8_t modifiers,
+        const std::array<std::uint8_t, 6> &keycodes);
+    hid_runtime::MouseReportBeginResult queue_ble_mouse_report(
+        std::uint8_t buttons, std::int8_t x, std::int8_t y,
+        std::int8_t vertical, std::int8_t horizontal);
     ExposureSnapshot snapshot() const;
     hid_runtime::RouteStatusSnapshot route_snapshot() const;
     BleCommandOutcome request_ble_enable();
@@ -314,9 +334,9 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     bool signal_ble_event(BleEvent event) override;
     void signal_ble_lifecycle_handoff_failure() override;
 
-    // Internal U7.4A seams. They are not wired to UART, public HID commands,
-    // or route selection. Submission callers must already be executing in
-    // the serialized control-owner context.
+    // Internal BLE adapter seams. The general runtime reaches these only via
+    // an exact U7.4B ticket in the serialized control-owner context; UART,
+    // host, and CLI have no direct adapter or BLE-route entry point.
     BleHidPeerSnapshot ble_hid_peer_snapshot() const;
     bool ble_link_ready() const;
     BleHidSubmitResult submit_ble_keyboard(
@@ -373,6 +393,10 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     void mark_ble_event_overflow(BleEvent event);
     bool ble_event_overflow_pending(
         ble_lifecycle::Generation generation) const;
+    void mark_ble_route_loss(BleEvent event);
+    bool ble_route_loss_pending(ble_lifecycle::Generation generation) const;
+    void clear_ble_route_loss(ble_lifecycle::Generation generation);
+    static bool event_immediately_loses_ble_hid_readiness(BleEvent event);
     bool reconcile_ble_lifecycle_handoff_failure();
     void fail_current_ble_queue_overflow();
     bool consume_ble_overflow();
@@ -390,6 +414,13 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     BleHidSubmitResult submit_ble_report(
         BleHidWorkIdentity identity, BleHidInterface interface,
         const std::uint8_t *payload, std::uint16_t payload_length);
+    void retire_ble_route_if_unready();
+    bool enqueue_ble_hid_work(hid_runtime::Interface interface,
+                              hid_runtime::HidWorkToken token);
+    static hid_runtime::BleSubmitResult submit_runtime_ble_report(
+        void *context, hid_runtime::Interface interface,
+        hid_runtime::HidWorkToken token, const std::uint8_t *payload,
+        std::uint16_t payload_length);
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     static void task_entry(void *context);
@@ -413,6 +444,12 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
     static_assert(std::atomic_bool::is_always_lock_free);
     std::atomic<ble_lifecycle::Generation> overflow_authority_{0};
     std::atomic_bool overflow_authority_zero_{false};
+    // Callback-side, generation-fenced fail-closed bell for physical events
+    // that revoke HID readiness before their queued compound-state update is
+    // consumed. It gates notification submission but never mutates route or
+    // peer state outside the serialized executor.
+    std::atomic<ble_lifecycle::Generation> ble_route_loss_authority_{0};
+    std::atomic_bool ble_route_loss_authority_zero_{false};
     // Reset/Sync is a lifecycle ownership transfer: the backend may already
     // own the next generation while the executor still owns the retired one.
     // A failed publication is therefore a separate boot-lifetime fail-closed

@@ -8,7 +8,7 @@ namespace hid_route {
 enum class OutputRoute : std::uint8_t {
     kNone,
     kUsb,
-    // Placeholder only. U7.2A supplies no BLE adapter or public behavior.
+    // Internal-only through U7.4B. Public route v1 remains none|usb.
     kBle,
 };
 
@@ -51,6 +51,9 @@ class StateMachine final {
     // The compatibility policy is the only U7.2A caller of this transition.
     // It is non-blocking: a callback-side invalidation wins fail-closed.
     bool commit_usb_if_none();
+    // Internal-only BLE activation. Public route-v1 callers never reach this
+    // transition; they continue to reject BLE before entering route state.
+    bool commit_ble_if_none();
 
     // Serialized route-controller transitions. begin_usb_release() publishes
     // desired=none/active=usb/releasing without retiring the old generation;
@@ -77,6 +80,7 @@ class StateMachine final {
     void leave_writer();
     bool commit_none_locked(OutputRoute expected_route, Generation expected_generation,
                             bool require_exact_match);
+    bool commit_if_none(OutputRoute route);
 
     static_assert(std::atomic<Generation>::is_always_lock_free);
     static_assert(std::atomic<std::uint32_t>::is_always_lock_free);

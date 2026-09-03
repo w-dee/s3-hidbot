@@ -106,6 +106,13 @@ service database, mbuf allocation, and NimBLE notification API are
 target-linked. None of these checks performs radio, serial, or hardware
 access.
 
+U7.4B extends the same executor and static entrypoints with internal BLE route
+activation, exact HID/route/BLE/connection/characteristic/ticket fencing,
+single-transport dispatch, callback-side readiness-loss preemption, failure
+retirement, reconnect/no-auto-restore behavior, and relative-mouse no-replay
+coverage. Public protocol, host, and CLI static guards continue to require the
+route-v1 value set to remain exactly `none|usb` and reject route v2.
+
 Run these commands from the repository root:
 
 ```text

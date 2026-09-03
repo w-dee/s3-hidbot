@@ -49,6 +49,18 @@ bool unsafe_report_holds_state(ReportKind kind, const std::uint8_t *report,
     return false;
 }
 
+bool same_work_token(HidWorkToken left, HidWorkToken right) {
+    return left.authority_epoch == right.authority_epoch &&
+           left.route_generation == right.route_generation &&
+           left.transport == right.transport &&
+           left.transport_generation == right.transport_generation &&
+           left.ticket_id == right.ticket_id &&
+           left.release_epoch == right.release_epoch &&
+           left.connection_handle == right.connection_handle &&
+           left.characteristic_handle == right.characteristic_handle &&
+           left.report_kind == right.report_kind;
+}
+
 }  // namespace
 
 StateMachine::StateMachine() = default;
@@ -278,7 +290,11 @@ void StateMachine::on_unmount() {
     }
     // Callback-side invalidation never waits for the shared control executor.
     // Its pending gate closes unsafe route work before later cleanup runs.
-    (void)route_.invalidate();
+    const hid_route::Snapshot active_route = route_.snapshot();
+    if (active_route.coherent &&
+        active_route.active == hid_route::OutputRoute::kUsb) {
+        (void)route_.invalidate_if_matches(active_route);
+    }
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -317,7 +333,11 @@ void StateMachine::on_suspend() {
     if (!usb_lifecycle_.observe_suspend()) {
         return;
     }
-    (void)route_.invalidate();
+    const hid_route::Snapshot active_route = route_.snapshot();
+    if (active_route.coherent &&
+        active_route.active == hid_route::OutputRoute::kUsb) {
+        (void)route_.invalidate_if_matches(active_route);
+    }
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -448,6 +468,65 @@ usb_lifecycle::Snapshot StateMachine::usb_lifecycle_snapshot() const {
 
 hid_route::Snapshot StateMachine::route_snapshot() const { return route_.snapshot(); }
 
+BleRouteAuthoritySnapshot StateMachine::ble_route_authority_snapshot() const {
+    constexpr unsigned kMaxAttempts = 3;
+    for (unsigned attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        const std::uint32_t before =
+            ble_route_sequence_.load(std::memory_order_acquire);
+        if ((before & 1U) != 0) {
+            continue;
+        }
+        const BleRouteAuthoritySnapshot result{
+            .authority_epoch = ble_route_authority_epoch_.load(std::memory_order_relaxed),
+            .route_generation = ble_route_generation_.load(std::memory_order_relaxed),
+            .ble_generation = ble_route_transport_generation_.load(std::memory_order_relaxed),
+            .connection_handle = ble_route_connection_.load(std::memory_order_relaxed),
+            .keyboard_characteristic_handle =
+                ble_route_keyboard_handle_.load(std::memory_order_relaxed),
+            .mouse_characteristic_handle =
+                ble_route_mouse_handle_.load(std::memory_order_relaxed),
+            .active = ble_route_active_.load(std::memory_order_relaxed),
+            .coherent = true,
+        };
+        const std::uint32_t after =
+            ble_route_sequence_.load(std::memory_order_acquire);
+        if (before == after && (after & 1U) == 0) {
+            return result;
+        }
+    }
+    return BleRouteAuthoritySnapshot{.coherent = false};
+}
+
+void StateMachine::publish_ble_route_authority(
+    BleRouteActivation activation, AuthorityEpoch authority_epoch,
+    RouteGeneration route_generation) {
+    ble_route_sequence_.fetch_add(1, std::memory_order_acq_rel);
+    ble_route_authority_epoch_.store(authority_epoch, std::memory_order_relaxed);
+    ble_route_generation_.store(route_generation, std::memory_order_relaxed);
+    ble_route_transport_generation_.store(activation.ble_generation,
+                                          std::memory_order_relaxed);
+    ble_route_connection_.store(activation.connection_handle,
+                                std::memory_order_relaxed);
+    ble_route_keyboard_handle_.store(activation.keyboard_characteristic_handle,
+                                     std::memory_order_relaxed);
+    ble_route_mouse_handle_.store(activation.mouse_characteristic_handle,
+                                  std::memory_order_relaxed);
+    ble_route_active_.store(true, std::memory_order_relaxed);
+    ble_route_sequence_.fetch_add(1, std::memory_order_release);
+}
+
+void StateMachine::clear_ble_route_authority() {
+    ble_route_sequence_.fetch_add(1, std::memory_order_acq_rel);
+    ble_route_active_.store(false, std::memory_order_relaxed);
+    ble_route_authority_epoch_.store(0, std::memory_order_relaxed);
+    ble_route_generation_.store(0, std::memory_order_relaxed);
+    ble_route_transport_generation_.store(0, std::memory_order_relaxed);
+    ble_route_connection_.store(kNoBleConnection, std::memory_order_relaxed);
+    ble_route_keyboard_handle_.store(0, std::memory_order_relaxed);
+    ble_route_mouse_handle_.store(0, std::memory_order_relaxed);
+    ble_route_sequence_.fetch_add(1, std::memory_order_release);
+}
+
 bool StateMachine::route_usb_ready(const hid_route::Snapshot &route,
                                    const usb_lifecycle::Snapshot &lifecycle,
                                    const StatusSnapshot &runtime) const {
@@ -559,6 +638,105 @@ RouteTransitionOutcome StateMachine::request_route_usb() {
                                   .snapshot = route_status_snapshot()};
 }
 
+RouteTransitionOutcome StateMachine::request_route_ble(
+    BleRouteActivation activation) {
+    const hid_route::Snapshot before = route_.snapshot();
+    if (activation.connection_handle == kNoBleConnection ||
+        activation.keyboard_characteristic_handle == 0 ||
+        activation.mouse_characteristic_handle == 0 ||
+        activation.keyboard_characteristic_handle ==
+            activation.mouse_characteristic_handle ||
+        activation.expected_authority_epoch != authority_epoch() ||
+        activation.expected_route_generation != before.generation) {
+        return RouteTransitionOutcome{
+            .action_result = RouteTransitionResult::kNotReady,
+            .snapshot_valid = true,
+            .snapshot = RouteStatusSnapshot{.route = before, .ready = false},
+        };
+    }
+    if (!before.coherent || before.invalidation_pending ||
+        before.desired != hid_route::OutputRoute::kNone ||
+        before.active != hid_route::OutputRoute::kNone ||
+        before.transition != hid_route::Transition::kStable) {
+        return {};
+    }
+    if (release_requested_.load(std::memory_order_acquire) ||
+        any_safety_required()) {
+        return RouteTransitionOutcome{
+            .action_result = RouteTransitionResult::kSafetyPending,
+            .snapshot_valid = true,
+            .snapshot = RouteStatusSnapshot{.route = before, .ready = false},
+        };
+    }
+    retire_unsafe_route_authority();
+    if (!route_.commit_ble_if_none()) {
+        return RouteTransitionOutcome{
+            .action_result = RouteTransitionResult::kNotReady,
+            .snapshot_valid = true,
+            .snapshot = RouteStatusSnapshot{.route = route_.snapshot(), .ready = false},
+        };
+    }
+    const hid_route::Snapshot active = route_.snapshot();
+    if (!active.coherent || active.invalidation_pending ||
+        active.desired != hid_route::OutputRoute::kBle ||
+        active.active != hid_route::OutputRoute::kBle ||
+        active.transition != hid_route::Transition::kStable) {
+        (void)route_.invalidate_if_matches(active);
+        return RouteTransitionOutcome{
+            .action_result = RouteTransitionResult::kNotReady,
+            .snapshot_valid = true,
+            .snapshot = RouteStatusSnapshot{.route = route_.snapshot(), .ready = false},
+        };
+    }
+    publish_ble_route_authority(activation, authority_epoch(),
+                                active.generation);
+    return RouteTransitionOutcome{
+        .action_result = RouteTransitionResult::kAccepted,
+        .snapshot_valid = true,
+        .snapshot = RouteStatusSnapshot{.route = active, .ready = true},
+    };
+}
+
+bool StateMachine::retire_ble_route_if_matches(
+    BleRouteAuthoritySnapshot expected, bool report_state_uncertain,
+    Interface uncertain_interface) {
+    const BleRouteAuthoritySnapshot current = ble_route_authority_snapshot();
+    const hid_route::Snapshot route = route_.snapshot();
+    const bool exact = expected.coherent && expected.active && current.coherent &&
+                       current.active &&
+                       current.authority_epoch == expected.authority_epoch &&
+                       current.route_generation == expected.route_generation &&
+                       current.ble_generation == expected.ble_generation &&
+                       current.connection_handle == expected.connection_handle &&
+                       current.keyboard_characteristic_handle ==
+                           expected.keyboard_characteristic_handle &&
+                       current.mouse_characteristic_handle ==
+                           expected.mouse_characteristic_handle &&
+                       route.coherent && !route.invalidation_pending &&
+                       route.active == hid_route::OutputRoute::kBle &&
+                       route.desired == hid_route::OutputRoute::kBle &&
+                       route.transition == hid_route::Transition::kStable &&
+                       route.generation == expected.route_generation;
+    if (!exact || !route_.invalidate_if_matches(route)) {
+        return false;
+    }
+    clear_ble_route_authority();
+    if (report_state_uncertain) {
+        InterfaceState &affected = state(uncertain_interface);
+        affected.host_state_uncertain.store(true, std::memory_order_release);
+        affected.safety_required.store(true, std::memory_order_release);
+    }
+    for (InterfaceState &interface_state : interfaces_) {
+        if (interface_state.logical_state_held.load(std::memory_order_acquire) ||
+            interface_state.host_state_uncertain.load(std::memory_order_acquire)) {
+            interface_state.safety_required.store(true,
+                                                  std::memory_order_release);
+        }
+    }
+    retire_unsafe_route_authority();
+    return true;
+}
+
 RouteTransitionOutcome StateMachine::request_route_none() {
     const RouteStatusSnapshot before = route_status_snapshot();
     if (before.route.desired == hid_route::OutputRoute::kNone &&
@@ -663,8 +841,42 @@ bool StateMachine::mounted_and_active(Interface interface) const {
 
 bool StateMachine::unsafe_route_active(RouteGeneration generation,
                                        HidTransport transport) const {
-    return transport == HidTransport::kUsb &&
-           route_.matches(hid_route::OutputRoute::kUsb, generation);
+    if (transport == HidTransport::kUsb) {
+        return route_.matches(hid_route::OutputRoute::kUsb, generation);
+    }
+    const BleRouteAuthoritySnapshot ble = ble_route_authority_snapshot();
+    return ble.coherent && ble.active && ble.route_generation == generation &&
+           ble.authority_epoch == authority_epoch() &&
+           route_.matches(hid_route::OutputRoute::kBle, generation);
+}
+
+bool StateMachine::unsafe_work_current(Interface interface,
+                                       HidWorkToken token) const {
+    if (token.report_kind !=
+            (interface == Interface::kKeyboard
+                 ? ReportKind::kUnsafeKeyboard
+                 : ReportKind::kUnsafeMouse) ||
+        token.authority_epoch != authority_epoch() ||
+        token.release_epoch != release_epoch_.load(std::memory_order_acquire) ||
+        !unsafe_route_active(token.route_generation, token.transport)) {
+        return false;
+    }
+    if (token.transport == HidTransport::kUsb) {
+        return token.transport_generation == attach_generation() &&
+               mounted_and_active(interface);
+    }
+    const BleRouteAuthoritySnapshot ble = ble_route_authority_snapshot();
+    const std::uint16_t expected_handle =
+        interface == Interface::kKeyboard
+            ? ble.keyboard_characteristic_handle
+            : ble.mouse_characteristic_handle;
+    return ble.coherent && ble.active &&
+           ble.authority_epoch == token.authority_epoch &&
+           ble.route_generation == token.route_generation &&
+           ble.ble_generation == token.transport_generation &&
+           ble.connection_handle == token.connection_handle &&
+           expected_handle != 0 &&
+           expected_handle == token.characteristic_handle;
 }
 
 bool StateMachine::safety_transport_active(Interface interface) const {
@@ -886,8 +1098,20 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
 
     const StatusSnapshot snapshot = status();
     const hid_route::Snapshot route = route_.snapshot();
-    if (!snapshot.mounted || snapshot.suspended || !snapshot.keyboard_ready ||
-        !unsafe_route_active(route.generation, HidTransport::kUsb)) {
+    const BleRouteAuthoritySnapshot ble = ble_route_authority_snapshot();
+    const bool usb_route = route.coherent &&
+                           route.active == hid_route::OutputRoute::kUsb &&
+                           !snapshot.suspended && snapshot.mounted &&
+                           snapshot.keyboard_ready &&
+                           unsafe_route_active(route.generation,
+                                               HidTransport::kUsb);
+    const bool ble_route = route.coherent && ble.coherent && ble.active &&
+                           route.active == hid_route::OutputRoute::kBle &&
+                           ble.route_generation == route.generation &&
+                           ble.authority_epoch == authority_epoch() &&
+                           unsafe_route_active(route.generation,
+                                               HidTransport::kBle);
+    if (!usb_route && !ble_route) {
         return KeyboardReportBeginResult::kNotReady;
     }
     if (release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
@@ -916,16 +1140,23 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
             std::memory_order_acq_rel, std::memory_order_acquire)) {
         return KeyboardReportBeginResult::kBusy;
     }
-    const UsbGeneration generation = attach_generation();
+    const HidTransport transport = usb_route ? HidTransport::kUsb
+                                             : HidTransport::kBle;
+    const std::uint32_t generation =
+        usb_route ? attach_generation() : ble.ble_generation;
     const AuthorityEpoch epoch = authority_epoch();
     const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
     keyboard_ticket_.transport_generation.store(generation, std::memory_order_relaxed);
     keyboard_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
     keyboard_ticket_.route_generation.store(route.generation, std::memory_order_relaxed);
-    keyboard_ticket_.transport.store(HidTransport::kUsb, std::memory_order_relaxed);
+    keyboard_ticket_.transport.store(transport, std::memory_order_relaxed);
     keyboard_ticket_.ticket_id.store(next_ticket_id_.fetch_add(1, std::memory_order_acq_rel),
                                      std::memory_order_relaxed);
     keyboard_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
+    keyboard_ticket_.connection_handle =
+        usb_route ? kNoBleConnection : ble.connection_handle;
+    keyboard_ticket_.characteristic_handle =
+        usb_route ? 0 : ble.keyboard_characteristic_handle;
     std::memcpy(keyboard_ticket_.report, report, sizeof(report));
     keyboard_ticket_.outcome.store(KeyboardReportTicketOutcome::kNone, std::memory_order_relaxed);
 
@@ -935,23 +1166,41 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
     }
 #endif
 
-    if (generation != attach_generation() || epoch != authority_epoch() ||
+    const HidWorkToken token{
+        .authority_epoch = epoch,
+        .route_generation = route.generation,
+        .transport = transport,
+        .transport_generation = generation,
+        .ticket_id = keyboard_ticket_.ticket_id.load(std::memory_order_relaxed),
+        .release_epoch = release_epoch,
+        .connection_handle = keyboard_ticket_.connection_handle,
+        .characteristic_handle = keyboard_ticket_.characteristic_handle,
+        .report_kind = ReportKind::kUnsafeKeyboard,
+    };
+    if (!unsafe_work_current(Interface::kKeyboard, token) ||
         release_epoch != release_epoch_.load(std::memory_order_acquire) ||
-        !unsafe_route_active(route.generation, HidTransport::kUsb) ||
-        !mounted_and_active(Interface::kKeyboard) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required() ||
         keyboard.in_flight.load(std::memory_order_acquire) ||
         keyboard.slot_state.load(std::memory_order_acquire) != kSlotEmpty) {
+        const bool authority_lost = epoch != authority_epoch() ||
+                                    !unsafe_route_active(route.generation,
+                                                         transport);
         keyboard_ticket_.outcome.store(
-            generation != attach_generation() || epoch != authority_epoch()
+            authority_lost
                 ? KeyboardReportTicketOutcome::kAuthorityLost
-                : KeyboardReportTicketOutcome::kSafetyPending,
+                : release_requested_.load(std::memory_order_acquire) ||
+                          any_safety_required()
+                      ? KeyboardReportTicketOutcome::kSafetyPending
+                      : KeyboardReportTicketOutcome::kNotReady,
             std::memory_order_release);
         keyboard_ticket_.state.store(KeyboardReportTicketState::kCanceled,
                                      std::memory_order_release);
-        return generation != attach_generation() || epoch != authority_epoch()
+        return authority_lost
                    ? KeyboardReportBeginResult::kAuthorityLost
-                   : KeyboardReportBeginResult::kSafetyPending;
+                   : release_requested_.load(std::memory_order_acquire) ||
+                             any_safety_required()
+                         ? KeyboardReportBeginResult::kSafetyPending
+                         : KeyboardReportBeginResult::kNotReady;
     }
     KeyboardReportTicketState publishing = KeyboardReportTicketState::kWriting;
     if (!keyboard_ticket_.state.compare_exchange_strong(
@@ -1022,8 +1271,20 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
 
     const StatusSnapshot snapshot = status();
     const hid_route::Snapshot route = route_.snapshot();
-    if (!snapshot.mounted || snapshot.suspended || !snapshot.mouse_ready ||
-        !unsafe_route_active(route.generation, HidTransport::kUsb)) {
+    const BleRouteAuthoritySnapshot ble = ble_route_authority_snapshot();
+    const bool usb_route = route.coherent &&
+                           route.active == hid_route::OutputRoute::kUsb &&
+                           !snapshot.suspended && snapshot.mounted &&
+                           snapshot.mouse_ready &&
+                           unsafe_route_active(route.generation,
+                                               HidTransport::kUsb);
+    const bool ble_route = route.coherent && ble.coherent && ble.active &&
+                           route.active == hid_route::OutputRoute::kBle &&
+                           ble.route_generation == route.generation &&
+                           ble.authority_epoch == authority_epoch() &&
+                           unsafe_route_active(route.generation,
+                                               HidTransport::kBle);
+    if (!usb_route && !ble_route) {
         return MouseReportBeginResult::kNotReady;
     }
     if (release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
@@ -1049,16 +1310,23 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
             std::memory_order_acq_rel, std::memory_order_acquire)) {
         return MouseReportBeginResult::kBusy;
     }
-    const UsbGeneration generation = attach_generation();
+    const HidTransport transport = usb_route ? HidTransport::kUsb
+                                             : HidTransport::kBle;
+    const std::uint32_t generation =
+        usb_route ? attach_generation() : ble.ble_generation;
     const AuthorityEpoch epoch = authority_epoch();
     const std::uint32_t release_epoch = release_epoch_.load(std::memory_order_acquire);
     mouse_ticket_.transport_generation.store(generation, std::memory_order_relaxed);
     mouse_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
     mouse_ticket_.route_generation.store(route.generation, std::memory_order_relaxed);
-    mouse_ticket_.transport.store(HidTransport::kUsb, std::memory_order_relaxed);
+    mouse_ticket_.transport.store(transport, std::memory_order_relaxed);
     mouse_ticket_.ticket_id.store(next_ticket_id_.fetch_add(1, std::memory_order_acq_rel),
                                   std::memory_order_relaxed);
     mouse_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
+    mouse_ticket_.connection_handle =
+        usb_route ? kNoBleConnection : ble.connection_handle;
+    mouse_ticket_.characteristic_handle =
+        usb_route ? 0 : ble.mouse_characteristic_handle;
     mouse_ticket_.report[0] = static_cast<std::uint8_t>(buttons & 0x1fU);
     mouse_ticket_.report[1] = static_cast<std::uint8_t>(x);
     mouse_ticket_.report[2] = static_cast<std::uint8_t>(y);
@@ -1072,22 +1340,39 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     }
 #endif
 
-    if (generation != attach_generation() || epoch != authority_epoch() ||
+    const HidWorkToken token{
+        .authority_epoch = epoch,
+        .route_generation = route.generation,
+        .transport = transport,
+        .transport_generation = generation,
+        .ticket_id = mouse_ticket_.ticket_id.load(std::memory_order_relaxed),
+        .release_epoch = release_epoch,
+        .connection_handle = mouse_ticket_.connection_handle,
+        .characteristic_handle = mouse_ticket_.characteristic_handle,
+        .report_kind = ReportKind::kUnsafeMouse,
+    };
+    if (!unsafe_work_current(Interface::kMouse, token) ||
         release_epoch != release_epoch_.load(std::memory_order_acquire) ||
-        !unsafe_route_active(route.generation, HidTransport::kUsb) ||
-        !mounted_and_active(Interface::kMouse) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required() ||
         mouse.in_flight.load(std::memory_order_acquire) ||
         mouse.slot_state.load(std::memory_order_acquire) != kSlotEmpty) {
-        const bool authority_lost = generation != attach_generation() || epoch != authority_epoch();
+        const bool authority_lost = epoch != authority_epoch() ||
+                                    !unsafe_route_active(route.generation,
+                                                         transport);
         mouse_ticket_.outcome.store(
             authority_lost ? MouseReportTicketOutcome::kAuthorityLost
-                           : MouseReportTicketOutcome::kSafetyPending,
+                           : release_requested_.load(std::memory_order_acquire) ||
+                                     any_safety_required()
+                                 ? MouseReportTicketOutcome::kSafetyPending
+                                 : MouseReportTicketOutcome::kNotReady,
             std::memory_order_release);
         mouse_ticket_.state.store(MouseReportTicketState::kCanceled,
                                   std::memory_order_release);
         return authority_lost ? MouseReportBeginResult::kAuthorityLost
-                              : MouseReportBeginResult::kSafetyPending;
+                              : release_requested_.load(std::memory_order_acquire) ||
+                                        any_safety_required()
+                                    ? MouseReportBeginResult::kSafetyPending
+                                    : MouseReportBeginResult::kNotReady;
     }
     MouseReportTicketState publishing = MouseReportTicketState::kWriting;
     if (!mouse_ticket_.state.compare_exchange_strong(
@@ -1132,6 +1417,199 @@ void StateMachine::finalize_mouse_report() {
             return;
         }
     }
+}
+
+HidWorkToken StateMachine::published_report_token(Interface interface) const {
+    if (interface == Interface::kKeyboard) {
+        if (keyboard_ticket_.state.load(std::memory_order_acquire) !=
+            KeyboardReportTicketState::kPublished) {
+            return {};
+        }
+        return HidWorkToken{
+            .authority_epoch = keyboard_ticket_.authority_epoch.load(std::memory_order_relaxed),
+            .route_generation = keyboard_ticket_.route_generation.load(std::memory_order_relaxed),
+            .transport = keyboard_ticket_.transport.load(std::memory_order_relaxed),
+            .transport_generation = keyboard_ticket_.transport_generation.load(std::memory_order_relaxed),
+            .ticket_id = keyboard_ticket_.ticket_id.load(std::memory_order_relaxed),
+            .release_epoch = keyboard_ticket_.release_epoch.load(std::memory_order_relaxed),
+            .connection_handle = keyboard_ticket_.connection_handle,
+            .characteristic_handle = keyboard_ticket_.characteristic_handle,
+            .report_kind = ReportKind::kUnsafeKeyboard,
+        };
+    }
+    if (mouse_ticket_.state.load(std::memory_order_acquire) !=
+        MouseReportTicketState::kPublished) {
+        return {};
+    }
+    return HidWorkToken{
+        .authority_epoch = mouse_ticket_.authority_epoch.load(std::memory_order_relaxed),
+        .route_generation = mouse_ticket_.route_generation.load(std::memory_order_relaxed),
+        .transport = mouse_ticket_.transport.load(std::memory_order_relaxed),
+        .transport_generation = mouse_ticket_.transport_generation.load(std::memory_order_relaxed),
+        .ticket_id = mouse_ticket_.ticket_id.load(std::memory_order_relaxed),
+        .release_epoch = mouse_ticket_.release_epoch.load(std::memory_order_relaxed),
+        .connection_handle = mouse_ticket_.connection_handle,
+        .characteristic_handle = mouse_ticket_.characteristic_handle,
+        .report_kind = ReportKind::kUnsafeMouse,
+    };
+}
+
+bool StateMachine::ble_work_token_current(Interface interface,
+                                          HidWorkToken token) const {
+    if (token.transport != HidTransport::kBle || token.ticket_id == 0 ||
+        !unsafe_work_current(interface, token)) {
+        return false;
+    }
+    if (interface == Interface::kKeyboard) {
+        const auto ticket_state =
+            keyboard_ticket_.state.load(std::memory_order_acquire);
+        if (ticket_state != KeyboardReportTicketState::kPublished &&
+            ticket_state != KeyboardReportTicketState::kClaimed) {
+            return false;
+        }
+        const HidWorkToken current{
+            .authority_epoch = keyboard_ticket_.authority_epoch.load(std::memory_order_relaxed),
+            .route_generation = keyboard_ticket_.route_generation.load(std::memory_order_relaxed),
+            .transport = keyboard_ticket_.transport.load(std::memory_order_relaxed),
+            .transport_generation = keyboard_ticket_.transport_generation.load(std::memory_order_relaxed),
+            .ticket_id = keyboard_ticket_.ticket_id.load(std::memory_order_relaxed),
+            .release_epoch = keyboard_ticket_.release_epoch.load(std::memory_order_relaxed),
+            .connection_handle = keyboard_ticket_.connection_handle,
+            .characteristic_handle = keyboard_ticket_.characteristic_handle,
+            .report_kind = ReportKind::kUnsafeKeyboard,
+        };
+        return same_work_token(current, token);
+    }
+    const auto ticket_state = mouse_ticket_.state.load(std::memory_order_acquire);
+    if (ticket_state != MouseReportTicketState::kPublished &&
+        ticket_state != MouseReportTicketState::kClaimed) {
+        return false;
+    }
+    const HidWorkToken current{
+        .authority_epoch = mouse_ticket_.authority_epoch.load(std::memory_order_relaxed),
+        .route_generation = mouse_ticket_.route_generation.load(std::memory_order_relaxed),
+        .transport = mouse_ticket_.transport.load(std::memory_order_relaxed),
+        .transport_generation = mouse_ticket_.transport_generation.load(std::memory_order_relaxed),
+        .ticket_id = mouse_ticket_.ticket_id.load(std::memory_order_relaxed),
+        .release_epoch = mouse_ticket_.release_epoch.load(std::memory_order_relaxed),
+        .connection_handle = mouse_ticket_.connection_handle,
+        .characteristic_handle = mouse_ticket_.characteristic_handle,
+        .report_kind = ReportKind::kUnsafeMouse,
+    };
+    return same_work_token(current, token);
+}
+
+bool StateMachine::process_ble_report(Interface interface, HidWorkToken token,
+                                      BleSubmitFn submit, void *context) {
+    if (submit == nullptr || token.transport != HidTransport::kBle ||
+        token.ticket_id == 0) {
+        return false;
+    }
+    const bool keyboard_interface = interface == Interface::kKeyboard;
+    if (keyboard_interface) {
+        KeyboardReportTicketState expected =
+            KeyboardReportTicketState::kPublished;
+        if (!keyboard_ticket_.state.compare_exchange_strong(
+                expected, KeyboardReportTicketState::kClaimed,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return false;
+        }
+    } else {
+        MouseReportTicketState expected = MouseReportTicketState::kPublished;
+        if (!mouse_ticket_.state.compare_exchange_strong(
+                expected, MouseReportTicketState::kClaimed,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return false;
+        }
+    }
+
+    const auto finish_failure = [&](KeyboardReportTicketOutcome keyboard_outcome,
+                                    MouseReportTicketOutcome mouse_outcome) {
+        if (keyboard_interface) {
+            keyboard_ticket_.outcome.store(keyboard_outcome,
+                                           std::memory_order_release);
+            keyboard_ticket_.state.store(KeyboardReportTicketState::kCanceled,
+                                         std::memory_order_release);
+        } else {
+            mouse_ticket_.outcome.store(mouse_outcome,
+                                        std::memory_order_release);
+            mouse_ticket_.state.store(MouseReportTicketState::kCanceled,
+                                      std::memory_order_release);
+        }
+    };
+
+    if (!ble_work_token_current(interface, token) ||
+        release_requested_.load(std::memory_order_acquire) ||
+        any_safety_required()) {
+        finish_failure(KeyboardReportTicketOutcome::kAuthorityLost,
+                       MouseReportTicketOutcome::kAuthorityLost);
+        return false;
+    }
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (before_submit_hook_ != nullptr) {
+        before_submit_hook_(this);
+    }
+#endif
+    if (!ble_work_token_current(interface, token) ||
+        release_requested_.load(std::memory_order_acquire) ||
+        any_safety_required()) {
+        finish_failure(KeyboardReportTicketOutcome::kAuthorityLost,
+                       MouseReportTicketOutcome::kAuthorityLost);
+        return false;
+    }
+
+    const std::uint8_t *payload = keyboard_interface
+                                      ? keyboard_ticket_.report
+                                      : mouse_ticket_.report;
+    const std::uint16_t length = keyboard_interface
+                                     ? sizeof(keyboard_ticket_.report)
+                                     : sizeof(mouse_ticket_.report);
+    const BleSubmitResult result = submit(context, interface, token, payload,
+                                          length);
+    if (result != BleSubmitResult::kStackAccepted) {
+        const BleRouteAuthoritySnapshot route_authority =
+            ble_route_authority_snapshot();
+        const bool uncertain = result == BleSubmitResult::kResourceFailure ||
+                               result == BleSubmitResult::kStackRejected;
+        (void)retire_ble_route_if_matches(route_authority, uncertain,
+                                          interface);
+        finish_failure(KeyboardReportTicketOutcome::kAuthorityLost,
+                       MouseReportTicketOutcome::kAuthorityLost);
+        return false;
+    }
+
+    InterfaceState &interface_state = state(interface);
+    interface_state.host_state_uncertain.store(false,
+                                               std::memory_order_release);
+    if (keyboard_interface) {
+        keyboard_ticket_.outcome.store(KeyboardReportTicketOutcome::kSubmitted,
+                                       std::memory_order_release);
+        keyboard_ticket_.state.store(KeyboardReportTicketState::kSubmitted,
+                                     std::memory_order_release);
+        interface_state.keyboard.modifiers = keyboard_ticket_.report[0];
+        for (std::size_t key = 0; key <
+             interface_state.keyboard.keycodes.size(); ++key) {
+            interface_state.keyboard.keycodes[key] =
+                keyboard_ticket_.report[key + 2];
+        }
+        write_confirmed_keyboard(keyboard_ticket_.report);
+        interface_state.logical_state_held.store(
+            unsafe_report_holds_state(ReportKind::kUnsafeKeyboard,
+                                      keyboard_ticket_.report,
+                                      sizeof(keyboard_ticket_.report)),
+            std::memory_order_release);
+    } else {
+        mouse_ticket_.outcome.store(MouseReportTicketOutcome::kSubmitted,
+                                    std::memory_order_release);
+        mouse_ticket_.state.store(MouseReportTicketState::kSubmitted,
+                                  std::memory_order_release);
+        interface_state.mouse.buttons =
+            static_cast<std::uint8_t>(mouse_ticket_.report[0] & 0x1fU);
+        write_confirmed_mouse(interface_state.mouse.buttons);
+        interface_state.logical_state_held.store(
+            interface_state.mouse.buttons != 0, std::memory_order_release);
+    }
+    return true;
 }
 
 bool StateMachine::queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
@@ -1418,6 +1896,12 @@ void StateMachine::cancel_queued(Interface interface) {
 bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
                                             UsbGeneration current_generation,
                                             AuthorityEpoch current_authority_epoch) {
+    if (keyboard_ticket_.state.load(std::memory_order_acquire) !=
+            KeyboardReportTicketState::kPublished ||
+        keyboard_ticket_.transport.load(std::memory_order_relaxed) !=
+            HidTransport::kUsb) {
+        return false;
+    }
     KeyboardReportTicketState expected = KeyboardReportTicketState::kPublished;
     if (!keyboard_ticket_.state.compare_exchange_strong(
             expected, KeyboardReportTicketState::kClaimed,
@@ -1522,6 +2006,12 @@ bool StateMachine::process_keyboard_ticket(SubmitFn submit, void *context,
 bool StateMachine::process_mouse_ticket(SubmitFn submit, void *context,
                                          UsbGeneration current_generation,
                                          AuthorityEpoch current_authority_epoch) {
+    if (mouse_ticket_.state.load(std::memory_order_acquire) !=
+            MouseReportTicketState::kPublished ||
+        mouse_ticket_.transport.load(std::memory_order_relaxed) !=
+            HidTransport::kUsb) {
+        return false;
+    }
     MouseReportTicketState expected = MouseReportTicketState::kPublished;
     if (!mouse_ticket_.state.compare_exchange_strong(
             expected, MouseReportTicketState::kClaimed,
@@ -2023,6 +2513,11 @@ KeyboardReportResult Runtime::keyboard_report(
     std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes) {
     const KeyboardReportBeginResult begin =
         state_machine_.begin_keyboard_report(modifiers, keycodes);
+    return complete_keyboard_report(begin);
+}
+
+KeyboardReportResult Runtime::complete_keyboard_report(
+    KeyboardReportBeginResult begin) {
     if (begin == KeyboardReportBeginResult::kAlreadySet) {
         return KeyboardReportResult{.success = true,
                                     .authority_lost = false,
@@ -2101,6 +2596,10 @@ MouseReportResult Runtime::mouse_report(std::uint8_t buttons, std::int8_t x,
                                         std::int8_t horizontal) {
     const MouseReportBeginResult begin =
         state_machine_.begin_mouse_report(buttons, x, y, vertical, horizontal);
+    return complete_mouse_report(begin);
+}
+
+MouseReportResult Runtime::complete_mouse_report(MouseReportBeginResult begin) {
     if (begin == MouseReportBeginResult::kAlreadySet) {
         return MouseReportResult{.success = true,
                                  .authority_lost = false,

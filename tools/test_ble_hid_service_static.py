@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic guards for the internal-only U7.4A BLE HID foundation."""
+"""Deterministic guards for the internal-only U7.4B BLE HID route."""
 
 from __future__ import annotations
 
@@ -16,6 +16,12 @@ SDKCONFIG_DEFAULTS = ROOT / "firmware/sdkconfig.defaults"
 PROJECT_COMPONENTS = ROOT / "firmware/components"
 MAIN = ROOT / "firmware/main/main.cpp"
 CONTROL_PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
+CONTROL_PROTOCOL_HEADER = ROOT / "firmware/components/control_protocol/include/control_protocol/control_protocol.hpp"
+EXECUTOR = ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp"
+RUNTIME = ROOT / "firmware/components/hid_runtime/hid_runtime.cpp"
+HOST_PROTOCOL = ROOT / "host/src/hidbot/protocol.py"
+HOST_CLIENT = ROOT / "host/src/hidbot/client.py"
+HOST_CLI = ROOT / "host/src/hidbot/cli.py"
 
 
 def main() -> int:
@@ -26,6 +32,12 @@ def main() -> int:
     sdkconfig_defaults = SDKCONFIG_DEFAULTS.read_text(encoding="utf-8")
     main = MAIN.read_text(encoding="utf-8")
     control_protocol = CONTROL_PROTOCOL.read_text(encoding="utf-8")
+    control_protocol_header = CONTROL_PROTOCOL_HEADER.read_text(encoding="utf-8")
+    executor = EXECUTOR.read_text(encoding="utf-8")
+    runtime = RUNTIME.read_text(encoding="utf-8")
+    host_protocol = HOST_PROTOCOL.read_text(encoding="utf-8")
+    host_client = HOST_CLIENT.read_text(encoding="utf-8")
+    host_cli = HOST_CLI.read_text(encoding="utf-8")
 
     report_body = re.search(r"kReportMap\{(.*?)\};", header, re.DOTALL)
     assert report_body is not None
@@ -114,9 +126,35 @@ def main() -> int:
     assert "terminate_orphan_connection(" in signal.group(1)
     assert "submit_ble_keyboard" not in main
     assert "submit_ble_mouse" not in main
-    assert "hid.output-route-v2" not in control_protocol
-    assert "hid.route.v2." not in control_protocol
+    public_sources = "\n".join(
+        (control_protocol, control_protocol_header, host_protocol, host_client, host_cli)
+    )
+    assert "hid.output-route-v2" not in public_sources
+    assert "hid.route.v2." not in public_sources
     assert "hid.route.set route must be none or usb" in control_protocol
+    assert 'value == "none"' in control_protocol
+    assert 'value == "usb"' in control_protocol
+    assert 'value == "ble"' not in control_protocol
+    output_route = re.search(
+        r"enum class OutputRoute.*?\{(.*?)\};", control_protocol_header, re.DOTALL
+    )
+    assert output_route is not None and "kBle" not in output_route.group(1)
+    host_route = re.search(r"class OutputRoute.*?\n\n", host_protocol, re.DOTALL)
+    assert host_route is not None and 'BLE = "ble"' not in host_route.group(0)
+
+    assert "activate_ble_route_internal" in executor
+    assert "request_route_ble" in executor
+    assert "desired == hid_route::OutputRoute::kBle" in executor
+    assert "return {};" in executor  # public request_route rejects kBle
+    assert "ActionKind::kBleHidReport" in executor
+    assert "process_ble_report" in executor
+    assert "submit_runtime_ble_report" in executor
+    assert "retire_ble_route_if_unready" in executor
+    assert "ble_work_token_current" in executor
+    assert "BleSubmitResult::kStackAccepted" in runtime
+    assert "BleSubmitResult::kResourceFailure" in runtime
+    assert "BleSubmitResult::kStackRejected" in runtime
+    assert "retire_ble_route_if_matches" in runtime
 
     assert 'kDeviceName[] = "s3-hidbot"' in transport
     assert "kHidAppearance = 0x03c0" in transport

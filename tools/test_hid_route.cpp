@@ -57,6 +57,20 @@ void test_exact_identity_rejects_stale_invalidation() {
     assert(state.matches(hid_route::OutputRoute::kUsb, current.generation));
 }
 
+void test_internal_ble_commit_is_single_route_authority() {
+    hid_route::StateMachine state;
+    assert(state.commit_ble_if_none());
+    const auto ble = state.snapshot();
+    assert(ble.desired == hid_route::OutputRoute::kBle);
+    assert(ble.active == hid_route::OutputRoute::kBle);
+    assert(ble.transition == hid_route::Transition::kStable);
+    assert(state.matches(hid_route::OutputRoute::kBle, ble.generation));
+    assert(!state.commit_usb_if_none());
+    assert(!state.commit_ble_if_none());
+    assert(state.invalidate_if_matches(ble));
+    assert(state.snapshot().active == hid_route::OutputRoute::kNone);
+}
+
 void test_generation_wrap_uses_exact_match_not_ordering() {
     hid_route::StateMachine state;
     state.set_generation_for_test(UINT32_MAX);
@@ -135,6 +149,7 @@ int main() {
     test_cold_boot_is_none_generation_zero();
     test_commit_and_invalidation_change_generation_exactly_once();
     test_exact_identity_rejects_stale_invalidation();
+    test_internal_ble_commit_is_single_route_authority();
     test_generation_wrap_uses_exact_match_not_ordering();
     test_pre_publish_invalidation_aborts_but_consumes_authority_epoch();
     test_pre_publish_invalidation_abort_wraps_modulo_uint32();

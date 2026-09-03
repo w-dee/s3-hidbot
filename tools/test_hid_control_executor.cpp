@@ -2370,6 +2370,376 @@ void test_internal_ble_notification_adapter_and_result_model() {
     assert(database.notify_calls == 4);
 }
 
+struct ReadyBleRouteFixture {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    std::uint16_t connection = 81;
+    ble_lifecycle::Generation generation = 0;
+
+    explicit ReadyBleRouteFixture(std::uint16_t handle = 81)
+        : connection(handle) {
+        connect_ble(runtime, usb, ble, database, controller, connection);
+        generation = controller.ble_snapshot().generation;
+        subscribe_composite(controller, database, generation, connection);
+        make_security_ready(ble);
+        ble.refresh_security(connection);
+        assert(controller.ble_link_ready());
+        const auto activation = controller.activate_ble_route_internal();
+        assert(activation.action_result ==
+               hid_runtime::RouteTransitionResult::kAccepted);
+        assert(runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kBle);
+    }
+};
+
+void test_internal_ble_route_activation_and_exact_payloads() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 80);
+        assert(controller.activate_ble_route_internal().action_result ==
+               hid_runtime::RouteTransitionResult::kNotReady);
+        assert(runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(controller.request_route(hid_route::OutputRoute::kBle)
+                   .action_result == hid_runtime::RouteTransitionResult::kBusy);
+    }
+
+    ReadyBleRouteFixture fixture;
+    const auto authority =
+        fixture.runtime.state_machine().ble_route_authority_snapshot();
+    assert(authority.active && authority.coherent);
+    assert(authority.authority_epoch ==
+           fixture.runtime.state_machine().authority_epoch());
+    assert(authority.route_generation ==
+           fixture.runtime.state_machine().route_snapshot().generation);
+    assert(authority.ble_generation == fixture.generation);
+    assert(authority.connection_handle == fixture.connection);
+    assert(authority.keyboard_characteristic_handle ==
+           fixture.database.handles.keyboard_value);
+    assert(authority.mouse_characteristic_handle ==
+           fixture.database.handles.mouse_value);
+
+    const std::array<std::uint8_t, 6> keys{0x73, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0x02, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.database.notify_calls == 1);
+    assert(fixture.database.last_connection == fixture.connection);
+    assert(fixture.database.last_characteristic ==
+           fixture.database.handles.keyboard_value);
+    assert(fixture.database.last_payload_length == 8);
+    const std::array<std::uint8_t, 8> expected_keyboard{
+        0x02, 0, 0x73, 0, 0, 0, 0, 0};
+    assert(fixture.database.last_payload == expected_keyboard);
+    assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
+           hid_runtime::KeyboardReportTicketState::kSubmitted);
+    fixture.runtime.state_machine().finalize_keyboard_report();
+
+    assert(fixture.controller.queue_ble_mouse_report(
+               0xff, -127, 127, -2, 1) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.database.notify_calls == 2);
+    assert(fixture.database.last_characteristic ==
+           fixture.database.handles.mouse_value);
+    assert(fixture.database.last_payload_length == 5);
+    assert(fixture.database.last_payload[0] == 0x1f);
+    assert(fixture.database.last_payload[1] == 0x81);
+    assert(fixture.database.last_payload[2] == 0x7f);
+    assert(fixture.database.last_payload[3] == 0xfe);
+    assert(fixture.database.last_payload[4] == 0x01);
+    fixture.runtime.state_machine().finalize_mouse_report();
+}
+
+void test_ble_route_none_usb_and_no_dual_delivery() {
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &usb, &ble, &database));
+        const std::array<std::uint8_t, 6> keys{0x73, 0, 0, 0, 0, 0};
+        assert(controller.queue_ble_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kNotReady);
+        assert(database.notify_calls == 0);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        complete_attach(runtime, usb, controller);
+        mount_ready(runtime);
+        assert(runtime.state_machine().request_route_usb().action_result ==
+               hid_runtime::RouteTransitionResult::kAccepted);
+        ReportSink sink;
+        const std::array<std::uint8_t, 6> keys{0x73, 0, 0, 0, 0, 0};
+        assert(runtime.state_machine().queue_keyboard_report(0, keys));
+        runtime.state_machine().execute(ReportSink::submit, &sink);
+        assert(sink.calls == 1);
+        assert(database.notify_calls == 0);
+    }
+    ReadyBleRouteFixture fixture(82);
+    ReportSink usb_sink;
+    const std::array<std::uint8_t, 6> keys{0x72, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    fixture.runtime.state_machine().execute(ReportSink::submit, &usb_sink);
+    assert(usb_sink.calls == 0);
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.database.notify_calls == 1);
+    assert(usb_sink.calls == 0);
+}
+
+void test_ble_work_token_fences_every_authority_field() {
+    ReadyBleRouteFixture fixture(83);
+    const std::array<std::uint8_t, 6> keys{0x71, 0, 0, 0, 0, 0};
+    for (int mutation = 0; mutation < 6; ++mutation) {
+        assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        hid_control_executor::Controller::Action work{};
+        assert(fixture.controller.dequeue_one_for_test(work));
+        switch (mutation) {
+            case 0: ++work.hid_work.route_generation; break;
+            case 1: ++work.hid_work.authority_epoch; break;
+            case 2: ++work.hid_work.transport_generation; break;
+            case 3: ++work.hid_work.connection_handle; break;
+            case 4: ++work.hid_work.characteristic_handle; break;
+            case 5:
+                work.hid_work.report_kind =
+                    hid_runtime::ReportKind::kUnsafeMouse;
+                break;
+        }
+        fixture.controller.process_for_test(work);
+        assert(fixture.database.notify_calls == 0);
+        assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
+               hid_runtime::KeyboardReportTicketState::kCanceled);
+        fixture.runtime.state_machine().finalize_keyboard_report();
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kBle);
+    }
+
+    assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    hid_control_executor::Controller::Action stale{};
+    assert(fixture.controller.dequeue_one_for_test(stale));
+    const auto authority =
+        fixture.runtime.state_machine().ble_route_authority_snapshot();
+    assert(fixture.runtime.state_machine().retire_ble_route_if_matches(
+        authority));
+    fixture.controller.process_for_test(stale);
+    assert(fixture.database.notify_calls == 0);
+}
+
+void test_ble_readiness_loss_retires_route_without_auto_restore() {
+    for (int loss = 0; loss < 3; ++loss) {
+        ReadyBleRouteFixture fixture(static_cast<std::uint16_t>(84 + loss));
+        const std::array<std::uint8_t, 6> keys{0x70, 0, 0, 0, 0, 0};
+        assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        hid_control_executor::Controller::Action delayed{};
+        assert(fixture.controller.dequeue_one_for_test(delayed));
+        if (loss == 0) {
+            assert(queue_subscription(
+                fixture.controller, fixture.generation, fixture.connection,
+                hid_control_executor::BleHidInterface::kKeyboard,
+                fixture.database.handles.keyboard_value, false));
+        } else if (loss == 1) {
+            assert(queue_subscription(
+                fixture.controller, fixture.generation, fixture.connection,
+                hid_control_executor::BleHidInterface::kMouse,
+                fixture.database.handles.mouse_value, false));
+        } else {
+            assert(queue_control_point(
+                fixture.controller, fixture.generation, fixture.connection,
+                fixture.database.handles.control_point_value, true));
+        }
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        fixture.controller.process_for_test(delayed);
+        assert(fixture.database.notify_calls == 0);
+
+        if (loss == 0) {
+            assert(queue_subscription(
+                fixture.controller, fixture.generation, fixture.connection,
+                hid_control_executor::BleHidInterface::kKeyboard,
+                fixture.database.handles.keyboard_value, true));
+        } else if (loss == 1) {
+            assert(queue_subscription(
+                fixture.controller, fixture.generation, fixture.connection,
+                hid_control_executor::BleHidInterface::kMouse,
+                fixture.database.handles.mouse_value, true));
+        } else {
+            assert(queue_control_point(
+                fixture.controller, fixture.generation, fixture.connection,
+                fixture.database.handles.control_point_value, false));
+        }
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.controller.ble_link_ready());
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kNotReady);
+        assert(fixture.database.notify_calls == 0);
+    }
+}
+
+void test_callback_readiness_loss_preempts_earlier_queued_report() {
+    ReadyBleRouteFixture fixture(91);
+    const std::array<std::uint8_t, 6> keys{0x6e, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    // The report action is already first in the FIFO. Callback-side loss
+    // publication must nevertheless close readiness before that action can
+    // reach the notification backend.
+    assert(queue_subscription(
+        fixture.controller, fixture.generation, fixture.connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        fixture.database.handles.keyboard_value, false));
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.database.notify_calls == 0);
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.database.notify_calls == 0);
+}
+
+void test_security_and_storage_loss_preempt_ble_work() {
+    {
+        ReadyBleRouteFixture fixture(92);
+        assert(fixture.controller.queue_ble_mouse_report(0, 1, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        fixture.ble.security_link.authenticated = false;
+        assert(fixture.ble.event(
+            hid_control_executor::BleEventKind::kEncryptionChange,
+            fixture.connection, 0));
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.database.notify_calls == 0);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(fixture.controller.process_one_for_test());
+    }
+    {
+        ReadyBleRouteFixture fixture(93);
+        const std::array<std::uint8_t, 6> keys{0x6d, 0, 0, 0, 0, 0};
+        assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(fixture.ble.event(
+            hid_control_executor::BleEventKind::kStorageFailure,
+            fixture.connection, -44));
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.database.notify_calls == 0);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.controller.ble_snapshot().recovery_required);
+    }
+}
+
+void test_overflow_and_store_full_retire_only_current_ble_route() {
+    {
+        ReadyBleRouteFixture fixture(94);
+        for (int index = 0;
+             index < static_cast<int>(
+                         hid_control_executor::Controller::kActionQueueDepth);
+             ++index) {
+            assert(fixture.controller.signal_ble_event({
+                .kind = hid_control_executor::BleEventKind::kEncryptionChange,
+                .generation = fixture.generation - 1,
+                .connection_handle = fixture.connection,
+            }));
+        }
+        assert(!queue_subscription(
+            fixture.controller, fixture.generation, fixture.connection,
+            hid_control_executor::BleHidInterface::kKeyboard,
+            fixture.database.handles.keyboard_value, false));
+        assert(fixture.controller.process_wake_cycle_for_test());
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(fixture.controller.ble_snapshot().recovery_required);
+        assert(fixture.database.notify_calls == 0);
+    }
+    {
+        ReadyBleRouteFixture fixture(95);
+        assert(fixture.ble.event(
+            hid_control_executor::BleEventKind::kStoreFull,
+            fixture.connection, -55));
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(!fixture.controller.ble_snapshot().recovery_required);
+        assert(fixture.database.notify_calls == 0);
+    }
+}
+
+void test_ble_backend_failure_retires_and_never_replays_mouse() {
+    for (const auto failure : {
+             hid_control_executor::BleNotifyBackendResult::kResourceFailure,
+             hid_control_executor::BleNotifyBackendResult::kStackRejected}) {
+        ReadyBleRouteFixture fixture(
+            failure == hid_control_executor::BleNotifyBackendResult::kResourceFailure
+                ? 87
+                : 88);
+        fixture.database.notify_result = failure;
+        assert(fixture.controller.queue_ble_mouse_report(1, 7, -3, 2, -1) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.database.notify_calls == 1);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(fixture.runtime.state_machine().host_state_uncertain(
+            hid_runtime::Interface::kMouse));
+        assert(fixture.runtime.state_machine().safety_required(
+            hid_runtime::Interface::kMouse));
+        assert(!fixture.controller.process_one_for_test());
+        assert(fixture.database.notify_calls == 1);
+        assert(fixture.controller.queue_ble_mouse_report(1, 0, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kNotReady);
+        assert(fixture.database.notify_calls == 1);
+    }
+}
+
+void test_ble_disconnect_reconnect_kills_old_work_and_route() {
+    ReadyBleRouteFixture fixture(89);
+    const std::array<std::uint8_t, 6> keys{0x6f, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    hid_control_executor::Controller::Action old_work{};
+    assert(fixture.controller.dequeue_one_for_test(old_work));
+    assert(fixture.ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                             fixture.connection));
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    fixture.controller.process_for_test(old_work);
+    assert(fixture.database.notify_calls == 0);
+
+    constexpr std::uint16_t new_connection = 90;
+    assert(fixture.ble.event(hid_control_executor::BleEventKind::kConnect,
+                             new_connection));
+    assert(fixture.controller.process_one_for_test());
+    const auto new_generation = fixture.controller.ble_snapshot().generation;
+    subscribe_composite(fixture.controller, fixture.database, new_generation,
+                        new_connection,
+                        hid_control_executor::BleSubscriptionReason::kRestore);
+    make_security_ready(fixture.ble);
+    fixture.ble.refresh_security(new_connection);
+    assert(fixture.controller.ble_link_ready());
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(fixture.database.notify_calls == 0);
+}
+
 void assert_fatal_storage_terminal_state(
     hid_control_executor::Controller &controller, FakeBleBackend &ble,
     std::uint16_t handle, int advertising_calls_before_disconnect) {
@@ -3235,6 +3605,15 @@ int main() {
     test_store_full_does_not_trigger_global_fatal_reconciliation();
     test_store_full_retirement_does_not_poison_future_peer();
     test_internal_ble_notification_adapter_and_result_model();
+    test_internal_ble_route_activation_and_exact_payloads();
+    test_ble_route_none_usb_and_no_dual_delivery();
+    test_ble_work_token_fences_every_authority_field();
+    test_ble_readiness_loss_retires_route_without_auto_restore();
+    test_callback_readiness_loss_preempts_earlier_queued_report();
+    test_security_and_storage_loss_preempt_ble_work();
+    test_overflow_and_store_full_retire_only_current_ble_route();
+    test_ble_backend_failure_retires_and_never_replays_mouse();
+    test_ble_disconnect_reconnect_kills_old_work_and_route();
     test_pairing_input_response_and_initiation();
     test_public_pairing_rpc_mailbox_status_and_races();
     test_security_event_ordering_and_existing_bond();

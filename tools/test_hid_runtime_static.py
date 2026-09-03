@@ -73,7 +73,18 @@ def main() -> int:
     assert "route_generation" in header and "transport_generation" in header
     assert "hid_route/hid_route.hpp" in header
     assert "unsafe_route_active" in runtime
-    assert "route_.invalidate()" in runtime
+    assert "active_route.active == hid_route::OutputRoute::kUsb" in runtime
+    assert "route_.invalidate_if_matches(active_route)" in runtime
+    assert "request_route_ble" in runtime
+    assert "ble_work_token_current" in runtime
+    assert "process_ble_report" in runtime
+    for field in (
+        "connection_handle",
+        "characteristic_handle",
+        "report_kind",
+        "ticket_id",
+    ):
+        assert field in header
     assert "commit_usb_if_none" in runtime
     assert "OutputRoute" in route_header
     assert "kBle" in route_header

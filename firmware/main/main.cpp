@@ -365,7 +365,7 @@ control_protocol::ReleaseAllResult release_all(void *) {
 control_protocol::KeyboardReportResult keyboard_report(
     void *, const control_protocol::KeyboardReportRequest &request) {
     const hid_runtime::KeyboardReportResult result =
-        s_hid_runtime.keyboard_report(request.modifiers, request.keycodes);
+        s_usb_exposure.keyboard_report(request.modifiers, request.keycodes);
     const auto failure = [](hid_runtime::KeyboardReportFailure value) {
         switch (value) {
             case hid_runtime::KeyboardReportFailure::kBusy:
@@ -394,8 +394,8 @@ control_protocol::KeyboardReportResult keyboard_report(
 control_protocol::MouseReportResult mouse_report(
     void *, const control_protocol::MouseReportRequest &request) {
     const hid_runtime::MouseReportResult result =
-        s_hid_runtime.mouse_report(request.buttons, request.x, request.y,
-                                   request.wheel, request.pan);
+        s_usb_exposure.mouse_report(request.buttons, request.x, request.y,
+                                    request.wheel, request.pan);
     const auto failure = [](hid_runtime::MouseReportFailure value) {
         switch (value) {
             case hid_runtime::MouseReportFailure::kBusy:
