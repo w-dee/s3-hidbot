@@ -928,7 +928,14 @@ void Controller::complete_ble_route_release_on_disconnect(BleEvent event) {
             release)) {
         return;
     }
-    const ControlOperation owner = ble_route_release_owner_;
+    ControlOperation owner = ble_route_release_owner_;
+    if (owner == ControlOperation::kNone &&
+        active_operation_.load(std::memory_order_acquire) ==
+            ControlOperation::kRouteChange) {
+        // An exact physical loss may beat the first executor wake after an
+        // explicit route-none Stage A. Recover that still-exact owner here.
+        owner = ControlOperation::kRouteChange;
+    }
     ble_route_release_ = {};
     ble_route_release_phase_ = BleRouteReleasePhase::kNone;
     ble_route_release_owner_ = ControlOperation::kNone;

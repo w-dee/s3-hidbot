@@ -3167,6 +3167,24 @@ void test_u74c_spontaneous_disconnect_and_stale_grace_are_fenced() {
     assert(fixture.ble.disconnect_calls == 0);
 }
 
+void test_u74c_disconnect_before_first_release_wake_releases_owner() {
+    ReadyBleRouteFixture fixture(134);
+    assert(fixture.controller.request_route(hid_route::OutputRoute::kNone)
+               .action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    assert(fixture.controller.active_operation_for_test() ==
+           ControlOperation::kRouteChange);
+    // The callback arrives before the capacity-independent Stage-A wake is
+    // consumed and before controller phase state has copied the operation.
+    assert(fixture.ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                             fixture.connection));
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(fixture.controller.active_operation_for_test() ==
+           ControlOperation::kNone);
+    assert(fixture.ble.disconnect_calls == 0);
+}
+
 void test_u74c_disconnect_expiry_race_and_release_action_reuse() {
     ReadyBleRouteFixture fixture(126);
     begin_explicit_ble_route_retirement(fixture);
@@ -4195,6 +4213,7 @@ int main() {
     test_u74c_grace_queue_full_has_sticky_progress();
     test_u74c_dropped_exact_disconnect_still_completes_route();
     test_u74c_spontaneous_disconnect_and_stale_grace_are_fenced();
+    test_u74c_disconnect_before_first_release_wake_releases_owner();
     test_u74c_disconnect_expiry_race_and_release_action_reuse();
     test_u74c_lease_overflow_and_disable_retirement_paths();
     test_u74c_ble_completion_preserves_independent_usb_uncertainty();
