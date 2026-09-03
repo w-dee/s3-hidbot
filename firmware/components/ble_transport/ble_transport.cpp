@@ -1,5 +1,7 @@
 #include "ble_transport/ble_transport.hpp"
 
+#include "store_delete_result.hpp"
+
 #include <array>
 #include <cstring>
 
@@ -1310,8 +1312,12 @@ int Backend::store_delete(int object_type, const union ble_store_key *key) {
     if (instance_ == nullptr || instance_->original_store_delete_ == nullptr) {
         return BLE_HS_EINVAL;
     }
-    int result = instance_->original_store_delete_(object_type, key);
-    if (result == 0 && key != nullptr &&
+    const int result = instance_->original_store_delete_(object_type, key);
+    const auto delete_result =
+        detail::classify_store_delete_callback_result(result,
+                                                      BLE_HS_ENOENT);
+    if (delete_result == detail::StoreDeleteCallbackResult::kDeleted &&
+        key != nullptr &&
         (object_type == BLE_STORE_OBJ_TYPE_OUR_SEC ||
          object_type == BLE_STORE_OBJ_TYPE_PEER_SEC) &&
         has_exact_identity(key->sec.peer_addr)) {
@@ -1325,7 +1331,7 @@ int Backend::store_delete(int object_type, const union ble_store_key *key) {
             return BLE_HS_ESTORE_FAIL;
         }
     }
-    if (result != 0) {
+    if (delete_result == detail::StoreDeleteCallbackResult::kFailure) {
         instance_->observe_store_failure(
             ble_security::StoreFailureKind::kDelete, result, true,
             instance_->current_connection_.load(std::memory_order_acquire));

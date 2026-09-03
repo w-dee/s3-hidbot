@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "ble_security/ble_security.hpp"
+#include "store_delete_result.hpp"
 
 namespace {
 using ble_security::LinkSecurityEvidence;
@@ -198,6 +199,52 @@ void capacity_is_fail_closed() {
     const FixedIdentityStore rebooted = store;
     assert(!rebooted.contains(2));
 }
+
+void delete_callback_exhaustion_is_not_a_storage_failure() {
+    using ble_transport::detail::StoreDeleteCallbackResult;
+    using ble_transport::detail::classify_store_delete_callback_result;
+    constexpr int kDeleted = 0;
+    constexpr int kNotFound = 5;
+    constexpr int kGenuineFailure = 17;
+
+    static_assert(classify_store_delete_callback_result(kDeleted, kNotFound) ==
+                  StoreDeleteCallbackResult::kDeleted);
+    static_assert(classify_store_delete_callback_result(kNotFound, kNotFound) ==
+                  StoreDeleteCallbackResult::kExhausted);
+    static_assert(classify_store_delete_callback_result(kGenuineFailure,
+                                                        kNotFound) ==
+                  StoreDeleteCallbackResult::kFailure);
+
+    const auto helper_delete_all = [](const auto &callback_results,
+                                      bool &fatal_latched) {
+        for (const int status : callback_results) {
+            const auto result = classify_store_delete_callback_result(
+                status, kNotFound);
+            if (result == StoreDeleteCallbackResult::kFailure) {
+                fatal_latched = true;
+                return false;
+            }
+            if (result == StoreDeleteCallbackResult::kExhausted) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool fatal_latched = false;
+    assert(helper_delete_all(std::array{kDeleted, kDeleted, kNotFound},
+                             fatal_latched));
+    assert(!fatal_latched);
+
+    fatal_latched = false;
+    assert(helper_delete_all(std::array{kNotFound}, fatal_latched));
+    assert(!fatal_latched);
+
+    fatal_latched = false;
+    assert(!helper_delete_all(std::array{kDeleted, kGenuineFailure},
+                              fatal_latched));
+    assert(fatal_latched);
+}
 }  // namespace
 
 int main() {
@@ -205,5 +252,6 @@ int main() {
     readiness_and_fencing();
     immediate_inhibit_identity_fencing();
     capacity_is_fail_closed();
+    delete_callback_exhaustion_is_not_a_storage_failure();
     return 0;
 }

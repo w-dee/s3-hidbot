@@ -157,7 +157,8 @@ schemas, deterministic opaque-ID ordering, strict exact removal input, normal
 retry replay without a second mutation, active/advertising/pairing/BLE-route
 rejection, USB-route independence, StoreFull/manual-capacity and fatal Storage
 policy, exact NimBLE plus schema cleanup, post-read verification, unrelated
-bond preservation, collision/partial-failure fail-close, and absence of public
+bond preservation, normal delete-all `BLE_HS_ENOENT` exhaustion versus genuine
+delete failure, collision/partial-failure fail-close, and absence of public
 key/address material. The ESP-IDF target build remains required for the real
 NimBLE store and NVS callback linkage. These checks do not access Bluetooth
 radio, BlueZ, serial, `.envrc`, or hardware.

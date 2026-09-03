@@ -94,6 +94,11 @@ def main() -> int:
     store_delete = function(
         transport, "int Backend::store_delete(", "int Backend::store_status("
     )
+    assert "classify_store_delete_callback_result(result" in store_delete
+    assert "BLE_HS_ENOENT" in store_delete
+    assert "StoreDeleteCallbackResult::kDeleted" in store_delete
+    assert "StoreDeleteCallbackResult::kFailure" in store_delete
+    assert "if (result != 0)" not in store_delete
     assert "original_store_delete_(object_type, key)" in store_delete
     assert "delete_schema_revision(key->sec.peer_addr)" in store_delete
     assert "BLE_STORE_OBJ_TYPE_OUR_SEC" in store_delete

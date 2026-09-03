@@ -272,7 +272,11 @@ which also deletes the same resolved identity's `hid_schema` revision. Success
 is returned only after rereading `OUR_SEC`, `PEER_SEC`, and schema metadata as
 absent, relisting one fewer bond, and proving all other public bond IDs remain.
 A partial deletion is therefore an exposed fatal storage failure, never false
-success. StoreFull remains connection-local and does not evict; a successful
+success. NimBLE's delete-all iterator ends each record class with
+`BLE_HS_ENOENT`; the wrapper returns that sentinel to NimBLE without treating
+normal exhaustion as a storage fault. Other delete errors remain fatal, and
+required reads plus removal postconditions retain their independent ENOENT
+semantics. StoreFull remains connection-local and does not evict; a successful
 manual removal frees one slot for a future pairing. Firmware-side removal does
 not modify a host OS pairing database. A host that retains its own record may
 require a separately authorized host-side lifecycle action before pairing can
