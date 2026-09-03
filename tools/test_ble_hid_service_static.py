@@ -23,6 +23,7 @@ RUNTIME_HEADER = ROOT / "firmware/components/hid_runtime/include/hid_runtime/hid
 HOST_PROTOCOL = ROOT / "host/src/hidbot/protocol.py"
 HOST_CLIENT = ROOT / "host/src/hidbot/client.py"
 HOST_CLI = ROOT / "host/src/hidbot/cli.py"
+DEPENDENCIES_LOCK = ROOT / "firmware/dependencies.lock"
 TINYUSB_HID = ROOT / "firmware/managed_components/espressif__tinyusb/src/class/hid/hid_device.h"
 
 
@@ -94,7 +95,7 @@ def main() -> int:
     host_protocol = HOST_PROTOCOL.read_text(encoding="utf-8")
     host_client = HOST_CLIENT.read_text(encoding="utf-8")
     host_cli = HOST_CLI.read_text(encoding="utf-8")
-    tinyusb_hid = TINYUSB_HID.read_text(encoding="utf-8")
+    dependencies_lock = DEPENDENCIES_LOCK.read_text(encoding="utf-8")
 
     report_body = re.search(r"kReportMap\{(.*?)\};", header, re.DOTALL)
     assert report_body is not None
@@ -130,9 +131,24 @@ def main() -> int:
         for field in keyboard_fields
     ) == 8 * 8
 
-    usb_keyboard = macro_body(tinyusb_hid, "TUD_HID_REPORT_DESC_KEYBOARD")
-    assert macro_two_argument_value(usb_keyboard, "HID_LOGICAL_MAX_N") == (255, 2)
-    assert macro_two_argument_value(usb_keyboard, "HID_USAGE_MAX_N") == (255, 2)
+    assert "TUD_HID_REPORT_DESC_KEYBOARD()" in main
+    tinyusb_dependency = re.search(
+        r"  espressif/tinyusb:\n(.*?)(?=\n  [^ \n]+:|\ndirect_dependencies:)",
+        dependencies_lock,
+        re.DOTALL,
+    )
+    assert tinyusb_dependency is not None
+    # A dependency change must explicitly revalidate the USB descriptor range.
+    assert "version: 0.21.0~1" in tinyusb_dependency.group(1)
+    assert (
+        "component_hash: a72b7d67472914ab76309340fd50d578b31e310963d45ad0f81144bde3314752"
+        in tinyusb_dependency.group(1)
+    )
+    if TINYUSB_HID.is_file():
+        tinyusb_hid = TINYUSB_HID.read_text(encoding="utf-8")
+        usb_keyboard = macro_body(tinyusb_hid, "TUD_HID_REPORT_DESC_KEYBOARD")
+        assert macro_two_argument_value(usb_keyboard, "HID_LOGICAL_MAX_N") == (255, 2)
+        assert macro_two_argument_value(usb_keyboard, "HID_USAGE_MAX_N") == (255, 2)
 
     firmware_usage_guard = re.search(
         r"bool allowed_keyboard_usage\(.*?\n\}", control_protocol, re.DOTALL
