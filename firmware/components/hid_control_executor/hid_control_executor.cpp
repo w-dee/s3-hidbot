@@ -290,8 +290,7 @@ bool Controller::signal_ble_route_release_grace(
         return false;
     }
     ble_route_grace_due_.store(true, std::memory_order_release);
-    const Action action{.kind = ActionKind::kBleRouteReleaseGrace,
-                        .ble_route_release = identity};
+    const Action action{.kind = ActionKind::kBleRouteReleaseGrace};
     if (!enqueue(action)) {
         // The due bit is authoritative and the independent task notification
         // makes a full normal queue unable to strand retirement.
@@ -1059,9 +1058,9 @@ void Controller::process(Action action) {
         return;
     }
     if (action.kind == ActionKind::kBleRouteReleaseGrace) {
-        if (ble_route_release_identity_current(action.ble_route_release)) {
-            drive_ble_route_retirement();
-        }
+        // The action is only a wake hint. The exact callback already claimed
+        // the retained timer owner and published the authoritative due bit.
+        drive_ble_route_retirement();
         return;
     }
     if (action.kind == ActionKind::kPairingStatus) {

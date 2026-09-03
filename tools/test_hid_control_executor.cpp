@@ -3157,6 +3157,8 @@ void test_u74c_spontaneous_disconnect_and_stale_grace_are_fenced() {
 void test_u74c_disconnect_expiry_race_and_release_action_reuse() {
     ReadyBleRouteFixture fixture(126);
     begin_explicit_ble_route_retirement(fixture);
+    const auto old_identity =
+        fixture.controller.ble_route_release_identity_for_test();
     assert(fixture.controller.expire_ble_route_release_grace_for_test());
     hid_control_executor::Controller::Action old_expiry{};
     assert(fixture.controller.dequeue_one_for_test(old_expiry));
@@ -3183,9 +3185,9 @@ void test_u74c_disconnect_expiry_race_and_release_action_reuse() {
     // C10/C28/C32/C33: stale action acknowledgment cannot consume the newer
     // retirement despite connection-handle reuse.
     assert(new_identity.release_epoch !=
-               old_expiry.ble_route_release.release_epoch ||
+               old_identity.release_epoch ||
            new_identity.ble_generation !=
-               old_expiry.ble_route_release.ble_generation);
+               old_identity.ble_generation);
     fixture.controller.process_for_test(old_expiry);
     assert(fixture.ble.disconnect_calls == 0);
     assert(fixture.controller.expire_ble_route_release_grace_for_test());

@@ -304,7 +304,6 @@ class Controller final : public usb_lifecycle::Executor,
         BleEvent ble_event{};
         hid_runtime::Interface hid_interface = hid_runtime::Interface::kKeyboard;
         hid_runtime::HidWorkToken hid_work{};
-        BleRouteReleaseIdentity ble_route_release{};
         std::uint32_t mailbox_token = 0;
     };
 
