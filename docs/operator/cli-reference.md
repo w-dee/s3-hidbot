@@ -76,8 +76,9 @@ retry is attempted; reboot or manual operator intervention is required.
 `ble-exposure-status` has exactly `desired`, `observed`, `generation`,
 `stack_ready`, `advertising`, `connected`, `recovery_required`, and
 `last_error`. BLE is uninitialized/non-advertising at cold boot. USB and BLE
-may be exposed simultaneously, but there is no BLE report output, `route=ble`,
-bond administration, or formal HOGP/security compliance claim.
+may be exposed simultaneously. There is no public BLE report-output selection,
+`route=ble`, bond administration, or formal HOGP/security compliance claim;
+the firmware's U7.4B BLE report route is internal-only.
 
 The pairing workflow is deliberately manual: query `ble-pairing-status`, note
 its non-null `pairing_id`, run `ble-pairing-respond --pairing-id ID`, enter the

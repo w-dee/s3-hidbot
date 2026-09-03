@@ -60,6 +60,7 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
         return false;
     }
 #endif
+    runtime_->bind_authority_event_sink(this);
     initialized_ = true;
     if (ble_backend_ != nullptr) {
         ble_backend_->record_heap_checkpoint(BleBackend::HeapCheckpoint::kColdBoot);
@@ -427,11 +428,20 @@ RouteCommandOutcome Controller::activate_ble_route_internal() {
 
 bool Controller::enqueue_ble_hid_work(hid_runtime::Interface interface,
                                       hid_runtime::HidWorkToken token) {
-    return initialized_ && token.transport == hid_runtime::HidTransport::kBle &&
-           token.ticket_id != 0 &&
-           enqueue(Action{.kind = ActionKind::kBleHidReport,
-                          .hid_interface = interface,
-                          .hid_work = token});
+    if (!initialized_ || runtime_ == nullptr ||
+        token.transport != hid_runtime::HidTransport::kBle ||
+        token.ticket_id == 0 ||
+        !runtime_->state_machine().mark_ble_report_scheduled(interface,
+                                                              token)) {
+        return false;
+    }
+    if (enqueue(Action{.kind = ActionKind::kBleHidReport,
+                       .hid_interface = interface,
+                       .hid_work = token})) {
+        return true;
+    }
+    runtime_->state_machine().abandon_ble_report(interface, token);
+    return false;
 }
 
 hid_runtime::KeyboardReportBeginResult Controller::queue_ble_keyboard_report(
@@ -713,6 +723,10 @@ void Controller::request_executor_wake() {
         (void)xTaskNotifyGive(s_executor_task);
     }
 #endif
+}
+
+void Controller::signal_hid_authority_change() {
+    request_executor_wake();
 }
 
 bool Controller::schedule(usb_lifecycle::ExecutorAction action,

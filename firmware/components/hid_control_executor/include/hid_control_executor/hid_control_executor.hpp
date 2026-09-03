@@ -259,7 +259,9 @@ struct PairingStatusSnapshot {
     std::uint32_t remaining_ms = 0;
 };
 
-class Controller final : public usb_lifecycle::Executor, public BleEventSink {
+class Controller final : public usb_lifecycle::Executor,
+                         public BleEventSink,
+                         public hid_runtime::AuthorityEventSink {
   public:
     static constexpr std::size_t kActionQueueDepth = 12;
     enum class ActionKind : std::uint8_t {
@@ -333,6 +335,7 @@ class Controller final : public usb_lifecycle::Executor, public BleEventSink {
                   usb_lifecycle::Snapshot snapshot) override;
     bool signal_ble_event(BleEvent event) override;
     void signal_ble_lifecycle_handoff_failure() override;
+    void signal_hid_authority_change() override;
 
     // Internal BLE adapter seams. The general runtime reaches these only via
     // an exact U7.4B ticket in the serialized control-owner context; UART,

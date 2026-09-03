@@ -2508,6 +2508,7 @@ void test_ble_work_token_fences_every_authority_field() {
                hid_runtime::KeyboardReportBeginResult::kPublished);
         hid_control_executor::Controller::Action work{};
         assert(fixture.controller.dequeue_one_for_test(work));
+        const auto original = work.hid_work;
         switch (mutation) {
             case 0: ++work.hid_work.route_generation; break;
             case 1: ++work.hid_work.authority_epoch; break;
@@ -2522,7 +2523,10 @@ void test_ble_work_token_fences_every_authority_field() {
         fixture.controller.process_for_test(work);
         assert(fixture.database.notify_calls == 0);
         assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
-               hid_runtime::KeyboardReportTicketState::kCanceled);
+               hid_runtime::KeyboardReportTicketState::kPublished);
+        assert(fixture.runtime.state_machine().cancel_keyboard_report());
+        fixture.runtime.state_machine().abandon_ble_report(
+            hid_runtime::Interface::kKeyboard, original);
         fixture.runtime.state_machine().finalize_keyboard_report();
         assert(fixture.runtime.state_machine().route_snapshot().active ==
                hid_route::OutputRoute::kBle);
@@ -2538,6 +2542,63 @@ void test_ble_work_token_fences_every_authority_field() {
         authority));
     fixture.controller.process_for_test(stale);
     assert(fixture.database.notify_calls == 0);
+}
+
+void test_canceled_ble_ticket_waits_for_exact_action_acknowledgment() {
+    ReadyBleRouteFixture fixture(96);
+    const std::array<std::uint8_t, 6> old_keys{0x6c, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0, old_keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    hid_control_executor::Controller::Action old_action{};
+    assert(fixture.controller.dequeue_one_for_test(old_action));
+    assert(fixture.runtime.state_machine().cancel_keyboard_report());
+    fixture.runtime.state_machine().finalize_keyboard_report();
+    assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
+           hid_runtime::KeyboardReportTicketState::kCanceled);
+
+    const std::array<std::uint8_t, 6> new_keys{0x6b, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0, new_keys) ==
+           hid_runtime::KeyboardReportBeginResult::kBusy);
+    fixture.controller.process_for_test(old_action);
+    assert(fixture.database.notify_calls == 0);
+    assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
+           hid_runtime::KeyboardReportTicketState::kCanceled);
+
+    assert(fixture.controller.queue_ble_keyboard_report(0, new_keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.database.notify_calls == 1);
+    assert(fixture.database.last_payload[2] == 0x6b);
+}
+
+void test_usb_mount_retires_ble_authority_without_forgetting_held_state() {
+    ReadyBleRouteFixture fixture(97);
+    const std::array<std::uint8_t, 6> keys{0x6a, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(fixture.controller.process_one_for_test());
+    fixture.runtime.state_machine().finalize_keyboard_report();
+    assert(fixture.runtime.state_machine().keyboard_state().keycodes[0] ==
+           0x6a);
+    assert(fixture.controller.process_wake_cycle_for_test());
+
+    assert(action(fixture.controller.request_attach()) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.controller.process_wake_cycle_for_test());
+    fixture.runtime.state_machine().on_mount();
+
+    // Native tests call StateMachine directly, so explicitly model Runtime's
+    // production callback-to-executor authority wake.
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(fixture.runtime.state_machine().safety_required(
+        hid_runtime::Interface::kKeyboard));
+    assert(fixture.runtime.state_machine().keyboard_state().keycodes[0] ==
+           0x6a);
+    assert(fixture.database.notify_calls == 1);
 }
 
 void test_ble_readiness_loss_retires_route_without_auto_restore() {
@@ -3608,6 +3669,8 @@ int main() {
     test_internal_ble_route_activation_and_exact_payloads();
     test_ble_route_none_usb_and_no_dual_delivery();
     test_ble_work_token_fences_every_authority_field();
+    test_canceled_ble_ticket_waits_for_exact_action_acknowledgment();
+    test_usb_mount_retires_ble_authority_without_forgetting_held_state();
     test_ble_readiness_loss_retires_route_without_auto_restore();
     test_callback_readiness_loss_preempts_earlier_queued_report();
     test_security_and_storage_loss_preempt_ble_work();

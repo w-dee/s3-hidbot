@@ -247,11 +247,30 @@ void StateMachine::on_mount() {
     if (!usb_lifecycle_.observe_mount()) {
         return;
     }
+    const BleRouteAuthoritySnapshot ble_route =
+        ble_route_authority_snapshot();
+    const hid_route::Snapshot active_route = route_.snapshot();
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    bool retained_state_needs_safety = false;
+    for (const InterfaceState &interface_state : interfaces_) {
+        retained_state_needs_safety =
+            retained_state_needs_safety ||
+            interface_state.logical_state_held.load(
+                std::memory_order_acquire) ||
+            interface_state.in_flight.load(std::memory_order_acquire) ||
+            interface_state.host_state_uncertain.load(
+                std::memory_order_acquire) ||
+            interface_state.safety_required.load(std::memory_order_acquire);
+    }
+    const bool state_must_be_preserved =
+        (ble_route.coherent && ble_route.active) || !active_route.coherent ||
+        active_route.active == hid_route::OutputRoute::kBle ||
+        active_route.desired == hid_route::OutputRoute::kBle ||
+        retained_state_needs_safety;
     if (usb_lifecycle_.has_unresolved_prior_generation()) {
         // A reinstalled stack cannot prove the prior host observed all-up.
         // Keep a fresh-generation safety barrier until a new all-up completes.
@@ -263,6 +282,27 @@ void StateMachine::on_mount() {
             interface_state.logical_state_held.store(false, std::memory_order_release);
         }
         request_release_all();
+    } else if (state_must_be_preserved) {
+        // USB exposure is independent from the selected HID transport. A USB
+        // mount invalidates the shared authority epoch, but it must not erase
+        // BLE-held logical state before the control executor retires that BLE
+        // route. U7.4C will own the eventual BLE release operation.
+        for (InterfaceState &interface_state : interfaces_) {
+            interface_state.slot_state.store(kSlotEmpty,
+                                             std::memory_order_release);
+            const bool needs_safety =
+                interface_state.logical_state_held.load(
+                    std::memory_order_acquire) ||
+                interface_state.in_flight.load(std::memory_order_acquire) ||
+                interface_state.host_state_uncertain.load(
+                    std::memory_order_acquire);
+            interface_state.in_flight.store(false,
+                                            std::memory_order_release);
+            if (needs_safety) {
+                interface_state.safety_required.store(
+                    true, std::memory_order_release);
+            }
+        }
     } else {
         clear_interface(interfaces_[0]);
         clear_interface(interfaces_[1]);
@@ -1085,6 +1125,11 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
     while (ticket_state == KeyboardReportTicketState::kSubmitted ||
            ticket_state == KeyboardReportTicketState::kNotReady ||
            ticket_state == KeyboardReportTicketState::kCanceled) {
+        if (ticket_state == KeyboardReportTicketState::kCanceled &&
+            keyboard_ticket_.ble_action_pending.load(
+                std::memory_order_acquire)) {
+            return KeyboardReportBeginResult::kBusy;
+        }
         if (keyboard_ticket_.state.compare_exchange_weak(
                 ticket_state, KeyboardReportTicketState::kFree,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -1157,6 +1202,8 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
         usb_route ? kNoBleConnection : ble.connection_handle;
     keyboard_ticket_.characteristic_handle =
         usb_route ? 0 : ble.keyboard_characteristic_handle;
+    keyboard_ticket_.ble_action_pending.store(false,
+                                              std::memory_order_relaxed);
     std::memcpy(keyboard_ticket_.report, report, sizeof(report));
     keyboard_ticket_.outcome.store(KeyboardReportTicketOutcome::kNone, std::memory_order_relaxed);
 
@@ -1241,6 +1288,11 @@ void StateMachine::finalize_keyboard_report() {
     while (state == KeyboardReportTicketState::kSubmitted ||
            state == KeyboardReportTicketState::kNotReady ||
            state == KeyboardReportTicketState::kCanceled) {
+        if (state == KeyboardReportTicketState::kCanceled &&
+            keyboard_ticket_.ble_action_pending.load(
+                std::memory_order_acquire)) {
+            return;
+        }
         if (keyboard_ticket_.state.compare_exchange_weak(
                 state, KeyboardReportTicketState::kFree,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -1258,6 +1310,10 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     while (ticket_state == MouseReportTicketState::kSubmitted ||
            ticket_state == MouseReportTicketState::kNotReady ||
            ticket_state == MouseReportTicketState::kCanceled) {
+        if (ticket_state == MouseReportTicketState::kCanceled &&
+            mouse_ticket_.ble_action_pending.load(std::memory_order_acquire)) {
+            return MouseReportBeginResult::kBusy;
+        }
         if (mouse_ticket_.state.compare_exchange_weak(
                 ticket_state, MouseReportTicketState::kFree,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -1327,6 +1383,8 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
         usb_route ? kNoBleConnection : ble.connection_handle;
     mouse_ticket_.characteristic_handle =
         usb_route ? 0 : ble.mouse_characteristic_handle;
+    mouse_ticket_.ble_action_pending.store(false,
+                                           std::memory_order_relaxed);
     mouse_ticket_.report[0] = static_cast<std::uint8_t>(buttons & 0x1fU);
     mouse_ticket_.report[1] = static_cast<std::uint8_t>(x);
     mouse_ticket_.report[2] = static_cast<std::uint8_t>(y);
@@ -1411,6 +1469,10 @@ void StateMachine::finalize_mouse_report() {
     while (state == MouseReportTicketState::kSubmitted ||
            state == MouseReportTicketState::kNotReady ||
            state == MouseReportTicketState::kCanceled) {
+        if (state == MouseReportTicketState::kCanceled &&
+            mouse_ticket_.ble_action_pending.load(std::memory_order_acquire)) {
+            return;
+        }
         if (mouse_ticket_.state.compare_exchange_weak(
                 state, MouseReportTicketState::kFree,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -1419,12 +1481,8 @@ void StateMachine::finalize_mouse_report() {
     }
 }
 
-HidWorkToken StateMachine::published_report_token(Interface interface) const {
+HidWorkToken StateMachine::current_report_token(Interface interface) const {
     if (interface == Interface::kKeyboard) {
-        if (keyboard_ticket_.state.load(std::memory_order_acquire) !=
-            KeyboardReportTicketState::kPublished) {
-            return {};
-        }
         return HidWorkToken{
             .authority_epoch = keyboard_ticket_.authority_epoch.load(std::memory_order_relaxed),
             .route_generation = keyboard_ticket_.route_generation.load(std::memory_order_relaxed),
@@ -1436,10 +1494,6 @@ HidWorkToken StateMachine::published_report_token(Interface interface) const {
             .characteristic_handle = keyboard_ticket_.characteristic_handle,
             .report_kind = ReportKind::kUnsafeKeyboard,
         };
-    }
-    if (mouse_ticket_.state.load(std::memory_order_acquire) !=
-        MouseReportTicketState::kPublished) {
-        return {};
     }
     return HidWorkToken{
         .authority_epoch = mouse_ticket_.authority_epoch.load(std::memory_order_relaxed),
@@ -1454,64 +1508,103 @@ HidWorkToken StateMachine::published_report_token(Interface interface) const {
     };
 }
 
+bool StateMachine::report_token_matches(Interface interface,
+                                        HidWorkToken token) const {
+    return token.ticket_id != 0 &&
+           same_work_token(current_report_token(interface), token);
+}
+
+HidWorkToken StateMachine::published_report_token(Interface interface) const {
+    const bool published =
+        interface == Interface::kKeyboard
+            ? keyboard_ticket_.state.load(std::memory_order_acquire) ==
+                  KeyboardReportTicketState::kPublished
+            : mouse_ticket_.state.load(std::memory_order_acquire) ==
+                  MouseReportTicketState::kPublished;
+    return published ? current_report_token(interface) : HidWorkToken{};
+}
+
+bool StateMachine::mark_ble_report_scheduled(Interface interface,
+                                             HidWorkToken token) {
+    if (token.transport != HidTransport::kBle ||
+        !report_token_matches(interface, token)) {
+        return false;
+    }
+    std::atomic_bool &pending = interface == Interface::kKeyboard
+                                    ? keyboard_ticket_.ble_action_pending
+                                    : mouse_ticket_.ble_action_pending;
+    bool expected = false;
+    if (!pending.compare_exchange_strong(expected, true,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+        return false;
+    }
+    const bool still_published =
+        interface == Interface::kKeyboard
+            ? keyboard_ticket_.state.load(std::memory_order_acquire) ==
+                  KeyboardReportTicketState::kPublished
+            : mouse_ticket_.state.load(std::memory_order_acquire) ==
+                  MouseReportTicketState::kPublished;
+    if (!still_published || !report_token_matches(interface, token)) {
+        pending.store(false, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+void StateMachine::abandon_ble_report(Interface interface,
+                                      HidWorkToken token) {
+    if (!report_token_matches(interface, token)) {
+        return;
+    }
+    std::atomic_bool &pending = interface == Interface::kKeyboard
+                                    ? keyboard_ticket_.ble_action_pending
+                                    : mouse_ticket_.ble_action_pending;
+    pending.store(false, std::memory_order_release);
+}
+
 bool StateMachine::ble_work_token_current(Interface interface,
                                           HidWorkToken token) const {
     if (token.transport != HidTransport::kBle || token.ticket_id == 0 ||
         !unsafe_work_current(interface, token)) {
         return false;
     }
-    if (interface == Interface::kKeyboard) {
-        const auto ticket_state =
-            keyboard_ticket_.state.load(std::memory_order_acquire);
-        if (ticket_state != KeyboardReportTicketState::kPublished &&
-            ticket_state != KeyboardReportTicketState::kClaimed) {
-            return false;
-        }
-        const HidWorkToken current{
-            .authority_epoch = keyboard_ticket_.authority_epoch.load(std::memory_order_relaxed),
-            .route_generation = keyboard_ticket_.route_generation.load(std::memory_order_relaxed),
-            .transport = keyboard_ticket_.transport.load(std::memory_order_relaxed),
-            .transport_generation = keyboard_ticket_.transport_generation.load(std::memory_order_relaxed),
-            .ticket_id = keyboard_ticket_.ticket_id.load(std::memory_order_relaxed),
-            .release_epoch = keyboard_ticket_.release_epoch.load(std::memory_order_relaxed),
-            .connection_handle = keyboard_ticket_.connection_handle,
-            .characteristic_handle = keyboard_ticket_.characteristic_handle,
-            .report_kind = ReportKind::kUnsafeKeyboard,
-        };
-        return same_work_token(current, token);
-    }
-    const auto ticket_state = mouse_ticket_.state.load(std::memory_order_acquire);
-    if (ticket_state != MouseReportTicketState::kPublished &&
-        ticket_state != MouseReportTicketState::kClaimed) {
-        return false;
-    }
-    const HidWorkToken current{
-        .authority_epoch = mouse_ticket_.authority_epoch.load(std::memory_order_relaxed),
-        .route_generation = mouse_ticket_.route_generation.load(std::memory_order_relaxed),
-        .transport = mouse_ticket_.transport.load(std::memory_order_relaxed),
-        .transport_generation = mouse_ticket_.transport_generation.load(std::memory_order_relaxed),
-        .ticket_id = mouse_ticket_.ticket_id.load(std::memory_order_relaxed),
-        .release_epoch = mouse_ticket_.release_epoch.load(std::memory_order_relaxed),
-        .connection_handle = mouse_ticket_.connection_handle,
-        .characteristic_handle = mouse_ticket_.characteristic_handle,
-        .report_kind = ReportKind::kUnsafeMouse,
-    };
-    return same_work_token(current, token);
+    const bool claimable =
+        interface == Interface::kKeyboard
+            ? (keyboard_ticket_.state.load(std::memory_order_acquire) ==
+                   KeyboardReportTicketState::kPublished ||
+               keyboard_ticket_.state.load(std::memory_order_acquire) ==
+                   KeyboardReportTicketState::kClaimed)
+            : (mouse_ticket_.state.load(std::memory_order_acquire) ==
+                   MouseReportTicketState::kPublished ||
+               mouse_ticket_.state.load(std::memory_order_acquire) ==
+                   MouseReportTicketState::kClaimed);
+    return claimable && report_token_matches(interface, token);
 }
 
 bool StateMachine::process_ble_report(Interface interface, HidWorkToken token,
                                       BleSubmitFn submit, void *context) {
     if (submit == nullptr || token.transport != HidTransport::kBle ||
-        token.ticket_id == 0) {
+        token.ticket_id == 0 || !report_token_matches(interface, token)) {
         return false;
     }
     const bool keyboard_interface = interface == Interface::kKeyboard;
+    std::atomic_bool &action_pending =
+        keyboard_interface ? keyboard_ticket_.ble_action_pending
+                           : mouse_ticket_.ble_action_pending;
+    if (!action_pending.load(std::memory_order_acquire)) {
+        return false;
+    }
     if (keyboard_interface) {
         KeyboardReportTicketState expected =
             KeyboardReportTicketState::kPublished;
         if (!keyboard_ticket_.state.compare_exchange_strong(
                 expected, KeyboardReportTicketState::kClaimed,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (expected == KeyboardReportTicketState::kCanceled &&
+                report_token_matches(interface, token)) {
+                action_pending.store(false, std::memory_order_release);
+            }
             return false;
         }
     } else {
@@ -1519,9 +1612,14 @@ bool StateMachine::process_ble_report(Interface interface, HidWorkToken token,
         if (!mouse_ticket_.state.compare_exchange_strong(
                 expected, MouseReportTicketState::kClaimed,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (expected == MouseReportTicketState::kCanceled &&
+                report_token_matches(interface, token)) {
+                action_pending.store(false, std::memory_order_release);
+            }
             return false;
         }
     }
+    action_pending.store(false, std::memory_order_release);
 
     const auto finish_failure = [&](KeyboardReportTicketOutcome keyboard_outcome,
                                     MouseReportTicketOutcome mouse_outcome) {
@@ -2487,13 +2585,33 @@ void Runtime::on_mount() {
     // every configured attach gets the task-affine readiness refresh.
     tud_sof_cb_enable(true);
     result_bits_.store(0, std::memory_order_release);
+    if (AuthorityEventSink *sink =
+            authority_event_sink_.load(std::memory_order_acquire)) {
+        sink->signal_hid_authority_change();
+    }
 }
 void Runtime::on_unmount() {
     state_machine_.on_unmount();
     result_bits_.store(0, std::memory_order_release);
+    if (AuthorityEventSink *sink =
+            authority_event_sink_.load(std::memory_order_acquire)) {
+        sink->signal_hid_authority_change();
+    }
 }
-void Runtime::on_suspend() { state_machine_.on_suspend(); }
-void Runtime::on_resume() { state_machine_.on_resume(); }
+void Runtime::on_suspend() {
+    state_machine_.on_suspend();
+    if (AuthorityEventSink *sink =
+            authority_event_sink_.load(std::memory_order_acquire)) {
+        sink->signal_hid_authority_change();
+    }
+}
+void Runtime::on_resume() {
+    state_machine_.on_resume();
+    if (AuthorityEventSink *sink =
+            authority_event_sink_.load(std::memory_order_acquire)) {
+        sink->signal_hid_authority_change();
+    }
+}
 
 StatusSnapshot Runtime::status_snapshot() const { return state_machine_.status(); }
 

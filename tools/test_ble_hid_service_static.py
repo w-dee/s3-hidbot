@@ -19,6 +19,7 @@ CONTROL_PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol
 CONTROL_PROTOCOL_HEADER = ROOT / "firmware/components/control_protocol/include/control_protocol/control_protocol.hpp"
 EXECUTOR = ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp"
 RUNTIME = ROOT / "firmware/components/hid_runtime/hid_runtime.cpp"
+RUNTIME_HEADER = ROOT / "firmware/components/hid_runtime/include/hid_runtime/hid_runtime.hpp"
 HOST_PROTOCOL = ROOT / "host/src/hidbot/protocol.py"
 HOST_CLIENT = ROOT / "host/src/hidbot/client.py"
 HOST_CLI = ROOT / "host/src/hidbot/cli.py"
@@ -35,6 +36,7 @@ def main() -> int:
     control_protocol_header = CONTROL_PROTOCOL_HEADER.read_text(encoding="utf-8")
     executor = EXECUTOR.read_text(encoding="utf-8")
     runtime = RUNTIME.read_text(encoding="utf-8")
+    runtime_header = RUNTIME_HEADER.read_text(encoding="utf-8")
     host_protocol = HOST_PROTOCOL.read_text(encoding="utf-8")
     host_client = HOST_CLIENT.read_text(encoding="utf-8")
     host_cli = HOST_CLI.read_text(encoding="utf-8")
@@ -155,6 +157,11 @@ def main() -> int:
     assert "BleSubmitResult::kResourceFailure" in runtime
     assert "BleSubmitResult::kStackRejected" in runtime
     assert "retire_ble_route_if_matches" in runtime
+    assert "ble_action_pending" in runtime_header
+    assert "mark_ble_report_scheduled" in runtime
+    assert "abandon_ble_report" in runtime
+    assert "bind_authority_event_sink" in executor
+    assert "signal_hid_authority_change" in executor
 
     assert 'kDeviceName[] = "s3-hidbot"' in transport
     assert "kHidAppearance = 0x03c0" in transport

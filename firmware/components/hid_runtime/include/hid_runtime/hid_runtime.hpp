@@ -22,11 +22,20 @@ enum class ReportKind : std::uint8_t {
     kSafetyMouse,
 };
 
-// Future transports are identity values only in U7.2A. No BLE adapter or
-// execution path exists in this slice.
+// BLE remains an internal-only transport in U7.4B. Public route selection is
+// still limited to none/USB; the serialized control executor owns BLE work.
 enum class HidTransport : std::uint8_t {
     kUsb,
     kBle,
+};
+
+// Lifecycle callbacks can invalidate shared HID authority outside the control
+// executor. The sink is only a capacity-independent wake; executor-owned state
+// remains the source of truth.
+class AuthorityEventSink {
+  public:
+    virtual ~AuthorityEventSink() = default;
+    virtual void signal_hid_authority_change() = 0;
 };
 
 enum class LifecycleSafetyResult : std::uint8_t {
@@ -374,6 +383,8 @@ class StateMachine {
     void finalize_mouse_report();
 
     HidWorkToken published_report_token(Interface interface) const;
+    bool mark_ble_report_scheduled(Interface interface, HidWorkToken token);
+    void abandon_ble_report(Interface interface, HidWorkToken token);
     bool ble_work_token_current(Interface interface, HidWorkToken token) const;
     bool process_ble_report(Interface interface, HidWorkToken token,
                             BleSubmitFn submit, void *context);
@@ -473,6 +484,8 @@ class StateMachine {
                          const StatusSnapshot &runtime) const;
     bool unsafe_route_active(RouteGeneration generation, HidTransport transport) const;
     bool unsafe_work_current(Interface interface, HidWorkToken token) const;
+    HidWorkToken current_report_token(Interface interface) const;
+    bool report_token_matches(Interface interface, HidWorkToken token) const;
     void publish_ble_route_authority(BleRouteActivation activation,
                                      AuthorityEpoch authority_epoch,
                                      RouteGeneration route_generation);
@@ -524,6 +537,7 @@ class StateMachine {
         std::atomic<std::uint32_t> release_epoch{0};
         std::uint16_t connection_handle = kNoBleConnection;
         std::uint16_t characteristic_handle = 0;
+        std::atomic_bool ble_action_pending{false};
         std::atomic<KeyboardReportTicketOutcome> outcome{KeyboardReportTicketOutcome::kNone};
         std::uint8_t report[8]{};
     };
@@ -538,6 +552,7 @@ class StateMachine {
         std::atomic<std::uint32_t> release_epoch{0};
         std::uint16_t connection_handle = kNoBleConnection;
         std::uint16_t characteristic_handle = 0;
+        std::atomic_bool ble_action_pending{false};
         std::atomic<MouseReportTicketOutcome> outcome{MouseReportTicketOutcome::kNone};
         std::uint8_t report[5]{};
     };
@@ -584,6 +599,9 @@ class StateMachine {
 // is invoked by TinyUSB's public SOF callback in TinyUSB task context.
 class Runtime {
   public:
+    void bind_authority_event_sink(AuthorityEventSink *sink) {
+        authority_event_sink_.store(sink, std::memory_order_release);
+    }
     void initialize();
     void on_mount();
     void on_unmount();
@@ -632,6 +650,7 @@ class Runtime {
     void notify_lifecycle_safety_waiter();
 
     StateMachine state_machine_;
+    std::atomic<AuthorityEventSink *> authority_event_sink_{nullptr};
     std::atomic<std::uint8_t> result_bits_{0};  // sent bits 0/1, failed bits 2/3
     std::atomic<void *> lifecycle_safety_waiter_{nullptr};
 };
