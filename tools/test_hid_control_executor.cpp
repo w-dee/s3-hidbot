@@ -3075,6 +3075,19 @@ void test_u74c_release_rejection_and_disconnect_failure_are_bounded() {
         assert(fixture.runtime.state_machine().route_snapshot().active ==
                hid_route::OutputRoute::kNone);
     }
+    {
+        ReadyBleRouteFixture fixture(133);
+        fixture.ble.route_release_grace_result = -66;
+        begin_explicit_ble_route_retirement(fixture);
+        // Timer-arm failure cannot strand releasing state: no grace owner was
+        // established, so the exact hardened disconnect starts immediately.
+        assert(!fixture.ble.route_release_grace_armed);
+        assert(fixture.ble.disconnect_calls == 1);
+        assert(fixture.ble.last_connection == fixture.connection);
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+    }
 }
 
 void test_u74c_grace_queue_full_has_sticky_progress() {
