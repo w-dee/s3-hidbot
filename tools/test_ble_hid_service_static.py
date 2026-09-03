@@ -23,6 +23,60 @@ RUNTIME_HEADER = ROOT / "firmware/components/hid_runtime/include/hid_runtime/hid
 HOST_PROTOCOL = ROOT / "host/src/hidbot/protocol.py"
 HOST_CLIENT = ROOT / "host/src/hidbot/client.py"
 HOST_CLI = ROOT / "host/src/hidbot/cli.py"
+TINYUSB_HID = ROOT / "firmware/managed_components/espressif__tinyusb/src/class/hid/hid_device.h"
+
+
+def parse_hid_input_fields(report_map: bytes) -> list[dict[str, int]]:
+    """Parse the short-item state attached to every HID Input main item."""
+
+    fields: list[dict[str, int]] = []
+    global_state: dict[str, int] = {}
+    local_state: dict[str, int] = {}
+    global_tags = {
+        0: "usage_page",
+        1: "logical_minimum",
+        2: "logical_maximum",
+        7: "report_size",
+        8: "report_id",
+        9: "report_count",
+    }
+    local_tags = {1: "usage_minimum", 2: "usage_maximum"}
+    offset = 0
+    while offset < len(report_map):
+        prefix = report_map[offset]
+        offset += 1
+        assert prefix != 0xFE, "long HID items are not expected in this Report Map"
+        size_code = prefix & 0x03
+        size = 4 if size_code == 3 else size_code
+        assert offset + size <= len(report_map), "truncated HID short item"
+        raw = report_map[offset : offset + size]
+        offset += size
+        value = int.from_bytes(raw, "little", signed=False)
+        item_type = (prefix >> 2) & 0x03
+        tag = (prefix >> 4) & 0x0F
+        if item_type == 1 and tag in global_tags:
+            global_state[global_tags[tag]] = value
+        elif item_type == 2 and tag in local_tags:
+            local_state[local_tags[tag]] = value
+        elif item_type == 0:
+            if tag == 8:  # Input
+                fields.append({**global_state, **local_state, "flags": value})
+            local_state.clear()
+    return fields
+
+
+def macro_body(source: str, name: str) -> str:
+    match = re.search(rf"#define {re.escape(name)}\(\.\.\.\) \\\n((?:.*\\\n)+)", source)
+    assert match is not None
+    return match.group(1)
+
+
+def macro_two_argument_value(body: str, name: str) -> tuple[int, int]:
+    match = re.search(
+        rf"\b{re.escape(name)}\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", body
+    )
+    assert match is not None
+    return int(match.group(1)), int(match.group(2))
 
 
 def main() -> int:
@@ -40,6 +94,7 @@ def main() -> int:
     host_protocol = HOST_PROTOCOL.read_text(encoding="utf-8")
     host_client = HOST_CLIENT.read_text(encoding="utf-8")
     host_cli = HOST_CLI.read_text(encoding="utf-8")
+    tinyusb_hid = TINYUSB_HID.read_text(encoding="utf-8")
 
     report_body = re.search(r"kReportMap\{(.*?)\};", header, re.DOTALL)
     assert report_body is not None
@@ -50,6 +105,55 @@ def main() -> int:
     assert bytes((0x95, 0x06, 0x75, 0x08)) in report_map  # six keyboard keys
     assert bytes((0x95, 0x03, 0x81, 0x06)) in report_map  # X/Y/wheel
     assert bytes((0x95, 0x01, 0x81, 0x06)) in report_map  # pan
+
+    keyboard_fields = [
+        field for field in parse_hid_input_fields(report_map)
+        if field.get("report_id") == 1
+    ]
+    keyboard_array_fields = [
+        field for field in keyboard_fields
+        if field.get("usage_page") == 0x07
+        and field.get("report_count") == 6
+        and field.get("report_size") == 8
+        and field["flags"] & 0x02 == 0
+    ]
+    assert len(keyboard_array_fields) == 1
+    keyboard_array = keyboard_array_fields[0]
+    assert keyboard_array["logical_minimum"] == 0
+    assert keyboard_array["logical_maximum"] == 0xFF
+    assert keyboard_array["usage_minimum"] == 0
+    assert keyboard_array["usage_maximum"] == 0xFF
+    assert keyboard_array["usage_minimum"] <= 0x73 <= keyboard_array["usage_maximum"]
+    assert keyboard_array["logical_minimum"] <= 0x73 <= keyboard_array["logical_maximum"]
+    assert sum(
+        field["report_size"] * field["report_count"]
+        for field in keyboard_fields
+    ) == 8 * 8
+
+    usb_keyboard = macro_body(tinyusb_hid, "TUD_HID_REPORT_DESC_KEYBOARD")
+    assert macro_two_argument_value(usb_keyboard, "HID_LOGICAL_MAX_N") == (255, 2)
+    assert macro_two_argument_value(usb_keyboard, "HID_USAGE_MAX_N") == (255, 2)
+
+    firmware_usage_guard = re.search(
+        r"bool allowed_keyboard_usage\(.*?\n\}", control_protocol, re.DOTALL
+    )
+    host_usage_guard = re.search(
+        r"def validate_keyboard_report_inputs\(.*?\n    return values",
+        host_protocol,
+        re.DOTALL,
+    )
+    assert firmware_usage_guard is not None and host_usage_guard is not None
+    firmware_maximum = max(
+        int(value, 16)
+        for value in re.findall(r"usage <= 0x([0-9a-fA-F]+)U", firmware_usage_guard.group(0))
+    )
+    host_maximum = max(
+        int(value, 16)
+        for value in re.findall(r"value <= 0x([0-9a-fA-F]+)", host_usage_guard.group(0))
+    )
+    assert firmware_maximum == host_maximum
+    assert firmware_maximum <= keyboard_array["usage_maximum"]
+    assert firmware_maximum <= keyboard_array["logical_maximum"]
 
     assert "kHidInformation{\n    0x11, 0x01, 0x00, 0x00}" in header
     assert "kNeutralKeyboard{}" in header and "uint8_t, 8" in header
