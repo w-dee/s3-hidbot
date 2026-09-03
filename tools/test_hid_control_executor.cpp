@@ -5,6 +5,7 @@
 #include <limits>
 #include <utility>
 
+#include "ble_hid_service/ble_hid_service.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
 
 namespace {
@@ -1504,9 +1505,36 @@ void test_gatt_cache_legacy_refresh_read_persist_and_current_reconnect() {
     FakeBleDatabase database;
     hid_control_executor::Controller controller;
     constexpr std::uint16_t connection = 140;
+    database.handles = {
+        .report_map_value =
+            ble_hid_service::kRevision1ReportMapValueHandle,
+        .keyboard_value = ble_hid_service::kRevision1KeyboardValueHandle,
+        .mouse_value = ble_hid_service::kRevision1MouseValueHandle,
+        .control_point_value =
+            ble_hid_service::kRevision1ControlPointValueHandle,
+    };
     ble.stored_gatt_schema_current = false;  // Legacy record: key absent.
     connect_ble(runtime, usb, ble, database, controller, connection);
     const auto generation = controller.ble_snapshot().generation;
+    // NimBLE v5.5.4 emits RESTORE even for stored CCCD value handles that are
+    // absent from the current configurable-characteristic table.  Exact
+    // current-handle fencing prevents both legacy HID handles from becoming
+    // current subscription evidence.
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kKeyboard,
+        ble_hid_service::kLegacyKeyboardValueHandle, true,
+        hid_control_executor::BleSubscriptionReason::kRestore));
+    assert(controller.process_one_for_test());
+    assert(queue_subscription(
+        controller, generation, connection,
+        hid_control_executor::BleHidInterface::kMouse,
+        ble_hid_service::kLegacyMouseValueHandle, true,
+        hid_control_executor::BleSubscriptionReason::kRestore));
+    assert(controller.process_one_for_test());
+    auto peer = controller.ble_hid_peer_snapshot();
+    assert(!peer.keyboard_notify_enabled && !peer.mouse_notify_enabled);
+
     subscribe_composite(controller, database, generation, connection,
                         hid_control_executor::BleSubscriptionReason::kRestore);
     make_security_ready(ble);
@@ -1549,6 +1577,8 @@ void test_gatt_cache_legacy_refresh_read_persist_and_current_reconnect() {
     assert(ble.last_gatt_persist_connection == connection);
     assert(ble.stored_gatt_schema_current && ble.gatt_schema_current);
     assert(controller.ble_link_ready());
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
 
     // Cache 6: reconnect reads the durable current revision and does not ask
     // for another Service Changed indication.

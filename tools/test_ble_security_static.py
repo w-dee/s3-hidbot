@@ -26,6 +26,7 @@ def main() -> int:
         "CONFIG_BT_NIMBLE_SM_SC=y", "CONFIG_BT_NIMBLE_SM_LVL=3",
         "CONFIG_BT_NIMBLE_SM_SC_ONLY=0", "CONFIG_BT_NIMBLE_NVS_PERSIST=y",
         "CONFIG_BT_NIMBLE_MAX_BONDS=3",
+        "CONFIG_BT_NIMBLE_MAX_CCCDS=15",
         "# CONFIG_BT_NIMBLE_HANDLE_REPEAT_PAIRING_DELETION is not set",
     ):
         assert defaults.count(value) == 1
@@ -52,7 +53,9 @@ def main() -> int:
             assert flag in body.group(1)
         assert ".min_key_size = 16" in body.group(1)
     assert service.count(".att_flags = BLE_ATT_F_READ") == 2
-    assert service.count(".min_key_size = 0") == 2
+    # Two Report Reference descriptors and the public, read-only schema epoch
+    # characteristic intentionally have no encryption-key-size requirement.
+    assert service.count(".min_key_size = 0") == 3
     for exposed in ("ble.pairing.status", "ble.pairing.respond",
                     "ble.pairing-transaction-v1"):
         assert exposed in protocol

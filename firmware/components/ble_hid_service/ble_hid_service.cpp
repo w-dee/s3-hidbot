@@ -11,6 +11,7 @@ namespace ble_hid_service {
 namespace {
 
 enum class AccessTarget : std::uint8_t {
+    kSchemaEpoch,
     kInformation,
     kReportMap,
     kControlPoint,
@@ -20,6 +21,17 @@ enum class AccessTarget : std::uint8_t {
     kMouseReference,
 };
 
+// Project-owned internal UUIDs.  Canonical service UUID:
+// 5f7d0a10-7e38-4ed1-b97b-1fa4e83c2a10
+// Canonical characteristic UUID:
+// 5f7d0a11-7e38-4ed1-b97b-1fa4e83c2a10
+ble_uuid128_t s_schema_epoch_service = BLE_UUID128_INIT(
+    0x10, 0x2a, 0x3c, 0xe8, 0xa4, 0x1f, 0x7b, 0xb9,
+    0xd1, 0x4e, 0x38, 0x7e, 0x10, 0x0a, 0x7d, 0x5f);
+ble_uuid128_t s_schema_epoch_characteristic = BLE_UUID128_INIT(
+    0x10, 0x2a, 0x3c, 0xe8, 0xa4, 0x1f, 0x7b, 0xb9,
+    0xd1, 0x4e, 0x38, 0x7e, 0x11, 0x0a, 0x7d, 0x5f);
+ble_uuid16_t s_gatt_service = BLE_UUID16_INIT(0x1801);
 ble_uuid16_t s_hid_service = BLE_UUID16_INIT(0x1812);
 ble_uuid16_t s_hid_information = BLE_UUID16_INIT(0x2a4a);
 ble_uuid16_t s_report_map = BLE_UUID16_INIT(0x2a4b);
@@ -29,6 +41,7 @@ ble_uuid16_t s_report_reference = BLE_UUID16_INIT(0x2908);
 
 std::uint16_t s_keyboard_value_handle = 0;
 std::uint16_t s_mouse_value_handle = 0;
+std::uint16_t s_schema_epoch_value_handle = 0;
 std::uint16_t s_information_value_handle = 0;
 std::uint16_t s_report_map_value_handle = 0;
 std::uint16_t s_control_point_value_handle = 0;
@@ -41,6 +54,18 @@ void *target(AccessTarget value) {
 AccessTarget target_from(void *argument) {
     return static_cast<AccessTarget>(reinterpret_cast<std::uintptr_t>(argument) - 1U);
 }
+
+ble_gatt_chr_def s_schema_epoch_characteristics[] = {
+    {.uuid = &s_schema_epoch_characteristic.u,
+     .access_cb = Database::access,
+     .arg = target(AccessTarget::kSchemaEpoch),
+     .descriptors = nullptr,
+     .flags = BLE_GATT_CHR_F_READ,
+     .min_key_size = 0,
+     .val_handle = &s_schema_epoch_value_handle,
+     .cpfd = nullptr},
+    {},
+};
 
 ble_gatt_dsc_def s_keyboard_descriptors[] = {
     {.uuid = &s_report_reference.u,
@@ -100,6 +125,10 @@ ble_gatt_chr_def s_characteristics[] = {
 
 ble_gatt_svc_def s_services[] = {
     {.type = BLE_GATT_SVC_TYPE_PRIMARY,
+     .uuid = &s_schema_epoch_service.u,
+     .includes = nullptr,
+     .characteristics = s_schema_epoch_characteristics},
+    {.type = BLE_GATT_SVC_TYPE_PRIMARY,
      .uuid = &s_hid_service.u,
      .characteristics = s_characteristics},
     {},
@@ -131,9 +160,32 @@ int Database::validate_registered_database() {
     if (s_database != this) {
         return BLE_HS_ENOENT;
     }
-    std::uint16_t service_handle = 0;
-    int result = ble_gatts_find_svc(&s_hid_service.u, &service_handle);
-    if (result != 0 || service_handle == 0) {
+    std::uint16_t gatt_service_handle = 0;
+    int result = ble_gatts_find_svc(&s_gatt_service.u, &gatt_service_handle);
+    if (result != 0 ||
+        gatt_service_handle != kGattServiceStartHandle) {
+        return result != 0 ? result : BLE_HS_ENOENT;
+    }
+    std::uint16_t epoch_service_handle = 0;
+    result = ble_gatts_find_svc(&s_schema_epoch_service.u,
+                                &epoch_service_handle);
+    if (result != 0 ||
+        epoch_service_handle != kRevision1EpochServiceStartHandle) {
+        return result != 0 ? result : BLE_HS_ENOENT;
+    }
+    std::uint16_t epoch_value_handle = 0;
+    result = ble_gatts_find_chr(&s_schema_epoch_service.u,
+                                &s_schema_epoch_characteristic.u, nullptr,
+                                &epoch_value_handle);
+    if (result != 0 || epoch_value_handle == 0 ||
+        epoch_value_handle != s_schema_epoch_value_handle ||
+        epoch_value_handle != kRevision1EpochServiceEndHandle) {
+        return result != 0 ? result : BLE_HS_ENOENT;
+    }
+    std::uint16_t hid_service_handle = 0;
+    result = ble_gatts_find_svc(&s_hid_service.u, &hid_service_handle);
+    if (result != 0 ||
+        hid_service_handle != kRevision1HidServiceStartHandle) {
         return result != 0 ? result : BLE_HS_ENOENT;
     }
 
@@ -156,7 +208,11 @@ int Database::validate_registered_database() {
         }
     }
     if (s_keyboard_value_handle == 0 || s_mouse_value_handle == 0 ||
-        s_keyboard_value_handle == s_mouse_value_handle) {
+        s_keyboard_value_handle == s_mouse_value_handle ||
+        s_report_map_value_handle != kRevision1ReportMapValueHandle ||
+        s_control_point_value_handle != kRevision1ControlPointValueHandle ||
+        s_keyboard_value_handle != kRevision1KeyboardValueHandle ||
+        s_mouse_value_handle != kRevision1MouseValueHandle) {
         return BLE_HS_ENOENT;
     }
     return 0;
@@ -223,6 +279,10 @@ int Database::access(std::uint16_t connection_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
     switch (target_from(argument)) {
+        case AccessTarget::kSchemaEpoch:
+            return context->op == BLE_GATT_ACCESS_OP_READ_CHR
+                       ? append(context->om, kGattSchemaEpochValue)
+                       : BLE_ATT_ERR_READ_NOT_PERMITTED;
         case AccessTarget::kInformation:
             return append(context->om, kHidInformation);
         case AccessTarget::kReportMap: {

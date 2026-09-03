@@ -11,6 +11,7 @@ EXPECTED = {
     "CONFIG_BT_NIMBLE_SM_SC_ONLY": "0",
     "CONFIG_BT_NIMBLE_NVS_PERSIST": "y",
     "CONFIG_BT_NIMBLE_MAX_BONDS": "3",
+    "CONFIG_BT_NIMBLE_MAX_CCCDS": "15",
 }
 
 def main() -> int:

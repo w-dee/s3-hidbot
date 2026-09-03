@@ -15,11 +15,14 @@ Bonded hosts may cache the GATT database and HID Report Map across firmware
 updates. Firmware records the cache-relevant schema revision per resolved bond.
 An older or legacy bond remains HID-route-ineligible while stale; after normal
 authenticated reconnect it receives a bounded standard Service Changed
-request, and becomes eligible only after it actually reads the current Report
-Map and the revision is durably verified. This migration preserves bonds and
-does not select a route. Clearing BlueZ cache, deleting a host pairing, or
-erasing device NVS is not the normal repair procedure and must not be used as
-an automatic recovery step.
+request. A small schema-epoch service before HID changes the HID service handle
+tuple, allowing supported hosts to discover a fresh HID instance. The peer
+becomes eligible only after it actually reads the current Report Map and the
+revision is durably verified. This mechanism is designed to preserve bonds and
+does not select a route, but it is not a universal cross-host compatibility
+claim until each host stack is qualified. Clearing BlueZ cache, deleting a host
+pairing, or erasing device NVS is not the normal repair procedure and must not
+be used as an automatic recovery step.
 
 The CH343 USB-UART path controls and programs the fixture. The separate native
 USB-OTG path presents HID to a DUT host. Provisioning and identity verification

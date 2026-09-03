@@ -574,9 +574,20 @@ The NimBLE server also exposes the standard 0x1800 Generic Access service and
 Generic HID appearance `0x03c0` as the advertisement; GATT provides the
 stack-standard Service Changed infrastructure. Before every project HID
 advertising attempt, firmware uses the live local GATT database to prove that
-0x1812 and its required characteristic handles were registered. A missing or
-incomplete project service fails the BLE lifecycle closed with no visible HID
-advertisement.
+the standard GATT, project-owned HID Schema Epoch, and 0x1812 services occupy
+the revision-1 handle topology and that required characteristic handles were
+registered. A missing, incomplete, or reordered database fails the BLE
+lifecycle closed with no visible HID advertisement.
+
+The fixed registration order is GAP, GATT, HID Schema Epoch, then HID. The
+internal epoch Primary Service UUID is
+`5f7d0a10-7e38-4ed1-b97b-1fa4e83c2a10`; its sole read-only characteristic is
+`5f7d0a11-7e38-4ed1-b97b-1fa4e83c2a10` and returns exactly one unsigned byte,
+currently `1`. The service has three attributes and no write, notification,
+indication, or CCCD. It occupies `0x000e..0x0010`, moving the HID Primary
+Service start from the legacy `0x000e` to `0x0011`. Reading this informational
+value has no side effect and is not evidence that the peer consumed the HID
+Report Map.
 
 Bonded-client cache compatibility uses an explicit one-byte GATT schema
 revision. Revision 1 identifies the current cache-relevant HID Report Map and
@@ -602,7 +613,23 @@ queue-overflow handling clear or fail-close all uncommitted evidence; neither
 cache repair nor reconnect selects the BLE route automatically. Increment the
 schema revision and update its host-side descriptor fingerprint whenever the
 HID Report Map, cache-relevant GATT layout, or other bonded-client cached
-semantics change.
+semantics change. Every future cache-relevant revision must also append one or
+more fixed revision-marker attributes before HID (without removing or
+reordering older epoch attributes) so that the HID Primary Service start
+changes monotonically. The firmware still exposes one compile-time database
+to every peer; per-peer
+revision records never select a dynamic topology.
+
+ESP-NimBLE v5.5.4 persists a bonded CCCD by peer identity and characteristic
+value handle. During restore it applies flags only when that handle is one of
+the current database's configurable characteristics, but it still emits a
+RESTORE event and does not purge an unmatched old record. The project accepts
+subscription evidence only when generation, connection, interface, and the
+current registered value handle all match. Revision 1 therefore ignores the
+legacy keyboard `0x0016` and mouse `0x001a` records; neither aliases the new
+keyboard `0x0019` or mouse `0x001d`. The persistent CCCD capacity is 15 so all
+three supported bonds can retain Service Changed plus two legacy and two
+current HID records during this migration without bond deletion or eviction.
 
 Advertising is legacy connectable undirected with an exact 22-byte payload:
 Flags `0x06`, complete UUID list `0x1812`, Generic HID appearance `0x03c0`, and
@@ -610,6 +637,11 @@ complete name `s3-hidbot`; no scan response is used. Interval is 40 ms. The
 single connection is offered 15–30 ms interval, latency 0, and 4 s supervision
 timeout. NimBLE chooses a public identity if available or a supported static
 random identity; it is never returned over UART.
+
+The topology epoch is designed to make a retained-host service rediscovery
+remove the old HID tuple and probe the new one. Bond-preserving cache migration
+is not claimed for every host stack until each target stack is physically
+qualified.
 
 ## Explicit USB exposure control
 

@@ -138,9 +138,18 @@ count, authoritative Report Map read ordering, write-and-reread persistence,
 fresh/current reconnect behavior, generation/handle fencing, disconnect,
 missing subscription, send failure, StoreFull/persistent-storage failure, and
 queue-overflow cases. The static test binds schema revision 1 to a SHA-256
-fingerprint of the Report Map and checks the real 0x2A4B access path publishes
-the exact generation/connection/attribute evidence only after a successful
-read. These tests do not access Bluetooth radio, BlueZ, serial, or hardware.
+fingerprint covering the Report Map, Report References, epoch UUIDs/value, and
+handle topology, and checks the real 0x2A4B access path publishes the exact
+generation/connection/attribute evidence only after a successful read. The
+separate topology guard models the ESP-IDF v5.5.4 sequential registration:
+GATT remains `0x0006..0x000d`, the three-attribute revision-1 epoch occupies
+`0x000e..0x0010`, and HID moves to `0x0011..0xffff`. It also checks that legacy
+keyboard/mouse CCCD value handles cannot alias current notifiable handles and
+that the configured persistent capacity covers all three migrated bonds.
+Executor coverage injects both old-handle and current-handle RESTORE evidence;
+old handles remain ineligible and an exact current Report Map read is still
+required before persistence/readiness. These tests do not access Bluetooth
+radio, BlueZ, serial, or hardware.
 
 Run these commands from the repository root:
 

@@ -81,6 +81,39 @@ def macro_two_argument_value(body: str, name: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
+def integer_constant(source: str, name: str) -> int:
+    match = re.search(
+        rf"\b{re.escape(name)}\s*=\s*(0x[0-9a-fA-F]+|[0-9]+)\s*;",
+        source,
+    )
+    assert match is not None
+    return int(match.group(1), 0)
+
+
+def byte_array(source: str, name: str) -> bytes:
+    match = re.search(rf"\b{re.escape(name)}\{{(.*?)\}};", source, re.DOTALL)
+    assert match is not None
+    return bytes(
+        int(value, 16)
+        for value in re.findall(r"0x([0-9a-fA-F]{2})", match.group(1))
+    )
+
+
+def uuid128_little_endian(source: str, name: str) -> bytes:
+    match = re.search(
+        rf"ble_uuid128_t\s+{re.escape(name)}\s*=\s*BLE_UUID128_INIT\((.*?)\);",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None
+    value = bytes(
+        int(byte, 16)
+        for byte in re.findall(r"0x([0-9a-fA-F]{2})", match.group(1))
+    )
+    assert len(value) == 16
+    return value
+
+
 def main() -> int:
     header = HEADER.read_text(encoding="utf-8")
     service = SERVICE.read_text(encoding="utf-8")
@@ -113,11 +146,44 @@ def main() -> int:
     )
     assert revision_match is not None
     schema_revision = int(revision_match.group(1))
-    descriptor_fingerprints = {
-        1: "ef1be45d8fe7d0637568c8954b64bab971d5b5f57bf3d44f1cc040e8fe5c3d32",
+    topology_fields = tuple(
+        integer_constant(header, name)
+        for name in (
+            "kGattServiceStartHandle",
+            "kLegacyHidServiceStartHandle",
+            "kRevision1EpochAttributeCount",
+            "kRevision1EpochServiceStartHandle",
+            "kRevision1EpochServiceEndHandle",
+            "kRevision1HidServiceStartHandle",
+            "kRevision1ReportMapValueHandle",
+            "kRevision1ControlPointValueHandle",
+            "kRevision1KeyboardValueHandle",
+            "kRevision1MouseValueHandle",
+            "kRevision1HidLastAttributeHandle",
+        )
+    )
+    cache_schema = (
+        b"s3-hidbot-cache-schema\x00"
+        + bytes((schema_revision,))
+        + b"gap-gatt-epoch-hid\x00"
+        + uuid128_little_endian(service, "s_schema_epoch_service")
+        + uuid128_little_endian(service, "s_schema_epoch_characteristic")
+        + b"epoch-primary-read-only-u8\x00"
+        + b"".join(value.to_bytes(2, "little") for value in topology_fields)
+        + byte_array(header, "kGattSchemaEpochValue")
+        + byte_array(header, "kKeyboardReportReference")
+        + byte_array(header, "kMouseReportReference")
+        + report_map
+    )
+    schema_fingerprints = {
+        1: "980209137b8ab856b406564fadf833be046a386ebe3f8bfed98a044ad2f37cb1",
     }
-    assert schema_revision in descriptor_fingerprints
-    assert hashlib.sha256(report_map).hexdigest() == descriptor_fingerprints[schema_revision]
+    assert schema_revision in schema_fingerprints
+    cache_schema_fingerprint = hashlib.sha256(cache_schema).hexdigest()
+    assert cache_schema_fingerprint == schema_fingerprints[schema_revision], (
+        schema_revision,
+        cache_schema_fingerprint,
+    )
 
     keyboard_fields = [
         field for field in parse_hid_input_fields(report_map)
