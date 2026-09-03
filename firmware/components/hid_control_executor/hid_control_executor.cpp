@@ -98,8 +98,7 @@ BleCommandOutcome Controller::request_ble_disable() {
                            ? hid_route::Snapshot{}
                            : runtime_->state_machine().route_snapshot();
     if (!initialized_ || ble_backend_ == nullptr || !route.coherent ||
-        route.active != hid_route::OutputRoute::kNone ||
-        route.transition != hid_route::Transition::kStable ||
+        route.active == hid_route::OutputRoute::kBle ||
         !claim_operation(operation)) {
         return {};
     }

@@ -202,7 +202,15 @@ def main() -> int:
     assert "ble_backend_->disconnect(identity.connection_handle)" in executor
     assert "complete_ble_route_release_on_disconnect" in executor
     assert "ble_route_disconnect_observed_.store(true" in executor
-    assert "route.active != hid_route::OutputRoute::kNone" in executor
+    disable = re.search(
+        r"BleCommandOutcome Controller::request_ble_disable\(\) \{(.*?)\n\}",
+        executor,
+        re.DOTALL,
+    )
+    assert disable is not None
+    assert "route.active == hid_route::OutputRoute::kBle" in disable.group(1)
+    assert "route.active != hid_route::OutputRoute::kNone" not in disable.group(1)
+    assert "route.transition != hid_route::Transition::kStable" not in disable.group(1)
 
     assert 'kDeviceName[] = "s3-hidbot"' in transport
     assert "kHidAppearance = 0x03c0" in transport

@@ -1802,9 +1802,17 @@ void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
     fixture.payload(request(6, session, "ble.disable", "{\"unexpected\":true}"));
     require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
     assert(fixture.ble.disable_calls == 0);
-    fixture.payload(request(7, session, "ble.disable"));
-    require_contains(fixture.sink.last(), "\"observed\":\"disabling\"");
+    const std::string disable_request = request(7, session, "ble.disable");
+    fixture.payload(disable_request);
+    const std::string disable_accepted = fixture.sink.last();
+    require_contains(disable_accepted, "\"observed\":\"disabling\"");
     assert(fixture.authority.epoch == authority_before);
+    assert(fixture.ble.disable_calls == 1);
+    fixture.payload(disable_request);
+    assert(fixture.sink.last() == disable_accepted);
+    assert(fixture.ble.disable_calls == 1);
+    fixture.payload(request(8, session, "system.ping"));
+    require_contains(fixture.sink.last(), "\"pong\":true");
 
     Fixture busy;
     busy.payload(hello_request(1, kNonceA));
@@ -1813,6 +1821,10 @@ void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
     busy.payload(request(2, busy_session, "ble.enable"));
     require_contains(busy.sink.last(), "\"code\":\"HID_BUSY\"");
     assert(busy.ble.status.generation == 0);
+    busy.ble.disable_result = control_protocol::BleExposureActionResult::kBusy;
+    busy.payload(request(3, busy_session, "ble.disable"));
+    require_contains(busy.sink.last(), "\"code\":\"HID_BUSY\"");
+    assert(busy.ble.disable_calls == 1);
 }
 
 void test_ble_pairing_status_exact_schema() {

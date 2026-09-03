@@ -348,12 +348,16 @@ struct AcceptingExecutor final : usb_lifecycle::Executor {
 
 struct ReportSink {
     int calls = 0;
+    std::uint8_t instance = 0;
+    std::uint16_t length = 0;
     std::array<std::uint8_t, 8> report{};
 
-    static bool submit(void *context, std::uint8_t,
+    static bool submit(void *context, std::uint8_t instance,
                        const std::uint8_t *report, std::uint16_t length) {
         auto *sink = static_cast<ReportSink *>(context);
         ++sink->calls;
+        sink->instance = instance;
+        sink->length = length;
         std::memcpy(sink->report.data(), report, length);
         return true;
     }
@@ -973,6 +977,173 @@ void connect_ble(hid_runtime::Runtime &runtime, FakeBackend &usb,
     assert(ble.event(hid_control_executor::BleEventKind::kConnect, handle));
     assert(controller.process_one_for_test());
     assert(controller.ble_snapshot().connected);
+}
+
+void test_ble_disable_preserves_active_usb_route_and_reports() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    ReportSink usb_sink;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    complete_attach(runtime, usb, controller);
+    mount_ready(runtime);
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+
+    const std::array<std::uint8_t, 6> held_keys{0x73, 0, 0, 0, 0, 0};
+    assert(runtime.state_machine().queue_keyboard_report(0, held_keys));
+    runtime.state_machine().execute(ReportSink::submit, &usb_sink);
+    assert(usb_sink.calls == 1 && usb_sink.instance == 0 &&
+           usb_sink.length == 8 && usb_sink.report[2] == 0x73);
+    assert(runtime.state_machine().report_complete(0));
+    assert(runtime.state_machine().queue_mouse_report(1, 0, 0, 0, 0));
+    runtime.state_machine().execute(ReportSink::submit, &usb_sink);
+    assert(usb_sink.calls == 2 && usb_sink.instance == 1 &&
+           usb_sink.length == 5 && usb_sink.report[0] == 1);
+    assert(runtime.state_machine().report_complete(1));
+
+    connect_ble(runtime, usb, ble, database, controller, 70);
+    const auto route_before = runtime.state_machine().route_snapshot();
+    const auto authority_before = runtime.state_machine().authority_epoch();
+    const auto attach_generation_before =
+        runtime.state_machine().attach_generation();
+    const auto keyboard_before = runtime.state_machine().keyboard_state();
+    const auto mouse_before = runtime.state_machine().mouse_state();
+    assert(route_before.desired == hid_route::OutputRoute::kUsb);
+    assert(route_before.active == hid_route::OutputRoute::kUsb);
+    assert(route_before.transition == hid_route::Transition::kStable);
+
+    const auto disable = controller.request_ble_disable();
+    assert(disable.action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(disable.snapshot.desired == ble_lifecycle::DesiredExposure::kHidden);
+    assert(disable.snapshot.observed == ble_lifecycle::ObservedState::kDisabling);
+    assert(controller.process_one_for_test());
+    assert(ble.disconnect_calls == 1 && ble.last_connection == 70);
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 70));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kIdle);
+
+    const auto route_after = runtime.state_machine().route_snapshot();
+    assert(route_after.desired == route_before.desired);
+    assert(route_after.active == route_before.active);
+    assert(route_after.transition == route_before.transition);
+    assert(route_after.generation == route_before.generation);
+    assert(runtime.state_machine().authority_epoch() == authority_before);
+    assert(runtime.state_machine().attach_generation() ==
+           attach_generation_before);
+    assert(runtime.state_machine().keyboard_state().modifiers ==
+           keyboard_before.modifiers);
+    assert(runtime.state_machine().keyboard_state().keycodes ==
+           keyboard_before.keycodes);
+    assert(runtime.state_machine().mouse_state().buttons ==
+           mouse_before.buttons);
+    assert(!runtime.state_machine().safety_required(
+        hid_runtime::Interface::kKeyboard));
+    assert(!runtime.state_machine().safety_required(
+        hid_runtime::Interface::kMouse));
+    assert(usb_sink.calls == 2);
+    assert(database.notify_calls == 0);
+
+    const std::array<std::uint8_t, 6> next_keys{0x72, 0, 0, 0, 0, 0};
+    assert(runtime.state_machine().queue_keyboard_report(2, next_keys));
+    runtime.state_machine().execute(ReportSink::submit, &usb_sink);
+    assert(usb_sink.calls == 3 && usb_sink.instance == 0 &&
+           usb_sink.length == 8 && usb_sink.report[0] == 2 &&
+           usb_sink.report[2] == 0x72);
+    assert(runtime.state_machine().report_complete(0));
+    assert(runtime.state_machine().queue_mouse_report(3, 1, -1, 2, -2));
+    runtime.state_machine().execute(ReportSink::submit, &usb_sink);
+    assert(usb_sink.calls == 4 && usb_sink.instance == 1 &&
+           usb_sink.length == 5 && usb_sink.report[0] == 3 &&
+           usb_sink.report[1] == 1 && usb_sink.report[2] == 0xff &&
+           usb_sink.report[3] == 2 && usb_sink.report[4] == 0xfe);
+    assert(runtime.state_machine().report_complete(1));
+    assert(database.notify_calls == 0);
+}
+
+void test_ble_disable_failure_preserves_active_usb_route() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    ReportSink usb_sink;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    complete_attach(runtime, usb, controller);
+    mount_ready(runtime);
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    advertise_ble(runtime, usb, ble, database, controller);
+    const auto route_before = runtime.state_machine().route_snapshot();
+    const auto authority_before = runtime.state_machine().authority_epoch();
+    ble.stop_result = -70;
+
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    const auto failure = controller.ble_snapshot();
+    assert(failure.observed == ble_lifecycle::ObservedState::kFault);
+    assert(failure.recovery_required);
+    const auto route_after = runtime.state_machine().route_snapshot();
+    assert(route_after.desired == route_before.desired);
+    assert(route_after.active == route_before.active);
+    assert(route_after.transition == route_before.transition);
+    assert(route_after.generation == route_before.generation);
+    assert(runtime.state_machine().authority_epoch() == authority_before);
+    assert(!runtime.state_machine().safety_required(
+        hid_runtime::Interface::kKeyboard));
+    assert(!runtime.state_machine().safety_required(
+        hid_runtime::Interface::kMouse));
+
+    const std::array<std::uint8_t, 6> keys{0x71, 0, 0, 0, 0, 0};
+    assert(runtime.state_machine().queue_keyboard_report(0, keys));
+    runtime.state_machine().execute(ReportSink::submit, &usb_sink);
+    assert(usb_sink.calls == 1 && usb_sink.instance == 0 &&
+           usb_sink.report[2] == 0x71);
+    assert(database.notify_calls == 0);
+}
+
+void test_usb_route_release_serializes_ble_disable_without_ble_stage_a() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    ReportSink usb_sink;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    complete_attach(runtime, usb, controller);
+    mount_ready(runtime);
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    hold_f24(runtime, usb_sink);
+    advertise_ble(runtime, usb, ble, database, controller);
+
+    assert(controller.request_route(hid_route::OutputRoute::kNone).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    const auto releasing = runtime.state_machine().route_snapshot();
+    assert(releasing.active == hid_route::OutputRoute::kUsb);
+    assert(releasing.transition == hid_route::Transition::kReleasing);
+    assert(controller.active_operation_for_test() == ControlOperation::kRouteChange);
+    const auto ble_before = controller.ble_snapshot();
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kBusy);
+    const auto ble_after = controller.ble_snapshot();
+    assert(ble_after.desired == ble_before.desired);
+    assert(ble_after.observed == ble_before.observed);
+    assert(ble_after.generation == ble_before.generation);
+
+    assert(controller.process_one_for_test());
+    const auto none = runtime.state_machine().route_snapshot();
+    assert(none.active == hid_route::OutputRoute::kNone);
+    assert(none.transition == hid_route::Transition::kStable);
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kIdle);
 }
 
 ble_security::StoredSecurityRecord valid_security_record(bool sc = true) {
@@ -3335,6 +3506,15 @@ void test_u74c_lease_overflow_and_disable_retirement_paths() {
         assert(fixture.controller.request_ble_disable().action_result ==
                ble_lifecycle::TransitionResult::kBusy);
         begin_explicit_ble_route_retirement(fixture);
+        const auto releasing =
+            fixture.runtime.state_machine().route_snapshot();
+        assert(releasing.active == hid_route::OutputRoute::kBle);
+        assert(releasing.transition == hid_route::Transition::kReleasing);
+        assert(fixture.controller.request_ble_disable().action_result ==
+               ble_lifecycle::TransitionResult::kBusy);
+        assert(fixture.runtime.state_machine().route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
+        assert(fixture.ble.disconnect_calls == 0);
         assert(fixture.controller.expire_ble_route_release_grace_for_test());
         assert(fixture.controller.process_one_for_test());
         assert(fixture.ble.disconnect_calls == 1);
@@ -4221,6 +4401,9 @@ int main() {
     test_unmount_preempts_route_action_and_guard_releases_once();
     test_ble_lifecycle_is_shared_serialized_and_transport_independent();
     test_ble_disable_expected_disconnect_and_retained_stack();
+    test_ble_disable_preserves_active_usb_route_and_reports();
+    test_ble_disable_failure_preserves_active_usb_route();
+    test_usb_route_release_serializes_ble_disable_without_ble_stage_a();
     test_missing_live_database_fails_closed_before_advertising();
     test_stale_sync_cannot_validate_or_advertise();
     test_retained_cycles_validate_without_duplicate_registration();
