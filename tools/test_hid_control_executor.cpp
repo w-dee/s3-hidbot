@@ -2906,9 +2906,11 @@ void test_ble_disconnect_reconnect_kills_old_work_and_route() {
     assert(fixture.controller.dequeue_one_for_test(old_work));
     assert(fixture.ble.event(hid_control_executor::BleEventKind::kDisconnect,
                              fixture.connection));
-    assert(fixture.controller.process_one_for_test());
-    assert(fixture.runtime.state_machine().route_snapshot().active ==
-           hid_route::OutputRoute::kNone);
+    const auto status = fixture.controller.route_snapshot();
+    assert(status.route.desired == hid_route::OutputRoute::kNone);
+    assert(status.route.active == hid_route::OutputRoute::kNone);
+    assert(status.route.transition == hid_route::Transition::kStable);
+    assert(!status.ready);
     fixture.controller.process_for_test(old_work);
     assert(fixture.database.notify_calls == 0);
 

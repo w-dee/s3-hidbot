@@ -381,9 +381,11 @@ hid_runtime::RouteStatusSnapshot Controller::route_snapshot() {
     if (runtime_ == nullptr) {
         return {};
     }
+    const auto status = request_pairing_status();
     auto snapshot = runtime_->state_machine().route_status_snapshot();
     snapshot.ready = snapshot.ready ||
-                     request_pairing_status().ble_route_ready;
+                     (status.ble_route_ready &&
+                      snapshot.route.desired == hid_route::OutputRoute::kBle);
     return snapshot;
 }
 
