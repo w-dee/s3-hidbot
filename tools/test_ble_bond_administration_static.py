@@ -18,6 +18,7 @@ def function(source: str, signature: str, next_signature: str) -> str:
 
 def main() -> int:
     transport = (ROOT / "firmware/components/ble_transport/ble_transport.cpp").read_text()
+    recovery = (ROOT / "firmware/components/ble_transport/persistent_store_recovery.hpp").read_text()
     executor = (ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp").read_text()
     protocol = (ROOT / "firmware/components/control_protocol/control_protocol.cpp").read_text()
     protocol_header = (ROOT / "firmware/components/control_protocol/include/control_protocol/control_protocol.hpp").read_text()
@@ -76,15 +77,18 @@ def main() -> int:
         ".connected",
         "ble_store_util_bonded_peers",
         "exact_identity_matches != 1",
+        "run_schema_first_removal",
+        "delete_schema_revision_verified(target)",
         "ble_store_util_delete_peer(&target)",
         "ble_store_read_our_sec",
         "ble_store_read_peer_sec",
         "read_schema_revision(target",
-        "const auto after = list_bonds()",
+        "verify_peer_auxiliary_absent(target)",
+        "after = list_bonds()",
         "after.count + 1U == before.count",
         "others_preserved",
-        "old_bond.schema_revision == new_bond.schema_revision",
-        "old_bond.schema_current == new_bond.schema_current",
+        "new_bond.schema_revision",
+        "new_bond.schema_current",
         "StoreFailureKind::kDelete",
     ):
         assert required in removal
@@ -96,13 +100,68 @@ def main() -> int:
     )
     assert "classify_store_delete_callback_result(result" in store_delete
     assert "BLE_HS_ENOENT" in store_delete
-    assert "StoreDeleteCallbackResult::kDeleted" in store_delete
     assert "StoreDeleteCallbackResult::kFailure" in store_delete
     assert "if (result != 0)" not in store_delete
     assert "original_store_delete_(object_type, key)" in store_delete
-    assert "delete_schema_revision(key->sec.peer_addr)" in store_delete
+    assert "delete_schema_revision_verified(key->sec.peer_addr)" in store_delete
+    assert store_delete.index(
+        "delete_schema_revision_verified(key->sec.peer_addr)") < store_delete.index(
+            "original_store_delete_(object_type, key)")
     assert "BLE_STORE_OBJ_TYPE_OUR_SEC" in store_delete
     assert "BLE_STORE_OBJ_TYPE_PEER_SEC" in store_delete
+
+    initialization = function(
+        transport, "std::int32_t Backend::initialize(",
+        "void Backend::set_generation(",
+    )
+    for required in (
+        "ble_store_config_init()",
+        "ble_hs_cfg.store_delete_cb = store_delete",
+        "recover_orphan_schema_records()",
+        "ble_svc_gap_init()",
+        "nimble_port_freertos_init(host_task)",
+    ):
+        assert required in initialization
+    assert initialization.index("ble_store_config_init()") < initialization.index(
+        "recover_orphan_schema_records()")
+    assert initialization.index(
+        "ble_hs_cfg.store_delete_cb = store_delete") < initialization.index(
+            "recover_orphan_schema_records()")
+    assert initialization.index("recover_orphan_schema_records()") < initialization.index(
+        "ble_svc_gap_init()")
+    assert initialization.index("recover_orphan_schema_records()") < initialization.index(
+        "nimble_port_freertos_init(host_task)")
+
+    for required in (
+        "ESP_IDF_VERSION == ESP_IDF_VERSION_VAL(5, 5, 4)",
+        "MYNEWT_VAL(BLE_STORE_CONFIG_PERSIST) == 1",
+        "MYNEWT_VAL(BLE_STORE_MAX_CCCDS) == 15",
+        "MYNEWT_VAL(ENC_ADV_DATA) == 0",
+        "MYNEWT_VAL(BLE_HOST_BASED_PRIVACY) == 0",
+        'kNimbleStoreNamespace[] = "nimble_bond"',
+        '"our_sec_1", "our_sec_2", "our_sec_3"',
+        '"peer_sec_1", "peer_sec_2", "peer_sec_3"',
+        "NVS_TYPE_BLOB",
+        "sizeof(ble_store_value_sec)",
+        "read_persistent_security",
+        "read_restored_security",
+        "read_schema_identities",
+        "make_recovery_plan",
+        "delete_schema_revision_verified",
+    ):
+        assert required in transport
+    for required in (
+        "kSchemaRecoveryCapacity = 16",
+        "same_set",
+        "A half bond is globally inconsistent",
+        "make_recovery_plan",
+        "run_orphan_recovery",
+        "run_schema_first_removal",
+        "kSchemaDelete",
+        "kPeerDelete",
+        "kPostcondition",
+    ):
+        assert required in recovery
 
     eligible = function(
         executor,

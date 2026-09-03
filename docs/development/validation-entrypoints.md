@@ -171,6 +171,19 @@ numeric-handle reuse, route retirement, non-storage stale-key failure, and a
 genuine persistent-store failure. Other disconnect callers retain their
 existing nonzero-result policy.
 
+The crash-safe companion-store regression uses the production recovery planner
+and schema-first transaction skeleton. It covers complete persistent/RAM
+identity-set agreement, both mismatch directions, invalid type/size input,
+duplicates, capacity overflow, all two-sided and half-bond states, malformed
+schema input, multiple peers, deterministic orphan selection, mutation
+failure, idempotent clean reboot, and the five removal power-cut states. Static
+guards bind the raw layout boundary to ESP-IDF v5.5.4, `nimble_bond`, the three
+OUR_SEC/PEER_SEC blob slots, exact record size, strict schema parsing, startup
+placement before GATT/host exposure, schema-first store callbacks, and explicit
+CCCD/RPA/CSFC postconditions. Executor coverage proves a startup persistent
+store fault prevents advertising and pairing while bond administration reports
+Storage. Existing ENOTCONN regressions remain in the same focused suites.
+
 Run these commands from the repository root:
 
 ```text

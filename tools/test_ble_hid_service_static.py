@@ -367,12 +367,15 @@ def main() -> int:
         "original_store_delete_(object_type, key)",
         "object_type == BLE_STORE_OBJ_TYPE_OUR_SEC",
         "object_type == BLE_STORE_OBJ_TYPE_PEER_SEC",
-        "has_exact_identity(key->sec.peer_addr)",
-        "delete_schema_revision(key->sec.peer_addr)",
+        "valid_identity(key->sec.peer_addr)",
+        "delete_schema_revision_verified(key->sec.peer_addr)",
         "StoreFailureKind::kDelete",
         "return BLE_HS_ESTORE_FAIL",
     ):
         assert token in store_delete
+    assert store_delete.index(
+        "delete_schema_revision_verified(key->sec.peer_addr)") < store_delete.index(
+            "original_store_delete_(object_type, key)")
     assert "CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1" in sdkconfig_defaults
     orphan = re.search(
         r"Backend::terminate_orphan_connection\((.*?)\n\}", transport, re.DOTALL

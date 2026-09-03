@@ -1,5 +1,6 @@
 #include "ble_transport/ble_transport.hpp"
 
+#include "persistent_store_recovery.hpp"
 #include "store_delete_result.hpp"
 
 #include <array>
@@ -8,6 +9,7 @@
 #include "ble_hid_service/ble_hid_service.hpp"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
@@ -46,6 +48,25 @@ constexpr char kSchemaNamespace[] = "hid_schema";
 constexpr char kSchemaKeyHex[] = "0123456789abcdef";
 constexpr char kBondIdDomain[] = "s3-hidbot/bond-id/v1";
 
+// ESP-IDF does not expose failures from ble_store_config_init().  This small
+// boundary therefore validates the exact v5.5.4 NVS representation against
+// the restored RAM store before trusting an absent security record.
+static_assert(ESP_IDF_VERSION == ESP_IDF_VERSION_VAL(5, 5, 4));
+static_assert(ble_security::kBondCapacity == 3);
+static_assert(MYNEWT_VAL(BLE_STORE_CONFIG_PERSIST) == 1);
+static_assert(MYNEWT_VAL(BLE_STORE_MAX_BONDS) ==
+              ble_security::kBondCapacity);
+static_assert(MYNEWT_VAL(BLE_STORE_MAX_CCCDS) == 15);
+static_assert(MYNEWT_VAL(BLE_STORE_MAX_CSFCS) ==
+              ble_security::kBondCapacity);
+static_assert(MYNEWT_VAL(ENC_ADV_DATA) == 0);
+static_assert(MYNEWT_VAL(BLE_HOST_BASED_PRIVACY) == 0);
+constexpr char kNimbleStoreNamespace[] = "nimble_bond";
+constexpr std::array<const char *, ble_security::kBondCapacity>
+    kNimbleOurSecurityKeys{"our_sec_1", "our_sec_2", "our_sec_3"};
+constexpr std::array<const char *, ble_security::kBondCapacity>
+    kNimblePeerSecurityKeys{"peer_sec_1", "peer_sec_2", "peer_sec_3"};
+
 struct StoredPeer {
     ble_addr_t identity{};
     ble_security::StoredSecurityRecord our{};
@@ -53,6 +74,19 @@ struct StoredPeer {
 };
 
 bool has_exact_identity(const ble_addr_t &identity);
+
+detail::StoreIdentity model_identity(const ble_addr_t &identity) {
+    detail::StoreIdentity output{.type = identity.type};
+    std::memcpy(output.value.data(), identity.val, output.value.size());
+    return output;
+}
+
+ble_addr_t nimble_identity(const detail::StoreIdentity &identity) {
+    ble_addr_t output{};
+    output.type = identity.type;
+    std::memcpy(output.val, identity.value.data(), identity.value.size());
+    return output;
+}
 
 bool same_identity(const ble_addr_t &left, const ble_addr_t &right) {
     return ble_addr_cmp(&left, &right) == 0;
@@ -145,6 +179,260 @@ esp_err_t delete_schema_revision(const ble_addr_t &identity) {
     return result;
 }
 
+esp_err_t delete_schema_revision_verified(const ble_addr_t &identity) {
+    esp_err_t result = delete_schema_revision(identity);
+    if (result != ESP_OK) {
+        return result;
+    }
+    std::uint8_t revision = 0;
+    result = read_schema_revision(identity, revision);
+    return result == ESP_ERR_NVS_NOT_FOUND ? ESP_OK
+         : result == ESP_OK ? ESP_ERR_INVALID_STATE
+                            : result;
+}
+
+bool security_slot_key(const char *key,
+                       const std::array<const char *,
+                                        ble_security::kBondCapacity> &keys) {
+    for (const char *candidate : keys) {
+        if (std::strcmp(key, candidate) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+esp_err_t validate_nimble_security_key_layout(nvs_handle_t handle) {
+    nvs_iterator_t iterator = nullptr;
+    esp_err_t result = nvs_entry_find_in_handle(handle, NVS_TYPE_ANY,
+                                                &iterator);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    while (result == ESP_OK) {
+        nvs_entry_info_t info{};
+        result = nvs_entry_info(iterator, &info);
+        if (result != ESP_OK) {
+            nvs_release_iterator(iterator);
+            return result;
+        }
+        const bool security_name =
+            std::strncmp(info.key, "our_sec_", 8) == 0 ||
+            std::strncmp(info.key, "peer_sec_", 9) == 0;
+        if (security_name &&
+            ((!security_slot_key(info.key, kNimbleOurSecurityKeys) &&
+              !security_slot_key(info.key, kNimblePeerSecurityKeys)) ||
+             !detail::valid_security_record_layout(
+                 info.type == NVS_TYPE_BLOB, sizeof(ble_store_value_sec),
+                 sizeof(ble_store_value_sec)))) {
+            nvs_release_iterator(iterator);
+            return ESP_ERR_INVALID_STATE;
+        }
+        result = nvs_entry_next(&iterator);
+    }
+    nvs_release_iterator(iterator);
+    return result == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : result;
+}
+
+esp_err_t read_persistent_security_slots(
+    nvs_handle_t handle,
+    const std::array<const char *, ble_security::kBondCapacity> &keys,
+    detail::SecurityIdentitySet &output) {
+    for (const char *key : keys) {
+        std::size_t size = 0;
+        esp_err_t result = nvs_get_blob(handle, key, nullptr, &size);
+        if (result == ESP_ERR_NVS_NOT_FOUND) {
+            continue;
+        }
+        if (result != ESP_OK || !detail::valid_security_record_layout(
+                                    true, size,
+                                    sizeof(ble_store_value_sec))) {
+            return result == ESP_OK ? ESP_ERR_NVS_INVALID_LENGTH : result;
+        }
+        ble_store_value_sec value{};
+        result = nvs_get_blob(handle, key, &value, &size);
+        if (result != ESP_OK || size != sizeof(value)) {
+            return result == ESP_OK ? ESP_ERR_NVS_INVALID_LENGTH : result;
+        }
+        output.identities[output.count++] = model_identity(value.peer_addr);
+    }
+    return ESP_OK;
+}
+
+esp_err_t read_persistent_security(
+    detail::SecurityIdentitySet &our,
+    detail::SecurityIdentitySet &peer) {
+    nvs_handle_t handle = 0;
+    esp_err_t result =
+        nvs_open(kNimbleStoreNamespace, NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (result != ESP_OK) {
+        return result;
+    }
+    result = validate_nimble_security_key_layout(handle);
+    if (result == ESP_OK) {
+        result = read_persistent_security_slots(handle,
+                                                kNimbleOurSecurityKeys, our);
+    }
+    if (result == ESP_OK) {
+        result = read_persistent_security_slots(
+            handle, kNimblePeerSecurityKeys, peer);
+    }
+    nvs_close(handle);
+    return result;
+}
+
+std::int32_t read_restored_security(bool our,
+                                    detail::SecurityIdentitySet &output) {
+    for (std::uint8_t index = 0;
+         index <= ble_security::kBondCapacity; ++index) {
+        ble_store_key_sec key{};
+        key.idx = index;
+        ble_store_value_sec value{};
+        const int result = our ? ble_store_read_our_sec(&key, &value)
+                               : ble_store_read_peer_sec(&key, &value);
+        if (result == BLE_HS_ENOENT) {
+            return 0;
+        }
+        if (result != 0) {
+            return result;
+        }
+        if (output.count == output.identities.size()) {
+            return BLE_HS_ENOMEM;
+        }
+        output.identities[output.count++] = model_identity(value.peer_addr);
+    }
+    return BLE_HS_ENOMEM;
+}
+
+bool parse_schema_key(const char *key, detail::StoreIdentity &identity) {
+    if (!detail::parse_canonical_schema_key(key, identity)) {
+        return false;
+    }
+    char canonical[16]{};
+    schema_key(nimble_identity(identity), canonical);
+    return std::strcmp(key, canonical) == 0;
+}
+
+esp_err_t read_schema_identities(detail::SchemaIdentitySet &output) {
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(kSchemaNamespace, NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    nvs_iterator_t iterator = nullptr;
+    result = nvs_entry_find_in_handle(handle, NVS_TYPE_ANY, &iterator);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return ESP_OK;
+    }
+    while (result == ESP_OK) {
+        nvs_entry_info_t info{};
+        result = nvs_entry_info(iterator, &info);
+        if (result != ESP_OK) {
+            break;
+        }
+        detail::StoreIdentity identity{};
+        std::uint8_t revision = 0;
+        if (!detail::valid_schema_record_layout(
+                info.type == NVS_TYPE_U8, sizeof(revision)) ||
+            !parse_schema_key(info.key, identity) ||
+            output.count == output.identities.size()) {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        result = nvs_get_u8(handle, info.key, &revision);
+        if (result != ESP_OK) {
+            break;
+        }
+        output.identities[output.count++] = identity;
+        result = nvs_entry_next(&iterator);
+    }
+    nvs_release_iterator(iterator);
+    nvs_close(handle);
+    return result == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : result;
+}
+
+struct StartupRecoveryResult {
+    ble_security::StoreFailureKind failure_kind =
+        ble_security::StoreFailureKind::kNone;
+    std::int32_t status = 0;
+};
+
+StartupRecoveryResult recover_orphan_schema_records() {
+    detail::SecurityIdentitySet persistent_our{};
+    detail::SecurityIdentitySet persistent_peer{};
+    detail::SecurityIdentitySet restored_our{};
+    detail::SecurityIdentitySet restored_peer{};
+    detail::SchemaIdentitySet schemas{};
+
+    esp_err_t status =
+        read_persistent_security(persistent_our, persistent_peer);
+    if (status == ESP_OK) {
+        status = read_schema_identities(schemas);
+    }
+    std::int32_t restored_status = 0;
+    if (status == ESP_OK) {
+        restored_status = read_restored_security(true, restored_our);
+    }
+    if (status == ESP_OK && restored_status == 0) {
+        restored_status = read_restored_security(false, restored_peer);
+    }
+    if (status != ESP_OK || restored_status != 0) {
+        return {.failure_kind = ble_security::StoreFailureKind::kRead,
+                .status = status != ESP_OK ? status : restored_status};
+    }
+
+    const auto plan = detail::make_recovery_plan(
+        persistent_our, persistent_peer, restored_our, restored_peer, schemas);
+    if (plan.kind != detail::RecoveryPlanKind::kReady) {
+        return {.failure_kind = ble_security::StoreFailureKind::kRead,
+                .status = BLE_HS_ESTORE_FAIL};
+    }
+    const auto recovery = detail::run_orphan_recovery(
+        plan, [](const detail::StoreIdentity &identity) -> std::int32_t {
+            return delete_schema_revision_verified(
+                nimble_identity(identity));
+        });
+    if (recovery.status != 0) {
+        return {.failure_kind = ble_security::StoreFailureKind::kDelete,
+                .status = recovery.status};
+    }
+    return {};
+}
+
+std::int32_t verify_peer_auxiliary_absent(const ble_addr_t &identity) {
+    ble_store_key_cccd cccd_key{};
+    cccd_key.peer_addr = identity;
+    ble_store_value_cccd cccd{};
+    int status = ble_store_read_cccd(&cccd_key, &cccd);
+    if (status != BLE_HS_ENOENT) {
+        return status == 0 ? BLE_HS_ESTORE_FAIL : status;
+    }
+
+    ble_store_key_rpa_rec rpa_key{};
+    rpa_key.peer_rpa_addr = identity;
+    ble_store_value_rpa_rec rpa{};
+    status = ble_store_read_rpa_rec(&rpa_key, &rpa);
+    if (status != BLE_HS_ENOENT) {
+        return status == 0 ? BLE_HS_ESTORE_FAIL : status;
+    }
+
+    ble_store_key_csfc csfc_key{};
+    csfc_key.peer_addr = identity;
+    ble_store_value_csfc csfc{};
+    status = ble_store_read_csfc(&csfc_key, &csfc);
+    return status == BLE_HS_ENOENT ? 0
+         : status == 0 ? BLE_HS_ESTORE_FAIL
+                       : status;
+}
+
 bool peer_identity(std::uint16_t connection_handle, ble_addr_t &identity) {
     ble_gap_conn_desc descriptor{};
     if (ble_gap_conn_find(connection_handle, &descriptor) != 0) {
@@ -230,6 +518,12 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     ble_hs_cfg.store_delete_cb = store_delete;
     ble_hs_cfg.store_status_cb = store_status;
     ble_hs_cfg.store_status_arg = this;
+    const auto recovery = recover_orphan_schema_records();
+    if (recovery.failure_kind != ble_security::StoreFailureKind::kNone) {
+        observe_store_failure(recovery.failure_kind, recovery.status, true,
+                              ble_lifecycle::kNoConnection);
+        return recovery.status != 0 ? recovery.status : BLE_HS_ESTORE_FAIL;
+    }
     // Queue the mandatory standard server foundation before the project
     // service. ble_gatts_start() consumes all queued definitions when the
     // NimBLE host task starts.
@@ -1157,57 +1451,69 @@ hid_control_executor::BleBondRemoveResult Backend::remove_bond(
         return result;
     }
 
-    status = ble_store_util_delete_peer(&target);
-    if (status != 0) {
-        observe_store_failure(ble_security::StoreFailureKind::kDelete, status,
-                              true, ble_lifecycle::kNoConnection);
-        result.kind = Kind::kStorageFailure;
-        return result;
-    }
-
-    ble_store_key_sec key{};
-    key.peer_addr = target;
-    ble_store_value_sec value{};
-    const int our_status = ble_store_read_our_sec(&key, &value);
-    const int peer_status = ble_store_read_peer_sec(&key, &value);
-    std::uint8_t revision = 0;
-    const esp_err_t schema_status = read_schema_revision(target, revision);
-    const auto after = list_bonds();
-    bool others_preserved =
-        after.kind == hid_control_executor::BleBondListResultKind::kSuccess &&
-        after.healthy && after.count + 1U == before.count;
-    for (std::size_t old_index = 0;
-         others_preserved && old_index < before.count; ++old_index) {
-        if (old_index == match_index) {
-            continue;
-        }
-        bool found = false;
-        for (std::size_t new_index = 0; new_index < after.count; ++new_index) {
-            const auto &old_bond = before.bonds[old_index];
-            const auto &new_bond = after.bonds[new_index];
-            found = found ||
-                (std::strcmp(old_bond.bond_id.data(),
-                             new_bond.bond_id.data()) == 0 &&
-                 old_bond.our_sec == new_bond.our_sec &&
-                 old_bond.peer_sec == new_bond.peer_sec &&
-                 old_bond.verified == new_bond.verified &&
-                 old_bond.schema_revision_present ==
-                     new_bond.schema_revision_present &&
-                 old_bond.schema_revision == new_bond.schema_revision &&
-                 old_bond.schema_current == new_bond.schema_current &&
-                 old_bond.connected == new_bond.connected);
-        }
-        others_preserved = found;
-    }
-    if (our_status != BLE_HS_ENOENT || peer_status != BLE_HS_ENOENT ||
-        schema_status != ESP_ERR_NVS_NOT_FOUND || !others_preserved) {
-        const std::int32_t failure =
-            our_status != BLE_HS_ENOENT ? our_status
-            : peer_status != BLE_HS_ENOENT ? peer_status
-            : schema_status != ESP_ERR_NVS_NOT_FOUND ? schema_status
-                                                     : BLE_HS_ESTORE_FAIL;
+    hid_control_executor::BleBondListResult after{};
+    const auto transaction = detail::run_schema_first_removal(
+        [&target]() -> std::int32_t {
+            return delete_schema_revision_verified(target);
+        },
+        [&target]() -> std::int32_t {
+            return ble_store_util_delete_peer(&target);
+        },
+        [&]() -> std::int32_t {
+            ble_store_key_sec key{};
+            key.peer_addr = target;
+            ble_store_value_sec our_value{};
+            ble_store_value_sec peer_value{};
+            const int our_status =
+                ble_store_read_our_sec(&key, &our_value);
+            const int peer_status =
+                ble_store_read_peer_sec(&key, &peer_value);
+            const int auxiliary_status =
+                verify_peer_auxiliary_absent(target);
+            std::uint8_t revision = 0;
+            const esp_err_t schema_status =
+                read_schema_revision(target, revision);
+            after = list_bonds();
+            bool others_preserved =
+                after.kind ==
+                    hid_control_executor::BleBondListResultKind::kSuccess &&
+                after.healthy && after.count + 1U == before.count;
+            for (std::size_t old_index = 0;
+                 others_preserved && old_index < before.count; ++old_index) {
+                if (old_index == match_index) {
+                    continue;
+                }
+                bool found = false;
+                for (std::size_t new_index = 0;
+                     new_index < after.count; ++new_index) {
+                    const auto &old_bond = before.bonds[old_index];
+                    const auto &new_bond = after.bonds[new_index];
+                    found = found ||
+                        (std::strcmp(old_bond.bond_id.data(),
+                                     new_bond.bond_id.data()) == 0 &&
+                         old_bond.our_sec == new_bond.our_sec &&
+                         old_bond.peer_sec == new_bond.peer_sec &&
+                         old_bond.verified == new_bond.verified &&
+                         old_bond.schema_revision_present ==
+                             new_bond.schema_revision_present &&
+                         old_bond.schema_revision ==
+                             new_bond.schema_revision &&
+                         old_bond.schema_current ==
+                             new_bond.schema_current &&
+                         old_bond.connected == new_bond.connected);
+                }
+                others_preserved = found;
+            }
+            return our_status != BLE_HS_ENOENT ? our_status
+                 : peer_status != BLE_HS_ENOENT ? peer_status
+                 : auxiliary_status != 0 ? auxiliary_status
+                 : schema_status != ESP_ERR_NVS_NOT_FOUND ? schema_status
+                 : !others_preserved ? BLE_HS_ESTORE_FAIL
+                                     : 0;
+        });
+    if (transaction.status != 0) {
         observe_store_failure(ble_security::StoreFailureKind::kDelete,
-                              failure, true,
+                              transaction.status, true,
                               ble_lifecycle::kNoConnection);
         result.kind = Kind::kStorageFailure;
         return result;
@@ -1317,17 +1623,19 @@ int Backend::store_delete(int object_type, const union ble_store_key *key) {
     if (instance_ == nullptr || instance_->original_store_delete_ == nullptr) {
         return BLE_HS_EINVAL;
     }
-    const int result = instance_->original_store_delete_(object_type, key);
-    const auto delete_result =
-        detail::classify_store_delete_callback_result(result,
-                                                      BLE_HS_ENOENT);
-    if (delete_result == detail::StoreDeleteCallbackResult::kDeleted &&
-        key != nullptr &&
-        (object_type == BLE_STORE_OBJ_TYPE_OUR_SEC ||
-         object_type == BLE_STORE_OBJ_TYPE_PEER_SEC) &&
-        has_exact_identity(key->sec.peer_addr)) {
+    const bool security_delete =
+        object_type == BLE_STORE_OBJ_TYPE_OUR_SEC ||
+        object_type == BLE_STORE_OBJ_TYPE_PEER_SEC;
+    if (security_delete) {
+        if (key == nullptr || !valid_identity(key->sec.peer_addr)) {
+            instance_->observe_store_failure(
+                ble_security::StoreFailureKind::kDelete, BLE_HS_EINVAL, true,
+                instance_->current_connection_.load(
+                    std::memory_order_acquire));
+            return BLE_HS_ESTORE_FAIL;
+        }
         const esp_err_t schema_result =
-            delete_schema_revision(key->sec.peer_addr);
+            delete_schema_revision_verified(key->sec.peer_addr);
         if (schema_result != ESP_OK) {
             instance_->observe_store_failure(
                 ble_security::StoreFailureKind::kDelete, schema_result, true,
@@ -1336,6 +1644,10 @@ int Backend::store_delete(int object_type, const union ble_store_key *key) {
             return BLE_HS_ESTORE_FAIL;
         }
     }
+    const int result = instance_->original_store_delete_(object_type, key);
+    const auto delete_result =
+        detail::classify_store_delete_callback_result(result,
+                                                      BLE_HS_ENOENT);
     if (delete_result == detail::StoreDeleteCallbackResult::kFailure) {
         instance_->observe_store_failure(
             ble_security::StoreFailureKind::kDelete, result, true,

@@ -267,12 +267,16 @@ unsafe-live-state, and storage/postcondition failures are respectively
 `BLE_BOND_NOT_FOUND`, `BLE_BOND_AMBIGUOUS`, `BLE_BOND_BUSY`, and
 `BLE_BOND_STORAGE`.
 
-Removal uses NimBLE's exact-peer deletion through the wrapped store callback,
-which also deletes the same resolved identity's `hid_schema` revision. Success
-is returned only after rereading `OUR_SEC`, `PEER_SEC`, and schema metadata as
-absent, relisting one fewer bond, and proving all other public bond IDs remain.
-A partial deletion is therefore an exposed fatal storage failure, never false
-success. NimBLE's delete-all iterator ends each record class with
+Removal first deletes, commits, and rereads the exact resolved identity's
+`hid_schema` revision as absent, then invokes NimBLE's exact-peer deletion.
+Success is returned only after rereading `OUR_SEC`, `PEER_SEC`, CCCD,
+peer-address/RPA, CSFC, and schema metadata as absent, relisting one fewer
+bond, and proving all other public bond IDs remain unchanged. If companion
+deletion fails, peer-security deletion does not begin. If peer deletion fails
+after companion deletion, the schema is not recreated: a remaining security
+bond is conservatively stale and the persistent Storage failure remains
+fail-closed. A partial deletion is therefore never false success. NimBLE's
+delete-all iterator ends each record class with
 `BLE_HS_ENOENT`; the wrapper returns that sentinel to NimBLE without treating
 normal exhaustion as a storage fault. Other delete errors remain fatal, and
 required reads plus removal postconditions retain their independent ENOENT
@@ -684,6 +688,26 @@ reordering older epoch attributes) so that the HID Primary Service start
 changes monotonically. The firmware still exposes one compile-time database
 to every peer; per-peer
 revision records never select a dynamic topology.
+
+On first BLE initialization, after ESP-NimBLE's store callbacks are installed
+but before GATT registration, host-task startup, advertising, connection, or
+pairing, firmware validates the pinned ESP-IDF v5.5.4 `nimble_bond` NVS
+OUR_SEC/PEER_SEC slots against the identities restored into NimBLE RAM. The
+project performs this direct, isolated layout check because
+`ble_store_config_init()` does not report NVS restore errors. Unexpected
+security slot names/types/sizes, duplicate or invalid identities, persistent
+versus RAM disagreement, a half bond, malformed `hid_schema` entries, or model
+overflow produces a boot-lifetime Storage failure before radio exposure.
+
+Only after the complete bounded security and schema model is valid does the
+same initialization pass delete exact schema records whose OUR_SEC and
+PEER_SEC are both absent. Deletion order is deterministic and every record is
+committed and reread as absent. Both security records present preserves the
+schema; both absent makes it an orphan candidate; exactly one present is fatal
+and is not repaired automatically. CCCD, peer-address/RPA, and CSFC records do
+not establish bond authority and are not garbage-collected by this startup
+repair. An already-clean subsequent initialization performs no schema write or
+delete. No public repair command is exposed.
 
 ESP-NimBLE v5.5.4 persists a bonded CCCD by peer identity and characteristic
 value handle. During restore it applies flags only when that handle is one of
