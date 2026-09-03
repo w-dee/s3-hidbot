@@ -172,6 +172,7 @@ void Database::set_generation(ble_lifecycle::Generation generation) {
 
 hid_control_executor::BleHidHandles Database::hid_handles() const {
     return {
+        .report_map_value = s_report_map_value_handle,
         .keyboard_value = s_keyboard_value_handle,
         .mouse_value = s_mouse_value_handle,
         .control_point_value = s_control_point_value_handle,
@@ -215,7 +216,8 @@ bool Database::capture_control_point(std::uint16_t connection_handle,
     });
 }
 
-int Database::access(std::uint16_t connection_handle, std::uint16_t,
+int Database::access(std::uint16_t connection_handle,
+                     std::uint16_t attribute_handle,
                      struct ble_gatt_access_ctxt *context, void *argument) {
     if (context == nullptr || argument == nullptr) {
         return BLE_ATT_ERR_UNLIKELY;
@@ -223,8 +225,20 @@ int Database::access(std::uint16_t connection_handle, std::uint16_t,
     switch (target_from(argument)) {
         case AccessTarget::kInformation:
             return append(context->om, kHidInformation);
-        case AccessTarget::kReportMap:
-            return append(context->om, kReportMap);
+        case AccessTarget::kReportMap: {
+            const int result = append(context->om, kReportMap);
+            if (result == 0 && context->op == BLE_GATT_ACCESS_OP_READ_CHR &&
+                s_database != nullptr && s_database->event_sink_ != nullptr) {
+                (void)s_database->event_sink_->signal_ble_event({
+                    .kind = hid_control_executor::BleEventKind::kReportMapRead,
+                    .generation = s_database->generation_.load(
+                        std::memory_order_acquire),
+                    .connection_handle = connection_handle,
+                    .attribute_handle = attribute_handle,
+                });
+            }
+            return result;
+        }
         case AccessTarget::kKeyboardReport:
             return append(context->om, kNeutralKeyboard);
         case AccessTarget::kMouseReport:

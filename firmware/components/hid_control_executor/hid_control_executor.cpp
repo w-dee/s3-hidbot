@@ -155,6 +155,8 @@ bool Controller::ble_link_ready() const {
            handles.control_point_value ==
                ble_hid_peer_.handles.control_point_value &&
            ble_backend_->security_ready_for_hid(
+               ble_hid_peer_.generation, ble_hid_peer_.connection_handle) &&
+           ble_backend_->gatt_schema_current_for_hid(
                ble_hid_peer_.generation, ble_hid_peer_.connection_handle);
 }
 
@@ -632,8 +634,12 @@ void Controller::begin_ble_hid_peer(
         return;
     }
     const auto handles = ble_database_->hid_handles();
-    if (handles.keyboard_value == 0 || handles.mouse_value == 0 ||
+    if (handles.report_map_value == 0 || handles.keyboard_value == 0 ||
+        handles.mouse_value == 0 ||
         handles.control_point_value == 0 ||
+        handles.report_map_value == handles.keyboard_value ||
+        handles.report_map_value == handles.mouse_value ||
+        handles.report_map_value == handles.control_point_value ||
         handles.keyboard_value == handles.mouse_value ||
         handles.keyboard_value == handles.control_point_value ||
         handles.mouse_value == handles.control_point_value) {
@@ -692,7 +698,9 @@ bool Controller::ble_hid_interface_ready(
            lifecycle.connected && !lifecycle.recovery_required &&
            ble_state_.connection_handle() == identity.connection_handle &&
            ble_backend_->security_ready_for_hid(identity.generation,
-                                                identity.connection_handle);
+                                                identity.connection_handle) &&
+           ble_backend_->gatt_schema_current_for_hid(
+               identity.generation, identity.connection_handle);
 }
 
 BleHidSubmitResult Controller::submit_ble_report(
@@ -1467,6 +1475,8 @@ bool Controller::event_targets_current_ble_authority(BleEvent event) const {
         case BleEventKind::kStoreFull:
         case BleEventKind::kSubscription:
         case BleEventKind::kControlPoint:
+        case BleEventKind::kReportMapRead:
+        case BleEventKind::kServiceChangedSubscription:
             return current.connected &&
                    event.connection_handle == connection;
         case BleEventKind::kSync:
@@ -1497,6 +1507,8 @@ bool Controller::event_immediately_loses_ble_hid_readiness(BleEvent event) {
             return !event.notify_enabled;
         case BleEventKind::kControlPoint:
             return event.suspended;
+        case BleEventKind::kReportMapRead:
+        case BleEventKind::kServiceChangedSubscription:
         case BleEventKind::kSync:
         case BleEventKind::kConnect:
         case BleEventKind::kAdvertisingComplete:
@@ -1799,6 +1811,7 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
         pairing_deadline_us_ = 0;
         wipe_pairing_mailbox();
         ble_backend_->cancel_pairing_timeout();
+        reconcile_gatt_cache();
         return;
     }
     const auto security = ble_backend_->security_snapshot();
@@ -1813,6 +1826,59 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
             terminate_security_connection(ble_pairing::LastResult::kStorage,
                                           true);
         }
+    }
+}
+
+void Controller::reconcile_gatt_cache() {
+    using Kind = GattSchemaStoreResultKind;
+    if (ble_backend_ == nullptr || !ble_hid_peer_.active ||
+        ble_hid_peer_.generation != ble_state_.generation() ||
+        ble_hid_peer_.connection_handle != ble_state_.connection_handle() ||
+        !ble_backend_->security_ready_for_hid(
+            ble_hid_peer_.generation, ble_hid_peer_.connection_handle) ||
+        ble_backend_->gatt_schema_current_for_hid(
+            ble_hid_peer_.generation, ble_hid_peer_.connection_handle)) {
+        return;
+    }
+    const auto fail_store = [this](GattSchemaStoreResult result) {
+        if (result.kind == Kind::kCapacityFull) {
+            ble_backend_->apply_store_failure(
+                ble_hid_peer_.generation, ble_hid_peer_.connection_handle,
+                ble_security::StoreFailureKind::kCapacityFull, result.status);
+            terminate_security_connection(ble_pairing::LastResult::kStoreFull,
+                                          false);
+        } else if (result.kind == Kind::kStorageFailure) {
+            commit_persistent_store_failure(
+                ble_security::StoreFailureKind::kWrite, result.status);
+        }
+    };
+    if (!ble_hid_peer_.schema_checked) {
+        const auto result = ble_backend_->gatt_schema_status(
+            ble_hid_peer_.generation, ble_hid_peer_.connection_handle);
+        if (result.kind == Kind::kCurrent) {
+            ble_hid_peer_.schema_checked = true;
+            return;
+        }
+        if (result.kind != Kind::kStale) {
+            fail_store(result);
+            return;
+        }
+        ble_hid_peer_.schema_checked = true;
+    }
+    if (ble_hid_peer_.report_map_read) {
+        const auto result = ble_backend_->persist_gatt_schema_current(
+            ble_hid_peer_.generation, ble_hid_peer_.connection_handle);
+        if (result.kind != Kind::kCurrent) {
+            fail_store(result);
+        }
+        return;
+    }
+    if (ble_hid_peer_.service_changed_indicate_enabled &&
+        !ble_hid_peer_.refresh_requested) {
+        ble_hid_peer_.refresh_requested = true;
+        (void)ble_backend_->request_gatt_cache_refresh(
+            ble_hid_peer_.generation, ble_hid_peer_.connection_handle,
+            kGattChangedStartHandle, kGattChangedEndHandle);
     }
 }
 
@@ -2164,6 +2230,29 @@ void Controller::process_ble_event(BleEvent event) {
                 event.attribute_handle ==
                     ble_hid_peer_.handles.control_point_value) {
                 ble_hid_peer_.suspended = event.suspended;
+            }
+            return;
+        case BleEventKind::kReportMapRead:
+            if (ble_hid_peer_.active &&
+                event.generation == ble_hid_peer_.generation &&
+                event.connection_handle == ble_hid_peer_.connection_handle &&
+                event.attribute_handle ==
+                    ble_hid_peer_.handles.report_map_value) {
+                ble_hid_peer_.report_map_read = true;
+                reconcile_gatt_cache();
+            }
+            return;
+        case BleEventKind::kServiceChangedSubscription:
+            if (ble_hid_peer_.active &&
+                event.generation == ble_hid_peer_.generation &&
+                event.connection_handle == ble_hid_peer_.connection_handle &&
+                event.attribute_handle ==
+                    ble_backend_->service_changed_value_handle() &&
+                event.subscription_reason !=
+                    BleSubscriptionReason::kUnknown) {
+                ble_hid_peer_.service_changed_indicate_enabled =
+                    event.indicate_enabled;
+                reconcile_gatt_cache();
             }
             return;
     }

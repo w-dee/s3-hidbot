@@ -61,6 +61,20 @@ class Backend final : public hid_control_executor::BleBackend {
     ble_security::Snapshot security_snapshot() const override;
     bool security_ready_for_hid(ble_lifecycle::Generation generation,
                                 std::uint16_t connection_handle) const override;
+    hid_control_executor::GattSchemaStoreResult gatt_schema_status(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) override;
+    hid_control_executor::GattSchemaStoreResult persist_gatt_schema_current(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) override;
+    bool gatt_schema_current_for_hid(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) const override;
+    std::uint16_t service_changed_value_handle() const override;
+    std::int32_t request_gatt_cache_refresh(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle, std::uint16_t start_handle,
+        std::uint16_t end_handle) override;
 
     static void on_sync();
     static void on_reset(int reason);
@@ -97,6 +111,8 @@ class Backend final : public hid_control_executor::BleBackend {
     std::atomic<std::uint16_t> current_connection_{
         ble_lifecycle::kNoConnection};
     std::atomic_bool identity_resolved_{false};
+    std::atomic_bool gatt_schema_current_{false};
+    std::atomic<std::uint16_t> service_changed_value_handle_{0};
     ble_security::ReadinessInhibit security_inhibit_{};
     ble_security::State security_{};
     ble_store_read_fn *original_store_read_ = nullptr;

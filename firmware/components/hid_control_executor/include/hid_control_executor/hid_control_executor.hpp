@@ -62,6 +62,8 @@ enum class BleEventKind : std::uint8_t {
     kStorageFailure,
     kSubscription,
     kControlPoint,
+    kReportMapRead,
+    kServiceChangedSubscription,
 };
 
 enum class BleHidInterface : std::uint8_t {
@@ -92,6 +94,7 @@ enum class BleHidSubmitResult : std::uint8_t {
 };
 
 struct BleHidHandles {
+    std::uint16_t report_map_value = 0;
     std::uint16_t keyboard_value = 0;
     std::uint16_t mouse_value = 0;
     std::uint16_t control_point_value = 0;
@@ -107,10 +110,30 @@ struct BleHidPeerSnapshot {
     ble_lifecycle::Generation generation = 0;
     std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
     BleHidHandles handles{};
-    bool active = false;
-    bool keyboard_notify_enabled = false;
-    bool mouse_notify_enabled = false;
-    bool suspended = false;
+    bool active : 1 = false;
+    bool keyboard_notify_enabled : 1 = false;
+    bool mouse_notify_enabled : 1 = false;
+    bool suspended : 1 = false;
+    bool report_map_read : 1 = false;
+    bool service_changed_indicate_enabled : 1 = false;
+    bool schema_checked : 1 = false;
+    bool refresh_requested : 1 = false;
+};
+
+inline constexpr std::uint16_t kGattChangedStartHandle = 0x0001;
+inline constexpr std::uint16_t kGattChangedEndHandle = 0xffff;
+
+enum class GattSchemaStoreResultKind : std::uint8_t {
+    kCurrent,
+    kStale,
+    kCapacityFull,
+    kStorageFailure,
+    kStaleIdentity,
+};
+
+struct GattSchemaStoreResult {
+    GattSchemaStoreResultKind kind = GattSchemaStoreResultKind::kStaleIdentity;
+    std::int32_t status = 0;
 };
 
 using BleKeyboardReport = std::array<std::uint8_t, 8>;
@@ -144,6 +167,7 @@ struct BleEvent {
     ble_security::StoreFailureKind store_failure_kind =
         ble_security::StoreFailureKind::kNone;
     bool notify_enabled = false;
+    bool indicate_enabled = false;
     bool suspended = false;
 };
 
@@ -238,6 +262,20 @@ class BleBackend {
     virtual bool security_ready_for_hid(
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle) const = 0;
+    virtual GattSchemaStoreResult gatt_schema_status(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) = 0;
+    virtual GattSchemaStoreResult persist_gatt_schema_current(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) = 0;
+    virtual bool gatt_schema_current_for_hid(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) const = 0;
+    virtual std::uint16_t service_changed_value_handle() const = 0;
+    virtual std::int32_t request_gatt_cache_refresh(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle, std::uint16_t start_handle,
+        std::uint16_t end_handle) = 0;
     virtual void record_heap_checkpoint(HeapCheckpoint checkpoint) = 0;
 };
 
@@ -418,6 +456,7 @@ class Controller final : public usb_lifecycle::Executor,
                                        bool fatal);
     void reconcile_security(std::uint16_t connection_handle,
                             bool pairing_complete_seen);
+    void reconcile_gatt_cache();
     bool event_targets_current_ble_authority(BleEvent event) const;
     void mark_ble_event_overflow(BleEvent event);
     bool ble_event_overflow_pending(

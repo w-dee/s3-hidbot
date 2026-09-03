@@ -578,6 +578,32 @@ advertising attempt, firmware uses the live local GATT database to prove that
 incomplete project service fails the BLE lifecycle closed with no visible HID
 advertisement.
 
+Bonded-client cache compatibility uses an explicit one-byte GATT schema
+revision. Revision 1 identifies the current cache-relevant HID Report Map and
+database semantics. The revision is stored in the `hid_schema` NVS namespace
+under a key derived from the resolved peer identity address; it is deliberately
+separate from NimBLE's fixed `OUR_SEC`/`PEER_SEC` record formats. Exact bond
+security-record deletion also deletes its companion revision, without eviction
+or cache-reset commands. A missing key is a valid legacy bond with
+unknown/stale schema, not storage corruption.
+
+After the existing authenticated, identity-resolved, persisted-bond checks, a
+stale peer with a restored/enabled Service Changed CCCD receives one
+`ble_svc_gatt_changed(0x0001, 0xffff)` request for that connection. The
+conservative full-database range avoids depending on fragile generated handle
+numbers. Send acceptance or indication confirmation is not cache-current
+evidence. Only a successful read of this firmware's Report Map by the exact
+generation/connection, reconciled with the qualified bond identity, permits a
+write-and-reread of revision 1. A Report Map read that precedes identity
+resolution is retained only as connection-local executor state until security
+becomes qualified. Stale schema therefore inhibits composite BLE HID readiness
+even when security and both HID CCCDs are otherwise ready. Disconnect and
+queue-overflow handling clear or fail-close all uncommitted evidence; neither
+cache repair nor reconnect selects the BLE route automatically. Increment the
+schema revision and update its host-side descriptor fingerprint whenever the
+HID Report Map, cache-relevant GATT layout, or other bonded-client cached
+semantics change.
+
 Advertising is legacy connectable undirected with an exact 22-byte payload:
 Flags `0x06`, complete UUID list `0x1812`, Generic HID appearance `0x03c0`, and
 complete name `s3-hidbot`; no scan response is used. Interval is 40 ms. The

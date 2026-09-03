@@ -131,6 +131,17 @@ truthful releasing-status, and v1-under-BLE compatibility coverage. Route-v1
 remains exactly `none|usb`; v2 adds `ble` and is preferred only when its
 capability is advertised. These checks remain software-only.
 
+The bonded GATT-cache regression extends the executor and BLE HID static
+entrypoints with legacy missing-revision migration, stale-cache readiness
+inhibition, exact per-connection Service Changed eligibility and bounded call
+count, authoritative Report Map read ordering, write-and-reread persistence,
+fresh/current reconnect behavior, generation/handle fencing, disconnect,
+missing subscription, send failure, StoreFull/persistent-storage failure, and
+queue-overflow cases. The static test binds schema revision 1 to a SHA-256
+fingerprint of the Report Map and checks the real 0x2A4B access path publishes
+the exact generation/connection/attribute evidence only after a successful
+read. These tests do not access Bluetooth radio, BlueZ, serial, or hardware.
+
 Run these commands from the repository root:
 
 ```text

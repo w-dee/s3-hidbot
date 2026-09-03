@@ -10,6 +10,9 @@ struct ble_gatt_access_ctxt;
 
 namespace ble_hid_service {
 
+// Bump only when bonded clients must refresh cache-relevant GATT/HID
+// interpretation.  Missing per-peer metadata is legacy revision zero.
+inline constexpr std::uint8_t kGattSchemaRevision = 1;
 inline constexpr std::array<std::uint8_t, 4> kHidInformation{
     0x11, 0x01, 0x00, 0x00};
 inline constexpr std::array<std::uint8_t, 8> kNeutralKeyboard{};

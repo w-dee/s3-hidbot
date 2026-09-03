@@ -2,6 +2,7 @@
 
 #include <cstring>
 
+#include "ble_hid_service/ble_hid_service.hpp"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -13,6 +14,7 @@
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "secure_memory/secure_memory.hpp"
 #include "services/gap/ble_svc_gap.h"
@@ -34,6 +36,75 @@ constexpr std::uint16_t kConnectionIntervalMax = 24;  // 30 ms.
 constexpr std::uint16_t kSupervisionTimeout = 400;    // 4 s.
 constexpr char kLogTag[] = "ble_transport";
 ble_uuid16_t s_hid_service_uuid = BLE_UUID16_INIT(0x1812);
+ble_uuid16_t s_gatt_service_uuid = BLE_UUID16_INIT(0x1801);
+ble_uuid16_t s_service_changed_uuid = BLE_UUID16_INIT(0x2a05);
+constexpr char kSchemaNamespace[] = "hid_schema";
+constexpr char kSchemaKeyHex[] = "0123456789abcdef";
+
+void schema_key(const ble_addr_t &identity, char (&key)[16]) {
+    key[0] = 'r';
+    key[1] = kSchemaKeyHex[identity.type >> 4U];
+    key[2] = kSchemaKeyHex[identity.type & 0x0fU];
+    for (std::size_t index = 0; index < sizeof(identity.val); ++index) {
+        key[3 + index * 2] = kSchemaKeyHex[identity.val[index] >> 4U];
+        key[4 + index * 2] = kSchemaKeyHex[identity.val[index] & 0x0fU];
+    }
+    key[15] = '\0';
+}
+
+esp_err_t read_schema_revision(const ble_addr_t &identity,
+                               std::uint8_t &revision) {
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(kSchemaNamespace, NVS_READONLY, &handle);
+    if (result == ESP_OK) {
+        char key[16]{};
+        schema_key(identity, key);
+        result = nvs_get_u8(handle, key, &revision);
+        nvs_close(handle);
+    }
+    return result;
+}
+
+esp_err_t delete_schema_revision(const ble_addr_t &identity) {
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(kSchemaNamespace, NVS_READWRITE, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (result == ESP_OK) {
+        char key[16]{};
+        schema_key(identity, key);
+        result = nvs_erase_key(handle, key);
+        if (result == ESP_ERR_NVS_NOT_FOUND) {
+            result = ESP_OK;
+        } else if (result == ESP_OK) {
+            result = nvs_commit(handle);
+        }
+        nvs_close(handle);
+    }
+    return result;
+}
+
+bool peer_identity(std::uint16_t connection_handle, ble_addr_t &identity) {
+    ble_gap_conn_desc descriptor{};
+    if (ble_gap_conn_find(connection_handle, &descriptor) != 0) {
+        return false;
+    }
+    identity = descriptor.peer_id_addr;
+    return true;
+}
+
+bool has_exact_identity(const ble_addr_t &identity) {
+    if (identity.type != 0) {
+        return true;
+    }
+    for (const std::uint8_t byte : identity.val) {
+        if (byte != 0) {
+            return true;
+        }
+    }
+    return false;
+}
 }  // namespace
 
 Backend *Backend::instance_ = nullptr;
@@ -258,6 +329,17 @@ void Backend::on_sync() {
     if (result == 0) {
         result = ble_hs_id_infer_auto(0, &instance_->own_address_type_);
     }
+    std::uint16_t service_changed_handle = 0;
+    if (result == 0) {
+        result = ble_gatts_find_chr(
+            &s_gatt_service_uuid.u, &s_service_changed_uuid.u, nullptr,
+            &service_changed_handle);
+        if (result == 0 && service_changed_handle == 0) {
+            result = BLE_HS_ENOENT;
+        }
+    }
+    instance_->service_changed_value_handle_.store(
+        result == 0 ? service_changed_handle : 0, std::memory_order_release);
     if (instance_->sink_ == nullptr) {
         return;
     }
@@ -286,6 +368,10 @@ void Backend::on_reset(int reason) {
         instance_->current_connection_.store(ble_lifecycle::kNoConnection,
                                              std::memory_order_release);
         instance_->identity_resolved_.store(false, std::memory_order_release);
+        instance_->gatt_schema_current_.store(false,
+                                             std::memory_order_release);
+        instance_->service_changed_value_handle_.store(
+            0, std::memory_order_release);
         const std::int32_t timeout_result = instance_->arm_timeout(
             kSyncTimeoutUs, LifecycleTimeoutPurpose::kSync);
         if (instance_->sink_ != nullptr) {
@@ -376,14 +462,6 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
             break;
         case BLE_GAP_EVENT_SUBSCRIBE:
             if (backend->database_ != nullptr && backend->sink_ != nullptr) {
-                const auto handles = backend->database_->hid_handles();
-                hid_control_executor::BleHidInterface interface =
-                    hid_control_executor::BleHidInterface::kUnknown;
-                if (event->subscribe.attr_handle == handles.keyboard_value) {
-                    interface = hid_control_executor::BleHidInterface::kKeyboard;
-                } else if (event->subscribe.attr_handle == handles.mouse_value) {
-                    interface = hid_control_executor::BleHidInterface::kMouse;
-                }
                 hid_control_executor::BleSubscriptionReason reason =
                     hid_control_executor::BleSubscriptionReason::kUnknown;
                 switch (event->subscribe.reason) {
@@ -399,12 +477,38 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                     default:
                         break;
                 }
+                const auto generation = backend->generation_.load(
+                    std::memory_order_acquire);
+                if (event->subscribe.attr_handle ==
+                        backend->service_changed_value_handle_.load(
+                            std::memory_order_acquire) &&
+                    reason !=
+                        hid_control_executor::BleSubscriptionReason::kUnknown) {
+                    (void)backend->sink_->signal_ble_event({
+                        .kind = hid_control_executor::BleEventKind::
+                            kServiceChangedSubscription,
+                        .generation = generation,
+                        .connection_handle = event->subscribe.conn_handle,
+                        .attribute_handle = event->subscribe.attr_handle,
+                        .subscription_reason = reason,
+                        .indicate_enabled =
+                            event->subscribe.cur_indicate != 0,
+                    });
+                    break;
+                }
+                const auto handles = backend->database_->hid_handles();
+                hid_control_executor::BleHidInterface interface =
+                    hid_control_executor::BleHidInterface::kUnknown;
+                if (event->subscribe.attr_handle == handles.keyboard_value) {
+                    interface = hid_control_executor::BleHidInterface::kKeyboard;
+                } else if (event->subscribe.attr_handle == handles.mouse_value) {
+                    interface = hid_control_executor::BleHidInterface::kMouse;
+                }
                 if (interface != hid_control_executor::BleHidInterface::kUnknown &&
                     reason != hid_control_executor::BleSubscriptionReason::kUnknown) {
                     (void)backend->sink_->signal_ble_event({
                         .kind = hid_control_executor::BleEventKind::kSubscription,
-                        .generation = backend->generation_.load(
-                            std::memory_order_acquire),
+                        .generation = generation,
                         .connection_handle = event->subscribe.conn_handle,
                         .attribute_handle = event->subscribe.attr_handle,
                         .hid_interface = interface,
@@ -627,6 +731,7 @@ void Backend::begin_security(ble_lifecycle::Generation generation,
                              std::uint16_t connection_handle) {
     current_connection_.store(connection_handle, std::memory_order_release);
     identity_resolved_.store(false, std::memory_order_release);
+    gatt_schema_current_.store(false, std::memory_order_release);
     security_inhibit_.begin_connection(generation, connection_handle);
     security_.begin_connection(generation, connection_handle);
 }
@@ -640,6 +745,7 @@ void Backend::retire_security(ble_lifecycle::Generation generation,
         current_connection_.store(ble_lifecycle::kNoConnection,
                                   std::memory_order_release);
         identity_resolved_.store(false, std::memory_order_release);
+        gatt_schema_current_.store(false, std::memory_order_release);
     }
 }
 
@@ -693,6 +799,109 @@ bool Backend::security_ready_for_hid(
     std::uint16_t connection_handle) const {
     return !security_inhibit_.inhibits(generation, connection_handle) &&
            security_.security_ready_for_hid(generation, connection_handle);
+}
+
+hid_control_executor::GattSchemaStoreResult Backend::gatt_schema_status(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) {
+    using Kind = hid_control_executor::GattSchemaStoreResultKind;
+    if (generation_.load(std::memory_order_acquire) != generation ||
+        current_connection_.load(std::memory_order_acquire) !=
+            connection_handle ||
+        !security_ready_for_hid(generation, connection_handle)) {
+        return {.kind = Kind::kStaleIdentity};
+    }
+    ble_addr_t identity{};
+    if (!peer_identity(connection_handle, identity)) {
+        return {.kind = Kind::kStaleIdentity};
+    }
+    std::uint8_t revision = 0;
+    const esp_err_t result = read_schema_revision(identity, revision);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return {.kind = Kind::kStale};
+    }
+    if (result != ESP_OK) {
+        return {.kind = Kind::kStorageFailure, .status = result};
+    }
+    if (revision != ble_hid_service::kGattSchemaRevision) {
+        return {.kind = Kind::kStale};
+    }
+    gatt_schema_current_.store(true, std::memory_order_release);
+    return {.kind = Kind::kCurrent};
+}
+
+hid_control_executor::GattSchemaStoreResult
+Backend::persist_gatt_schema_current(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) {
+    using Kind = hid_control_executor::GattSchemaStoreResultKind;
+    if (generation_.load(std::memory_order_acquire) != generation ||
+        current_connection_.load(std::memory_order_acquire) !=
+            connection_handle ||
+        !security_ready_for_hid(generation, connection_handle)) {
+        return {.kind = Kind::kStaleIdentity};
+    }
+    ble_addr_t identity{};
+    if (!peer_identity(connection_handle, identity)) {
+        return {.kind = Kind::kStaleIdentity};
+    }
+    char key[16]{};
+    schema_key(identity, key);
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(kSchemaNamespace, NVS_READWRITE, &handle);
+    if (result == ESP_OK) {
+        result = nvs_set_u8(handle, key,
+                            ble_hid_service::kGattSchemaRevision);
+    }
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    if (result == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        return {.kind = Kind::kCapacityFull, .status = result};
+    }
+    if (result != ESP_OK) {
+        return {.kind = Kind::kStorageFailure, .status = result};
+    }
+    std::uint8_t verified = 0;
+    result = read_schema_revision(identity, verified);
+    if (result != ESP_OK ||
+        verified != ble_hid_service::kGattSchemaRevision) {
+        return {.kind = Kind::kStorageFailure,
+                .status = result != ESP_OK ? result : ESP_ERR_INVALID_STATE};
+    }
+    gatt_schema_current_.store(true, std::memory_order_release);
+    return {.kind = Kind::kCurrent};
+}
+
+bool Backend::gatt_schema_current_for_hid(
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) const {
+    return generation_.load(std::memory_order_acquire) == generation &&
+           current_connection_.load(std::memory_order_acquire) ==
+               connection_handle &&
+           gatt_schema_current_.load(std::memory_order_acquire);
+}
+
+std::uint16_t Backend::service_changed_value_handle() const {
+    return service_changed_value_handle_.load(std::memory_order_acquire);
+}
+
+std::int32_t Backend::request_gatt_cache_refresh(
+    ble_lifecycle::Generation generation, std::uint16_t connection_handle,
+    std::uint16_t start_handle, std::uint16_t end_handle) {
+    if (generation_.load(std::memory_order_acquire) != generation ||
+        current_connection_.load(std::memory_order_acquire) !=
+            connection_handle ||
+        service_changed_value_handle() == 0 ||
+        !security_ready_for_hid(generation, connection_handle) ||
+        start_handle == 0 || start_handle > end_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ble_svc_gatt_changed(start_handle, end_handle);
+    return 0;
 }
 
 void Backend::refresh_security(std::uint16_t connection_handle,
@@ -795,7 +1004,21 @@ int Backend::store_delete(int object_type, const union ble_store_key *key) {
     if (instance_ == nullptr || instance_->original_store_delete_ == nullptr) {
         return BLE_HS_EINVAL;
     }
-    const int result = instance_->original_store_delete_(object_type, key);
+    int result = instance_->original_store_delete_(object_type, key);
+    if (result == 0 && key != nullptr &&
+        (object_type == BLE_STORE_OBJ_TYPE_OUR_SEC ||
+         object_type == BLE_STORE_OBJ_TYPE_PEER_SEC) &&
+        has_exact_identity(key->sec.peer_addr)) {
+        const esp_err_t schema_result =
+            delete_schema_revision(key->sec.peer_addr);
+        if (schema_result != ESP_OK) {
+            instance_->observe_store_failure(
+                ble_security::StoreFailureKind::kDelete, schema_result, true,
+                instance_->current_connection_.load(
+                    std::memory_order_acquire));
+            return BLE_HS_ESTORE_FAIL;
+        }
+    }
     if (result != 0) {
         instance_->observe_store_failure(
             ble_security::StoreFailureKind::kDelete, result, true,

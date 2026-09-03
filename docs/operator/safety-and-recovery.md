@@ -11,6 +11,16 @@ switching, queued selection, and reconnect auto-restore are forbidden. A BLE
 `fault` with `recovery_required:true` requires reboot/human review rather than
 fabricated recovery.
 
+Bonded hosts may cache the GATT database and HID Report Map across firmware
+updates. Firmware records the cache-relevant schema revision per resolved bond.
+An older or legacy bond remains HID-route-ineligible while stale; after normal
+authenticated reconnect it receives a bounded standard Service Changed
+request, and becomes eligible only after it actually reads the current Report
+Map and the revision is durably verified. This migration preserves bonds and
+does not select a route. Clearing BlueZ cache, deleting a host pairing, or
+erasing device NVS is not the normal repair procedure and must not be used as
+an automatic recovery step.
+
 The CH343 USB-UART path controls and programs the fixture. The separate native
 USB-OTG path presents HID to a DUT host. Provisioning and identity verification
 need only CH343. VBUS sourcing, backfeed, general dual-cable power safety,

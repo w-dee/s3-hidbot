@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -106,6 +107,17 @@ def main() -> int:
     assert bytes((0x95, 0x06, 0x75, 0x08)) in report_map  # six keyboard keys
     assert bytes((0x95, 0x03, 0x81, 0x06)) in report_map  # X/Y/wheel
     assert bytes((0x95, 0x01, 0x81, 0x06)) in report_map  # pan
+
+    revision_match = re.search(
+        r"kGattSchemaRevision\s*=\s*(\d+)", header
+    )
+    assert revision_match is not None
+    schema_revision = int(revision_match.group(1))
+    descriptor_fingerprints = {
+        1: "ef1be45d8fe7d0637568c8954b64bab971d5b5f57bf3d44f1cc040e8fe5c3d32",
+    }
+    assert schema_revision in descriptor_fingerprints
+    assert hashlib.sha256(report_map).hexdigest() == descriptor_fingerprints[schema_revision]
 
     keyboard_fields = [
         field for field in parse_hid_input_fields(report_map)
@@ -219,6 +231,26 @@ def main() -> int:
     assert "BleNotifyBackendResult::kStackAccepted" in service
     assert "bind_event_sink" in header
     assert "BleEventKind::kControlPoint" in service
+    report_map_access = re.search(
+        r"case AccessTarget::kReportMap: \{(.*?)\n        \}",
+        service,
+        re.DOTALL,
+    )
+    assert report_map_access is not None
+    report_map_access_body = report_map_access.group(1)
+    assert "append(context->om, kReportMap)" in report_map_access_body
+    assert "result == 0" in report_map_access_body
+    assert "context->op == BLE_GATT_ACCESS_OP_READ_CHR" in report_map_access_body
+    assert "BleEventKind::kReportMapRead" in report_map_access_body
+    for exact_field in (
+        ".generation = s_database->generation_.load(",
+        ".connection_handle = connection_handle",
+        ".attribute_handle = attribute_handle",
+    ):
+        assert exact_field in report_map_access_body
+    assert report_map_access_body.index("append(context->om, kReportMap)") < (
+        report_map_access_body.index("BleEventKind::kReportMapRead")
+    )
     assert "value == 0" in service
     assert "OS_MBUF_PKTLEN(context->om) != 1" in service
     assert "length != 1 || value > 1" in service
@@ -226,12 +258,55 @@ def main() -> int:
     assert "suspended_.store" not in service
 
     assert "BLE_GAP_EVENT_SUBSCRIBE" in transport
-    for field in ("conn_handle", "attr_handle", "cur_notify", "reason"):
+    for field in ("conn_handle", "attr_handle", "cur_notify", "cur_indicate", "reason"):
         assert f"event->subscribe.{field}" in transport
     for reason in ("WRITE", "TERM", "RESTORE"):
         assert f"BLE_GAP_SUBSCRIBE_REASON_{reason}" in transport
     assert "database_->on_subscribe" not in transport
     assert "BleEventKind::kSubscription" in transport
+    assert re.search(
+        r"BleEventKind::\s*kServiceChangedSubscription", transport
+    )
+    assert "BLE_UUID16_INIT(0x1801)" in transport
+    assert "BLE_UUID16_INIT(0x2a05)" in transport
+    assert re.search(
+        r"ble_gatts_find_chr\(\s*&s_gatt_service_uuid\.u", transport
+    )
+    assert transport.count("ble_svc_gatt_changed(start_handle, end_handle)") == 1
+    assert "BLE_GAP_EVENT_NOTIFY_TX" not in transport
+    assert "kGattChangedStartHandle = 0x0001" in executor_header
+    assert "kGattChangedEndHandle = 0xffff" in executor_header
+    assert "kSchemaNamespace[] = \"hid_schema\"" in transport
+    assert "nvs_set_u8(handle, key," in transport
+    assert "nvs_commit(handle)" in transport
+    assert "read_schema_revision(identity, verified)" in transport
+    assert "result == ESP_ERR_NVS_NOT_FOUND" in transport
+    schema_status = transport[
+        transport.index("Backend::gatt_schema_status(") :
+        transport.index("Backend::persist_gatt_schema_current(")
+    ]
+    missing_revision = re.search(
+        r"if \(result == ESP_ERR_NVS_NOT_FOUND\) \{(.*?)\n    \}",
+        schema_status,
+        re.DOTALL,
+    )
+    assert missing_revision is not None and "Kind::kStale" in missing_revision.group(1)
+    assert "descriptor.peer_id_addr" in transport
+    assert "identity.type" in transport and "identity.val[index]" in transport
+    assert transport.count("nvs_erase_key(handle, key)") == 1
+    store_delete_start = transport.index("int Backend::store_delete(")
+    store_delete_end = transport.index("int Backend::store_status(")
+    store_delete = transport[store_delete_start:store_delete_end]
+    for token in (
+        "original_store_delete_(object_type, key)",
+        "object_type == BLE_STORE_OBJ_TYPE_OUR_SEC",
+        "object_type == BLE_STORE_OBJ_TYPE_PEER_SEC",
+        "has_exact_identity(key->sec.peer_addr)",
+        "delete_schema_revision(key->sec.peer_addr)",
+        "StoreFailureKind::kDelete",
+        "return BLE_HS_ESTORE_FAIL",
+    ):
+        assert token in store_delete
     assert "CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1" in sdkconfig_defaults
     orphan = re.search(
         r"Backend::terminate_orphan_connection\((.*?)\n\}", transport, re.DOTALL

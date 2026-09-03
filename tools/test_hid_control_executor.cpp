@@ -135,6 +135,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     }
     void begin_security(ble_lifecycle::Generation generation,
                         std::uint16_t connection_handle) override {
+        gatt_schema_current = false;
         security_inhibit.begin_connection(generation, connection_handle);
         security.begin_connection(generation, connection_handle);
     }
@@ -144,12 +145,17 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         if (identity_resolved_event) security_link.identity_resolved = true;
         security.apply_verification(active_generation, connection_handle,
                                     security_link, security_persisted);
+        if (security.security_ready_for_hid(active_generation,
+                                            connection_handle)) {
+            gatt_schema_current = stored_gatt_schema_current;
+        }
     }
     void retire_security(ble_lifecycle::Generation generation,
                          std::uint16_t connection_handle) override {
         ++retire_security_calls;
         security_inhibit.retire_connection(generation, connection_handle);
         security.retire_connection(generation, connection_handle);
+        gatt_schema_current = false;
     }
     void mark_security_unhealthy(
         ble_lifecycle::Generation generation) override {
@@ -184,6 +190,71 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
                                 std::uint16_t connection_handle) const override {
         return !security_inhibit.inhibits(generation, connection_handle) &&
                security.security_ready_for_hid(generation, connection_handle);
+    }
+    hid_control_executor::GattSchemaStoreResult gatt_schema_status(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) override {
+        ++gatt_schema_status_calls;
+        if (generation != active_generation ||
+            !security_ready_for_hid(generation, connection_handle)) {
+            return {.kind = hid_control_executor::GattSchemaStoreResultKind::
+                                kStaleIdentity};
+        }
+        if (gatt_schema_status_result.kind !=
+            hid_control_executor::GattSchemaStoreResultKind::kStale) {
+            if (gatt_schema_status_result.kind ==
+                hid_control_executor::GattSchemaStoreResultKind::kCurrent) {
+                gatt_schema_current = true;
+            }
+            return gatt_schema_status_result;
+        }
+        if (stored_gatt_schema_current) {
+            gatt_schema_current = true;
+            return {.kind = hid_control_executor::GattSchemaStoreResultKind::
+                                kCurrent};
+        }
+        return {.kind =
+                    hid_control_executor::GattSchemaStoreResultKind::kStale};
+    }
+    hid_control_executor::GattSchemaStoreResult persist_gatt_schema_current(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) override {
+        ++persist_gatt_schema_calls;
+        last_gatt_persist_generation = generation;
+        last_gatt_persist_connection = connection_handle;
+        if (generation != active_generation ||
+            !security_ready_for_hid(generation, connection_handle)) {
+            return {.kind = hid_control_executor::GattSchemaStoreResultKind::
+                                kStaleIdentity};
+        }
+        if (persist_gatt_schema_result.kind ==
+            hid_control_executor::GattSchemaStoreResultKind::kCurrent) {
+            stored_gatt_schema_current = true;
+            gatt_schema_current = true;
+        }
+        return persist_gatt_schema_result;
+    }
+    bool gatt_schema_current_for_hid(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle) const override {
+        const auto snapshot = security.snapshot();
+        return snapshot.coherent && snapshot.generation == generation &&
+               snapshot.connection_handle == connection_handle &&
+               gatt_schema_current;
+    }
+    std::uint16_t service_changed_value_handle() const override {
+        return service_changed_handle;
+    }
+    std::int32_t request_gatt_cache_refresh(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle, std::uint16_t start_handle,
+        std::uint16_t end_handle) override {
+        ++gatt_cache_refresh_calls;
+        last_gatt_refresh_generation = generation;
+        last_gatt_refresh_connection = connection_handle;
+        last_gatt_refresh_start = start_handle;
+        last_gatt_refresh_end = end_handle;
+        return gatt_cache_refresh_result;
     }
     void record_heap_checkpoint(HeapCheckpoint checkpoint) override {
         ++heap_checkpoint_calls;
@@ -251,6 +322,9 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     int retire_security_calls = 0;
     int apply_store_failure_calls = 0;
     int apply_persistent_store_failure_calls = 0;
+    int gatt_schema_status_calls = 0;
+    int persist_gatt_schema_calls = 0;
+    int gatt_cache_refresh_calls = 0;
     int heap_checkpoint_calls = 0;
     std::int32_t initialize_result = 0;
     std::int32_t advertising_result = 0;
@@ -261,11 +335,29 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     std::int32_t configure_connection_result = 0;
     std::int32_t initiate_security_result = 0;
     std::int32_t inject_result = 0;
+    std::int32_t gatt_cache_refresh_result = 0;
     std::uint32_t last_injected_value = 0;
     ble_lifecycle::Generation timer_generation = 0;
     std::uint16_t timer_connection = ble_lifecycle::kNoConnection;
     std::uint32_t timer_pairing_id = 0;
     std::uint64_t now_us = 0;
+    bool stored_gatt_schema_current = true;
+    bool gatt_schema_current = false;
+    std::uint16_t service_changed_handle = 40;
+    ble_lifecycle::Generation last_gatt_refresh_generation = 0;
+    ble_lifecycle::Generation last_gatt_persist_generation = 0;
+    std::uint16_t last_gatt_refresh_connection =
+        ble_lifecycle::kNoConnection;
+    std::uint16_t last_gatt_persist_connection =
+        ble_lifecycle::kNoConnection;
+    std::uint16_t last_gatt_refresh_start = 0;
+    std::uint16_t last_gatt_refresh_end = 0;
+    hid_control_executor::GattSchemaStoreResult gatt_schema_status_result{
+        .kind = hid_control_executor::GattSchemaStoreResultKind::kStale,
+    };
+    hid_control_executor::GattSchemaStoreResult persist_gatt_schema_result{
+        .kind = hid_control_executor::GattSchemaStoreResultKind::kCurrent,
+    };
     bool route_release_grace_armed = false;
     hid_control_executor::BleRouteReleaseIdentity route_release_identity{};
     ble_security::State security{};
@@ -322,6 +414,7 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
     hid_control_executor::BleEventSink *sink = nullptr;
     ble_lifecycle::Generation generation = 0;
     hid_control_executor::BleHidHandles handles{
+        .report_map_value = 5,
         .keyboard_value = 10,
         .mouse_value = 20,
         .control_point_value = 30,
@@ -1197,6 +1290,35 @@ bool queue_control_point(hid_control_executor::Controller &controller,
     });
 }
 
+bool queue_report_map_read(
+    hid_control_executor::Controller &controller,
+    ble_lifecycle::Generation generation, std::uint16_t connection_handle,
+    std::uint16_t attribute_handle) {
+    return controller.signal_ble_event({
+        .kind = hid_control_executor::BleEventKind::kReportMapRead,
+        .generation = generation,
+        .connection_handle = connection_handle,
+        .attribute_handle = attribute_handle,
+    });
+}
+
+bool queue_service_changed_subscription(
+    hid_control_executor::Controller &controller,
+    ble_lifecycle::Generation generation, std::uint16_t connection_handle,
+    std::uint16_t attribute_handle, bool enabled,
+    hid_control_executor::BleSubscriptionReason reason =
+        hid_control_executor::BleSubscriptionReason::kRestore) {
+    return controller.signal_ble_event({
+        .kind =
+            hid_control_executor::BleEventKind::kServiceChangedSubscription,
+        .generation = generation,
+        .connection_handle = connection_handle,
+        .attribute_handle = attribute_handle,
+        .subscription_reason = reason,
+        .indicate_enabled = enabled,
+    });
+}
+
 void subscribe_composite(hid_control_executor::Controller &controller,
                          FakeBleDatabase &database,
                          ble_lifecycle::Generation generation,
@@ -1212,6 +1334,10 @@ void subscribe_composite(hid_control_executor::Controller &controller,
                               database.handles.mouse_value, true, reason));
     assert(controller.process_one_for_test());
 }
+
+void fill_queue_with_stale_security_events(
+    FakeBleBackend &ble, ble_lifecycle::Generation generation,
+    std::uint16_t connection, std::size_t count);
 
 void test_generation_owned_cccd_restore_term_and_clearing() {
     hid_runtime::Runtime runtime;
@@ -1367,6 +1493,275 @@ void test_ble_link_readiness_security_and_suspend_predicate() {
     assert(!controller.ble_link_ready());
     assert(controller.process_one_for_test());
     assert(!controller.ble_hid_peer_snapshot().active);
+}
+
+void test_gatt_cache_legacy_refresh_read_persist_and_current_reconnect() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 140;
+    ble.stored_gatt_schema_current = false;  // Legacy record: key absent.
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection,
+                        hid_control_executor::BleSubscriptionReason::kRestore);
+    make_security_ready(ble);
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     connection));
+    assert(controller.process_one_for_test());
+
+    // Cache 1/2: legacy security records remain valid, but CCCDs and complete
+    // security evidence cannot bypass the missing schema revision.
+    assert(ble.security_ready_for_hid(generation, connection));
+    assert(ble.gatt_schema_status_calls == 1);
+    assert(!ble.gatt_schema_current);
+    assert(!controller.ble_link_ready());
+
+    // Cache 3 / API seam: restored Service Changed subscription permits one
+    // conservative full-database request for this exact connection.
+    assert(queue_service_changed_subscription(
+        controller, generation, connection, ble.service_changed_handle, true));
+    assert(controller.process_one_for_test());
+    assert(ble.gatt_cache_refresh_calls == 1);
+    assert(ble.last_gatt_refresh_generation == generation);
+    assert(ble.last_gatt_refresh_connection == connection);
+    assert(ble.last_gatt_refresh_start ==
+           hid_control_executor::kGattChangedStartHandle);
+    assert(ble.last_gatt_refresh_end ==
+           hid_control_executor::kGattChangedEndHandle);
+    assert(queue_service_changed_subscription(
+        controller, generation, connection, ble.service_changed_handle, true));
+    assert(controller.process_one_for_test());
+    assert(ble.gatt_cache_refresh_calls == 1);
+    assert(!controller.ble_link_ready());
+
+    // Cache 4/5: only an exact Report Map read persists current revision for
+    // the exact generation and connection, then restores route eligibility.
+    assert(queue_report_map_read(controller, generation, connection,
+                                 database.handles.report_map_value));
+    assert(controller.process_one_for_test());
+    assert(ble.persist_gatt_schema_calls == 1);
+    assert(ble.last_gatt_persist_generation == generation);
+    assert(ble.last_gatt_persist_connection == connection);
+    assert(ble.stored_gatt_schema_current && ble.gatt_schema_current);
+    assert(controller.ble_link_ready());
+
+    // Cache 6: reconnect reads the durable current revision and does not ask
+    // for another Service Changed indication.
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                     connection));
+    assert(controller.process_one_for_test());
+    const auto next_generation = controller.ble_snapshot().generation;
+    constexpr std::uint16_t next_connection = 141;
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect,
+                     next_connection));
+    assert(controller.process_one_for_test());
+    subscribe_composite(controller, database, next_generation, next_connection,
+                        hid_control_executor::BleSubscriptionReason::kRestore);
+    make_security_ready(ble);
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     next_connection));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+    assert(queue_service_changed_subscription(
+        controller, next_generation, next_connection,
+        ble.service_changed_handle, true));
+    assert(controller.process_one_for_test());
+    assert(ble.gatt_cache_refresh_calls == 1);
+}
+
+void test_gatt_cache_non_authoritative_refresh_results_and_independent_read() {
+    // Cache 7 / API failure semantics: request acceptance, failure, timeout,
+    // or confirmation are deliberately not modeled as cache-current evidence.
+    // With no Report Map read, every case stays stale and attempts only once.
+    for (const std::int32_t request_result : {0, -7, -8}) {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        const auto connection = static_cast<std::uint16_t>(142 - request_result);
+        ble.stored_gatt_schema_current = false;
+        ble.gatt_cache_refresh_result = request_result;
+        connect_ble(runtime, usb, ble, database, controller, connection);
+        const auto generation = controller.ble_snapshot().generation;
+        subscribe_composite(controller, database, generation, connection);
+        make_security_ready(ble);
+        assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                         connection));
+        assert(controller.process_one_for_test());
+        assert(queue_service_changed_subscription(
+            controller, generation, connection, ble.service_changed_handle,
+            true));
+        assert(controller.process_one_for_test());
+        assert(ble.gatt_cache_refresh_calls == 1);
+        assert(!ble.stored_gatt_schema_current && !ble.gatt_schema_current);
+        assert(ble.persist_gatt_schema_calls == 0);
+        assert(!controller.ble_link_ready());
+        assert(queue_service_changed_subscription(
+            controller, generation, connection, ble.service_changed_handle,
+            true));
+        assert(controller.process_one_for_test());
+        assert(ble.gatt_cache_refresh_calls == 1);
+    }
+
+    // Cache 8/14: fresh discovery can read Report Map before identity settles;
+    // the executor retains only connection-local evidence and persists it once
+    // that exact bond becomes authenticated and identity-qualified.
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 151;
+    ble.stored_gatt_schema_current = false;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    assert(queue_report_map_read(controller, generation, connection,
+                                 database.handles.report_map_value));
+    assert(controller.process_one_for_test());
+    assert(ble.persist_gatt_schema_calls == 0);
+    make_security_ready(ble);
+    assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
+                     connection));
+    assert(controller.process_one_for_test());
+    assert(ble.persist_gatt_schema_calls == 1);
+    assert(ble.stored_gatt_schema_current);
+    assert(ble.gatt_cache_refresh_calls == 0);
+}
+
+void test_gatt_cache_identity_disconnect_and_subscription_fencing() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t reused_connection = 152;
+    ble.stored_gatt_schema_current = false;
+    connect_ble(runtime, usb, ble, database, controller, reused_connection);
+    const auto generation_a = controller.ble_snapshot().generation;
+    make_security_ready(ble);
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     reused_connection));
+    assert(controller.process_one_for_test());
+
+    // Cache 12: no Service Changed subscription means no request, no false
+    // readiness, and no retry loop.
+    assert(ble.gatt_cache_refresh_calls == 0);
+    assert(!controller.ble_link_ready());
+    assert(queue_service_changed_subscription(
+        controller, generation_a, reused_connection,
+        ble.service_changed_handle, false));
+    assert(controller.process_one_for_test());
+    assert(ble.gatt_cache_refresh_calls == 0);
+
+    // Cache 10: disconnect before Report Map consumption never persists.
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                     reused_connection));
+    assert(controller.process_one_for_test());
+    assert(!ble.stored_gatt_schema_current);
+    assert(ble.persist_gatt_schema_calls == 0);
+
+    // Cache 9: a reused connection handle is fenced by generation; old reads,
+    // wrong handles, and wrong connections cannot update the new peer.
+    const auto generation_b = controller.ble_snapshot().generation;
+    assert(generation_b != generation_a);
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect,
+                     reused_connection));
+    assert(controller.process_one_for_test());
+    make_security_ready(ble);
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     reused_connection));
+    assert(controller.process_one_for_test());
+    assert(queue_report_map_read(controller, generation_a, reused_connection,
+                                 database.handles.report_map_value));
+    assert(controller.process_one_for_test());
+    assert(queue_report_map_read(controller, generation_b, reused_connection,
+                                 database.handles.keyboard_value));
+    assert(controller.process_one_for_test());
+    assert(queue_report_map_read(controller, generation_b,
+                                 reused_connection + 1U,
+                                 database.handles.report_map_value));
+    assert(controller.process_one_for_test());
+    assert(ble.persist_gatt_schema_calls == 0);
+    assert(!ble.stored_gatt_schema_current);
+
+    // The still-stale reconnect gets one new bounded attempt when its restored
+    // Service Changed subscription is observed.
+    assert(queue_service_changed_subscription(
+        controller, generation_b, reused_connection,
+        ble.service_changed_handle, true));
+    assert(controller.process_one_for_test());
+    assert(ble.gatt_cache_refresh_calls == 1);
+}
+
+void test_gatt_cache_persistence_failures_follow_store_policy() {
+    for (const auto kind : {
+             hid_control_executor::GattSchemaStoreResultKind::kCapacityFull,
+             hid_control_executor::GattSchemaStoreResultKind::kStorageFailure}) {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        constexpr std::uint16_t connection = 154;
+        ble.stored_gatt_schema_current = false;
+        ble.persist_gatt_schema_result = {.kind = kind, .status = -31};
+        connect_ble(runtime, usb, ble, database, controller, connection);
+        const auto generation = controller.ble_snapshot().generation;
+        make_security_ready(ble);
+        assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                         connection));
+        assert(controller.process_one_for_test());
+        assert(queue_report_map_read(controller, generation, connection,
+                                     database.handles.report_map_value));
+        assert(controller.process_one_for_test());
+        assert(!ble.stored_gatt_schema_current && !ble.gatt_schema_current);
+        assert(!controller.ble_link_ready());
+        if (kind == hid_control_executor::GattSchemaStoreResultKind::
+                        kCapacityFull) {
+            assert(ble.apply_store_failure_calls == 1);
+            assert(ble.apply_persistent_store_failure_calls == 0);
+            assert(!controller.ble_snapshot().recovery_required);
+            assert(ble.disconnect_calls == 1);
+        } else {
+            assert(ble.apply_store_failure_calls == 0);
+            assert(ble.apply_persistent_store_failure_calls == 1);
+            assert(controller.ble_snapshot().recovery_required);
+        }
+    }
+}
+
+void test_gatt_cache_dropped_report_map_read_fails_closed() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t connection = 155;
+    ble.stored_gatt_schema_current = false;
+    connect_ble(runtime, usb, ble, database, controller, connection);
+    const auto generation = controller.ble_snapshot().generation;
+    make_security_ready(ble);
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     connection));
+    assert(controller.process_one_for_test());
+    fill_queue_with_stale_security_events(
+        ble, generation, connection,
+        hid_control_executor::Controller::kActionQueueDepth);
+
+    // Cache 13: callback evidence that cannot enter the bounded queue is never
+    // converted into durable current state; the existing overflow path wins.
+    assert(!queue_report_map_read(controller, generation, connection,
+                                  database.handles.report_map_value));
+    assert(ble.persist_gatt_schema_calls == 0);
+    assert(!ble.stored_gatt_schema_current && !ble.gatt_schema_current);
+    assert(controller.process_wake_cycle_for_test());
+    assert(controller.ble_snapshot().recovery_required);
+    assert(!controller.ble_link_ready());
+    assert(ble.persist_gatt_schema_calls == 0);
 }
 
 void test_store_failure_immediately_inhibits_stale_verification() {
@@ -4410,6 +4805,11 @@ int main() {
     test_ble_busy_has_no_stage_a_and_usb_detach_does_not_change_ble();
     test_generation_owned_cccd_restore_term_and_clearing();
     test_ble_link_readiness_security_and_suspend_predicate();
+    test_gatt_cache_legacy_refresh_read_persist_and_current_reconnect();
+    test_gatt_cache_non_authoritative_refresh_results_and_independent_read();
+    test_gatt_cache_identity_disconnect_and_subscription_fencing();
+    test_gatt_cache_persistence_failures_follow_store_policy();
+    test_gatt_cache_dropped_report_map_read_fails_closed();
     test_store_failure_immediately_inhibits_stale_verification();
     test_store_failure_identity_reuse_is_fenced();
     test_disable_request_defers_security_retirement_to_executor();
