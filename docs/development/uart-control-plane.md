@@ -14,14 +14,15 @@ HID output routing, the safety-only `hid.release_all` command, and the public ab
 `usb.exposure.status`, `usb.attach`, `usb.detach`, `hid.route.status`,
 `hid.route.set`, `hid.route.v2.status`, `hid.route.v2.set`, `hid.release_all`,
 `hid.keyboard.report`, `hid.mouse.report`, `ble.exposure.status`, `ble.enable`,
-`ble.disable`, `ble.pairing.status`, and `ble.pairing.respond`. There is still no keyboard
+`ble.disable`, `ble.pairing.status`, `ble.pairing.respond`, `ble.bond.list`, and
+`ble.bond.remove`. There is still no keyboard
 helper, high-level keyboard/mouse automation, asynchronous event, GPIO action,
 or reset command. Primitive report CLI commands are documented below and
 remain explicitly unsafe.
 
 U7.3 adds `ble.exposure.status`, `ble.enable`, and `ble.disable` under
 `ble.exposure-control-v1`; protocol remains 1. With the later pairing and route
-extensions, the full identity hello has 14 unique capabilities. BLE is
+extensions, the full identity hello has 15 unique capabilities. BLE is
 uninitialized/non-advertising at boot and lazy
 initialization occurs only after accepted enable. Normal disable retains the
 stack in hidden idle. BLE lifecycle generation is independent of USB route and
@@ -47,10 +48,21 @@ recovery-required BLE lifecycle fault; ordinary store capacity, timeout,
 repeat-pairing, or peer failure disconnects without global recovery. This
 internal model is exposed in Slice C by the firmware-only
 `ble.pairing-transaction-v1` capability and the `ble.pairing.status` and
-`ble.pairing.respond` commands. The full identity hello now has 13 unique
+`ble.pairing.respond` commands. At that Slice C boundary, the full identity
+hello had 13 unique
 capabilities. Slice D adds the strictly typed host API and explicit no-echo
 CLI for those frozen commands, without a firmware change. No BLE route or HID
 notification output was publicly reachable at that U7.3 boundary.
+
+U7.5B adds `ble.bond-administration-v1` without changing protocol v1. Its
+read-only `ble.bond.list` inventory and destructive `ble.bond.remove` mutation
+both run through the existing serialized BLE control executor. The public bond
+ID is the first 128 bits of SHA-256 over the domain
+`s3-hidbot/bond-id/v1`, resolved identity address type, and six identity bytes,
+rendered as exactly 32 lowercase hexadecimal characters. It is stable for a
+stored bond but exposes neither the raw address nor security material. A
+collision makes the inventory unhealthy and removal ambiguous; no list index,
+name, prefix, wildcard, oldest, or first-record selection exists.
 
 U7.4A adds an internal-only BLE HID output prerequisite without changing this
 public protocol. Keyboard and mouse CCCD evidence and HID Control Point suspend
@@ -233,6 +245,42 @@ request. The executor queue carries only a fixed mailbox token; the mailbox
 and all project-owned parser, framing, and NimBLE passkey temporaries are
 explicitly wiped after use.
 
+`ble.bond.list` accepts only omitted or empty params and returns exactly
+`capacity`, `count`, `available`, `healthy`, and `bonds`. Capacity is always
+three and `available` is `3-count`. Entries are sorted by exact `bond_id` and
+contain only `bond_id`, `our_sec`, `peer_sec`, `verified`, nullable
+`schema_revision`, `schema_current`, and `connected`. A half bond is never
+verified. Missing schema metadata is represented by `null` and is not by
+itself security-store corruption; malformed records, enumeration failure, or
+an already-fatal persistent storage state fail closed as `BLE_BOND_STORAGE`.
+Cold-boot uninitialized BLE returns `BLE_NOT_READY`.
+
+`ble.bond.remove` requires exactly
+`{"bond_id":"<32-lowercase-hex>"}`. The executor permits mutation only after
+BLE has been initialized and explicitly disabled to hidden idle, with no
+advertising or connection, no active/releasing BLE route or route uncertainty,
+no active pairing transaction, and no fatal storage state. A stable USB route
+is independent and is not modified. Exact unknown, collision,
+unsafe-live-state, and storage/postcondition failures are respectively
+`BLE_BOND_NOT_FOUND`, `BLE_BOND_AMBIGUOUS`, `BLE_BOND_BUSY`, and
+`BLE_BOND_STORAGE`.
+
+Removal uses NimBLE's exact-peer deletion through the wrapped store callback,
+which also deletes the same resolved identity's `hid_schema` revision. Success
+is returned only after rereading `OUR_SEC`, `PEER_SEC`, and schema metadata as
+absent, relisting one fewer bond, and proving all other public bond IDs remain.
+A partial deletion is therefore an exposed fatal storage failure, never false
+success. StoreFull remains connection-local and does not evict; a successful
+manual removal frees one slot for a future pairing. Firmware-side removal does
+not modify a host OS pairing database. A host that retains its own record may
+require a separately authorized host-side lifecycle action before pairing can
+succeed again.
+
+Normal stop-and-wait retry caching applies to `ble.bond.remove`: the same
+session, request ID, authority epoch, and exact serialized request bytes replay
+the frozen successful response without invoking storage a second time. A
+different payload with the same ID is a conflict.
+
 Native USB is hidden by default: boot initializes HID/runtime state and its
 lifecycle task, then starts the UART control plane without calling
 `tinyusb_driver_install()`. CH343 UART is the bootstrap path. Only the
@@ -388,7 +436,8 @@ initial capability list:
   usb.exposure-control-v1, hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
   hid.mouse-report-v1, firmware.identity-v1, hid.output-route-v1,
   hid.output-route-v2,
-  ble.exposure-control-v1, ble.pairing-transaction-v1
+  ble.exposure-control-v1, ble.pairing-transaction-v1,
+  ble.bond-administration-v1
 ```
 
 For a successful hello, top-level `session` equals `result.session`. Both are
@@ -398,7 +447,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1","hid.output-route-v1","hid.output-route-v2","ble.exposure-control-v1","ble.pairing-transaction-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1","hid.output-route-v1","hid.output-route-v2","ble.exposure-control-v1","ble.pairing-transaction-v1","ble.bond-administration-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
@@ -930,10 +979,12 @@ After `connect()`/hello, the host client exposes `ping()`, `info()`,
 `usb_status()`, optional `usb_exposure_status()`, `usb_attach()`, and
 `usb_detach()`, optional `hid_route_status()` and `hid_route_set()`, the
 optional one-shot `ble_pairing_status()` and `ble_pairing_respond()` methods,
+typed `ble_bond_list()` and exact-ID `ble_bond_remove()` methods,
 safety-only `Client.release_all()` API, and the explicit
 `Client.keyboard_report()` and `Client.mouse_report()` primitive APIs. The CLI
 also exposes `usb-exposure-status`, `usb-attach`, `usb-detach`,
-`hid-route-status`, `hid-route-set none|usb|ble`, and explicit `keyboard-report`
+`ble-bond-list`, `ble-bond-remove BOND_ID`, `hid-route-status`,
+`hid-route-set none|usb|ble`, and explicit `keyboard-report`
 and `mouse-report` commands, each with command-local
 `--unsafe-hid`; no arbitrary raw command API exists. The hello result exposes
 read-only `lease_ms` metadata. Closing the client only closes the injected
@@ -963,7 +1014,8 @@ failures become `TransportError`; request deadline expiry remains
 
 The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`,
 `usb-status`, `usb-exposure-status`, explicit `usb-attach` and `usb-detach`,
-explicit `ble-pairing-status` and `ble-pairing-respond --pairing-id ID`,
+explicit `ble-pairing-status`, `ble-pairing-respond --pairing-id ID`,
+`ble-bond-list`, and `ble-bond-remove BOND_ID`,
 explicit `hid-route-status` and `hid-route-set none|usb|ble`,
 and the safe `self-test` control-plane diagnostic through the diagnostic
 client methods, the safety recovery command `release-all` through

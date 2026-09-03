@@ -469,6 +469,32 @@ struct PairingSource {
     }
 };
 
+struct BondSource {
+    control_protocol::BleBondListResult list_result{
+        .kind = control_protocol::BleBondListResultKind::kSuccess,
+        .healthy = true,
+    };
+    control_protocol::BleBondRemoveResult remove_result{};
+    control_protocol::BondId requested_id{};
+    int list_calls = 0;
+    int remove_calls = 0;
+
+    static control_protocol::BleBondListResult list(void *context) {
+        auto *source = static_cast<BondSource *>(context);
+        ++source->list_calls;
+        return source->list_result;
+    }
+
+    static control_protocol::BleBondRemoveResult remove(
+        void *context, const control_protocol::BondId &bond_id) {
+        auto *source = static_cast<BondSource *>(context);
+        ++source->remove_calls;
+        source->requested_id = bond_id;
+        source->remove_result.bond_id = bond_id;
+        return source->remove_result;
+    }
+};
+
 void increment_authority(void *context) {
     ++static_cast<AuthoritySource *>(context)->epoch;
 }
@@ -489,6 +515,7 @@ struct LeaseFixture {
     ExposureSource exposure;
     BleSource ble;
     PairingSource pairing;
+    BondSource bonds;
     RouteSource route;
     ReleaseSource release;
     int expired_callbacks = 0;
@@ -572,6 +599,10 @@ struct LeaseFixture {
             .ble_pairing_status_context = &pairing,
             .ble_pairing_respond_provider = PairingSource::respond,
             .ble_pairing_respond_context = &pairing,
+            .ble_bond_list_provider = BondSource::list,
+            .ble_bond_list_context = &bonds,
+            .ble_bond_remove_provider = BondSource::remove,
+            .ble_bond_remove_context = &bonds,
             .hid_route_status_provider = RouteSource::get,
             .hid_route_status_context = &route,
             .hid_route_set_provider = RouteSource::set,
@@ -614,6 +645,7 @@ struct Fixture {
     ExposureSource exposure;
     BleSource ble;
     PairingSource pairing;
+    BondSource bonds;
     RouteSource route;
     ReleaseSource release;
     KeyboardSource keyboard;
@@ -661,6 +693,10 @@ struct Fixture {
             .ble_pairing_status_context = &pairing,
             .ble_pairing_respond_provider = PairingSource::respond,
             .ble_pairing_respond_context = &pairing,
+            .ble_bond_list_provider = BondSource::list,
+            .ble_bond_list_context = &bonds,
+            .ble_bond_remove_provider = BondSource::remove,
+            .ble_bond_remove_context = &bonds,
             .hid_route_status_provider = RouteSource::get,
             .hid_route_status_context = &route,
             .hid_route_set_provider = RouteSource::set,
@@ -735,6 +771,13 @@ std::string request(int id, std::string_view session, std::string_view command,
     return "{\"v\":1,\"id\":" + std::to_string(id) + ",\"session\":\"" +
         std::string(session) + "\",\"cmd\":\"" + std::string(command) +
         "\",\"params\":" + std::string(params) + "}";
+}
+
+control_protocol::BondId bond_id(char digit) {
+    control_protocol::BondId result{};
+    result.fill(digit);
+    result.back() = '\0';
+    return result;
 }
 
 void route_to_protocol(void *context, const control_framing::Event &event) {
@@ -1581,7 +1624,7 @@ void test_hid_route_schema_frozen_retry_and_errors() {
     const std::string session = extract_string(hello, "session");
     assert(count_occurrences(hello, "\"hid.output-route-v1\"") == 1);
     assert(count_occurrences(hello, "\"hid.output-route-v2\"") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 13);
+    assert(count_occurrences(hello, "-v1\"") == 14);
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
 
     fixture.payload(request(2, session, "hid.route.status"));
@@ -1767,7 +1810,7 @@ void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
     const std::string session = extract_string(hello, "session");
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
     assert(count_occurrences(hello, "ble.exposure-control-v1") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 13);
+    assert(count_occurrences(hello, "-v1\"") == 14);
 
     fixture.payload(request(2, session, "ble.exposure.status"));
     const std::string cold = fixture.sink.last();
@@ -1835,7 +1878,7 @@ void test_ble_pairing_status_exact_schema() {
     assert(count_occurrences(hello, "ble.pairing-transaction-v1") == 1);
     assert(hello.find("ble.pairing-control-v1") == std::string::npos);
     assert(hello.find("ble.bond-store-v1") == std::string::npos);
-    assert(count_occurrences(hello, "-v1\"") == 13);
+    assert(count_occurrences(hello, "-v1\"") == 14);
 
     fixture.payload(request(2, session, "ble.pairing.status"));
     require_contains(
@@ -2013,6 +2056,127 @@ void test_ble_pairing_respond_parser_retry_and_errors() {
     }
 }
 
+void test_ble_bond_administration_schema_errors_and_retry() {
+    {
+        Fixture fixture(0, true);
+        fixture.payload(hello_request(1, kNonceA));
+        require_contains(fixture.sink.last(),
+                         "\"ble.bond-administration-v1\"");
+        const std::string session = extract_string(fixture.sink.last(), "session");
+
+        fixture.payload(request(2, session, "ble.bond.list"));
+        require_contains(
+            fixture.sink.last(),
+            "\"result\":{\"capacity\":3,\"count\":0,\"available\":3,"
+            "\"healthy\":true,\"bonds\":[]}");
+        assert(fixture.bonds.list_calls == 1);
+
+        fixture.bonds.list_result.count = 3;
+        fixture.bonds.list_result.available = 0;
+        fixture.bonds.list_result.bonds[0] = {
+            .bond_id = bond_id('1'), .our_sec = true, .peer_sec = true,
+            .verified = true, .schema_revision_present = false};
+        fixture.bonds.list_result.bonds[1] = {
+            .bond_id = bond_id('2'), .our_sec = true, .peer_sec = true,
+            .verified = true, .schema_revision_present = true,
+            .schema_revision = 1, .schema_current = false};
+        fixture.bonds.list_result.bonds[2] = {
+            .bond_id = bond_id('f'), .our_sec = true, .peer_sec = true,
+            .verified = true, .schema_revision_present = true,
+            .schema_revision = 2, .schema_current = true};
+        fixture.payload(request(3, session, "ble.bond.list"));
+        const std::string three = fixture.sink.last();
+        require_contains(three, "\"count\":3,\"available\":0,\"healthy\":true");
+        require_contains(three, "\"schema_revision\":null");
+        require_contains(three, "\"schema_revision\":2,\"schema_current\":true");
+        assert(three.find(std::string(32, '1')) < three.find(std::string(32, '2')));
+        assert(three.find(std::string(32, '2')) < three.find(std::string(32, 'f')));
+        assert(three.find("ltk") == std::string::npos);
+        assert(three.find("irk") == std::string::npos);
+        assert(three.find("csrk") == std::string::npos);
+        assert(three.size() <= kMaxLogicalMachineFrameBytes);
+    }
+
+    {
+        Fixture fixture(0, true);
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string session = extract_string(fixture.sink.last(), "session");
+        fixture.bonds.remove_result = {
+            .kind = control_protocol::BleBondRemoveResultKind::kSuccess,
+            .remaining = 2};
+        const std::string exact = request(
+            2, session, "ble.bond.remove",
+            "{\"bond_id\":\"0123456789abcdef0123456789abcdef\"}");
+        fixture.payload(exact);
+        const std::string accepted = fixture.sink.last();
+        require_contains(accepted,
+                         "\"bond_id\":\"0123456789abcdef0123456789abcdef\","
+                         "\"removed\":true,\"remaining\":2");
+        assert(fixture.bonds.remove_calls == 1);
+        assert(std::strcmp(fixture.bonds.requested_id.data(),
+                           "0123456789abcdef0123456789abcdef") == 0);
+        fixture.payload(exact);
+        assert(fixture.sink.last() == accepted);
+        assert(fixture.bonds.remove_calls == 1);
+        fixture.payload(request(
+            2, session, "ble.bond.remove",
+            "{\"bond_id\":\"1123456789abcdef0123456789abcdef\"}"));
+        require_contains(fixture.sink.last(), "\"code\":\"REQUEST_ID_CONFLICT\"");
+        assert(fixture.bonds.remove_calls == 1);
+    }
+
+    const auto expect_invalid = [](std::string_view params) {
+        Fixture fixture(0, true);
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string session = extract_string(fixture.sink.last(), "session");
+        fixture.payload(request(2, session, "ble.bond.remove", params));
+        require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+        assert(fixture.bonds.remove_calls == 0);
+    };
+    expect_invalid("{}");
+    expect_invalid("{\"bond_id\":\"0123\"}");
+    expect_invalid("{\"bond_id\":\"0123456789ABCDEF0123456789ABCDEF\"}");
+    expect_invalid("{\"bond_id\":\"0123456789abcdef0123456789abcdef\",\"extra\":0}");
+    expect_invalid("{\"bond_id\":1}");
+
+    const std::array<std::pair<control_protocol::BleBondRemoveResultKind,
+                               std::string_view>, 5> failures{{
+        {control_protocol::BleBondRemoveResultKind::kNotReady, "BLE_NOT_READY"},
+        {control_protocol::BleBondRemoveResultKind::kNotFound, "BLE_BOND_NOT_FOUND"},
+        {control_protocol::BleBondRemoveResultKind::kAmbiguous, "BLE_BOND_AMBIGUOUS"},
+        {control_protocol::BleBondRemoveResultKind::kBusy, "BLE_BOND_BUSY"},
+        {control_protocol::BleBondRemoveResultKind::kStorageFailure,
+         "BLE_BOND_STORAGE"},
+    }};
+    for (const auto &[kind, code] : failures) {
+        Fixture fixture(0, true);
+        fixture.bonds.remove_result.kind = kind;
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string session = extract_string(fixture.sink.last(), "session");
+        fixture.payload(request(
+            2, session, "ble.bond.remove",
+            "{\"bond_id\":\"0123456789abcdef0123456789abcdef\"}"));
+        require_contains(fixture.sink.last(),
+                         std::string("\"code\":\"") + std::string(code) + "\"");
+        assert(fixture.bonds.remove_calls == 1);
+    }
+
+    for (const auto &[kind, code] : {
+             std::pair{control_protocol::BleBondListResultKind::kNotReady,
+                       "BLE_NOT_READY"},
+             std::pair{control_protocol::BleBondListResultKind::kStorageFailure,
+                       "BLE_BOND_STORAGE"},
+         }) {
+        Fixture fixture(0, true);
+        fixture.bonds.list_result.kind = kind;
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string session = extract_string(fixture.sink.last(), "session");
+        fixture.payload(request(2, session, "ble.bond.list"));
+        require_contains(fixture.sink.last(),
+                         std::string("\"code\":\"") + code + "\"");
+    }
+}
+
 void test_cjson_secret_is_wiped_before_free() {
     Fixture fixture(0, true);
     fixture.payload(hello_request(1, kNonceA));
@@ -2071,6 +2235,7 @@ int main() {
     test_ble_exposure_schema_frozen_retry_and_authority_isolation();
     test_ble_pairing_status_exact_schema();
     test_ble_pairing_respond_parser_retry_and_errors();
+    test_ble_bond_administration_schema_errors_and_retry();
     test_cjson_secret_is_wiped_before_free();
     test_pairing_rng_failure_is_startup_fail_closed();
     test_identity_hello_and_info_shapes();

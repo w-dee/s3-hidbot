@@ -258,6 +258,17 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         last_gatt_refresh_end = end_handle;
         return gatt_cache_refresh_result;
     }
+    hid_control_executor::BleBondListResult list_bonds() override {
+        ++bond_list_calls;
+        return bond_list_result;
+    }
+    hid_control_executor::BleBondRemoveResult remove_bond(
+        const hid_control_executor::BondId &bond_id) override {
+        ++bond_remove_calls;
+        last_bond_id = bond_id;
+        bond_remove_result.bond_id = bond_id;
+        return bond_remove_result;
+    }
     void record_heap_checkpoint(HeapCheckpoint checkpoint) override {
         ++heap_checkpoint_calls;
         last_heap_checkpoint = checkpoint;
@@ -327,6 +338,8 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     int gatt_schema_status_calls = 0;
     int persist_gatt_schema_calls = 0;
     int gatt_cache_refresh_calls = 0;
+    int bond_list_calls = 0;
+    int bond_remove_calls = 0;
     int heap_checkpoint_calls = 0;
     std::int32_t initialize_result = 0;
     std::int32_t advertising_result = 0;
@@ -361,6 +374,12 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     hid_control_executor::GattSchemaStoreResult persist_gatt_schema_result{
         .kind = hid_control_executor::GattSchemaStoreResultKind::kCurrent,
     };
+    hid_control_executor::BleBondListResult bond_list_result{
+        .kind = hid_control_executor::BleBondListResultKind::kSuccess,
+        .healthy = true,
+    };
+    hid_control_executor::BleBondRemoveResult bond_remove_result{};
+    hid_control_executor::BondId last_bond_id{};
     bool route_release_grace_armed = false;
     hid_control_executor::BleRouteReleaseIdentity route_release_identity{};
     ble_security::State security{};
@@ -1073,6 +1092,26 @@ void connect_ble(hid_runtime::Runtime &runtime, FakeBackend &usb,
     assert(ble.event(hid_control_executor::BleEventKind::kConnect, handle));
     assert(controller.process_one_for_test());
     assert(controller.ble_snapshot().connected);
+}
+
+void hide_ble(hid_runtime::Runtime &runtime, FakeBackend &usb,
+              FakeBleBackend &ble, FakeBleDatabase &database,
+              hid_control_executor::Controller &controller) {
+    advertise_ble(runtime, usb, ble, database, controller);
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    const auto hidden = controller.ble_snapshot();
+    assert(hidden.stack_ready && !hidden.advertising && !hidden.connected);
+    assert(hidden.desired == ble_lifecycle::DesiredExposure::kHidden);
+    assert(hidden.observed == ble_lifecycle::ObservedState::kIdle);
+}
+
+hid_control_executor::BondId executor_bond_id(char digit) {
+    hid_control_executor::BondId result{};
+    result.fill(digit);
+    result.back() = '\0';
+    return result;
 }
 
 void test_ble_disable_preserves_active_usb_route_and_reports() {
@@ -4847,6 +4886,143 @@ void test_policy_persistence_disconnect_disable_and_bounded_burst() {
     }
 }
 
+void test_bond_administration_serialization_and_safety_policy() {
+    const auto id = executor_bond_id('a');
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &usb, &ble, &database));
+        assert(controller.request_bond_list().kind ==
+               hid_control_executor::BleBondListResultKind::kNotReady);
+        assert(controller.request_bond_remove(id).kind ==
+               hid_control_executor::BleBondRemoveResultKind::kNotReady);
+        assert(ble.bond_list_calls == 0 && ble.bond_remove_calls == 0);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        advertise_ble(runtime, usb, ble, database, controller);
+        ble.bond_list_result.count = 1;
+        ble.bond_list_result.available = 2;
+        ble.bond_list_result.bonds[0] = {
+            .bond_id = id, .our_sec = true, .peer_sec = true,
+            .verified = true};
+        const auto listed = controller.request_bond_list();
+        assert(listed.kind ==
+               hid_control_executor::BleBondListResultKind::kSuccess);
+        assert(listed.count == 1 && ble.bond_list_calls == 1);
+        // Advertising is deliberately not an eligible destructive boundary:
+        // a physical connection could otherwise race the store mutation.
+        assert(controller.request_bond_remove(id).kind ==
+               hid_control_executor::BleBondRemoveResultKind::kBusy);
+        assert(ble.bond_remove_calls == 0);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        connect_ble(runtime, usb, ble, database, controller, 71);
+        // Read-only inventory remains available during a coherent connection.
+        ble.bond_list_result = {
+            .kind = hid_control_executor::BleBondListResultKind::kSuccess,
+            .healthy = true};
+        assert(controller.request_bond_list().kind ==
+               hid_control_executor::BleBondListResultKind::kSuccess);
+        assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction,
+                         71, 1));
+        assert(controller.process_one_for_test());
+        assert(controller.pairing_snapshot().pairing_active);
+        assert(controller.request_bond_remove(id).kind ==
+               hid_control_executor::BleBondRemoveResultKind::kBusy);
+        assert(ble.bond_remove_calls == 0);
+    }
+    for (const bool releasing : {false, true}) {
+        ReadyBleRouteFixture fixture(releasing ? 73 : 72);
+        if (releasing) {
+            assert(fixture.controller.request_route(hid_route::OutputRoute::kNone)
+                       .action_result ==
+                   hid_runtime::RouteTransitionResult::kAccepted);
+            assert(fixture.runtime.state_machine().route_snapshot().transition ==
+                   hid_route::Transition::kReleasing);
+        }
+        assert(fixture.controller.request_bond_remove(id).kind ==
+               hid_control_executor::BleBondRemoveResultKind::kBusy);
+        assert(fixture.ble.bond_remove_calls == 0);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &usb, &ble, &database));
+        complete_attach(runtime, usb, controller);
+        mount_ready(runtime);
+        assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+               hid_runtime::RouteTransitionResult::kAccepted);
+        hide_ble(runtime, usb, ble, database, controller);
+        const auto route_before = runtime.state_machine().route_snapshot();
+        const auto authority_before = runtime.state_machine().authority_epoch();
+        const auto keyboard_before = runtime.state_machine().keyboard_state();
+        const auto mouse_before = runtime.state_machine().mouse_state();
+        ble.bond_remove_result = {
+            .kind = hid_control_executor::BleBondRemoveResultKind::kSuccess,
+            .remaining = 2};
+        const auto removed = controller.request_bond_remove(id);
+        assert(removed.kind ==
+               hid_control_executor::BleBondRemoveResultKind::kSuccess);
+        assert(removed.remaining == 2 && ble.bond_remove_calls == 1);
+        assert(ble.last_bond_id == id);
+        const auto route_after = runtime.state_machine().route_snapshot();
+        assert(route_after.desired == route_before.desired);
+        assert(route_after.active == route_before.active);
+        assert(route_after.transition == route_before.transition);
+        assert(route_after.generation == route_before.generation);
+        assert(runtime.state_machine().authority_epoch() == authority_before);
+        assert(runtime.state_machine().keyboard_state().modifiers ==
+               keyboard_before.modifiers);
+        assert(runtime.state_machine().mouse_state().buttons ==
+               mouse_before.buttons);
+    }
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        hide_ble(runtime, usb, ble, database, controller);
+        ble.security_inhibit.inhibit(0, ble_lifecycle::kNoConnection, true);
+        assert(controller.request_bond_list().kind ==
+               hid_control_executor::BleBondListResultKind::kStorageFailure);
+        assert(controller.request_bond_remove(id).kind ==
+               hid_control_executor::BleBondRemoveResultKind::kStorageFailure);
+        assert(ble.bond_list_calls == 0 && ble.bond_remove_calls == 0);
+    }
+    for (const auto kind : {
+             hid_control_executor::BleBondRemoveResultKind::kNotFound,
+             hid_control_executor::BleBondRemoveResultKind::kAmbiguous,
+             hid_control_executor::BleBondRemoveResultKind::kStorageFailure,
+         }) {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        hide_ble(runtime, usb, ble, database, controller);
+        ble.bond_remove_result.kind = kind;
+        assert(controller.request_bond_remove(id).kind == kind);
+        assert(ble.bond_remove_calls == 1);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -4947,4 +5123,5 @@ int main() {
     test_smp_and_repeat_pairing_disconnect_failures_terminalize_recovery();
     test_queue_burst_overflow_and_id_wrap_fail_closed();
     test_policy_persistence_disconnect_disable_and_bounded_burst();
+    test_bond_administration_serialization_and_safety_policy();
 }

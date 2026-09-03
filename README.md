@@ -68,9 +68,12 @@ uninitialized and non-advertising at boot; `ble-enable` lazily starts the
 BLE-only NimBLE stack and advertises the project-owned, discoverable HID
 Service database to at most one peer. `ble-disable` hides BLE while retaining
 the initialized stack for later reuse. USB and BLE may be exposed
-simultaneously, but U7.3 never routes HID reports to BLE: `route=ble` remains
-invalid and no keyboard or mouse notification is emitted. Pairing/passkey
-control, bonding, and formal HOGP/security compliance remain deferred.
+simultaneously. Current route-v2 firmware can explicitly select an eligible
+secured BLE HID peer from stable none, while pairing remains an explicit
+passkey transaction. Firmware keeps at most three verified bonds without
+automatic eviction. The UART host can list opaque firmware bond IDs and remove
+one exact disconnected bond while BLE is hidden; that removal does not alter a
+host OS pairing database or an independent USB route.
 
 `flash-firmware` is destructive provisioning. It programs only a verified,
 supported plan and returns success only after an exact runtime identity match.

@@ -34,6 +34,8 @@ installation flow is in the project
 - Explicit BLE exposure control: `ble-enable` and `ble-disable`.
 - Explicit BLE pairing control: `ble-pairing-status` and
   `ble-pairing-respond --pairing-id ID`.
+- BLE bond inspection and exact removal: `ble-bond-list` and
+  `ble-bond-remove BOND_ID`.
 - Explicit HID output routing: `hid-route-status` and `hid-route-set none|usb|ble`.
 - UART diagnostic with safety action: `self-test`.
 - Explicit safety recovery: `release-all`.
@@ -79,6 +81,15 @@ transport retries. Python strings and bytes are immutable, however, so they
 cannot be guaranteed zeroized. Typed API callers remain responsible for the
 lifetime of their original passkey `str`; pyserial, interpreter allocator, and
 kernel copies are outside the library's erasure guarantees.
+
+Firmware stores at most three bonds and never evicts automatically.
+`ble-bond-list` returns deterministic 32-lowercase-hex opaque IDs plus
+non-secret verification/schema state. `ble-bond-remove BOND_ID` requires BLE
+to be initialized and disabled to hidden idle and removes only the exact
+firmware-side bond plus its companion HID schema revision; a stable USB route
+is unchanged. It does not remove the host OS pairing record. After successful
+firmware removal, pairing is required again, and a host retaining stale bond
+state may need a separate explicitly authorized host-side action.
 
 ## Artifact and identity commands
 

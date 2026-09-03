@@ -1,6 +1,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include <algorithm>
 #include <cstdlib>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -283,6 +284,82 @@ control_protocol::BlePairingRespondResult ble_pairing_respond(
         return control_protocol::BlePairingRespondResult::kInjectionFailed;
     }
     return control_protocol::BlePairingRespondResult::kNotPending;
+}
+
+control_protocol::BleBondListResult ble_bond_list(void *) {
+    static_assert(ble_security::kBondCapacity == 3);
+    const auto source = s_usb_exposure.request_bond_list();
+    control_protocol::BleBondListResult result{};
+    switch (source.kind) {
+        case hid_control_executor::BleBondListResultKind::kSuccess:
+            result.kind = control_protocol::BleBondListResultKind::kSuccess;
+            break;
+        case hid_control_executor::BleBondListResultKind::kStorageFailure:
+            result.kind =
+                control_protocol::BleBondListResultKind::kStorageFailure;
+            break;
+        case hid_control_executor::BleBondListResultKind::kNotReady:
+        default:
+            result.kind = control_protocol::BleBondListResultKind::kNotReady;
+            break;
+    }
+    result.count = source.count;
+    result.available = source.available;
+    result.healthy = source.healthy;
+    if (source.count > result.bonds.size()) {
+        result.kind = control_protocol::BleBondListResultKind::kStorageFailure;
+        result.count = 0;
+        result.available = static_cast<std::uint8_t>(result.bonds.size());
+        result.healthy = false;
+        return result;
+    }
+    for (std::size_t index = 0; index < source.count; ++index) {
+        result.bonds[index].bond_id = source.bonds[index].bond_id;
+        result.bonds[index].our_sec = source.bonds[index].our_sec;
+        result.bonds[index].peer_sec = source.bonds[index].peer_sec;
+        result.bonds[index].verified = source.bonds[index].verified;
+        result.bonds[index].schema_revision_present =
+            source.bonds[index].schema_revision_present;
+        result.bonds[index].schema_revision =
+            source.bonds[index].schema_revision;
+        result.bonds[index].schema_current =
+            source.bonds[index].schema_current;
+        result.bonds[index].connected = source.bonds[index].connected;
+    }
+    return result;
+}
+
+control_protocol::BleBondRemoveResult ble_bond_remove(
+    void *, const control_protocol::BondId &bond_id) {
+    hid_control_executor::BondId executor_id{};
+    std::copy(bond_id.begin(), bond_id.end(), executor_id.begin());
+    const auto source = s_usb_exposure.request_bond_remove(executor_id);
+    control_protocol::BleBondRemoveResult result{};
+    result.bond_id = source.bond_id;
+    result.remaining = source.remaining;
+    switch (source.kind) {
+        case hid_control_executor::BleBondRemoveResultKind::kSuccess:
+            result.kind = control_protocol::BleBondRemoveResultKind::kSuccess;
+            break;
+        case hid_control_executor::BleBondRemoveResultKind::kNotFound:
+            result.kind = control_protocol::BleBondRemoveResultKind::kNotFound;
+            break;
+        case hid_control_executor::BleBondRemoveResultKind::kAmbiguous:
+            result.kind = control_protocol::BleBondRemoveResultKind::kAmbiguous;
+            break;
+        case hid_control_executor::BleBondRemoveResultKind::kBusy:
+            result.kind = control_protocol::BleBondRemoveResultKind::kBusy;
+            break;
+        case hid_control_executor::BleBondRemoveResultKind::kStorageFailure:
+            result.kind =
+                control_protocol::BleBondRemoveResultKind::kStorageFailure;
+            break;
+        case hid_control_executor::BleBondRemoveResultKind::kNotReady:
+        default:
+            result.kind = control_protocol::BleBondRemoveResultKind::kNotReady;
+            break;
+    }
+    return result;
 }
 
 control_protocol::BleExposureActionOutcome ble_enable(void *) {
@@ -723,6 +800,10 @@ extern "C" void app_main() {
         .ble_pairing_status_context = nullptr,
         .ble_pairing_respond_provider = ble_pairing_respond,
         .ble_pairing_respond_context = nullptr,
+        .ble_bond_list_provider = ble_bond_list,
+        .ble_bond_list_context = nullptr,
+        .ble_bond_remove_provider = ble_bond_remove,
+        .ble_bond_remove_context = nullptr,
         .hid_route_status_provider = hid_route_status,
         .hid_route_status_context = nullptr,
         .hid_route_set_provider = hid_route_set,

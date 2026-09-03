@@ -23,9 +23,9 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -37,7 +37,7 @@ constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
 // Every formatter below writes to ResponseFrame::bytes. These conservative
 // bounds cover the largest identity-v1 protocol.hello and system.info responses
 // metadata, four 32-hex values (top-level session, result session, boot ID,
-// and client nonce), thirteen capabilities, maximum int32 id, framing, and LF.
+// and client nonce), fifteen capabilities, maximum int32 id, framing, and LF.
 // vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
@@ -71,6 +71,11 @@ static_assert(kMaximumHidRouteResponseBytes <= control_session::kMaxResponseByte
 constexpr std::size_t kMaximumBleExposureResponseBytes =
     kPrefixLength + 300 + control_session::kTokenHexLength + 1;
 static_assert(kMaximumBleExposureResponseBytes <= control_session::kMaxResponseBytes);
+constexpr std::size_t kMaximumBleBondListResponseBytes =
+    kPrefixLength + 220 + control_session::kTokenHexLength +
+    3 * (kBondIdHexChars + 150) + 1;
+static_assert(kMaximumBleBondListResponseBytes <=
+              control_session::kMaxResponseBytes);
 
 bool is_bounded_string(const char *value, std::size_t maximum_length) {
     return value != nullptr && std::strlen(value) <= maximum_length;
@@ -268,6 +273,27 @@ bool format_frame(control_session::ResponseFrame *frame, const char *format, ...
         return false;
     }
     frame->length = static_cast<std::size_t>(length);
+    return true;
+}
+
+bool append_frame(control_session::ResponseFrame *frame,
+                  const char *format, ...) {
+    if (frame == nullptr || frame->length >= sizeof(frame->bytes)) {
+        return false;
+    }
+    va_list arguments;
+    va_start(arguments, format);
+    const int length = std::vsnprintf(
+        reinterpret_cast<char *>(frame->bytes + frame->length),
+        sizeof(frame->bytes) - frame->length, format, arguments);
+    va_end(arguments);
+    if (length < 0 ||
+        static_cast<std::size_t>(length) >=
+            sizeof(frame->bytes) - frame->length) {
+        frame->length = 0;
+        return false;
+    }
+    frame->length += static_cast<std::size_t>(length);
     return true;
 }
 
@@ -703,6 +729,29 @@ bool validate_pairing_respond_params(const cJSON *params,
     return true;
 }
 
+bool valid_bond_id(const BondId &bond_id) {
+    return bond_id[kBondIdHexChars] == '\0' &&
+           control_session::is_lower_hex_token(
+               std::string_view(bond_id.data(), kBondIdHexChars));
+}
+
+bool validate_bond_remove_params(const cJSON *params, BondId *bond_id) {
+    static constexpr const char *kFields[] = {"bond_id"};
+    std::string_view value;
+    if (bond_id == nullptr || !cJSON_IsObject(params) ||
+        !object_has_only_fields(params, kFields, 1) ||
+        cJSON_GetArraySize(params) != 1 ||
+        !get_bounded_nonempty_string(params, "bond_id", kBondIdHexChars,
+                                     &value) ||
+        value.size() != kBondIdHexChars ||
+        !control_session::is_lower_hex_token(value)) {
+        return false;
+    }
+    std::memcpy(bond_id->data(), value.data(), value.size());
+    (*bond_id)[kBondIdHexChars] = '\0';
+    return true;
+}
+
 const char *pairing_state_json(BlePairingState state) {
     switch (state) {
         case BlePairingState::kSecuring: return "securing";
@@ -794,6 +843,88 @@ bool make_pairing_respond(control_session::ResponseFrame *frame,
                         "\"accepted\":true,\"pairing_id\":%lu}}\n",
                         static_cast<long>(id), session_field,
                         static_cast<unsigned long>(pairing_id));
+}
+
+bool make_bond_list(control_session::ResponseFrame *frame,
+                    ResponseSession session, std::int32_t id,
+                    const BleBondListResult &result) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session) || result.count > 3 ||
+        result.available != 3U - result.count) {
+        frame->length = 0;
+        return false;
+    }
+    if (!format_frame(frame,
+                      "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                      "\"session\":%s,\"ok\":true,\"result\":{"
+                      "\"capacity\":3,\"count\":%u,\"available\":%u,"
+                      "\"healthy\":%s,\"bonds\":[",
+                      static_cast<long>(id), session_field,
+                      static_cast<unsigned>(result.count),
+                      static_cast<unsigned>(result.available),
+                      json_bool(result.healthy))) {
+        return false;
+    }
+    bool expected_healthy = true;
+    for (std::size_t index = 0; index < result.count; ++index) {
+        const auto &bond = result.bonds[index];
+        if (!valid_bond_id(bond.bond_id) ||
+            (bond.schema_current && !bond.schema_revision_present) ||
+            (bond.verified && (!bond.our_sec || !bond.peer_sec)) ||
+            (index != 0 && std::strcmp(result.bonds[index - 1].bond_id.data(),
+                                       bond.bond_id.data()) >= 0)) {
+            frame->length = 0;
+            return false;
+        }
+        expected_healthy = expected_healthy && bond.verified;
+        if (!append_frame(
+                frame,
+                "%s{\"bond_id\":\"%s\",\"our_sec\":%s,\"peer_sec\":%s,"
+                "\"verified\":%s,\"schema_revision\":",
+                index == 0 ? "" : ",", bond.bond_id.data(),
+                json_bool(bond.our_sec), json_bool(bond.peer_sec),
+                json_bool(bond.verified))) {
+            return false;
+        }
+        if (bond.schema_revision_present) {
+            if (!append_frame(frame, "%u",
+                              static_cast<unsigned>(bond.schema_revision))) {
+                return false;
+            }
+        } else if (!append_frame(frame, "null")) {
+            return false;
+        }
+        if (!append_frame(frame,
+                          ",\"schema_current\":%s,\"connected\":%s}",
+                          json_bool(bond.schema_current),
+                          json_bool(bond.connected))) {
+            return false;
+        }
+    }
+    if (result.healthy != expected_healthy) {
+        frame->length = 0;
+        return false;
+    }
+    return append_frame(frame, "]}}\n");
+}
+
+bool make_bond_remove(control_session::ResponseFrame *frame,
+                      ResponseSession session, std::int32_t id,
+                      const BleBondRemoveResult &result) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session) ||
+        !valid_bond_id(result.bond_id) || result.remaining >= 3) {
+        frame->length = 0;
+        return false;
+    }
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"bond_id\":\"%s\",\"removed\":true,"
+                        "\"remaining\":%u}}\n",
+                        static_cast<long>(id), session_field,
+                        result.bond_id.data(),
+                        static_cast<unsigned>(result.remaining));
 }
 
 bool validate_route_set_params(const cJSON *params, bool allow_ble,
@@ -992,6 +1123,8 @@ bool Protocol::initialize(const Config &config,
         config.ble_disable_provider == nullptr ||
         config.ble_pairing_status_provider == nullptr ||
         config.ble_pairing_respond_provider == nullptr ||
+        config.ble_bond_list_provider == nullptr ||
+        config.ble_bond_remove_provider == nullptr ||
         config.hid_route_set_provider == nullptr || config.authority_epoch_provider == nullptr ||
         random_fill == nullptr ||
         !is_safe_metadata_string(config.metadata.project) ||
@@ -1516,6 +1649,75 @@ void Protocol::handle_frame(std::string_view payload) {
                     completed = make_error(&response, current_session, true, id,
                                            "BLE_PAIRING_NOT_PENDING",
                                            "pairing input is not pending");
+                    break;
+            }
+        }
+    } else if (command == "ble.bond.list") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "ble.bond.list accepts no params");
+        } else {
+            semantically_valid = true;
+            const BleBondListResult result = config_.ble_bond_list_provider(
+                config_.ble_bond_list_context);
+            switch (result.kind) {
+                case BleBondListResultKind::kSuccess:
+                    completed = make_bond_list(&response, current_session, id,
+                                               result);
+                    break;
+                case BleBondListResultKind::kStorageFailure:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_BOND_STORAGE",
+                                           "bond store is not trustworthy");
+                    break;
+                case BleBondListResultKind::kNotReady:
+                default:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_NOT_READY",
+                                           "BLE bond store is not initialized");
+                    break;
+            }
+        }
+    } else if (command == "ble.bond.remove") {
+        BondId bond_id{};
+        if (!validate_bond_remove_params(params, &bond_id)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "ble.bond.remove requires one exact bond_id");
+        } else {
+            semantically_valid = true;
+            const BleBondRemoveResult result =
+                config_.ble_bond_remove_provider(
+                    config_.ble_bond_remove_context, bond_id);
+            switch (result.kind) {
+                case BleBondRemoveResultKind::kSuccess:
+                    completed = make_bond_remove(&response, current_session,
+                                                 id, result);
+                    break;
+                case BleBondRemoveResultKind::kNotFound:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_BOND_NOT_FOUND",
+                                           "exact bond was not found");
+                    break;
+                case BleBondRemoveResultKind::kAmbiguous:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_BOND_AMBIGUOUS",
+                                           "bond identifier is not unique");
+                    break;
+                case BleBondRemoveResultKind::kBusy:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_BOND_BUSY",
+                                           "bond removal is not currently safe");
+                    break;
+                case BleBondRemoveResultKind::kStorageFailure:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_BOND_STORAGE",
+                                           "bond removal postcondition failed");
+                    break;
+                case BleBondRemoveResultKind::kNotReady:
+                default:
+                    completed = make_error(&response, current_session, true, id,
+                                           "BLE_NOT_READY",
+                                           "BLE bond store is not initialized");
                     break;
             }
         }

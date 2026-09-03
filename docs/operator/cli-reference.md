@@ -20,6 +20,8 @@ does not resolve a serial port or use them.
 | Explicit USB exposure control | `usb-attach`, `usb-detach` |
 | Explicit BLE exposure control | `ble-enable`, `ble-disable` |
 | Explicit BLE pairing control | `ble-pairing-status`, `ble-pairing-respond --pairing-id ID` |
+| BLE bond inspection | `ble-bond-list` |
+| Destructive BLE bond administration | `ble-bond-remove BOND_ID` |
 | Explicit HID output routing | `hid-route-status`, `hid-route-set none|usb|ble` |
 | UART diagnostic with safety action | `self-test` |
 | Explicit safety recovery | `release-all` |
@@ -47,6 +49,8 @@ intentionally injects a key, button, or movement.
 | `hidbotctl ble-disable` | UART + `ble.exposure-control-v1` | Stop advertising/disconnect a peer and enter hidden idle while retaining the initialized stack. It does not change USB or its HID route/session. |
 | `hidbotctl ble-pairing-status` | UART + `ble.pairing-transaction-v1` | Read one strict pairing transaction snapshot. It does not poll, connect, or pair automatically. |
 | `hidbotctl ble-pairing-respond --pairing-id ID` | UART + controlling TTY + `ble.pairing-transaction-v1` | Prompt without echo for one six-ASCII-digit passkey and submit it to the exact nonzero pairing ID. There is deliberately no passkey argv, environment, config-file, or stdin-pipe mode. |
+| `hidbotctl ble-bond-list` | UART + initialized BLE + `ble.bond-administration-v1` | List up to three firmware-side bonds in deterministic opaque-ID order, including non-secret persistence/schema state. It does not change firmware or host pairing state. |
+| `hidbotctl ble-bond-remove BOND_ID` | UART + BLE hidden idle + `ble.bond-administration-v1` | Destructively remove exactly the 32-lowercase-hex firmware bond ID and its companion schema metadata. It never selects by name, prefix, or list position. |
 | `hidbotctl hid-route-status` | UART + route v2, or v1 fallback | Read `desired`, `active`, `generation`, `transition`, and `ready`; the host prefers `hid.output-route-v2`. |
 | `hidbotctl hid-route-set none` | UART + route v2, or v1 fallback | Safely retire the active USB or BLE route. BLE remains `releasing` until exact disconnect completes. |
 | `hidbotctl hid-route-set usb` | UART + route v2, or v1 fallback | Select an already mounted, safety-clear USB transport from stable none. |
@@ -99,6 +103,17 @@ intentionally log or retain the passkey beyond the request/retry lifetime, but
 immutable Python `str` and `bytes` objects cannot be guaranteed zeroized.
 Typed API callers own the lifetime of their original passkey string; no claim
 is made about interpreter allocator, pyserial, or kernel copies.
+
+The firmware stores at most three bonds and never evicts one automatically.
+Use `ble-bond-list` to obtain the exact opaque ID. Before removal, select route
+`none` if BLE is active, wait for stable retirement, and run `ble-disable` until
+BLE is hidden, idle, disconnected, and non-advertising. A stable USB route may
+remain active and is not changed by removal. Successful removal verifies that
+both NimBLE security records and the exact peer's HID schema revision are gone;
+unrelated bonds are preserved. The host OS maintains a separate pairing
+record, so this command does not unpair BlueZ or any other host stack. The next
+encounter requires firmware-side pairing again and may require a separately
+authorized host-side cleanup if that host retains stale bond state.
 
 ## Artifact and firmware identity
 

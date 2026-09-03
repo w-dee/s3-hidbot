@@ -21,6 +21,7 @@ enum class ControlOperation : std::uint8_t {
     kRouteChange,
     kBleEnable,
     kBleDisable,
+    kBondAdministration,
 };
 
 enum class BackendResultKind : std::uint8_t {
@@ -154,6 +155,49 @@ struct BleRouteReleaseIdentity {
     std::uint32_t release_epoch = 0;
 };
 
+inline constexpr std::size_t kBondIdHexChars = 32;
+using BondId = std::array<char, kBondIdHexChars + 1>;
+
+struct BleBondInfo {
+    BondId bond_id{};
+    bool our_sec = false;
+    bool peer_sec = false;
+    bool verified = false;
+    bool schema_revision_present = false;
+    std::uint8_t schema_revision = 0;
+    bool schema_current = false;
+    bool connected = false;
+};
+
+enum class BleBondListResultKind : std::uint8_t {
+    kSuccess,
+    kNotReady,
+    kStorageFailure,
+};
+
+struct BleBondListResult {
+    BleBondListResultKind kind = BleBondListResultKind::kNotReady;
+    std::array<BleBondInfo, ble_security::kBondCapacity> bonds{};
+    std::uint8_t count = 0;
+    std::uint8_t available = ble_security::kBondCapacity;
+    bool healthy = false;
+};
+
+enum class BleBondRemoveResultKind : std::uint8_t {
+    kSuccess,
+    kNotReady,
+    kNotFound,
+    kAmbiguous,
+    kBusy,
+    kStorageFailure,
+};
+
+struct BleBondRemoveResult {
+    BleBondRemoveResultKind kind = BleBondRemoveResultKind::kNotReady;
+    BondId bond_id{};
+    std::uint8_t remaining = 0;
+};
+
 struct BleEvent {
     BleEventKind kind = BleEventKind::kSync;
     ble_lifecycle::Generation generation = 0;
@@ -276,6 +320,10 @@ class BleBackend {
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle, std::uint16_t start_handle,
         std::uint16_t end_handle) = 0;
+    // These store operations are invoked only by Controller's serialized task.
+    // Implementations expose opaque IDs and never return security key material.
+    virtual BleBondListResult list_bonds() = 0;
+    virtual BleBondRemoveResult remove_bond(const BondId &bond_id) = 0;
     virtual void record_heap_checkpoint(HeapCheckpoint checkpoint) = 0;
 };
 
@@ -334,6 +382,8 @@ class Controller final : public usb_lifecycle::Executor,
         kPairingRespond,
         kBleHidReport,
         kBleRouteReleaseGrace,
+        kBondList,
+        kBondRemove,
     };
 
     struct Action {
@@ -381,6 +431,8 @@ class Controller final : public usb_lifecycle::Executor,
     ble_pairing::RespondResult request_pairing_response(
         std::uint32_t pairing_id,
         const std::array<char, 6> &six_digit_secret);
+    BleBondListResult request_bond_list();
+    BleBondRemoveResult request_bond_remove(const BondId &bond_id);
 
     // Internal executor-owned seam. It is deliberately not connected to the
     // UART protocol; callers must already run in the serialized owner context.
@@ -474,6 +526,8 @@ class Controller final : public usb_lifecycle::Executor,
     bool ble_route_ready() const;
     void wipe_pairing_mailbox();
     void complete_pairing_rpc(std::uint32_t token);
+    std::uint32_t begin_serialized_rpc();
+    bool bond_remove_eligible() const;
     void begin_ble_hid_peer(ble_lifecycle::Generation generation,
                             std::uint16_t connection_handle);
     void clear_ble_hid_peer();
@@ -556,6 +610,9 @@ class Controller final : public usb_lifecycle::Executor,
     PairingStatusSnapshot pairing_rpc_status_{};
     ble_pairing::RespondResult pairing_rpc_result_ =
         ble_pairing::RespondResult::kNotPending;
+    BondId bond_remove_mailbox_{};
+    BleBondListResult bond_list_rpc_result_{};
+    BleBondRemoveResult bond_remove_rpc_result_{};
     RouteCommandOutcome route_rpc_result_{};
     BleHidPeerSnapshot ble_hid_peer_{};
     enum class BleRouteReleasePhase : std::uint8_t {

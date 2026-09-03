@@ -1,5 +1,6 @@
 #include "ble_transport/ble_transport.hpp"
 
+#include <array>
 #include <cstring>
 
 #include "ble_hid_service/ble_hid_service.hpp"
@@ -12,6 +13,7 @@
 #include "host/ble_store.h"
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
+#include "mbedtls/md.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs.h"
@@ -40,6 +42,62 @@ ble_uuid16_t s_gatt_service_uuid = BLE_UUID16_INIT(0x1801);
 ble_uuid16_t s_service_changed_uuid = BLE_UUID16_INIT(0x2a05);
 constexpr char kSchemaNamespace[] = "hid_schema";
 constexpr char kSchemaKeyHex[] = "0123456789abcdef";
+constexpr char kBondIdDomain[] = "s3-hidbot/bond-id/v1";
+
+struct StoredPeer {
+    ble_addr_t identity{};
+    ble_security::StoredSecurityRecord our{};
+    ble_security::StoredSecurityRecord peer{};
+};
+
+bool has_exact_identity(const ble_addr_t &identity);
+
+bool same_identity(const ble_addr_t &left, const ble_addr_t &right) {
+    return ble_addr_cmp(&left, &right) == 0;
+}
+
+bool valid_identity(const ble_addr_t &identity) {
+    return (identity.type == BLE_ADDR_PUBLIC ||
+            identity.type == BLE_ADDR_RANDOM) &&
+           has_exact_identity(identity);
+}
+
+ble_security::StoredSecurityRecord security_record(
+    const ble_addr_t &identity, int result,
+    const ble_store_value_sec &value) {
+    return {
+        .found = result == 0,
+        .identity_matches = result == 0 &&
+                            same_identity(identity, value.peer_addr),
+        .ltk_present = result == 0 && value.ltk_present != 0,
+        .authenticated = result == 0 && value.authenticated != 0,
+        .secure_connections = result == 0 && value.sc != 0,
+        .key_size = result == 0 ? value.key_size : std::uint8_t{0},
+    };
+}
+
+bool make_bond_id(const ble_addr_t &identity,
+                  hid_control_executor::BondId &output) {
+    std::array<std::uint8_t, sizeof(kBondIdDomain) - 1 + 1 + 6> input{};
+    std::memcpy(input.data(), kBondIdDomain, sizeof(kBondIdDomain) - 1);
+    input[sizeof(kBondIdDomain) - 1] = identity.type;
+    std::memcpy(input.data() + sizeof(kBondIdDomain), identity.val,
+                sizeof(identity.val));
+    std::array<std::uint8_t, 32> digest{};
+    const mbedtls_md_info_t *info =
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (info == nullptr ||
+        mbedtls_md(info, input.data(), input.size(), digest.data()) != 0) {
+        return false;
+    }
+    for (std::size_t index = 0;
+         index < hid_control_executor::kBondIdHexChars / 2; ++index) {
+        output[index * 2] = kSchemaKeyHex[digest[index] >> 4U];
+        output[index * 2 + 1] = kSchemaKeyHex[digest[index] & 0x0fU];
+    }
+    output[hid_control_executor::kBondIdHexChars] = '\0';
+    return true;
+}
 
 void schema_key(const ble_addr_t &identity, char (&key)[16]) {
     key[0] = 'r';
@@ -902,6 +960,254 @@ std::int32_t Backend::request_gatt_cache_refresh(
     }
     ble_svc_gatt_changed(start_handle, end_handle);
     return 0;
+}
+
+hid_control_executor::BleBondListResult Backend::list_bonds() {
+    using Result = hid_control_executor::BleBondListResult;
+    using Kind = hid_control_executor::BleBondListResultKind;
+    constexpr std::size_t kDetectionCapacity =
+        ble_security::kBondCapacity + 1;
+    if (!initialized_) {
+        return {};
+    }
+    if (persistent_store_failure_observed()) {
+        return {.kind = Kind::kStorageFailure};
+    }
+
+    std::array<StoredPeer, kDetectionCapacity> peers{};
+    std::size_t peer_count = 0;
+    const auto fail_storage = [this](std::int32_t status) {
+        observe_store_failure(ble_security::StoreFailureKind::kRead, status,
+                              true, ble_lifecycle::kNoConnection);
+        return Result{.kind = Kind::kStorageFailure};
+    };
+    const auto collect = [&](bool our) -> std::int32_t {
+        for (std::uint8_t index = 0; index < kDetectionCapacity; ++index) {
+            ble_store_key_sec key{};
+            key.idx = index;
+            ble_store_value_sec value{};
+            const int result = our ? ble_store_read_our_sec(&key, &value)
+                                   : ble_store_read_peer_sec(&key, &value);
+            if (result == BLE_HS_ENOENT) {
+                return 0;
+            }
+            if (result != 0 || !valid_identity(value.peer_addr)) {
+                return result != 0 ? result : BLE_HS_EINVAL;
+            }
+            std::size_t peer_index = 0;
+            while (peer_index < peer_count &&
+                   !same_identity(peers[peer_index].identity,
+                                  value.peer_addr)) {
+                ++peer_index;
+            }
+            if (peer_index == peer_count) {
+                if (peer_count == peers.size()) {
+                    return BLE_HS_ENOMEM;
+                }
+                peers[peer_count++].identity = value.peer_addr;
+            } else if ((our && peers[peer_index].our.found) ||
+                       (!our && peers[peer_index].peer.found)) {
+                return BLE_HS_ESTORE_FAIL;
+            }
+            auto &record = our ? peers[peer_index].our
+                               : peers[peer_index].peer;
+            record = security_record(peers[peer_index].identity, result,
+                                     value);
+        }
+        return BLE_HS_ENOMEM;
+    };
+
+    std::int32_t status = collect(true);
+    if (status == 0) {
+        status = collect(false);
+    }
+    if (status != 0 || peer_count > ble_security::kBondCapacity) {
+        return fail_storage(status != 0 ? status : BLE_HS_ENOMEM);
+    }
+
+    Result result{.kind = Kind::kSuccess, .healthy = true};
+    ble_addr_t connected_identity{};
+    const std::uint16_t connection =
+        current_connection_.load(std::memory_order_acquire);
+    const bool connected_identity_valid =
+        connection != ble_lifecycle::kNoConnection &&
+        peer_identity(connection, connected_identity);
+    for (std::size_t index = 0; index < peer_count; ++index) {
+        auto &output = result.bonds[index];
+        const auto &peer = peers[index];
+        if (!make_bond_id(peer.identity, output.bond_id)) {
+            return fail_storage(BLE_HS_ESTORE_FAIL);
+        }
+        output.our_sec = peer.our.found;
+        output.peer_sec = peer.peer.found;
+        output.verified = ble_security::State::persisted_bond_is_valid(
+            {.our = peer.our, .peer = peer.peer});
+        std::uint8_t revision = 0;
+        const esp_err_t schema_result =
+            read_schema_revision(peer.identity, revision);
+        if (schema_result == ESP_OK) {
+            output.schema_revision_present = true;
+            output.schema_revision = revision;
+            output.schema_current =
+                revision == ble_hid_service::kGattSchemaRevision;
+        } else if (schema_result != ESP_ERR_NVS_NOT_FOUND) {
+            return fail_storage(schema_result);
+        }
+        output.connected = connected_identity_valid &&
+                           same_identity(peer.identity, connected_identity);
+        result.healthy = result.healthy && output.verified;
+    }
+    result.count = static_cast<std::uint8_t>(peer_count);
+    result.available = static_cast<std::uint8_t>(
+        ble_security::kBondCapacity - peer_count);
+
+    for (std::size_t left = 0; left < peer_count; ++left) {
+        for (std::size_t right = left + 1; right < peer_count; ++right) {
+            const int order = std::strcmp(result.bonds[left].bond_id.data(),
+                                          result.bonds[right].bond_id.data());
+            if (order == 0) {
+                result.healthy = false;
+            } else if (order > 0) {
+                const auto temporary = result.bonds[left];
+                result.bonds[left] = result.bonds[right];
+                result.bonds[right] = temporary;
+            }
+        }
+    }
+    return result;
+}
+
+hid_control_executor::BleBondRemoveResult Backend::remove_bond(
+    const hid_control_executor::BondId &bond_id) {
+    using Result = hid_control_executor::BleBondRemoveResult;
+    using Kind = hid_control_executor::BleBondRemoveResultKind;
+    Result result{.kind = Kind::kNotFound, .bond_id = bond_id};
+    const auto before = list_bonds();
+    if (before.kind ==
+        hid_control_executor::BleBondListResultKind::kNotReady) {
+        result.kind = Kind::kNotReady;
+        return result;
+    }
+    if (before.kind ==
+        hid_control_executor::BleBondListResultKind::kStorageFailure) {
+        result.kind = Kind::kStorageFailure;
+        return result;
+    }
+    std::size_t match_count = 0;
+    std::size_t match_index = 0;
+    for (std::size_t index = 0; index < before.count; ++index) {
+        if (std::strcmp(before.bonds[index].bond_id.data(), bond_id.data()) ==
+            0) {
+            match_index = index;
+            ++match_count;
+        }
+    }
+    if (match_count == 0) {
+        return result;
+    }
+    if (match_count != 1) {
+        result.kind = Kind::kAmbiguous;
+        return result;
+    }
+    if (!before.healthy) {
+        result.kind = Kind::kStorageFailure;
+        return result;
+    }
+    if (before.bonds[match_index].connected) {
+        result.kind = Kind::kBusy;
+        return result;
+    }
+
+    std::array<ble_addr_t, ble_security::kBondCapacity> identities{};
+    int identity_count = 0;
+    int status = ble_store_util_bonded_peers(
+        identities.data(), &identity_count,
+        static_cast<int>(identities.size()));
+    ble_addr_t target{};
+    std::size_t exact_identity_matches = 0;
+    for (int index = 0; status == 0 && index < identity_count; ++index) {
+        hid_control_executor::BondId candidate{};
+        if (!make_bond_id(identities[static_cast<std::size_t>(index)],
+                          candidate)) {
+            status = BLE_HS_ESTORE_FAIL;
+            break;
+        }
+        if (std::strcmp(candidate.data(), bond_id.data()) == 0) {
+            target = identities[static_cast<std::size_t>(index)];
+            ++exact_identity_matches;
+        }
+    }
+    if (status != 0 || exact_identity_matches != 1) {
+        if (status != 0) {
+            observe_store_failure(ble_security::StoreFailureKind::kRead,
+                                  status, true,
+                                  ble_lifecycle::kNoConnection);
+            result.kind = Kind::kStorageFailure;
+        } else {
+            result.kind = exact_identity_matches == 0 ? Kind::kNotFound
+                                                       : Kind::kAmbiguous;
+        }
+        return result;
+    }
+
+    status = ble_store_util_delete_peer(&target);
+    if (status != 0) {
+        observe_store_failure(ble_security::StoreFailureKind::kDelete, status,
+                              true, ble_lifecycle::kNoConnection);
+        result.kind = Kind::kStorageFailure;
+        return result;
+    }
+
+    ble_store_key_sec key{};
+    key.peer_addr = target;
+    ble_store_value_sec value{};
+    const int our_status = ble_store_read_our_sec(&key, &value);
+    const int peer_status = ble_store_read_peer_sec(&key, &value);
+    std::uint8_t revision = 0;
+    const esp_err_t schema_status = read_schema_revision(target, revision);
+    const auto after = list_bonds();
+    bool others_preserved =
+        after.kind == hid_control_executor::BleBondListResultKind::kSuccess &&
+        after.healthy && after.count + 1U == before.count;
+    for (std::size_t old_index = 0;
+         others_preserved && old_index < before.count; ++old_index) {
+        if (old_index == match_index) {
+            continue;
+        }
+        bool found = false;
+        for (std::size_t new_index = 0; new_index < after.count; ++new_index) {
+            const auto &old_bond = before.bonds[old_index];
+            const auto &new_bond = after.bonds[new_index];
+            found = found ||
+                (std::strcmp(old_bond.bond_id.data(),
+                             new_bond.bond_id.data()) == 0 &&
+                 old_bond.our_sec == new_bond.our_sec &&
+                 old_bond.peer_sec == new_bond.peer_sec &&
+                 old_bond.verified == new_bond.verified &&
+                 old_bond.schema_revision_present ==
+                     new_bond.schema_revision_present &&
+                 old_bond.schema_revision == new_bond.schema_revision &&
+                 old_bond.schema_current == new_bond.schema_current &&
+                 old_bond.connected == new_bond.connected);
+        }
+        others_preserved = found;
+    }
+    if (our_status != BLE_HS_ENOENT || peer_status != BLE_HS_ENOENT ||
+        schema_status != ESP_ERR_NVS_NOT_FOUND || !others_preserved) {
+        const std::int32_t failure =
+            our_status != BLE_HS_ENOENT ? our_status
+            : peer_status != BLE_HS_ENOENT ? peer_status
+            : schema_status != ESP_ERR_NVS_NOT_FOUND ? schema_status
+                                                     : BLE_HS_ESTORE_FAIL;
+        observe_store_failure(ble_security::StoreFailureKind::kDelete,
+                              failure, true,
+                              ble_lifecycle::kNoConnection);
+        result.kind = Kind::kStorageFailure;
+        return result;
+    }
+    result.kind = Kind::kSuccess;
+    result.remaining = after.count;
+    return result;
 }
 
 void Backend::refresh_security(std::uint16_t connection_handle,

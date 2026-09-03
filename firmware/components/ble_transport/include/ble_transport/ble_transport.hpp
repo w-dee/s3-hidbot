@@ -75,6 +75,9 @@ class Backend final : public hid_control_executor::BleBackend {
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle, std::uint16_t start_handle,
         std::uint16_t end_handle) override;
+    hid_control_executor::BleBondListResult list_bonds() override;
+    hid_control_executor::BleBondRemoveResult remove_bond(
+        const hid_control_executor::BondId &bond_id) override;
 
     static void on_sync();
     static void on_reset(int reason);

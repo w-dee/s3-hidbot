@@ -209,7 +209,9 @@ def main() -> int:
     assert "event->passkey.params.action == BLE_SM_IOACT_INPUT" in transport
     assert "BLE_GAP_EVENT_REPEAT_PAIRING" in transport
     assert "return BLE_GAP_REPEAT_PAIRING_IGNORE;" in transport
-    assert "ble_store_util_delete_peer" not in transport
+    # U7.5B adds one exact, administrator-selected deletion path. Repeat
+    # pairing remains ignore-only and must never become an eviction trigger.
+    assert transport.count("ble_store_util_delete_peer(&target)") == 1
     assert transport.count("ble_gap_security_initiate(connection_handle)") == 1
     assert transport.count("ble_sm_inject_io(connection_handle, &input)") == 1
     assert "input.action = BLE_SM_IOACT_INPUT;" in transport

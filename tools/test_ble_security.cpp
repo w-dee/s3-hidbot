@@ -92,7 +92,8 @@ void readiness_and_fencing() {
     assert(failed.coherent && !failed.store_healthy);
     assert(failed.last_store_failure == ble_security::StoreFailureKind::kCapacityFull);
 
-    for (const auto kind : {ble_security::StoreFailureKind::kWrite,
+    for (const auto kind : {ble_security::StoreFailureKind::kRead,
+                            ble_security::StoreFailureKind::kWrite,
                             ble_security::StoreFailureKind::kDelete}) {
         State store_failure;
         store_failure.begin_connection(generation, handle);
@@ -159,6 +160,19 @@ class FixedIdentityStore {
         for (std::uint8_t value : identities_) if (value == identity) return true;
         return false;
     }
+    bool remove(std::uint8_t identity) {
+        for (std::size_t index = 0; index < count_; ++index) {
+            if (identities_[index] != identity) continue;
+            for (std::size_t next = index + 1; next < count_; ++next) {
+                identities_[next - 1] = identities_[next];
+            }
+            identities_[--count_] = 0;
+            full_ = false;
+            return true;
+        }
+        return false;
+    }
+    std::size_t count() const { return count_; }
     bool full() const { return full_; }
   private:
     std::array<std::uint8_t, ble_security::kBondCapacity> identities_{};
@@ -173,6 +187,16 @@ void capacity_is_fail_closed() {
     assert(!store.insert(4) && store.full());
     assert(store.contains(1) && store.contains(2) && store.contains(3));
     assert(!store.contains(4));
+    assert(!store.remove(4));
+    assert(store.count() == 3);
+    assert(store.remove(2));
+    assert(store.count() == 2 && store.contains(1) && store.contains(3));
+    assert(!store.contains(2));
+    assert(store.insert(4) && store.count() == 3);
+    assert(store.contains(1) && store.contains(3) && store.contains(4));
+    // A reboot model is a copy of persistent records, not a repopulation.
+    const FixedIdentityStore rebooted = store;
+    assert(!rebooted.contains(2));
 }
 }  // namespace
 

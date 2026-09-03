@@ -9,11 +9,17 @@ from hidbot.client import Client
 from hidbot.errors import CompatibilityError, ProtocolError, RemoteError, RequestTimeoutError
 from hidbot.framing import FRAME_PREFIX
 from hidbot.protocol import (
+    BLE_BOND_ADMINISTRATION_CAPABILITY,
     BLE_PAIRING_TRANSACTION_CAPABILITY,
+    BleBondList,
+    BleBondRemoveResult,
     BlePairingAction,
     BlePairingLastResult,
     BlePairingState,
+    build_ble_bond_remove_frame,
     build_ble_pairing_respond_frame,
+    validate_ble_bond_list,
+    validate_ble_bond_remove_result,
     validate_ble_pairing_respond_result,
     validate_ble_pairing_status,
 )
@@ -60,6 +66,27 @@ def status_value(**updates: object) -> dict[str, object]:
     }
     value.update(updates)
     return value
+
+
+def bond_value(*ids: str, healthy: bool = True) -> dict[str, object]:
+    return {
+        "capacity": 3,
+        "count": len(ids),
+        "available": 3 - len(ids),
+        "healthy": healthy,
+        "bonds": [
+            {
+                "bond_id": bond_id,
+                "our_sec": True,
+                "peer_sec": True,
+                "verified": True,
+                "schema_revision": 2,
+                "schema_current": True,
+                "connected": False,
+            }
+            for bond_id in ids
+        ],
+    }
 
 
 class Clock:
@@ -361,6 +388,113 @@ class PairingClientTests(unittest.TestCase):
             client.ble_pairing_respond(1, SECRET)
         self.assertNotIn(SECRET, str(caught.exception))
         self.assertNotIn(SECRET, repr(caught.exception))
+
+
+class BondAdministrationTests(unittest.TestCase):
+    def test_list_empty_one_three_and_strict_abnormal_states(self) -> None:
+        empty = validate_ble_bond_list(bond_value())
+        self.assertIsInstance(empty, BleBondList)
+        self.assertEqual((empty.count, empty.available, empty.bonds), (0, 3, ()))
+        one = validate_ble_bond_list(bond_value("1" * 32))
+        self.assertEqual(one.bonds[0].bond_id, "1" * 32)
+        three = validate_ble_bond_list(
+            bond_value("0" * 32, "8" * 32, "f" * 32)
+        )
+        self.assertEqual([item.bond_id for item in three.bonds],
+                         ["0" * 32, "8" * 32, "f" * 32])
+
+        half = bond_value("2" * 32, healthy=False)
+        half["bonds"][0]["peer_sec"] = False  # type: ignore[index]
+        half["bonds"][0]["verified"] = False  # type: ignore[index]
+        self.assertFalse(validate_ble_bond_list(half).healthy)
+
+        invalid = [
+            {**bond_value(), "capacity": 4},
+            {**bond_value(), "available": 2},
+            {**bond_value("1" * 32), "healthy": False},
+            bond_value("f" * 32, "0" * 32),
+            bond_value("0" * 32, "0" * 32),
+            bond_value("A" * 32),
+            {**bond_value(), "ltk": "secret"},
+        ]
+        incoherent = bond_value("3" * 32)
+        incoherent["bonds"][0]["schema_revision"] = None  # type: ignore[index]
+        invalid.append(incoherent)
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ProtocolError):
+                validate_ble_bond_list(value)
+
+    def test_remove_builder_result_and_client_are_exact_and_typed(self) -> None:
+        selected = "0123456789abcdef0123456789abcdef"
+        self.assertEqual(
+            build_ble_bond_remove_frame(4, TOKEN, selected),
+            b'@HIDBOT {"v":1,"id":4,"session":"0123456789abcdef0123456789abcdef",'
+            b'"cmd":"ble.bond.remove","params":{"bond_id":"0123456789abcdef0123456789abcdef"}}\n',
+        )
+        parsed = validate_ble_bond_remove_result(
+            {"bond_id": selected, "removed": True, "remaining": 2}
+        )
+        self.assertIsInstance(parsed, BleBondRemoveResult)
+
+        def on_write(transport: Transport, data: bytes) -> None:
+            request = json.loads(data[len(FRAME_PREFIX) : -1])
+            if request["cmd"] == "ble.bond.list":
+                transport.chunks.append(
+                    response(request["id"], result=bond_value(selected))
+                )
+            else:
+                self.assertEqual(request["params"], {"bond_id": selected})
+                transport.chunks.append(
+                    response(
+                        request["id"],
+                        result={"bond_id": selected, "removed": True, "remaining": 0},
+                    )
+                )
+
+        transport = Transport(on_write)
+        client = client_for(transport, attempts=1)
+        client._capabilities = (BLE_BOND_ADMINISTRATION_CAPABILITY,)
+        self.assertEqual(client.ble_bond_list().bonds[0].bond_id, selected)
+        self.assertEqual(client.ble_bond_remove(selected).bond_id, selected)
+
+    def test_remove_retry_is_byte_identical_and_invalid_or_missing_cap_is_zero_wire(self) -> None:
+        selected = "a" * 32
+        attempts = 0
+
+        def on_write(transport: Transport, data: bytes) -> None:
+            nonlocal attempts
+            attempts += 1
+            request = json.loads(data[len(FRAME_PREFIX) : -1])
+            if attempts == 2:
+                transport.chunks.append(
+                    response(
+                        request["id"],
+                        result={"bond_id": selected, "removed": True, "remaining": 1},
+                    )
+                )
+
+        transport = Transport(on_write)
+        client = client_for(transport, attempts=2)
+        client._capabilities = (BLE_BOND_ADMINISTRATION_CAPABILITY,)
+        self.assertTrue(client.ble_bond_remove(selected).removed)
+        self.assertEqual(transport.writes, [transport.writes[0], transport.writes[0]])
+
+        invalid_transport = Transport()
+        invalid = client_for(invalid_transport)
+        invalid._capabilities = (BLE_BOND_ADMINISTRATION_CAPABILITY,)
+        for value in ("", "0" * 31, "0" * 33, "A" * 32, 1, None):
+            with self.assertRaises(ProtocolError):
+                invalid.ble_bond_remove(value)  # type: ignore[arg-type]
+        self.assertEqual(invalid_transport.writes, [])
+
+        missing_transport = Transport()
+        missing = client_for(missing_transport)
+        missing._capabilities = ()
+        with self.assertRaises(CompatibilityError):
+            missing.ble_bond_list()
+        with self.assertRaises(CompatibilityError):
+            missing.ble_bond_remove(selected)
+        self.assertEqual(missing_transport.writes, [])
 
 
 if __name__ == "__main__":

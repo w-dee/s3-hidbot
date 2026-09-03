@@ -20,6 +20,7 @@ constexpr std::uint8_t kBondCapacity = 3;
 enum class StoreFailureKind : std::uint8_t {
     kNone,
     kCapacityFull,
+    kRead,
     kWrite,
     kDelete,
 };

@@ -227,6 +227,80 @@ ble_pairing::RespondResult Controller::request_pairing_response(
     return pairing_rpc_result_;
 }
 
+std::uint32_t Controller::begin_serialized_rpc() {
+    if (pairing_rpc_pending_.load(std::memory_order_acquire) != 0) {
+        return 0;
+    }
+    std::uint32_t token = next_pairing_rpc_token_++;
+    if (token == 0) {
+        token = next_pairing_rpc_token_++;
+    }
+    pairing_rpc_pending_.store(token, std::memory_order_release);
+    return token;
+}
+
+BleBondListResult Controller::request_bond_list() {
+    if (!initialized_ || ble_backend_ == nullptr) {
+        return {};
+    }
+    const std::uint32_t token = begin_serialized_rpc();
+    if (token == 0) {
+        return {};
+    }
+    bond_list_rpc_result_ = {};
+    if (!enqueue(Action{.kind = ActionKind::kBondList,
+                        .mailbox_token = token})) {
+        pairing_rpc_pending_.store(0, std::memory_order_release);
+        return {};
+    }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    while (pairing_rpc_pending_.load(std::memory_order_acquire) == token &&
+           process_one_for_test()) {
+    }
+#else
+    (void)xSemaphoreTake(s_pairing_rpc_completion, portMAX_DELAY);
+#endif
+    return bond_list_rpc_result_;
+}
+
+BleBondRemoveResult Controller::request_bond_remove(const BondId &bond_id) {
+    constexpr ControlOperation operation =
+        ControlOperation::kBondAdministration;
+    BleBondRemoveResult unavailable{};
+    unavailable.bond_id = bond_id;
+    if (!initialized_ || ble_backend_ == nullptr) {
+        return unavailable;
+    }
+    if (!claim_operation(operation)) {
+        unavailable.kind = BleBondRemoveResultKind::kBusy;
+        return unavailable;
+    }
+    const std::uint32_t token = begin_serialized_rpc();
+    if (token == 0) {
+        release_operation(operation);
+        unavailable.kind = BleBondRemoveResultKind::kBusy;
+        return unavailable;
+    }
+    bond_remove_mailbox_ = bond_id;
+    bond_remove_rpc_result_ = unavailable;
+    if (!enqueue(Action{.kind = ActionKind::kBondRemove,
+                        .operation = operation,
+                        .mailbox_token = token})) {
+        bond_remove_mailbox_ = {};
+        pairing_rpc_pending_.store(0, std::memory_order_release);
+        release_operation(operation);
+        return unavailable;
+    }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    while (pairing_rpc_pending_.load(std::memory_order_acquire) == token &&
+           process_one_for_test()) {
+    }
+#else
+    (void)xSemaphoreTake(s_pairing_rpc_completion, portMAX_DELAY);
+#endif
+    return bond_remove_rpc_result_;
+}
+
 bool Controller::signal_ble_event(BleEvent event) {
     mark_ble_route_loss(event);
     const Action item{.kind = ActionKind::kBleEvent, .ble_event = event};
@@ -1188,6 +1262,53 @@ void Controller::process(Action action) {
         complete_pairing_rpc(action.mailbox_token);
         return;
     }
+    if (action.kind == ActionKind::kBondList) {
+        if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
+            action.mailbox_token) {
+            return;
+        }
+        const auto lifecycle = ble_state_.snapshot();
+        if (!lifecycle.stack_ready) {
+            bond_list_rpc_result_ = {};
+        } else if (lifecycle.recovery_required ||
+                   ble_backend_->persistent_store_failure_observed()) {
+            bond_list_rpc_result_ = {
+                .kind = BleBondListResultKind::kStorageFailure};
+        } else {
+            bond_list_rpc_result_ = ble_backend_->list_bonds();
+        }
+        complete_pairing_rpc(action.mailbox_token);
+        return;
+    }
+    if (action.kind == ActionKind::kBondRemove) {
+        if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
+            action.mailbox_token) {
+            release_operation(action.operation);
+            return;
+        }
+        const BondId bond_id = bond_remove_mailbox_;
+        bond_remove_mailbox_ = {};
+        const auto lifecycle = ble_state_.snapshot();
+        if (!lifecycle.stack_ready) {
+            bond_remove_rpc_result_ = {
+                .kind = BleBondRemoveResultKind::kNotReady,
+                .bond_id = bond_id};
+        } else if (lifecycle.recovery_required ||
+                   ble_backend_->persistent_store_failure_observed()) {
+            bond_remove_rpc_result_ = {
+                .kind = BleBondRemoveResultKind::kStorageFailure,
+                .bond_id = bond_id};
+        } else if (!bond_remove_eligible()) {
+            bond_remove_rpc_result_ = {
+                .kind = BleBondRemoveResultKind::kBusy,
+                .bond_id = bond_id};
+        } else {
+            bond_remove_rpc_result_ = ble_backend_->remove_bond(bond_id);
+        }
+        release_operation(action.operation);
+        complete_pairing_rpc(action.mailbox_token);
+        return;
+    }
     if (action.kind == ActionKind::kBleEvent) {
         complete_ble_route_release_on_disconnect(action.ble_event);
         process_ble_event(action.ble_event);
@@ -1378,10 +1499,13 @@ bool Controller::reconcile_ble_fallbacks(const Action *action) {
         const bool detailed =
             action != nullptr && action->kind == ActionKind::kBleEvent &&
             action->ble_event.kind == BleEventKind::kStorageFailure;
+        const auto reported_kind =
+            detailed ? action->ble_event.store_failure_kind
+                     : ble_security::StoreFailureKind::kNone;
         const auto kind =
-            detailed && action->ble_event.store_failure_kind ==
-                            ble_security::StoreFailureKind::kDelete
-                ? ble_security::StoreFailureKind::kDelete
+            reported_kind == ble_security::StoreFailureKind::kRead ||
+                    reported_kind == ble_security::StoreFailureKind::kDelete
+                ? reported_kind
                 : ble_security::StoreFailureKind::kWrite;
         commit_persistent_store_failure(
             kind, detailed ? action->ble_event.status : -3);
@@ -1947,6 +2071,27 @@ void Controller::complete_pairing_rpc(std::uint32_t token) {
 #endif
 }
 
+bool Controller::bond_remove_eligible() const {
+    if (runtime_ == nullptr || ble_backend_ == nullptr) {
+        return false;
+    }
+    const auto lifecycle = ble_state_.snapshot();
+    const auto route = runtime_->state_machine().route_snapshot();
+    const auto pairing = pairing_state_.snapshot();
+    return lifecycle.stack_ready &&
+           lifecycle.desired == ble_lifecycle::DesiredExposure::kHidden &&
+           lifecycle.observed == ble_lifecycle::ObservedState::kIdle &&
+           !lifecycle.advertising && !lifecycle.connected &&
+           !lifecycle.recovery_required && route.coherent &&
+           !route.invalidation_pending &&
+           route.desired != hid_route::OutputRoute::kBle &&
+           route.active != hid_route::OutputRoute::kBle &&
+           route.transition == hid_route::Transition::kStable &&
+           pairing.coherent &&
+           pairing.live_state == ble_pairing::LiveState::kIdle &&
+           !pairing.pairing_active;
+}
+
 ble_pairing::RespondResult Controller::respond_to_pairing(
     ble_lifecycle::Generation generation, std::uint16_t connection_handle,
     std::uint32_t pairing_id,
@@ -2199,10 +2344,11 @@ void Controller::process_ble_event(BleEvent event) {
             // Persistent storage is a subsystem-global authority. Its fault
             // commit must survive retirement of the connection that exposed it.
             const auto kind =
-                event.store_failure_kind ==
-                        ble_security::StoreFailureKind::kDelete
-                    ? ble_security::StoreFailureKind::kDelete
-                    : ble_security::StoreFailureKind::kWrite;
+                event.store_failure_kind == ble_security::StoreFailureKind::kNone ||
+                        event.store_failure_kind ==
+                            ble_security::StoreFailureKind::kCapacityFull
+                    ? ble_security::StoreFailureKind::kWrite
+                    : event.store_failure_kind;
             commit_persistent_store_failure(kind, event.status);
             return;
         }

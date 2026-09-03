@@ -33,7 +33,10 @@ from .provisioning_workflow import (
 from .serial_transport import PySerialTransport
 from .provisioning import stage_and_verify_firmware_bundle
 from .protocol import (
+    BLE_BOND_ADMINISTRATION_CAPABILITY,
     BLE_PAIRING_TRANSACTION_CAPABILITY,
+    BleBondList,
+    BleBondRemoveResult,
     BleExposureStatus,
     BlePairingRespondResult,
     BlePairingStatus,
@@ -45,6 +48,7 @@ from .protocol import (
     UsbExposureStatus,
     OutputRouteV2,
     validate_ble_pairing_respond_inputs,
+    validate_bond_id,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
     validate_system_info,
@@ -134,6 +138,14 @@ def _pairing_id(value: str) -> int:
     if not 1 <= parsed <= 0xFFFF_FFFF:
         raise argparse.ArgumentTypeError("must be in 1..4294967295")
     return parsed
+
+
+def _bond_id(value: str) -> str:
+    try:
+        validate_bond_id(value)
+    except ProtocolError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
 
 
 def _read_pairing_passkey() -> str:
@@ -252,6 +264,8 @@ def _parser() -> argparse.ArgumentParser:
         ("ble-disable", "hide BLE while retaining the initialized stack"),
         ("ble-pairing-status", "show the current BLE pairing transaction"),
         ("ble-pairing-respond", "respond to one BLE pairing transaction"),
+        ("ble-bond-list", "list firmware-side BLE bonds"),
+        ("ble-bond-remove", "remove one exact firmware-side BLE bond"),
         ("hid-route-status", "show the explicit HID output route"),
         ("hid-route-set", "select none, USB, or BLE as the HID output route"),
         ("release-all", "perform the safe all-up recovery operation"),
@@ -296,6 +310,13 @@ def _parser() -> argparse.ArgumentParser:
                 required=True,
                 metavar="ID",
                 help="nonzero pairing transaction ID from ble-pairing-status",
+            )
+        if name == "ble-bond-remove":
+            command.add_argument(
+                "bond_id",
+                type=_bond_id,
+                metavar="BOND_ID",
+                help="exact 32-lowercase-hex ID from ble-bond-list",
             )
         if name in {"verify-artifact", "verify-firmware", "flash-firmware"}:
             command.add_argument(
@@ -395,6 +416,14 @@ def _result_value(command: str, result: object) -> object:
         return value
     if command == "ble-pairing-respond":
         assert isinstance(result, BlePairingRespondResult)
+        return asdict(result)
+    if command == "ble-bond-list":
+        assert isinstance(result, BleBondList)
+        value = asdict(result)
+        value["bonds"] = [asdict(bond) for bond in result.bonds]
+        return value
+    if command == "ble-bond-remove":
+        assert isinstance(result, BleBondRemoveResult)
         return asdict(result)
     if command in {"hid-route-status", "hid-route-set"}:
         assert isinstance(result, (HidRouteStatus, HidRouteV2Status))
@@ -632,6 +661,22 @@ def _print_result(command: str, result: object, *, as_json: bool, output: TextIO
         print(f"key_size: {value['key_size']}", file=output)
         print(f"last_result: {value['last_result']}", file=output)
         return
+    if command == "ble-bond-list":
+        assert isinstance(value, dict)
+        print(
+            f"bonds: {value['count']}/{value['capacity']} "
+            f"(available={value['available']}, healthy={value['healthy']})",
+            file=output,
+        )
+        for bond in value["bonds"]:
+            print(
+                f"bond_id: {bond['bond_id']} verified={bond['verified']} "
+                f"schema_revision={bond['schema_revision']} "
+                f"schema_current={bond['schema_current']} "
+                f"connected={bond['connected']}",
+                file=output,
+            )
+        return
     print(json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True), file=output)
 
 
@@ -750,6 +795,14 @@ def main(
                     # Python strings are immutable; release the CLI's local
                     # reference immediately after the single Client call.
                     passkey = ""
+            elif args.command == "ble-bond-list":
+                result = client.ble_bond_list()
+            elif args.command == "ble-bond-remove":
+                if BLE_BOND_ADMINISTRATION_CAPABILITY not in hello.capabilities:
+                    raise CompatibilityError(
+                        f"peer does not advertise {BLE_BOND_ADMINISTRATION_CAPABILITY}"
+                    )
+                result = client.ble_bond_remove(args.bond_id)
             elif args.command == "hid-route-status":
                 result = client.hid_route_status()
             elif args.command == "hid-route-set":

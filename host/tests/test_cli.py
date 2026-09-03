@@ -29,6 +29,7 @@ from hidbot.provisioning_workflow import (
     VerificationPhaseResult,
 )
 from hidbot.protocol import (
+    BLE_BOND_ADMINISTRATION_CAPABILITY,
     BLE_PAIRING_TRANSACTION_CAPABILITY,
     FirmwareIdentity,
     SystemInfo,
@@ -81,6 +82,7 @@ class FakeTransport:
         ]
         self.info_result: object = {"project": "s3-hidbot"}
         self.pairing_error: dict[str, str] | None = None
+        self.bond_error: dict[str, str] | None = None
         self.route_result: dict[str, object] | None = None
 
     def open(self) -> None:
@@ -238,6 +240,45 @@ class FakeTransport:
                         result={
                             "accepted": True,
                             "pairing_id": value["params"]["pairing_id"],
+                        },
+                    )
+                )
+        elif value["cmd"] == "ble.bond.list":
+            self.chunks.append(
+                response(
+                    value["id"],
+                    TOKEN,
+                    result={
+                        "capacity": 3,
+                        "count": 1,
+                        "available": 2,
+                        "healthy": True,
+                        "bonds": [{
+                            "bond_id": "a" * 32,
+                            "our_sec": True,
+                            "peer_sec": True,
+                            "verified": True,
+                            "schema_revision": 2,
+                            "schema_current": True,
+                            "connected": False,
+                        }],
+                    },
+                )
+            )
+        elif value["cmd"] == "ble.bond.remove":
+            if self.bond_error is not None:
+                self.chunks.append(
+                    response(value["id"], TOKEN, error=self.bond_error)
+                )
+            else:
+                self.chunks.append(
+                    response(
+                        value["id"],
+                        TOKEN,
+                        result={
+                            "bond_id": value["params"]["bond_id"],
+                            "removed": True,
+                            "remaining": 0,
                         },
                     )
                 )
@@ -776,6 +817,58 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertNotIn("12 456", errors)
         self.assertEqual(self.wire_commands(calls), ["protocol.hello"])
+
+    def test_ble_bond_list_and_exact_remove_cli(self) -> None:
+        selected = "a" * 32
+
+        def enable_bonds(transport: FakeTransport) -> None:
+            transport.hello_capabilities.append(BLE_BOND_ADMINISTRATION_CAPABILITY)
+
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "ble-bond-list"],
+            configure_transport=enable_bonds,
+        )
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("bonds: 1/3 (available=2, healthy=True)", output)
+        self.assertIn(f"bond_id: {selected}", output)
+        self.assertNotIn("ltk", output.lower())
+        self.assertEqual(
+            self.wire_commands(calls), ["protocol.hello", "ble.bond.list"]
+        )
+
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "--json", "ble-bond-remove", selected],
+            configure_transport=enable_bonds,
+        )
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(
+            json.loads(output),
+            {"bond_id": selected, "remaining": 0, "removed": True},
+        )
+        removal = next(
+            call[1]
+            for call in calls
+            if call[0] == "write" and b"ble.bond.remove" in call[1]
+        )
+        self.assertEqual(
+            json.loads(removal[len(FRAME_PREFIX) : -1])["params"],
+            {"bond_id": selected},
+        )
+
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "ble-bond-remove", selected]
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(output, "")
+        self.assertIn(BLE_BOND_ADMINISTRATION_CAPABILITY, errors)
+        self.assertEqual(self.wire_commands(calls), ["protocol.hello"])
+
+        code, errors, calls = self.run_parser_error(
+            ["--port", "dummy-port", "ble-bond-remove", "A" * 32]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("32 lowercase hexadecimal", errors)
+        self.assertEqual(calls, [])
 
     def test_pairing_no_controlling_tty_has_no_stdin_fallback_or_request(self) -> None:
         def enable_pairing(transport: FakeTransport) -> None:

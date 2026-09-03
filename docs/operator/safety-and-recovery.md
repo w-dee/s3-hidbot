@@ -24,6 +24,17 @@ claim until each host stack is qualified. Clearing BlueZ cache, deleting a host
 pairing, or erasing device NVS is not the normal repair procedure and must not
 be used as an automatic recovery step.
 
+Bond administration is explicitly scoped to firmware-side state. The device
+stores at most three bonds and never evicts automatically. `ble-bond-list`
+returns opaque exact IDs without addresses or keys. `ble-bond-remove BOND_ID`
+is permitted only with BLE initialized and disabled to hidden idle, no BLE
+route retirement in progress, no connection or pairing transaction, and a
+trustworthy store. It removes only that peer's `OUR_SEC`, `PEER_SEC`, and HID
+schema revision, verifies absence, and preserves every other bond. A partial
+failure becomes fatal Storage/recovery state and is not reported as success.
+The operation does not remove the host OS's separate pairing record; never
+infer BlueZ cleanup from firmware success.
+
 The CH343 USB-UART path controls and programs the fixture. The separate native
 USB-OTG path presents HID to a DUT host. Provisioning and identity verification
 need only CH343. VBUS sourcing, backfeed, general dual-cable power safety,

@@ -20,10 +20,13 @@ from .errors import (
 from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
+    BLE_BOND_ADMINISTRATION_CAPABILITY,
     BLE_PAIRING_TRANSACTION_CAPABILITY,
     HID_OUTPUT_ROUTE_V1_CAPABILITY,
     HID_OUTPUT_ROUTE_V2_CAPABILITY,
     BleExposureStatus,
+    BleBondList,
+    BleBondRemoveResult,
     BlePairingRespondResult,
     BlePairingStatus,
     HidRouteStatus,
@@ -36,6 +39,7 @@ from .protocol import (
     OutputRouteV2,
     Response,
     build_keyboard_report_frame,
+    build_ble_bond_remove_frame,
     build_ble_pairing_respond_frame,
     build_hid_route_set_frame,
     build_hid_route_v2_set_frame,
@@ -44,10 +48,13 @@ from .protocol import (
     build_hello_frame,
     parse_response,
     validate_keyboard_report_result,
+    validate_ble_bond_list,
+    validate_ble_bond_remove_result,
     validate_ble_exposure_status,
     validate_ble_pairing_respond_inputs,
     validate_ble_pairing_respond_result,
     validate_ble_pairing_status,
+    validate_bond_id,
     validate_hid_route_status,
     validate_hid_route_v2_status,
     validate_keyboard_report_inputs,
@@ -489,6 +496,29 @@ class Client:
                 # bytes are immutable and cannot be zeroized. Drop the only
                 # client-owned frame reference immediately after termination.
                 del frame
+
+    def ble_bond_list(self) -> BleBondList:
+        """Return the deterministic non-secret firmware-side bond inventory."""
+
+        with self._lock:
+            self._require_capability_locked(BLE_BOND_ADMINISTRATION_CAPABILITY)
+            return validate_ble_bond_list(self._request_locked("ble.bond.list"))
+
+    def ble_bond_remove(self, bond_id: str) -> BleBondRemoveResult:
+        """Remove exactly one disconnected firmware-side bond by exact ID."""
+
+        validate_bond_id(bond_id)
+        with self._lock:
+            self._require_capability_locked(BLE_BOND_ADMINISTRATION_CAPABILITY)
+            request_id, session = self._allocate_request_id_locked()
+            return validate_ble_bond_remove_result(
+                self._request_frame_locked(
+                    request_id,
+                    session,
+                    build_ble_bond_remove_frame(request_id, session, bond_id),
+                    remote_error_message="bond removal failed",
+                )
+            )
 
     def hid_route_status(self) -> HidRouteStatus | HidRouteV2Status:
         """Return the coherent explicit HID output-route transaction state."""

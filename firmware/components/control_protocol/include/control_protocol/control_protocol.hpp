@@ -163,6 +163,47 @@ using BlePairingStatusProvider = BlePairingStatus (*)(void *context);
 using BlePairingRespondProvider = BlePairingRespondResult (*)(
     void *context, const BlePairingRespondRequest &request);
 
+inline constexpr std::size_t kBondIdHexChars = 32;
+using BondId = std::array<char, kBondIdHexChars + 1>;
+struct BleBondInfo {
+    BondId bond_id{};
+    bool our_sec = false;
+    bool peer_sec = false;
+    bool verified = false;
+    bool schema_revision_present = false;
+    std::uint8_t schema_revision = 0;
+    bool schema_current = false;
+    bool connected = false;
+};
+enum class BleBondListResultKind : std::uint8_t {
+    kSuccess,
+    kNotReady,
+    kStorageFailure,
+};
+struct BleBondListResult {
+    BleBondListResultKind kind = BleBondListResultKind::kNotReady;
+    std::array<BleBondInfo, 3> bonds{};
+    std::uint8_t count = 0;
+    std::uint8_t available = 3;
+    bool healthy = false;
+};
+enum class BleBondRemoveResultKind : std::uint8_t {
+    kSuccess,
+    kNotReady,
+    kNotFound,
+    kAmbiguous,
+    kBusy,
+    kStorageFailure,
+};
+struct BleBondRemoveResult {
+    BleBondRemoveResultKind kind = BleBondRemoveResultKind::kNotReady;
+    BondId bond_id{};
+    std::uint8_t remaining = 0;
+};
+using BleBondListProvider = BleBondListResult (*)(void *context);
+using BleBondRemoveProvider = BleBondRemoveResult (*)(
+    void *context, const BondId &bond_id);
+
 enum class OutputRoute : std::uint8_t {
     kNone,
     kUsb,
@@ -296,6 +337,10 @@ struct Config {
     void *ble_pairing_status_context;
     BlePairingRespondProvider ble_pairing_respond_provider;
     void *ble_pairing_respond_context;
+    BleBondListProvider ble_bond_list_provider;
+    void *ble_bond_list_context;
+    BleBondRemoveProvider ble_bond_remove_provider;
+    void *ble_bond_remove_context;
     HidRouteStatusProvider hid_route_status_provider;
     void *hid_route_status_context;
     HidRouteActionProvider hid_route_set_provider;

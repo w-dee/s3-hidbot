@@ -31,6 +31,8 @@ MAX_USB_GENERATION = 0xFFFF_FFFF
 MAX_UINT32 = 0xFFFF_FFFF
 MAX_BLE_KEY_SIZE = 16
 BLE_PAIRING_TRANSACTION_CAPABILITY = "ble.pairing-transaction-v1"
+BLE_BOND_ADMINISTRATION_CAPABILITY = "ble.bond-administration-v1"
+MAX_BONDS = 3
 HID_OUTPUT_ROUTE_V1_CAPABILITY = "hid.output-route-v1"
 HID_OUTPUT_ROUTE_V2_CAPABILITY = "hid.output-route-v2"
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
@@ -61,6 +63,7 @@ OPTIONAL_CAPABILITIES = frozenset(
         HID_OUTPUT_ROUTE_V2_CAPABILITY,
         "ble.exposure-control-v1",
         BLE_PAIRING_TRANSACTION_CAPABILITY,
+        BLE_BOND_ADMINISTRATION_CAPABILITY,
     }
 )
 KNOWN_OPTIONAL_CAPABILITIES = OPTIONAL_CAPABILITIES
@@ -262,6 +265,35 @@ class BlePairingStatus:
 class BlePairingRespondResult:
     accepted: bool
     pairing_id: int
+
+
+@dataclass(frozen=True)
+class BleBondInfo:
+    """Non-secret administrative view of one firmware-side stored bond."""
+
+    bond_id: str
+    our_sec: bool
+    peer_sec: bool
+    verified: bool
+    schema_revision: int | None
+    schema_current: bool
+    connected: bool
+
+
+@dataclass(frozen=True)
+class BleBondList:
+    capacity: int
+    count: int
+    available: int
+    healthy: bool
+    bonds: tuple[BleBondInfo, ...]
+
+
+@dataclass(frozen=True)
+class BleBondRemoveResult:
+    bond_id: str
+    removed: bool
+    remaining: int
 
 
 class OutputRoute(str, Enum):
@@ -529,6 +561,30 @@ def build_ble_pairing_respond_frame(
             "session": session,
             "cmd": "ble.pairing.respond",
             "params": {"pairing_id": pairing_id, "passkey": passkey},
+        }
+    )
+
+
+def validate_bond_id(bond_id: str) -> None:
+    if type(bond_id) is not str or TOKEN_PATTERN.fullmatch(bond_id) is None:
+        raise ProtocolError("BLE bond ID must be exactly 32 lowercase hexadecimal characters")
+
+
+def build_ble_bond_remove_frame(
+    request_id: int, session: str, bond_id: str
+) -> bytes:
+    if type(request_id) is not int or not 0 <= request_id <= MAX_ID:
+        raise ProtocolError("request id is invalid")
+    if not isinstance(session, str) or TOKEN_PATTERN.fullmatch(session) is None:
+        raise ProtocolError("session is invalid")
+    validate_bond_id(bond_id)
+    return _serialize_request(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "session": session,
+            "cmd": "ble.bond.remove",
+            "params": {"bond_id": bond_id},
         }
     )
 
@@ -934,6 +990,101 @@ def validate_ble_pairing_respond_result(value: Any) -> BlePairingRespondResult:
     if type(pairing_id) is not int or not 1 <= pairing_id <= MAX_UINT32:
         raise ProtocolError("BLE pairing response ID is invalid")
     return BlePairingRespondResult(accepted=True, pairing_id=pairing_id)
+
+
+def validate_ble_bond_list(value: Any) -> BleBondList:
+    fields = {"capacity", "count", "available", "healthy", "bonds"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProtocolError("ble.bond.list result fields are invalid")
+    capacity = value["capacity"]
+    count = value["count"]
+    available = value["available"]
+    healthy = value["healthy"]
+    raw_bonds = value["bonds"]
+    if capacity != MAX_BONDS or type(capacity) is not int:
+        raise ProtocolError("BLE bond capacity is invalid")
+    if type(count) is not int or not 0 <= count <= MAX_BONDS:
+        raise ProtocolError("BLE bond count is invalid")
+    if type(available) is not int or available != MAX_BONDS - count:
+        raise ProtocolError("BLE bond available capacity is invalid")
+    if type(healthy) is not bool:
+        raise ProtocolError("BLE bond store health is invalid")
+    if not isinstance(raw_bonds, list) or len(raw_bonds) != count:
+        raise ProtocolError("BLE bond list length is invalid")
+    bonds: list[BleBondInfo] = []
+    expected_fields = {
+        "bond_id",
+        "our_sec",
+        "peer_sec",
+        "verified",
+        "schema_revision",
+        "schema_current",
+        "connected",
+    }
+    for raw in raw_bonds:
+        if not isinstance(raw, dict) or set(raw) != expected_fields:
+            raise ProtocolError("BLE bond entry fields are invalid")
+        validate_bond_id(raw["bond_id"])
+        bool_fields = (
+            "our_sec",
+            "peer_sec",
+            "verified",
+            "schema_current",
+            "connected",
+        )
+        if any(type(raw[name]) is not bool for name in bool_fields):
+            raise ProtocolError("BLE bond entry boolean state is invalid")
+        revision = raw["schema_revision"]
+        if revision is not None and (
+            type(revision) is not int or not 0 <= revision <= 255
+        ):
+            raise ProtocolError("BLE bond schema revision is invalid")
+        if raw["schema_current"] and revision is None:
+            raise ProtocolError("BLE bond schema state is incoherent")
+        if raw["verified"] and not (raw["our_sec"] and raw["peer_sec"]):
+            raise ProtocolError("BLE bond verification state is incoherent")
+        bonds.append(
+            BleBondInfo(
+                bond_id=raw["bond_id"],
+                our_sec=raw["our_sec"],
+                peer_sec=raw["peer_sec"],
+                verified=raw["verified"],
+                schema_revision=revision,
+                schema_current=raw["schema_current"],
+                connected=raw["connected"],
+            )
+        )
+    ids = [bond.bond_id for bond in bonds]
+    if ids != sorted(ids):
+        raise ProtocolError("BLE bond list ordering is invalid")
+    expected_healthy = all(bond.verified for bond in bonds) and len(ids) == len(set(ids))
+    if healthy != expected_healthy:
+        raise ProtocolError("BLE bond store health is incoherent")
+    return BleBondList(
+        capacity=capacity,
+        count=count,
+        available=available,
+        healthy=healthy,
+        bonds=tuple(bonds),
+    )
+
+
+def validate_ble_bond_remove_result(value: Any) -> BleBondRemoveResult:
+    if not isinstance(value, dict) or set(value) != {
+        "bond_id",
+        "removed",
+        "remaining",
+    }:
+        raise ProtocolError("ble.bond.remove result fields are invalid")
+    validate_bond_id(value["bond_id"])
+    if value["removed"] is not True:
+        raise ProtocolError("BLE bond removal result is invalid")
+    remaining = value["remaining"]
+    if type(remaining) is not int or not 0 <= remaining < MAX_BONDS:
+        raise ProtocolError("BLE bond removal remaining count is invalid")
+    return BleBondRemoveResult(
+        bond_id=value["bond_id"], removed=True, remaining=remaining
+    )
 
 
 def validate_hid_route_status(value: Any) -> HidRouteStatus:
