@@ -320,6 +320,20 @@ struct ReportSink {
     }
 };
 
+struct BleSubmitSink {
+    hid_runtime::BleSubmitResult result =
+        hid_runtime::BleSubmitResult::kStackAccepted;
+    int calls = 0;
+
+    static hid_runtime::BleSubmitResult submit(
+        void *context, hid_runtime::Interface, hid_runtime::HidWorkToken,
+        const std::uint8_t *, std::uint16_t) {
+        auto *sink = static_cast<BleSubmitSink *>(context);
+        ++sink->calls;
+        return sink->result;
+    }
+};
+
 usb_lifecycle::TransitionResult action(hid_control_executor::CommandOutcome outcome) {
     return outcome.action_result;
 }
@@ -2770,6 +2784,33 @@ void test_ble_backend_failure_retires_and_never_replays_mouse() {
     }
 }
 
+void test_ble_not_ready_and_stale_results_terminalize_runtime_ticket() {
+    for (const auto result : {hid_runtime::BleSubmitResult::kNotReady,
+                              hid_runtime::BleSubmitResult::kStale}) {
+        ReadyBleRouteFixture fixture(
+            result == hid_runtime::BleSubmitResult::kNotReady ? 98 : 99);
+        const std::array<std::uint8_t, 6> keys{0x69, 0, 0, 0, 0, 0};
+        assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        hid_control_executor::Controller::Action action{};
+        assert(fixture.controller.dequeue_one_for_test(action));
+        BleSubmitSink sink{.result = result};
+        assert(!fixture.runtime.state_machine().process_ble_report(
+            action.hid_interface, action.hid_work, BleSubmitSink::submit,
+            &sink));
+        assert(sink.calls == 1);
+        assert(fixture.database.notify_calls == 0);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
+               hid_runtime::KeyboardReportTicketState::kCanceled);
+        fixture.runtime.state_machine().finalize_keyboard_report();
+        assert(!fixture.controller.process_one_for_test());
+        assert(sink.calls == 1);
+        assert(fixture.database.notify_calls == 0);
+    }
+}
+
 void test_ble_disconnect_reconnect_kills_old_work_and_route() {
     ReadyBleRouteFixture fixture(89);
     const std::array<std::uint8_t, 6> keys{0x6f, 0, 0, 0, 0, 0};
@@ -3676,6 +3717,7 @@ int main() {
     test_security_and_storage_loss_preempt_ble_work();
     test_overflow_and_store_full_retire_only_current_ble_route();
     test_ble_backend_failure_retires_and_never_replays_mouse();
+    test_ble_not_ready_and_stale_results_terminalize_runtime_ticket();
     test_ble_disconnect_reconnect_kills_old_work_and_route();
     test_pairing_input_response_and_initiation();
     test_public_pairing_rpc_mailbox_status_and_races();
