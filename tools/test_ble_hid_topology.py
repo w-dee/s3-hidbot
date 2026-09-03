@@ -8,7 +8,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HEADER = ROOT / "firmware/components/ble_hid_service/include/ble_hid_service/ble_hid_service.hpp"
+HEADER = (
+    ROOT
+    / "firmware/components/ble_hid_service/include/ble_hid_service/ble_hid_service.hpp"
+)
 SERVICE = ROOT / "firmware/components/ble_hid_service/ble_hid_service.cpp"
 TRANSPORT = ROOT / "firmware/components/ble_transport/ble_transport.cpp"
 SDKCONFIG_DEFAULTS = ROOT / "firmware/sdkconfig.defaults"
@@ -166,7 +169,7 @@ def main() -> int:
     )
     component_sources = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (ROOT / "firmware/components").glob("*/*.cpp")
+        for path in (ROOT / "firmware/components").rglob("*.cpp")
     )
     assert component_sources.count("ble_gatts_count_cfg(") == 1
     assert component_sources.count("ble_gatts_add_svcs(") == 1
