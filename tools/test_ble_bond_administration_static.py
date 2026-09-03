@@ -131,6 +131,8 @@ def main() -> int:
     assert "ControlOperation::kBondAdministration" in executor
     assert "ble_bond_list_provider" in main_cpp
     assert "ble_bond_remove_provider" in main_cpp
+    assert "source.bonds[left].bond_id == source.bonds[right].bond_id" in main_cpp
+    assert "BleBondListResultKind::kStorageFailure" in main_cpp
 
     for required in (
         "BLE_BOND_ADMINISTRATION_CAPABILITY",

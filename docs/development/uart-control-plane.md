@@ -61,8 +61,9 @@ ID is the first 128 bits of SHA-256 over the domain
 `s3-hidbot/bond-id/v1`, resolved identity address type, and six identity bytes,
 rendered as exactly 32 lowercase hexadecimal characters. It is stable for a
 stored bond but exposes neither the raw address nor security material. A
-collision makes the inventory unhealthy and removal ambiguous; no list index,
-name, prefix, wildcard, oldest, or first-record selection exists.
+collision fails list publication as storage-untrustworthy and makes removal
+ambiguous; no list index, name, prefix, wildcard, oldest, or first-record
+selection exists.
 
 U7.4A adds an internal-only BLE HID output prerequisite without changing this
 public protocol. Keyboard and mouse CCCD evidence and HID Control Point suspend
@@ -251,9 +252,10 @@ three and `available` is `3-count`. Entries are sorted by exact `bond_id` and
 contain only `bond_id`, `our_sec`, `peer_sec`, `verified`, nullable
 `schema_revision`, `schema_current`, and `connected`. A half bond is never
 verified. Missing schema metadata is represented by `null` and is not by
-itself security-store corruption; malformed records, enumeration failure, or
-an already-fatal persistent storage state fail closed as `BLE_BOND_STORAGE`.
-Cold-boot uninitialized BLE returns `BLE_NOT_READY`.
+itself security-store corruption; malformed records, enumeration failure, an
+observed bond-ID collision, or an already-fatal persistent storage state fail
+closed as `BLE_BOND_STORAGE`. Cold-boot uninitialized BLE returns
+`BLE_NOT_READY`.
 
 `ble.bond.remove` requires exactly
 `{"bond_id":"<32-lowercase-hex>"}`. The executor permits mutation only after

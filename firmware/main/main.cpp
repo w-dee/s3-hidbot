@@ -313,6 +313,19 @@ control_protocol::BleBondListResult ble_bond_list(void *) {
         result.healthy = false;
         return result;
     }
+    for (std::size_t left = 0; left < source.count; ++left) {
+        for (std::size_t right = left + 1; right < source.count; ++right) {
+            if (source.bonds[left].bond_id == source.bonds[right].bond_id) {
+                result.kind =
+                    control_protocol::BleBondListResultKind::kStorageFailure;
+                result.count = 0;
+                result.available =
+                    static_cast<std::uint8_t>(result.bonds.size());
+                result.healthy = false;
+                return result;
+            }
+        }
+    }
     for (std::size_t index = 0; index < source.count; ++index) {
         result.bonds[index].bond_id = source.bonds[index].bond_id;
         result.bonds[index].our_sec = source.bonds[index].our_sec;
