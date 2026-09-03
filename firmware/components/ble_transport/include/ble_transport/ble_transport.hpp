@@ -24,6 +24,10 @@ class Backend final : public hid_control_executor::BleBackend {
     std::int32_t start_advertising() override;
     std::int32_t stop_advertising() override;
     std::int32_t disconnect(std::uint16_t connection_handle) override;
+    std::int32_t arm_ble_route_release_grace(
+        hid_control_executor::BleRouteReleaseIdentity identity) override;
+    void cancel_ble_route_release_grace(
+        hid_control_executor::BleRouteReleaseIdentity identity) override;
     std::int32_t terminate_orphan_connection(
         std::uint16_t connection_handle) override;
     std::int32_t configure_connection(
@@ -70,6 +74,7 @@ class Backend final : public hid_control_executor::BleBackend {
     static void host_task(void *context);
     static void timeout_callback(void *context);
     static void pairing_timeout_callback(void *context);
+    static void route_release_grace_callback(void *context);
     std::int32_t arm_timeout(std::uint64_t microseconds,
                              LifecycleTimeoutPurpose purpose);
     void cancel_timeout(LifecycleTimeoutPurpose purpose);
@@ -106,6 +111,16 @@ class Backend final : public hid_control_executor::BleBackend {
     std::atomic<std::uint16_t> pairing_timer_connection_{
         ble_lifecycle::kNoConnection};
     std::atomic<std::uint32_t> pairing_timer_id_{0};
+    esp_timer_handle_t route_release_timer_ = nullptr;
+    std::atomic<hid_runtime::AuthorityEpoch> route_release_authority_epoch_{0};
+    std::atomic<hid_runtime::RouteGeneration> route_release_route_generation_{0};
+    std::atomic<ble_lifecycle::Generation> route_release_ble_generation_{0};
+    std::atomic<std::uint16_t> route_release_connection_{
+        ble_lifecycle::kNoConnection};
+    std::atomic<std::uint16_t> route_release_keyboard_handle_{0};
+    std::atomic<std::uint16_t> route_release_mouse_handle_{0};
+    std::atomic<std::uint32_t> route_release_epoch_{0};
+    std::atomic_bool route_release_timer_active_{false};
 };
 
 }  // namespace ble_transport

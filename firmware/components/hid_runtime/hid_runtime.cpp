@@ -254,7 +254,9 @@ void StateMachine::on_mount() {
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (!ble_route.releasing) {
+        release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
     bool retained_state_needs_safety = false;
     for (const InterfaceState &interface_state : interfaces_) {
         retained_state_needs_safety =
@@ -341,7 +343,9 @@ void StateMachine::on_unmount() {
     // Invalidate first: work from an older attach or authority epoch can never
     // be accepted by a later executor pass, even if it races this callback.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (!ble_route_authority_snapshot().releasing) {
+        release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
     status_bits_.store(0, std::memory_order_release);
     bool uncertainty = false;
     for (InterfaceState &interface_state : interfaces_) {
@@ -384,7 +388,9 @@ void StateMachine::on_suspend() {
     // This is the control-authority linearization boundary. It intentionally
     // precedes the UART task's eventual session/cache cleanup notification.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (!ble_route_authority_snapshot().releasing) {
+        release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
     preserve_suspend_safety(interfaces_[0]);
     preserve_suspend_safety(interfaces_[1]);
     std::uint8_t current = status_bits_.load(std::memory_order_acquire);
@@ -450,7 +456,9 @@ UsbTransitionOutcome StateMachine::request_usb_attach(usb_lifecycle::Executor &e
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (!ble_route_authority_snapshot().releasing) {
+        release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
     status_bits_.store(0, std::memory_order_release);
     return UsbTransitionOutcome{
         .action_result = transition.action_result,
@@ -477,7 +485,9 @@ UsbTransitionOutcome StateMachine::request_usb_detach(usb_lifecycle::Executor &e
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (!ble_route_authority_snapshot().releasing) {
+        release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
     // Stage A retains mounted/readiness bits so only lifecycle-owned all-up
     // work can execute in the still-current installed generation. Unsafe work
     // is already rejected by desired=hidden and the fresh authority epoch.
@@ -526,6 +536,9 @@ BleRouteAuthoritySnapshot StateMachine::ble_route_authority_snapshot() const {
             .mouse_characteristic_handle =
                 ble_route_mouse_handle_.load(std::memory_order_relaxed),
             .active = ble_route_active_.load(std::memory_order_relaxed),
+            .releasing = ble_route_releasing_.load(std::memory_order_relaxed),
+            .release_epoch =
+                ble_route_release_epoch_.load(std::memory_order_relaxed),
             .coherent = true,
         };
         const std::uint32_t after =
@@ -552,12 +565,18 @@ void StateMachine::publish_ble_route_authority(
     ble_route_mouse_handle_.store(activation.mouse_characteristic_handle,
                                   std::memory_order_relaxed);
     ble_route_active_.store(true, std::memory_order_relaxed);
+    ble_route_releasing_.store(false, std::memory_order_relaxed);
+    ble_route_release_epoch_.store(
+        release_epoch_.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
     ble_route_sequence_.fetch_add(1, std::memory_order_release);
 }
 
 void StateMachine::clear_ble_route_authority() {
     ble_route_sequence_.fetch_add(1, std::memory_order_acq_rel);
     ble_route_active_.store(false, std::memory_order_relaxed);
+    ble_route_releasing_.store(false, std::memory_order_relaxed);
+    ble_route_release_epoch_.store(0, std::memory_order_relaxed);
     ble_route_authority_epoch_.store(0, std::memory_order_relaxed);
     ble_route_generation_.store(0, std::memory_order_relaxed);
     ble_route_transport_generation_.store(0, std::memory_order_relaxed);
@@ -742,7 +761,8 @@ bool StateMachine::retire_ble_route_if_matches(
     Interface uncertain_interface) {
     const BleRouteAuthoritySnapshot current = ble_route_authority_snapshot();
     const hid_route::Snapshot route = route_.snapshot();
-    const bool exact = expected.coherent && expected.active && current.coherent &&
+    const bool exact = expected.coherent && expected.active && !expected.releasing &&
+                       current.coherent &&
                        current.active &&
                        current.authority_epoch == expected.authority_epoch &&
                        current.route_generation == expected.route_generation &&
@@ -752,15 +772,27 @@ bool StateMachine::retire_ble_route_if_matches(
                            expected.keyboard_characteristic_handle &&
                        current.mouse_characteristic_handle ==
                            expected.mouse_characteristic_handle &&
+                       current.release_epoch == expected.release_epoch &&
                        route.coherent && !route.invalidation_pending &&
                        route.active == hid_route::OutputRoute::kBle &&
                        route.desired == hid_route::OutputRoute::kBle &&
                        route.transition == hid_route::Transition::kStable &&
                        route.generation == expected.route_generation;
-    if (!exact || !route_.invalidate_if_matches(route)) {
+    hid_route::Snapshot stage_a{};
+    if (!exact || !route_.begin_ble_release(&stage_a)) {
         return false;
     }
-    clear_ble_route_authority();
+    // Stage A closed route admission. Retire every normal ticket/epoch before
+    // publishing the retained safety-only tuple.
+    retire_unsafe_route_authority();
+    const std::uint32_t retirement_epoch =
+        release_epoch_.load(std::memory_order_acquire);
+    ble_route_sequence_.fetch_add(1, std::memory_order_acq_rel);
+    ble_route_active_.store(false, std::memory_order_relaxed);
+    ble_route_releasing_.store(true, std::memory_order_relaxed);
+    ble_route_release_epoch_.store(retirement_epoch,
+                                   std::memory_order_relaxed);
+    ble_route_sequence_.fetch_add(1, std::memory_order_release);
     if (report_state_uncertain) {
         InterfaceState &affected = state(uncertain_interface);
         affected.host_state_uncertain.store(true, std::memory_order_release);
@@ -773,7 +805,86 @@ bool StateMachine::retire_ble_route_if_matches(
                                                   std::memory_order_release);
         }
     }
-    retire_unsafe_route_authority();
+    return true;
+}
+
+bool StateMachine::ble_route_normal_authority_matches(
+    BleRouteAuthoritySnapshot expected) const {
+    const auto current = ble_route_authority_snapshot();
+    return expected.coherent && expected.active && !expected.releasing &&
+           current.coherent && current.active && !current.releasing &&
+           current.authority_epoch == expected.authority_epoch &&
+           current.route_generation == expected.route_generation &&
+           current.ble_generation == expected.ble_generation &&
+           current.connection_handle == expected.connection_handle &&
+           current.keyboard_characteristic_handle ==
+               expected.keyboard_characteristic_handle &&
+           current.mouse_characteristic_handle ==
+               expected.mouse_characteristic_handle &&
+           current.release_epoch == expected.release_epoch &&
+           authority_epoch() == expected.authority_epoch &&
+           release_epoch_.load(std::memory_order_acquire) ==
+               expected.release_epoch;
+}
+
+bool StateMachine::ble_route_release_matches(
+    BleRouteAuthoritySnapshot expected) const {
+    const auto current = ble_route_authority_snapshot();
+    const auto route = route_.snapshot();
+    return expected.coherent && expected.releasing && !expected.active &&
+           current.coherent && current.releasing && !current.active &&
+           current.authority_epoch == expected.authority_epoch &&
+           current.route_generation == expected.route_generation &&
+           current.ble_generation == expected.ble_generation &&
+           current.connection_handle == expected.connection_handle &&
+           current.keyboard_characteristic_handle ==
+               expected.keyboard_characteristic_handle &&
+           current.mouse_characteristic_handle ==
+               expected.mouse_characteristic_handle &&
+           current.release_epoch == expected.release_epoch &&
+           release_epoch_.load(std::memory_order_acquire) ==
+               expected.release_epoch &&
+           route.coherent && !route.invalidation_pending &&
+           route.desired == hid_route::OutputRoute::kNone &&
+           route.active == hid_route::OutputRoute::kBle &&
+           route.transition == hid_route::Transition::kReleasing &&
+           route.generation == expected.route_generation;
+}
+
+bool StateMachine::complete_ble_route_release_if_matches(
+    BleRouteAuthoritySnapshot expected) {
+    if (!ble_route_release_matches(expected)) {
+        return false;
+    }
+    const hid_route::Snapshot route = route_.snapshot();
+    if (!route_.complete_ble_release_if_matches(route)) {
+        return false;
+    }
+    const auto usb_lifecycle = usb_lifecycle_.snapshot();
+    const bool preserve_usb_uncertainty =
+        usb_lifecycle.host_release_uncertain ||
+        usb_lifecycle_.has_unresolved_prior_generation();
+    clear_ble_route_authority();
+    release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    for (InterfaceState &interface_state : interfaces_) {
+        clear_interface(interface_state);
+    }
+    cancel_release_ticket();
+    release_request_generation_.store(0, std::memory_order_release);
+    release_request_authority_epoch_.store(0, std::memory_order_release);
+    release_request_epoch_.store(0, std::memory_order_release);
+    release_requested_.store(false, std::memory_order_release);
+    if (preserve_usb_uncertainty) {
+        for (InterfaceState &interface_state : interfaces_) {
+            interface_state.safety_required.store(true,
+                                                  std::memory_order_release);
+            interface_state.host_state_uncertain.store(
+                true, std::memory_order_release);
+        }
+        request_release_all();
+    } else {
+        usb_lifecycle_.mark_release_confirmed();
+    }
     return true;
 }
 
@@ -787,9 +898,25 @@ RouteTransitionOutcome StateMachine::request_route_none() {
                                       .snapshot = before};
     }
     if (!before.route.coherent || before.route.invalidation_pending ||
-        before.route.desired != hid_route::OutputRoute::kUsb ||
-        before.route.active != hid_route::OutputRoute::kUsb ||
         before.route.transition != hid_route::Transition::kStable) {
+        return {};
+    }
+
+    if (before.route.desired == hid_route::OutputRoute::kBle &&
+        before.route.active == hid_route::OutputRoute::kBle) {
+        const auto authority = ble_route_authority_snapshot();
+        if (!retire_ble_route_if_matches(authority)) {
+            return {};
+        }
+        return RouteTransitionOutcome{
+            .action_result = RouteTransitionResult::kAccepted,
+            .snapshot_valid = true,
+            .async_required = true,
+            .snapshot = route_status_snapshot(),
+        };
+    }
+    if (before.route.desired != hid_route::OutputRoute::kUsb ||
+        before.route.active != hid_route::OutputRoute::kUsb) {
         return {};
     }
 
@@ -1767,8 +1894,10 @@ void StateMachine::publish_release_request() {
     // safety decisions are owned by the TinyUSB executor task.
     release_request_generation_.store(attach_generation(), std::memory_order_release);
     release_request_authority_epoch_.store(authority_epoch(), std::memory_order_release);
-    const std::uint32_t request_epoch =
-        release_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const auto ble_route = ble_route_authority_snapshot();
+    const std::uint32_t request_epoch = ble_route.releasing
+        ? ble_route.release_epoch
+        : release_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     release_request_epoch_.store(request_epoch, std::memory_order_release);
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kSafetyPending);
     cancel_mouse_ticket(MouseReportTicketOutcome::kSafetyPending);
@@ -2788,7 +2917,13 @@ MouseReportResult Runtime::complete_mouse_report(MouseReportBeginResult begin) {
     }
 }
 
-void Runtime::request_release_all() { state_machine_.request_release_all(); }
+void Runtime::request_release_all() {
+    state_machine_.request_release_all();
+    if (AuthorityEventSink *sink =
+            authority_event_sink_.load(std::memory_order_acquire)) {
+        sink->signal_hid_authority_change();
+    }
+}
 
 LifecycleSafetyResult Runtime::run_lifecycle_detach_safety() {
     const UsbGeneration old_generation = state_machine_.attach_generation();
@@ -2855,6 +2990,10 @@ void Runtime::on_driver_uninstalled() { state_machine_.on_driver_uninstalled(); 
 
 ReleaseAllResult Runtime::release_all() {
     state_machine_.begin_release_all();
+    if (AuthorityEventSink *sink =
+            authority_event_sink_.load(std::memory_order_acquire)) {
+        sink->signal_hid_authority_change();
+    }
     constexpr TickType_t kReleaseAllWaitTicks = pdMS_TO_TICKS(100);
     constexpr TickType_t kReleaseAllPollTicks = pdMS_TO_TICKS(1);
     const TickType_t wait_start = xTaskGetTickCount();

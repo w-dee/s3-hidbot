@@ -55,11 +55,13 @@ class StateMachine final {
     // transition; they continue to reject BLE before entering route state.
     bool commit_ble_if_none();
 
-    // Serialized route-controller transitions. begin_usb_release() publishes
-    // desired=none/active=usb/releasing without retiring the old generation;
-    // complete_usb_release_if_matches() retires it only after safety work.
+    // Serialized route-controller transitions publish
+    // desired=none/active=<old>/releasing without retiring the old generation;
+    // completion retires it only after the transport's safety boundary.
     bool begin_usb_release(Snapshot *stage_a);
     bool complete_usb_release_if_matches(Snapshot expected);
+    bool begin_ble_release(Snapshot *stage_a);
+    bool complete_ble_release_if_matches(Snapshot expected);
 
     // Invalidation is callback-safe and does not wait for a control executor.
     // It closes the unsafe gate before it attempts the committed transition.
@@ -81,6 +83,8 @@ class StateMachine final {
     bool commit_none_locked(OutputRoute expected_route, Generation expected_generation,
                             bool require_exact_match);
     bool commit_if_none(OutputRoute route);
+    bool begin_release(OutputRoute route, Snapshot *stage_a);
+    bool complete_release(OutputRoute route, Snapshot expected);
 
     static_assert(std::atomic<Generation>::is_always_lock_free);
     static_assert(std::atomic<std::uint32_t>::is_always_lock_free);

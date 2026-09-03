@@ -129,6 +129,26 @@ void test_usb_release_has_coherent_stage_a_and_final_publications() {
     assert(final.generation == 2);
 }
 
+void test_ble_release_has_coherent_stage_a_and_exact_completion() {
+    hid_route::StateMachine state;
+    assert(state.commit_ble_if_none());
+    hid_route::Snapshot stage_a{};
+    assert(state.begin_ble_release(&stage_a));
+    assert(stage_a.desired == hid_route::OutputRoute::kNone);
+    assert(stage_a.active == hid_route::OutputRoute::kBle);
+    assert(stage_a.transition == hid_route::Transition::kReleasing);
+    const auto stale = hid_route::Snapshot{.desired = hid_route::OutputRoute::kNone,
+                                           .active = hid_route::OutputRoute::kBle,
+                                           .generation = stage_a.generation + 1,
+                                           .transition = hid_route::Transition::kReleasing};
+    assert(!state.complete_ble_release_if_matches(stale));
+    assert(state.complete_ble_release_if_matches(stage_a));
+    const auto none = state.snapshot();
+    assert(none.active == hid_route::OutputRoute::kNone);
+    assert(none.transition == hid_route::Transition::kStable);
+    assert(none.generation == stage_a.generation + 1);
+}
+
 void test_bounded_snapshot_falls_back_fail_closed() {
     hid_route::StateMachine state;
     assert(state.commit_usb_if_none());
@@ -154,5 +174,6 @@ int main() {
     test_pre_publish_invalidation_aborts_but_consumes_authority_epoch();
     test_pre_publish_invalidation_abort_wraps_modulo_uint32();
     test_usb_release_has_coherent_stage_a_and_final_publications();
+    test_ble_release_has_coherent_stage_a_and_exact_completion();
     test_bounded_snapshot_falls_back_fail_closed();
 }

@@ -113,6 +113,18 @@ retirement, reconnect/no-auto-restore behavior, and relative-mouse no-replay
 coverage. Public protocol, host, and CLI static guards continue to require the
 route-v1 value set to remain exactly `none|usb` and reject route v2.
 
+U7.4C extends those entrypoints with the exact BLE-to-none safety transaction:
+normal-authority revocation, one Keyboard and Mouse all-up attempt, dedicated
+100 ms grace ownership, queue-full retained wake, the existing disconnect
+watchdog path, exact Disconnect completion, stable-none publication, and
+cross-transport switching only through stable none. Native cases cover stale
+timer/action fencing, early and racing Disconnect, same-handle reconnect,
+CCCD/Suspend/security/storage/overflow loss, disconnect-initiation failure,
+lease retirement, release-epoch ticket exclusion, and no automatic route
+restore. Static guards keep the public route-v1 vocabulary at `none|usb`,
+verify the dedicated timer, exact no-Report-ID payload sizes, and absence of a
+blocking grace delay. None of these checks accesses radio or hardware.
+
 Run these commands from the repository root:
 
 ```text

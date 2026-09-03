@@ -161,8 +161,33 @@ prevent a readiness-losing event queued behind a report from allowing that
 earlier report to submit. The executor then retires the active internal route;
 later CCCD restoration, Exit Suspend, security recovery, or reconnect can
 restore link readiness but never restores route authority automatically.
-U7.4C still owns BLE all-up, grace, disconnect, and stable-none retirement
-semantics, while U7.4D owns any future public BLE route API.
+U7.4C adds BLE route retirement without changing that public contract. The
+serialized owner publishes `desired=none, active=ble, transition=releasing`,
+revokes normal authority, and retains only an exact old authority tuple for
+one 8-byte Keyboard all-up attempt and one 5-byte Mouse all-up attempt. These
+notifications contain no Report ID; local stack acceptance is only a bounded
+delivery opportunity, never peer acknowledgment. An interface whose exact old
+connection, value handle, CCCD, lifecycle, and verified security are no longer
+usable is skipped without retry.
+
+After the two best-effort attempts, a dedicated one-shot 100 ms timer publishes
+an exact release-epoch/route-generation/BLE-generation/connection event. Its
+sticky due bit and independent executor wake survive a full action queue. A
+current expiry invokes the existing hardened BLE disconnect operation and its
+typed watchdog; the grace timer never shares or overwrites that watchdog.
+Spontaneous exact Disconnect, including an exact callback observation whose
+queue publication overflows, cancels/fences grace and is the final physical
+safety boundary. Only then is the retained release authority cleared and
+stable none committed. A disconnect-initiation failure leaves the route
+releasing and lifecycle recovery-required rather than claiming physical
+retirement. Stale expiry, Disconnect, notification work, and reused numeric
+connection handles cannot act on a newer tuple.
+
+Direct USB-to-BLE and BLE-to-USB route changes remain rejected: switching is
+only USB-to-none-to-BLE or BLE-to-none-to-USB. BLE exposure may advertise and
+reconnect after retirement, but reconnect, CCCD Restore, resumed Control Point,
+or restored security never reselects BLE. U7.4D still owns any future public
+BLE route API.
 
 `ble.pairing.status` accepts omitted or empty params. Its exact result fields
 are `state`, `generation`, `connected`, `pairing_id`, `action`,

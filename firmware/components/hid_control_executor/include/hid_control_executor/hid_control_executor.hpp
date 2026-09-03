@@ -117,6 +117,19 @@ using BleKeyboardReport = std::array<std::uint8_t, 8>;
 using BleMouseReport = std::array<std::uint8_t, 5>;
 inline constexpr BleKeyboardReport kBleKeyboardAllUp{};
 inline constexpr BleMouseReport kBleMouseAllUp{};
+inline constexpr std::uint32_t kBleRouteReleaseGraceMs = 100;
+
+// Exact identity of one BLE-route safety retirement. It is never interpreted
+// as the current peer: every field must still match the retained old route.
+struct BleRouteReleaseIdentity {
+    hid_runtime::AuthorityEpoch authority_epoch = 0;
+    hid_runtime::RouteGeneration route_generation = 0;
+    ble_lifecycle::Generation ble_generation = 0;
+    std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
+    std::uint16_t keyboard_characteristic_handle = 0;
+    std::uint16_t mouse_characteristic_handle = 0;
+    std::uint32_t release_epoch = 0;
+};
 
 struct BleEvent {
     BleEventKind kind = BleEventKind::kSync;
@@ -139,6 +152,8 @@ class BleEventSink {
     virtual ~BleEventSink() = default;
     // Callback-safe: implementations must use bounded, zero-wait signaling.
     virtual bool signal_ble_event(BleEvent event) = 0;
+    virtual bool signal_ble_route_release_grace(
+        BleRouteReleaseIdentity identity) = 0;
     // Called only after a Reset, post-Reset Sync, or one-shot lifecycle timeout
     // event could not enter the fixed queue. This is a durable fail-closed
     // handoff, not a generic event authority, so a backend generation that
@@ -180,6 +195,10 @@ class BleBackend {
     virtual std::int32_t start_advertising() = 0;
     virtual std::int32_t stop_advertising() = 0;
     virtual std::int32_t disconnect(std::uint16_t connection_handle) = 0;
+    virtual std::int32_t arm_ble_route_release_grace(
+        BleRouteReleaseIdentity identity) = 0;
+    virtual void cancel_ble_route_release_grace(
+        BleRouteReleaseIdentity identity) = 0;
     // Callback-safe immediate teardown for a successful physical Connect whose
     // event could not be delivered. The executor never adopts this connection.
     virtual std::int32_t terminate_orphan_connection(
@@ -274,6 +293,7 @@ class Controller final : public usb_lifecycle::Executor,
         kPairingStatus,
         kPairingRespond,
         kBleHidReport,
+        kBleRouteReleaseGrace,
     };
 
     struct Action {
@@ -284,6 +304,7 @@ class Controller final : public usb_lifecycle::Executor,
         BleEvent ble_event{};
         hid_runtime::Interface hid_interface = hid_runtime::Interface::kKeyboard;
         hid_runtime::HidWorkToken hid_work{};
+        BleRouteReleaseIdentity ble_route_release{};
         std::uint32_t mailbox_token = 0;
     };
 
@@ -334,6 +355,8 @@ class Controller final : public usb_lifecycle::Executor,
     bool schedule(usb_lifecycle::ExecutorAction action,
                   usb_lifecycle::Snapshot snapshot) override;
     bool signal_ble_event(BleEvent event) override;
+    bool signal_ble_route_release_grace(
+        BleRouteReleaseIdentity identity) override;
     void signal_ble_lifecycle_handoff_failure() override;
     void signal_hid_authority_change() override;
 
@@ -372,6 +395,8 @@ class Controller final : public usb_lifecycle::Executor,
     void fail_next_enqueue_for_test();
     void set_next_pairing_id_for_test(std::uint32_t value);
     bool pairing_mailbox_zero_for_test() const;
+    bool expire_ble_route_release_grace_for_test();
+    BleRouteReleaseIdentity ble_route_release_identity_for_test() const;
 #endif
 
   private:
@@ -418,6 +443,18 @@ class Controller final : public usb_lifecycle::Executor,
         BleHidWorkIdentity identity, BleHidInterface interface,
         const std::uint8_t *payload, std::uint16_t payload_length);
     void retire_ble_route_if_unready();
+    void drive_ble_route_retirement();
+    bool ble_route_release_identity_current(
+        BleRouteReleaseIdentity identity) const;
+    bool ble_safety_release_ready(BleRouteReleaseIdentity identity,
+                                  BleHidInterface interface) const;
+    void submit_ble_safety_release(BleRouteReleaseIdentity identity);
+    void start_ble_route_disconnect(BleRouteReleaseIdentity identity);
+    void note_ble_route_disconnect_started(
+        ble_lifecycle::Generation generation,
+        std::uint16_t connection_handle, std::int32_t result);
+    void complete_ble_route_release_on_disconnect(BleEvent event);
+    void cancel_ble_route_release_grace(BleRouteReleaseIdentity identity);
     bool enqueue_ble_hid_work(hid_runtime::Interface interface,
                               hid_runtime::HidWorkToken token);
     static hid_runtime::BleSubmitResult submit_runtime_ble_report(
@@ -478,6 +515,19 @@ class Controller final : public usb_lifecycle::Executor,
     ble_pairing::RespondResult pairing_rpc_result_ =
         ble_pairing::RespondResult::kNotPending;
     BleHidPeerSnapshot ble_hid_peer_{};
+    enum class BleRouteReleasePhase : std::uint8_t {
+        kNone,
+        kGrace,
+        kDisconnecting,
+        kFault,
+    };
+    BleRouteReleaseIdentity ble_route_release_{};
+    BleRouteReleasePhase ble_route_release_phase_ =
+        BleRouteReleasePhase::kNone;
+    ControlOperation ble_route_release_owner_ = ControlOperation::kNone;
+    std::atomic_bool ble_route_grace_armed_{false};
+    std::atomic_bool ble_route_grace_due_{false};
+    std::atomic_bool ble_route_disconnect_observed_{false};
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     Action native_queue_[kActionQueueDepth]{};

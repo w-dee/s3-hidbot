@@ -135,6 +135,18 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     if (result != ESP_OK) {
         return result;
     }
+    const esp_timer_create_args_t route_release_timer_args{
+        .callback = route_release_grace_callback,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ble_route_release",
+        .skip_unhandled_events = true,
+    };
+    result = esp_timer_create(&route_release_timer_args,
+                              &route_release_timer_);
+    if (result != ESP_OK) {
+        return result;
+    }
     if (database != nullptr) {
         const int database_result = database->register_database();
         if (database_result != 0) {
@@ -462,6 +474,93 @@ std::int32_t Backend::disconnect(std::uint16_t connection_handle) {
     // Sync watchdog cannot be cancelled by this cleanup.
     cancel_timeout(LifecycleTimeoutPurpose::kDisconnect);
     return terminate_result;
+}
+
+std::int32_t Backend::arm_ble_route_release_grace(
+    hid_control_executor::BleRouteReleaseIdentity identity) {
+    if (route_release_timer_ == nullptr ||
+        route_release_timer_active_.load(std::memory_order_acquire) ||
+        esp_timer_is_active(route_release_timer_)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    route_release_authority_epoch_.store(identity.authority_epoch,
+                                         std::memory_order_relaxed);
+    route_release_route_generation_.store(identity.route_generation,
+                                          std::memory_order_relaxed);
+    route_release_ble_generation_.store(identity.ble_generation,
+                                        std::memory_order_relaxed);
+    route_release_connection_.store(identity.connection_handle,
+                                    std::memory_order_relaxed);
+    route_release_keyboard_handle_.store(
+        identity.keyboard_characteristic_handle, std::memory_order_relaxed);
+    route_release_mouse_handle_.store(identity.mouse_characteristic_handle,
+                                      std::memory_order_relaxed);
+    route_release_epoch_.store(identity.release_epoch,
+                               std::memory_order_relaxed);
+    route_release_timer_active_.store(true, std::memory_order_release);
+    const esp_err_t result = esp_timer_start_once(
+        route_release_timer_,
+        static_cast<std::uint64_t>(
+            hid_control_executor::kBleRouteReleaseGraceMs) * 1000U);
+    if (result != ESP_OK) {
+        route_release_timer_active_.store(false, std::memory_order_release);
+    }
+    return result;
+}
+
+void Backend::cancel_ble_route_release_grace(
+    hid_control_executor::BleRouteReleaseIdentity identity) {
+    const bool exact =
+        route_release_authority_epoch_.load(std::memory_order_acquire) ==
+            identity.authority_epoch &&
+        route_release_route_generation_.load(std::memory_order_acquire) ==
+            identity.route_generation &&
+        route_release_ble_generation_.load(std::memory_order_acquire) ==
+            identity.ble_generation &&
+        route_release_connection_.load(std::memory_order_acquire) ==
+            identity.connection_handle &&
+        route_release_keyboard_handle_.load(std::memory_order_acquire) ==
+            identity.keyboard_characteristic_handle &&
+        route_release_mouse_handle_.load(std::memory_order_acquire) ==
+            identity.mouse_characteristic_handle &&
+        route_release_epoch_.load(std::memory_order_acquire) ==
+            identity.release_epoch;
+    if (!exact ||
+        !route_release_timer_active_.exchange(false,
+                                              std::memory_order_acq_rel)) {
+        return;
+    }
+    if (esp_timer_is_active(route_release_timer_)) {
+        (void)esp_timer_stop(route_release_timer_);
+    }
+}
+
+void Backend::route_release_grace_callback(void *context) {
+    auto *backend = static_cast<Backend *>(context);
+    if (backend == nullptr ||
+        !backend->route_release_timer_active_.exchange(
+            false, std::memory_order_acq_rel) ||
+        backend->sink_ == nullptr) {
+        return;
+    }
+    (void)backend->sink_->signal_ble_route_release_grace({
+        .authority_epoch = backend->route_release_authority_epoch_.load(
+            std::memory_order_acquire),
+        .route_generation = backend->route_release_route_generation_.load(
+            std::memory_order_acquire),
+        .ble_generation = backend->route_release_ble_generation_.load(
+            std::memory_order_acquire),
+        .connection_handle = backend->route_release_connection_.load(
+            std::memory_order_acquire),
+        .keyboard_characteristic_handle =
+            backend->route_release_keyboard_handle_.load(
+                std::memory_order_acquire),
+        .mouse_characteristic_handle =
+            backend->route_release_mouse_handle_.load(
+                std::memory_order_acquire),
+        .release_epoch = backend->route_release_epoch_.load(
+            std::memory_order_acquire),
+    });
 }
 
 std::int32_t Backend::terminate_orphan_connection(

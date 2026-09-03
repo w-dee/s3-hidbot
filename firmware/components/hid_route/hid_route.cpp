@@ -120,13 +120,13 @@ bool StateMachine::commit_ble_if_none() {
     return commit_if_none(OutputRoute::kBle);
 }
 
-bool StateMachine::begin_usb_release(Snapshot *stage_a) {
+bool StateMachine::begin_release(OutputRoute route, Snapshot *stage_a) {
     if (stage_a == nullptr || !try_enter_writer()) {
         return false;
     }
     if (invalidation_pending_.load(std::memory_order_acquire) ||
-        static_cast<OutputRoute>(desired_.load(std::memory_order_acquire)) != OutputRoute::kUsb ||
-        static_cast<OutputRoute>(active_.load(std::memory_order_acquire)) != OutputRoute::kUsb ||
+        static_cast<OutputRoute>(desired_.load(std::memory_order_acquire)) != route ||
+        static_cast<OutputRoute>(active_.load(std::memory_order_acquire)) != route ||
         static_cast<Transition>(transition_.load(std::memory_order_acquire)) != Transition::kStable) {
         leave_writer();
         return false;
@@ -142,20 +142,20 @@ bool StateMachine::begin_usb_release(Snapshot *stage_a) {
         return false;
     }
     return stage_a->coherent && stage_a->desired == OutputRoute::kNone &&
-           stage_a->active == OutputRoute::kUsb &&
+           stage_a->active == route &&
            stage_a->transition == Transition::kReleasing;
 }
 
-bool StateMachine::complete_usb_release_if_matches(Snapshot expected) {
+bool StateMachine::complete_release(OutputRoute route, Snapshot expected) {
     if (!try_enter_writer()) {
         return false;
     }
     const bool matches_stage_a =
         !invalidation_pending_.load(std::memory_order_acquire) &&
-        expected.desired == OutputRoute::kNone && expected.active == OutputRoute::kUsb &&
+        expected.desired == OutputRoute::kNone && expected.active == route &&
         expected.transition == Transition::kReleasing &&
         static_cast<OutputRoute>(desired_.load(std::memory_order_acquire)) == OutputRoute::kNone &&
-        static_cast<OutputRoute>(active_.load(std::memory_order_acquire)) == OutputRoute::kUsb &&
+        static_cast<OutputRoute>(active_.load(std::memory_order_acquire)) == route &&
         static_cast<Transition>(transition_.load(std::memory_order_acquire)) == Transition::kReleasing &&
         generation_.load(std::memory_order_acquire) == expected.generation;
     if (!matches_stage_a) {
@@ -173,6 +173,22 @@ bool StateMachine::complete_usb_release_if_matches(Snapshot expected) {
         return false;
     }
     return true;
+}
+
+bool StateMachine::begin_usb_release(Snapshot *stage_a) {
+    return begin_release(OutputRoute::kUsb, stage_a);
+}
+
+bool StateMachine::complete_usb_release_if_matches(Snapshot expected) {
+    return complete_release(OutputRoute::kUsb, expected);
+}
+
+bool StateMachine::begin_ble_release(Snapshot *stage_a) {
+    return begin_release(OutputRoute::kBle, stage_a);
+}
+
+bool StateMachine::complete_ble_release_if_matches(Snapshot expected) {
+    return complete_release(OutputRoute::kBle, expected);
 }
 
 bool StateMachine::commit_none_locked(OutputRoute expected_route,

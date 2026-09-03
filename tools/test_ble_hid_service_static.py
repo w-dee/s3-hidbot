@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic guards for the internal-only U7.4B BLE HID route."""
+"""Deterministic guards for the internal BLE HID route and U7.4C retirement."""
 
 from __future__ import annotations
 
@@ -162,6 +162,42 @@ def main() -> int:
     assert "abandon_ble_report" in runtime
     assert "bind_authority_event_sink" in executor
     assert "signal_hid_authority_change" in executor
+
+    # U7.4C: a safety-only old-route tuple survives normal-authority revoke,
+    # receives one exact all-up attempt per interface, then a dedicated
+    # nonblocking 100 ms timer drives the already-hardened disconnect path.
+    assert "kBleRouteReleaseGraceMs = 100" in executor_header
+    assert "kBleKeyboardAllUp{}" in executor_header
+    assert "kBleMouseAllUp{}" in executor_header
+    assert "begin_ble_release" in runtime
+    assert "complete_ble_route_release_if_matches" in runtime
+    assert "ble_route_releasing_" in runtime_header
+    assert "ble_route_release_epoch_" in runtime_header
+    release_submit = re.search(
+        r"void Controller::submit_ble_safety_release\((.*?)\n\}",
+        executor,
+        re.DOTALL,
+    )
+    assert release_submit is not None
+    assert release_submit.group(1).count("notify_custom(") == 2
+    assert "kBleKeyboardAllUp.data()" in release_submit.group(1)
+    assert "kBleMouseAllUp.data()" in release_submit.group(1)
+    assert "vTaskDelay" not in release_submit.group(1)
+    assert "arm_ble_route_release_grace(identity)" in executor
+    assert "ble_route_grace_due_.store(true" in executor
+    assert "request_executor_wake();" in executor
+    assert "route_release_timer_" in transport
+    assert 'name = "ble_route_release"' in transport
+    assert "&route_release_timer_" in transport
+    assert "&timeout_timer_" in transport
+    assert (
+        "hid_control_executor::kBleRouteReleaseGraceMs) * 1000U" in transport
+    )
+    assert "start_ble_route_disconnect" in executor
+    assert "ble_backend_->disconnect(identity.connection_handle)" in executor
+    assert "complete_ble_route_release_on_disconnect" in executor
+    assert "ble_route_disconnect_observed_.store(true" in executor
+    assert "route.active != hid_route::OutputRoute::kNone" in executor
 
     assert 'kDeviceName[] = "s3-hidbot"' in transport
     assert "kHidAppearance = 0x03c0" in transport

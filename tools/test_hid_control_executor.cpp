@@ -76,6 +76,27 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         last_connection = connection_handle;
         return disconnect_result;
     }
+    std::int32_t arm_ble_route_release_grace(
+        hid_control_executor::BleRouteReleaseIdentity identity) override {
+        ++arm_route_release_grace_calls;
+        route_release_identity = identity;
+        route_release_grace_armed = route_release_grace_result == 0;
+        return route_release_grace_result;
+    }
+    void cancel_ble_route_release_grace(
+        hid_control_executor::BleRouteReleaseIdentity identity) override {
+        ++cancel_route_release_grace_calls;
+        if (identity.authority_epoch ==
+                route_release_identity.authority_epoch &&
+            identity.route_generation ==
+                route_release_identity.route_generation &&
+            identity.ble_generation == route_release_identity.ble_generation &&
+            identity.connection_handle ==
+                route_release_identity.connection_handle &&
+            identity.release_epoch == route_release_identity.release_epoch) {
+            route_release_grace_armed = false;
+        }
+    }
     std::int32_t terminate_orphan_connection(
         std::uint16_t connection_handle) override {
         ++orphan_terminate_calls;
@@ -218,6 +239,8 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     int advertising_calls = 0;
     int stop_calls = 0;
     int disconnect_calls = 0;
+    int arm_route_release_grace_calls = 0;
+    int cancel_route_release_grace_calls = 0;
     int orphan_terminate_calls = 0;
     int configure_connection_calls = 0;
     int initiate_security_calls = 0;
@@ -233,6 +256,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     std::int32_t advertising_result = 0;
     std::int32_t stop_result = 0;
     std::int32_t disconnect_result = 0;
+    std::int32_t route_release_grace_result = 0;
     std::int32_t orphan_terminate_result = 0;
     std::int32_t configure_connection_result = 0;
     std::int32_t initiate_security_result = 0;
@@ -242,6 +266,8 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     std::uint16_t timer_connection = ble_lifecycle::kNoConnection;
     std::uint32_t timer_pairing_id = 0;
     std::uint64_t now_us = 0;
+    bool route_release_grace_armed = false;
+    hid_control_executor::BleRouteReleaseIdentity route_release_identity{};
     ble_security::State security{};
     ble_security::ReadinessInhibit security_inhibit{};
     ble_security::LinkSecurityEvidence security_link{};
@@ -270,6 +296,7 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
     hid_control_executor::BleNotifyBackendResult notify_custom(
         std::uint16_t connection_handle, std::uint16_t characteristic_handle,
         const std::uint8_t *payload, std::uint16_t payload_length) override {
+        const std::size_t history_index = static_cast<std::size_t>(notify_calls);
         ++notify_calls;
         last_connection = connection_handle;
         last_characteristic = characteristic_handle;
@@ -277,6 +304,14 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
         last_payload.fill(0);
         assert(payload_length <= last_payload.size());
         std::memcpy(last_payload.data(), payload, payload_length);
+        if (history_index < notify_history_length.size()) {
+            notify_history_connection[history_index] = connection_handle;
+            notify_history_characteristic[history_index] = characteristic_handle;
+            notify_history_length[history_index] = payload_length;
+            notify_history_payload[history_index].fill(0);
+            std::memcpy(notify_history_payload[history_index].data(), payload,
+                        payload_length);
+        }
         return notify_result;
     }
     int register_calls = 0;
@@ -295,6 +330,10 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
     std::uint16_t last_characteristic = 0;
     std::uint16_t last_payload_length = 0;
     std::array<std::uint8_t, 8> last_payload{};
+    std::array<std::uint16_t, 64> notify_history_connection{};
+    std::array<std::uint16_t, 64> notify_history_characteristic{};
+    std::array<std::uint16_t, 64> notify_history_length{};
+    std::array<std::array<std::uint8_t, 8>, 64> notify_history_payload{};
     hid_control_executor::BleNotifyBackendResult notify_result =
         hid_control_executor::BleNotifyBackendResult::kStackAccepted;
 };
@@ -2409,6 +2448,8 @@ struct ReadyBleRouteFixture {
     }
 };
 
+void observe_exact_route_disconnect(ReadyBleRouteFixture &fixture);
+
 void test_internal_ble_route_activation_and_exact_payloads() {
     {
         hid_runtime::Runtime runtime;
@@ -2555,7 +2596,9 @@ void test_ble_work_token_fences_every_authority_field() {
     assert(fixture.runtime.state_machine().retire_ble_route_if_matches(
         authority));
     fixture.controller.process_for_test(stale);
-    assert(fixture.database.notify_calls == 0);
+    assert(fixture.database.notify_calls == 2);
+    assert(fixture.runtime.state_machine().route_snapshot().transition ==
+           hid_route::Transition::kReleasing);
 }
 
 void test_canceled_ble_ticket_waits_for_exact_action_acknowledgment() {
@@ -2607,12 +2650,14 @@ void test_usb_mount_retires_ble_authority_without_forgetting_held_state() {
     fixture.controller.signal_hid_authority_change();
     assert(fixture.controller.process_wake_cycle_for_test());
     assert(fixture.runtime.state_machine().route_snapshot().active ==
-           hid_route::OutputRoute::kNone);
+           hid_route::OutputRoute::kBle);
+    assert(fixture.runtime.state_machine().route_snapshot().transition ==
+           hid_route::Transition::kReleasing);
     assert(fixture.runtime.state_machine().safety_required(
         hid_runtime::Interface::kKeyboard));
     assert(fixture.runtime.state_machine().keyboard_state().keycodes[0] ==
            0x6a);
-    assert(fixture.database.notify_calls == 1);
+    assert(fixture.database.notify_calls == 3);
 }
 
 void test_ble_readiness_loss_retires_route_without_auto_restore() {
@@ -2640,9 +2685,12 @@ void test_ble_readiness_loss_retires_route_without_auto_restore() {
         }
         assert(fixture.controller.process_one_for_test());
         assert(fixture.runtime.state_machine().route_snapshot().active ==
-               hid_route::OutputRoute::kNone);
+               hid_route::OutputRoute::kBle);
+        assert(fixture.runtime.state_machine().route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
         fixture.controller.process_for_test(delayed);
-        assert(fixture.database.notify_calls == 0);
+        const int safety_calls = loss < 2 ? 1 : 0;
+        assert(fixture.database.notify_calls == safety_calls);
 
         if (loss == 0) {
             assert(queue_subscription(
@@ -2662,10 +2710,20 @@ void test_ble_readiness_loss_retires_route_without_auto_restore() {
         assert(fixture.controller.process_one_for_test());
         assert(fixture.controller.ble_link_ready());
         assert(fixture.runtime.state_machine().route_snapshot().active ==
-               hid_route::OutputRoute::kNone);
+               hid_route::OutputRoute::kBle);
         assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
                hid_runtime::KeyboardReportBeginResult::kNotReady);
-        assert(fixture.database.notify_calls == 0);
+        assert(fixture.database.notify_calls == safety_calls);
+        assert(fixture.controller.expire_ble_route_release_grace_for_test());
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.ble.disconnect_calls == 1);
+        assert(fixture.ble.last_connection == fixture.connection);
+        assert(fixture.ble.event(
+            hid_control_executor::BleEventKind::kDisconnect,
+            fixture.connection));
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
     }
 }
 
@@ -2684,9 +2742,9 @@ void test_callback_readiness_loss_preempts_earlier_queued_report() {
     assert(fixture.controller.process_one_for_test());
     assert(fixture.database.notify_calls == 0);
     assert(fixture.runtime.state_machine().route_snapshot().active ==
-           hid_route::OutputRoute::kNone);
+           hid_route::OutputRoute::kBle);
     assert(fixture.controller.process_one_for_test());
-    assert(fixture.database.notify_calls == 0);
+    assert(fixture.database.notify_calls == 1);
 }
 
 void test_security_and_storage_loss_preempt_ble_work() {
@@ -2701,8 +2759,11 @@ void test_security_and_storage_loss_preempt_ble_work() {
         assert(fixture.controller.process_one_for_test());
         assert(fixture.database.notify_calls == 0);
         assert(fixture.runtime.state_machine().route_snapshot().active ==
-               hid_route::OutputRoute::kNone);
+               hid_route::OutputRoute::kBle);
         assert(fixture.controller.process_one_for_test());
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
     }
     {
         ReadyBleRouteFixture fixture(93);
@@ -2715,9 +2776,14 @@ void test_security_and_storage_loss_preempt_ble_work() {
         assert(fixture.controller.process_one_for_test());
         assert(fixture.database.notify_calls == 0);
         assert(fixture.runtime.state_machine().route_snapshot().active ==
-               hid_route::OutputRoute::kNone);
+               hid_route::OutputRoute::kBle);
         assert(fixture.controller.process_one_for_test());
         assert(fixture.controller.ble_snapshot().recovery_required);
+        assert(fixture.controller.pairing_snapshot().last_result ==
+               ble_pairing::LastResult::kStorage);
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
     }
 }
 
@@ -2740,9 +2806,12 @@ void test_overflow_and_store_full_retire_only_current_ble_route() {
             fixture.database.handles.keyboard_value, false));
         assert(fixture.controller.process_wake_cycle_for_test());
         assert(fixture.runtime.state_machine().route_snapshot().active ==
-               hid_route::OutputRoute::kNone);
+               hid_route::OutputRoute::kBle);
         assert(fixture.controller.ble_snapshot().recovery_required);
         assert(fixture.database.notify_calls == 0);
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
     }
     {
         ReadyBleRouteFixture fixture(95);
@@ -2751,9 +2820,12 @@ void test_overflow_and_store_full_retire_only_current_ble_route() {
             fixture.connection, -55));
         assert(fixture.controller.process_one_for_test());
         assert(fixture.runtime.state_machine().route_snapshot().active ==
-               hid_route::OutputRoute::kNone);
+               hid_route::OutputRoute::kBle);
         assert(!fixture.controller.ble_snapshot().recovery_required);
         assert(fixture.database.notify_calls == 0);
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
     }
 }
 
@@ -2769,18 +2841,18 @@ void test_ble_backend_failure_retires_and_never_replays_mouse() {
         assert(fixture.controller.queue_ble_mouse_report(1, 7, -3, 2, -1) ==
                hid_runtime::MouseReportBeginResult::kPublished);
         assert(fixture.controller.process_one_for_test());
-        assert(fixture.database.notify_calls == 1);
+        assert(fixture.database.notify_calls == 3);
         assert(fixture.runtime.state_machine().route_snapshot().active ==
-               hid_route::OutputRoute::kNone);
+               hid_route::OutputRoute::kBle);
         assert(fixture.runtime.state_machine().host_state_uncertain(
             hid_runtime::Interface::kMouse));
         assert(fixture.runtime.state_machine().safety_required(
             hid_runtime::Interface::kMouse));
         assert(!fixture.controller.process_one_for_test());
-        assert(fixture.database.notify_calls == 1);
+        assert(fixture.database.notify_calls == 3);
         assert(fixture.controller.queue_ble_mouse_report(1, 0, 0, 0, 0) ==
                hid_runtime::MouseReportBeginResult::kNotReady);
-        assert(fixture.database.notify_calls == 1);
+        assert(fixture.database.notify_calls == 3);
     }
 }
 
@@ -2801,7 +2873,9 @@ void test_ble_not_ready_and_stale_results_terminalize_runtime_ticket() {
         assert(sink.calls == 1);
         assert(fixture.database.notify_calls == 0);
         assert(fixture.runtime.state_machine().route_snapshot().active ==
-               hid_route::OutputRoute::kNone);
+               hid_route::OutputRoute::kBle);
+        assert(fixture.runtime.state_machine().route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
         assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
                hid_runtime::KeyboardReportTicketState::kCanceled);
         fixture.runtime.state_machine().finalize_keyboard_report();
@@ -2840,6 +2914,387 @@ void test_ble_disconnect_reconnect_kills_old_work_and_route() {
     assert(fixture.runtime.state_machine().route_snapshot().active ==
            hid_route::OutputRoute::kNone);
     assert(fixture.database.notify_calls == 0);
+}
+
+void begin_explicit_ble_route_retirement(ReadyBleRouteFixture &fixture) {
+    const auto outcome =
+        fixture.controller.request_route(hid_route::OutputRoute::kNone);
+    assert(outcome.action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    assert(outcome.snapshot.route.transition ==
+           hid_route::Transition::kReleasing);
+    assert(fixture.controller.process_wake_cycle_for_test());
+}
+
+void observe_exact_route_disconnect(ReadyBleRouteFixture &fixture) {
+    assert(fixture.ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                             fixture.connection));
+    assert(fixture.controller.process_one_for_test());
+}
+
+void test_u74c_normal_retirement_release_grace_and_cross_transport() {
+    static_assert(hid_control_executor::kBleRouteReleaseGraceMs == 100);
+    ReadyBleRouteFixture fixture(120);
+    const auto initial_route = fixture.runtime.state_machine().route_snapshot();
+    const auto initial_authority =
+        fixture.runtime.state_machine().ble_route_authority_snapshot();
+    const std::array<std::uint8_t, 6> queued_keys{0x73, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0, queued_keys) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+
+    // C1/C2/C30: Stage A revokes ordinary authority before the already queued
+    // normal action can run. Only the two safety reports reach the backend.
+    begin_explicit_ble_route_retirement(fixture);
+    const auto releasing = fixture.runtime.state_machine().route_snapshot();
+    assert(releasing.desired == hid_route::OutputRoute::kNone);
+    assert(releasing.active == hid_route::OutputRoute::kBle);
+    assert(releasing.transition == hid_route::Transition::kReleasing);
+    assert(releasing.generation == initial_route.generation);
+    assert(fixture.controller.queue_ble_mouse_report(1, 1, 1, 1, 1) ==
+           hid_runtime::MouseReportBeginResult::kNotReady);
+
+    // C3-C6/C31: exact Boot values, no Report ID, exact old tuple and fresh
+    // release epoch. Stack acceptance is only local acceptance, not delivery.
+    assert(fixture.database.notify_calls == 2);
+    assert(fixture.database.notify_history_connection[0] ==
+           fixture.connection);
+    assert(fixture.database.notify_history_characteristic[0] ==
+           fixture.database.handles.keyboard_value);
+    assert(fixture.database.notify_history_length[0] == 8);
+    const std::array<std::uint8_t, 8> all_up{};
+    assert(fixture.database.notify_history_payload[0] == all_up);
+    assert(fixture.database.notify_history_characteristic[1] ==
+           fixture.database.handles.mouse_value);
+    assert(fixture.database.notify_history_length[1] == 5);
+    assert(fixture.database.notify_history_payload[1] == all_up);
+    const auto identity =
+        fixture.controller.ble_route_release_identity_for_test();
+    assert(identity.authority_epoch == initial_authority.authority_epoch);
+    assert(identity.route_generation == initial_authority.route_generation);
+    assert(identity.ble_generation == initial_authority.ble_generation);
+    assert(identity.connection_handle == initial_authority.connection_handle);
+    assert(identity.release_epoch != initial_authority.release_epoch);
+    assert(fixture.ble.arm_route_release_grace_calls == 1);
+    assert(fixture.ble.route_release_grace_armed);
+    assert(fixture.ble.disconnect_calls == 0);
+
+    // C17/C19: neither direct USB selection nor normal BLE delivery is
+    // admitted while grace owns the old route.
+    assert(fixture.controller.request_route(hid_route::OutputRoute::kUsb)
+               .action_result == hid_runtime::RouteTransitionResult::kBusy);
+    assert(fixture.controller.activate_ble_route_internal().action_result ==
+           hid_runtime::RouteTransitionResult::kNotReady);
+
+    // C9: deterministic expiry drives the single existing hardened disconnect
+    // path; no test sleeps or wall-clock timing are involved.
+    assert(fixture.controller.expire_ble_route_release_grace_for_test());
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.ble.disconnect_calls == 1);
+    assert(fixture.ble.last_connection == fixture.connection);
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kBle);
+    observe_exact_route_disconnect(fixture);
+    const auto none = fixture.runtime.state_machine().route_snapshot();
+    assert(none.desired == hid_route::OutputRoute::kNone);
+    assert(none.active == hid_route::OutputRoute::kNone);
+    assert(none.transition == hid_route::Transition::kStable);
+    assert(none.generation == initial_route.generation + 1U);
+    assert(!fixture.ble.route_release_grace_armed);
+
+    // C18: USB can be selected only after exact BLE Disconnect established
+    // stable none. Exposure setup remains independent from route selection.
+    complete_attach(fixture.runtime, fixture.usb, fixture.controller);
+    mount_ready(fixture.runtime);
+    assert(fixture.controller.request_route(hid_route::OutputRoute::kUsb)
+               .action_result == hid_runtime::RouteTransitionResult::kAccepted);
+}
+
+void test_u74c_usb_none_ble_and_direct_switch_rejection() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    complete_attach(runtime, usb, controller);
+    mount_ready(runtime);
+    assert(runtime.state_machine().request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+
+    // C15: direct USB -> BLE never silently changes the route enum.
+    advertise_ble(runtime, usb, ble, database, controller);
+    constexpr std::uint16_t connection = 121;
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect, connection));
+    assert(controller.process_one_for_test());
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, connection);
+    make_security_ready(ble);
+    ble.refresh_security(connection);
+    assert(controller.activate_ble_route_internal().action_result ==
+           hid_runtime::RouteTransitionResult::kBusy);
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kUsb);
+
+    // C16: the existing USB release reaches observable stable none first,
+    // after which the internal BLE activation is legal.
+    assert(controller.request_route(hid_route::OutputRoute::kNone)
+               .action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(controller.activate_ble_route_internal().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+}
+
+void test_u74c_release_rejection_and_disconnect_failure_are_bounded() {
+    {
+        ReadyBleRouteFixture fixture(122);
+        fixture.database.notify_result =
+            hid_control_executor::BleNotifyBackendResult::kStackRejected;
+        begin_explicit_ble_route_retirement(fixture);
+        // C7: one keyboard and one mouse attempt, then grace; no retry.
+        assert(fixture.database.notify_calls == 2);
+        assert(fixture.ble.arm_route_release_grace_calls == 1);
+        assert(fixture.controller.expire_ble_route_release_grace_for_test());
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.ble.disconnect_calls == 1);
+    }
+    {
+        ReadyBleRouteFixture fixture(123);
+        begin_explicit_ble_route_retirement(fixture);
+        fixture.ble.disconnect_result = -77;
+        assert(fixture.controller.expire_ble_route_release_grace_for_test());
+        assert(fixture.controller.process_one_for_test());
+        // C26: no watchdog/operation was established, so lifecycle faults and
+        // the route cannot falsely publish stable none.
+        assert(fixture.controller.ble_snapshot().recovery_required);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kBle);
+        assert(fixture.runtime.state_machine().route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+    }
+}
+
+void test_u74c_grace_queue_full_has_sticky_progress() {
+    ReadyBleRouteFixture fixture(124);
+    begin_explicit_ble_route_retirement(fixture);
+    for (std::size_t index = 0;
+         index < hid_control_executor::Controller::kActionQueueDepth;
+         ++index) {
+        assert(fixture.controller.signal_ble_event({
+            .kind = hid_control_executor::BleEventKind::kEncryptionChange,
+            .generation = fixture.generation - 1U,
+            .connection_handle = fixture.connection,
+        }));
+    }
+    // C11: the timer action cannot enter the full queue, but its exact due bit
+    // and independent wake drive disconnect at the next executor boundary.
+    assert(fixture.controller.expire_ble_route_release_grace_for_test());
+    assert(fixture.controller.executor_wake_pending_for_test());
+    assert(fixture.controller.process_wake_cycle_for_test());
+    assert(fixture.ble.disconnect_calls == 1);
+    assert(fixture.ble.last_connection == fixture.connection);
+}
+
+void test_u74c_dropped_exact_disconnect_still_completes_route() {
+    ReadyBleRouteFixture fixture(130);
+    begin_explicit_ble_route_retirement(fixture);
+    for (std::size_t index = 0;
+         index < hid_control_executor::Controller::kActionQueueDepth;
+         ++index) {
+        assert(fixture.controller.signal_ble_event({
+            .kind = hid_control_executor::BleEventKind::kEncryptionChange,
+            .generation = fixture.generation - 1U,
+            .connection_handle = fixture.connection,
+        }));
+    }
+    // The callback itself observed the exact physical Disconnect. Its route
+    // completion evidence survives queue overflow while QueueOverflow remains
+    // the stronger lifecycle diagnosis.
+    assert(!fixture.ble.event(hid_control_executor::BleEventKind::kDisconnect,
+                              fixture.connection));
+    assert(fixture.controller.process_wake_cycle_for_test());
+    assert(fixture.controller.ble_snapshot().recovery_required);
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+}
+
+void test_u74c_spontaneous_disconnect_and_stale_grace_are_fenced() {
+    ReadyBleRouteFixture fixture(125);
+    begin_explicit_ble_route_retirement(fixture);
+    const auto old_identity =
+        fixture.controller.ble_route_release_identity_for_test();
+
+    // C12: Disconnect before grace cancels the timer and itself proves the
+    // final boundary without issuing a redundant disconnect.
+    observe_exact_route_disconnect(fixture);
+    assert(fixture.ble.disconnect_calls == 0);
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(!fixture.controller.signal_ble_route_release_grace(old_identity));
+
+    // C14/C27-C29: even the same numeric handle belongs to a fresh generation;
+    // reconnect/security/CCCD eligibility does not restore route authority.
+    assert(fixture.ble.event(hid_control_executor::BleEventKind::kConnect,
+                             fixture.connection));
+    assert(fixture.controller.process_one_for_test());
+    const auto generation_b = fixture.controller.ble_snapshot().generation;
+    assert(generation_b != old_identity.ble_generation);
+    subscribe_composite(fixture.controller, fixture.database, generation_b,
+                        fixture.connection,
+                        hid_control_executor::BleSubscriptionReason::kRestore);
+    make_security_ready(fixture.ble);
+    fixture.ble.refresh_security(fixture.connection);
+    assert(fixture.controller.ble_link_ready());
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(!fixture.controller.signal_ble_route_release_grace(old_identity));
+    assert(fixture.ble.disconnect_calls == 0);
+}
+
+void test_u74c_disconnect_expiry_race_and_release_action_reuse() {
+    ReadyBleRouteFixture fixture(126);
+    begin_explicit_ble_route_retirement(fixture);
+    assert(fixture.controller.expire_ble_route_release_grace_for_test());
+    hid_control_executor::Controller::Action old_expiry{};
+    assert(fixture.controller.dequeue_one_for_test(old_expiry));
+
+    // C13: exact Disconnect wins while the expired action is delayed; the
+    // later action is fenced and cannot issue a second disconnect.
+    observe_exact_route_disconnect(fixture);
+    fixture.controller.process_for_test(old_expiry);
+    assert(fixture.ble.disconnect_calls == 0);
+
+    assert(fixture.ble.event(hid_control_executor::BleEventKind::kConnect,
+                             fixture.connection));
+    assert(fixture.controller.process_one_for_test());
+    const auto generation_b = fixture.controller.ble_snapshot().generation;
+    subscribe_composite(fixture.controller, fixture.database, generation_b,
+                        fixture.connection);
+    make_security_ready(fixture.ble);
+    fixture.ble.refresh_security(fixture.connection);
+    assert(fixture.controller.activate_ble_route_internal().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    begin_explicit_ble_route_retirement(fixture);
+    const auto new_identity =
+        fixture.controller.ble_route_release_identity_for_test();
+    // C10/C28/C32/C33: stale action acknowledgment cannot consume the newer
+    // retirement despite connection-handle reuse.
+    assert(new_identity.release_epoch !=
+               old_expiry.ble_route_release.release_epoch ||
+           new_identity.ble_generation !=
+               old_expiry.ble_route_release.ble_generation);
+    fixture.controller.process_for_test(old_expiry);
+    assert(fixture.ble.disconnect_calls == 0);
+    assert(fixture.controller.expire_ble_route_release_grace_for_test());
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.ble.disconnect_calls == 1);
+}
+
+void test_u74c_lease_overflow_and_disable_retirement_paths() {
+    {
+        ReadyBleRouteFixture fixture(127);
+        // C8/C29 plus lease boundary: the existing 5000 ms authority callback
+        // publishes release work; it cannot leave BLE normal authority alive.
+        fixture.runtime.state_machine().request_release_all();
+        fixture.controller.signal_hid_authority_change();
+        assert(fixture.controller.process_wake_cycle_for_test());
+        assert(fixture.runtime.state_machine().route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
+        const std::array<std::uint8_t, 6> no_keys{};
+        assert(fixture.controller.queue_ble_keyboard_report(
+                   0, no_keys) ==
+               hid_runtime::KeyboardReportBeginResult::kNotReady);
+    }
+    {
+        ReadyBleRouteFixture fixture(128);
+        begin_explicit_ble_route_retirement(fixture);
+        for (std::size_t index = 0;
+             index < hid_control_executor::Controller::kActionQueueDepth;
+             ++index) {
+            assert(fixture.controller.signal_ble_event({
+                .kind = hid_control_executor::BleEventKind::kEncryptionChange,
+                .generation = fixture.generation - 1U,
+                .connection_handle = fixture.connection,
+            }));
+        }
+        assert(!queue_control_point(
+            fixture.controller, fixture.generation, fixture.connection,
+            fixture.database.handles.control_point_value, true));
+        assert(fixture.controller.process_wake_cycle_for_test());
+        // C25: generic overflow truth wins and initiates bounded teardown; it
+        // does not overwrite the retained exact route-release identity.
+        assert(fixture.controller.ble_snapshot().recovery_required);
+        assert(fixture.runtime.state_machine().route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+    }
+    {
+        ReadyBleRouteFixture fixture(129);
+        // Exposure disable remains independent but cannot bypass the route's
+        // observable stable-none boundary.
+        assert(fixture.controller.request_ble_disable().action_result ==
+               ble_lifecycle::TransitionResult::kBusy);
+        begin_explicit_ble_route_retirement(fixture);
+        assert(fixture.controller.expire_ble_route_release_grace_for_test());
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.ble.disconnect_calls == 1);
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(fixture.controller.request_ble_disable().action_result ==
+               ble_lifecycle::TransitionResult::kAccepted);
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.controller.ble_snapshot().observed ==
+               ble_lifecycle::ObservedState::kIdle);
+    }
+    {
+        ReadyBleRouteFixture fixture(131);
+        // A host reset is itself exact proof that the old controller-owned
+        // connection is gone; it need not wait for an impossible Disconnect.
+        assert(fixture.ble.event(
+            hid_control_executor::BleEventKind::kReset,
+            ble_lifecycle::kNoConnection, -9));
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        assert(fixture.ble.disconnect_calls == 0);
+    }
+}
+
+void test_u74c_ble_completion_preserves_independent_usb_uncertainty() {
+    ReadyBleRouteFixture fixture(132);
+    const std::array<std::uint8_t, 6> held_key{0x73, 0, 0, 0, 0, 0};
+    assert(fixture.controller.queue_ble_keyboard_report(0, held_key) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(fixture.controller.process_one_for_test());
+    fixture.runtime.state_machine().finalize_keyboard_report();
+
+    assert(action(fixture.controller.request_attach()) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    assert(fixture.controller.process_one_for_test());
+    fixture.runtime.state_machine().on_mount();
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    assert(fixture.runtime.state_machine().route_snapshot().transition ==
+           hid_route::Transition::kReleasing);
+
+    // An independent USB host loss becomes uncertain while BLE is retiring.
+    // Exact BLE completion must not erase that stronger USB safety barrier.
+    fixture.runtime.state_machine().on_unmount();
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    observe_exact_route_disconnect(fixture);
+    const auto usb_lifecycle =
+        fixture.runtime.state_machine().usb_lifecycle_snapshot();
+    assert(usb_lifecycle.host_release_uncertain);
+    assert(usb_lifecycle.safety_pending);
+    assert(fixture.runtime.state_machine().safety_required(
+        hid_runtime::Interface::kKeyboard));
 }
 
 void assert_fatal_storage_terminal_state(
@@ -3719,6 +4174,15 @@ int main() {
     test_ble_backend_failure_retires_and_never_replays_mouse();
     test_ble_not_ready_and_stale_results_terminalize_runtime_ticket();
     test_ble_disconnect_reconnect_kills_old_work_and_route();
+    test_u74c_normal_retirement_release_grace_and_cross_transport();
+    test_u74c_usb_none_ble_and_direct_switch_rejection();
+    test_u74c_release_rejection_and_disconnect_failure_are_bounded();
+    test_u74c_grace_queue_full_has_sticky_progress();
+    test_u74c_dropped_exact_disconnect_still_completes_route();
+    test_u74c_spontaneous_disconnect_and_stale_grace_are_fenced();
+    test_u74c_disconnect_expiry_race_and_release_action_reuse();
+    test_u74c_lease_overflow_and_disable_retirement_paths();
+    test_u74c_ble_completion_preserves_independent_usb_uncertainty();
     test_pairing_input_response_and_initiation();
     test_public_pairing_rpc_mailbox_status_and_races();
     test_security_event_ordering_and_existing_bond();

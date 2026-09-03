@@ -94,7 +94,13 @@ BleCommandOutcome Controller::request_ble_enable() {
 
 BleCommandOutcome Controller::request_ble_disable() {
     constexpr ControlOperation operation = ControlOperation::kBleDisable;
-    if (!initialized_ || ble_backend_ == nullptr || !claim_operation(operation)) {
+    const auto route = runtime_ == nullptr
+                           ? hid_route::Snapshot{}
+                           : runtime_->state_machine().route_snapshot();
+    if (!initialized_ || ble_backend_ == nullptr || !route.coherent ||
+        route.active != hid_route::OutputRoute::kNone ||
+        route.transition != hid_route::Transition::kStable ||
+        !claim_operation(operation)) {
         return {};
     }
     const ble_lifecycle::TransitionOutcome outcome = ble_state_.begin_disable();
@@ -236,6 +242,20 @@ bool Controller::signal_ble_event(BleEvent event) {
     }
 #endif
     mark_ble_event_overflow(event);
+    if (event.kind == BleEventKind::kDisconnect && runtime_ != nullptr) {
+        const auto release =
+            runtime_->state_machine().ble_route_authority_snapshot();
+        if (release.coherent && release.releasing && !release.active &&
+            release.ble_generation == event.generation &&
+            release.connection_handle == event.connection_handle) {
+            // The callback itself is an exact physical observation. Retain it
+            // independently of the full queue so route retirement can finish
+            // after the stronger generic-overflow fault is committed.
+            ble_route_disconnect_observed_.store(true,
+                                                 std::memory_order_release);
+            request_executor_wake();
+        }
+    }
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     if (ble_enqueue_failure_hook_ != nullptr &&
         ble_enqueue_failure_phase_ ==
@@ -256,6 +276,28 @@ bool Controller::signal_ble_event(BleEvent event) {
             event.connection_handle);
     }
     return false;
+}
+
+bool Controller::signal_ble_route_release_grace(
+    BleRouteReleaseIdentity identity) {
+    if (!ble_route_release_identity_current(identity)) {
+        return false;
+    }
+    bool expected = true;
+    if (!ble_route_grace_armed_.compare_exchange_strong(
+            expected, false, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return false;
+    }
+    ble_route_grace_due_.store(true, std::memory_order_release);
+    const Action action{.kind = ActionKind::kBleRouteReleaseGrace,
+                        .ble_route_release = identity};
+    if (!enqueue(action)) {
+        // The due bit is authoritative and the independent task notification
+        // makes a full normal queue unable to strand retirement.
+        request_executor_wake();
+    }
+    return true;
 }
 
 void Controller::signal_ble_lifecycle_handoff_failure() {
@@ -353,6 +395,14 @@ RouteCommandOutcome Controller::request_route(hid_route::OutputRoute desired) {
             : runtime_->state_machine().request_route_none();
     if (outcome.action_result == hid_runtime::RouteTransitionResult::kAccepted &&
         outcome.async_required) {
+        if (outcome.snapshot.route.active == hid_route::OutputRoute::kBle) {
+            // BLE release progress is capacity-independent: the retained
+            // runtime identity plus this wake replaces a queue-owned action.
+            request_executor_wake();
+            return RouteCommandOutcome{.action_result = outcome.action_result,
+                                       .snapshot_valid = outcome.snapshot_valid,
+                                       .snapshot = outcome.snapshot};
+        }
         const Action item{
             .kind = ActionKind::kRouteRelease,
             .lifecycle = runtime_->state_machine().usb_lifecycle_snapshot(),
@@ -415,6 +465,7 @@ RouteCommandOutcome Controller::activate_ble_route_internal() {
                            peer_after.handles.mouse_value;
     if (!exact) {
         (void)state.retire_ble_route_if_matches(active);
+        drive_ble_route_retirement();
         return RouteCommandOutcome{
             .action_result = hid_runtime::RouteTransitionResult::kNotReady,
             .snapshot_valid = true,
@@ -626,27 +677,263 @@ void Controller::retire_ble_route_if_unready() {
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
     const auto authority = state.ble_route_authority_snapshot();
-    if (!authority.coherent || !authority.active) {
+    if (!authority.coherent) {
         return;
     }
-    const auto peer = ble_hid_peer_;
-    const auto route = state.route_snapshot();
-    const bool exact_ready =
-        ble_link_ready() && peer.active && route.coherent &&
-        !route.invalidation_pending &&
-        route.active == hid_route::OutputRoute::kBle &&
-        route.desired == hid_route::OutputRoute::kBle &&
-        route.transition == hid_route::Transition::kStable &&
-        route.generation == authority.route_generation &&
-        state.authority_epoch() == authority.authority_epoch &&
-        peer.generation == authority.ble_generation &&
-        peer.connection_handle == authority.connection_handle &&
-        peer.handles.keyboard_value ==
-            authority.keyboard_characteristic_handle &&
-        peer.handles.mouse_value == authority.mouse_characteristic_handle;
-    if (!exact_ready) {
-        (void)state.retire_ble_route_if_matches(authority);
+    if (authority.active) {
+        const auto peer = ble_hid_peer_;
+        const auto route = state.route_snapshot();
+        const bool exact_ready =
+            ble_link_ready() && peer.active && route.coherent &&
+            !route.invalidation_pending &&
+            route.active == hid_route::OutputRoute::kBle &&
+            route.desired == hid_route::OutputRoute::kBle &&
+            route.transition == hid_route::Transition::kStable &&
+            route.generation == authority.route_generation &&
+            state.ble_route_normal_authority_matches(authority) &&
+            peer.generation == authority.ble_generation &&
+            peer.connection_handle == authority.connection_handle &&
+            peer.handles.keyboard_value ==
+                authority.keyboard_characteristic_handle &&
+            peer.handles.mouse_value == authority.mouse_characteristic_handle;
+        if (!exact_ready) {
+            (void)state.retire_ble_route_if_matches(authority);
+        }
     }
+    drive_ble_route_retirement();
+}
+
+bool Controller::ble_route_release_identity_current(
+    BleRouteReleaseIdentity identity) const {
+    if (runtime_ == nullptr) {
+        return false;
+    }
+    const hid_runtime::BleRouteAuthoritySnapshot expected{
+        .authority_epoch = identity.authority_epoch,
+        .route_generation = identity.route_generation,
+        .ble_generation = identity.ble_generation,
+        .connection_handle = identity.connection_handle,
+        .keyboard_characteristic_handle =
+            identity.keyboard_characteristic_handle,
+        .mouse_characteristic_handle = identity.mouse_characteristic_handle,
+        .active = false,
+        .releasing = true,
+        .release_epoch = identity.release_epoch,
+    };
+    return runtime_->state_machine().ble_route_release_matches(expected);
+}
+
+bool Controller::ble_safety_release_ready(
+    BleRouteReleaseIdentity identity, BleHidInterface interface) const {
+    if (!ble_route_release_identity_current(identity) ||
+        ble_backend_ == nullptr || ble_database_ == nullptr ||
+        ble_lifecycle_handoff_failure_.load(std::memory_order_acquire) ||
+        ble_backend_->persistent_store_failure_observed() ||
+        ble_route_loss_pending(identity.ble_generation) ||
+        ble_event_overflow_pending(identity.ble_generation) ||
+        !ble_hid_peer_.active || ble_hid_peer_.suspended ||
+        ble_hid_peer_.generation != identity.ble_generation ||
+        ble_hid_peer_.connection_handle != identity.connection_handle) {
+        return false;
+    }
+    const auto lifecycle = ble_state_.snapshot();
+    const auto handles = ble_database_->hid_handles();
+    const bool keyboard = interface == BleHidInterface::kKeyboard;
+    const std::uint16_t expected_handle =
+        keyboard ? identity.keyboard_characteristic_handle
+                 : identity.mouse_characteristic_handle;
+    const std::uint16_t peer_handle =
+        keyboard ? ble_hid_peer_.handles.keyboard_value
+                 : ble_hid_peer_.handles.mouse_value;
+    const std::uint16_t database_handle =
+        keyboard ? handles.keyboard_value : handles.mouse_value;
+    const bool subscribed = keyboard
+                                ? ble_hid_peer_.keyboard_notify_enabled
+                                : ble_hid_peer_.mouse_notify_enabled;
+    return expected_handle != 0 && peer_handle == expected_handle &&
+           database_handle == expected_handle && subscribed &&
+           lifecycle.generation == identity.ble_generation &&
+           lifecycle.desired == ble_lifecycle::DesiredExposure::kExposed &&
+           lifecycle.observed == ble_lifecycle::ObservedState::kConnected &&
+           lifecycle.connected && !lifecycle.recovery_required &&
+           ble_state_.connection_handle() == identity.connection_handle &&
+           ble_backend_->security_ready_for_hid(identity.ble_generation,
+                                                identity.connection_handle);
+}
+
+void Controller::submit_ble_safety_release(
+    BleRouteReleaseIdentity identity) {
+    if (ble_safety_release_ready(identity, BleHidInterface::kKeyboard)) {
+        // Stack acceptance is only a bounded delivery opportunity; it is not
+        // a peer acknowledgment and never causes retry.
+        (void)ble_database_->notify_custom(
+            identity.connection_handle,
+            identity.keyboard_characteristic_handle,
+            kBleKeyboardAllUp.data(), kBleKeyboardAllUp.size());
+    }
+    if (ble_safety_release_ready(identity, BleHidInterface::kMouse)) {
+        (void)ble_database_->notify_custom(
+            identity.connection_handle, identity.mouse_characteristic_handle,
+            kBleMouseAllUp.data(), kBleMouseAllUp.size());
+    }
+}
+
+void Controller::start_ble_route_disconnect(
+    BleRouteReleaseIdentity identity) {
+    if (ble_route_release_phase_ != BleRouteReleasePhase::kGrace ||
+        !ble_route_release_identity_current(identity)) {
+        return;
+    }
+    ble_route_release_phase_ = BleRouteReleasePhase::kDisconnecting;
+    const std::int32_t result =
+        ble_backend_->disconnect(identity.connection_handle);
+    if (result == 0) {
+        return;
+    }
+    // No Disconnect operation/watchdog exists. Keep the route releasing: a
+    // later exact Disconnect may still prove physical retirement, while the
+    // lifecycle fault truthfully records present uncertainty.
+    ble_route_release_phase_ = BleRouteReleasePhase::kFault;
+    ble_backend_->mark_security_unhealthy(identity.ble_generation);
+    fail_ble(identity.ble_generation, ble_lifecycle::Operation::kRuntime,
+             result, ControlOperation::kNone);
+    release_operation(ble_route_release_owner_);
+    ble_route_release_owner_ = ControlOperation::kNone;
+}
+
+void Controller::note_ble_route_disconnect_started(
+    ble_lifecycle::Generation generation, std::uint16_t connection_handle,
+    std::int32_t result) {
+    if (result != 0 || runtime_ == nullptr) {
+        return;
+    }
+    const auto release =
+        runtime_->state_machine().ble_route_authority_snapshot();
+    if (!release.coherent || !release.releasing || release.active ||
+        release.ble_generation != generation ||
+        release.connection_handle != connection_handle) {
+        return;
+    }
+    const BleRouteReleaseIdentity identity{
+        .authority_epoch = release.authority_epoch,
+        .route_generation = release.route_generation,
+        .ble_generation = release.ble_generation,
+        .connection_handle = release.connection_handle,
+        .keyboard_characteristic_handle =
+            release.keyboard_characteristic_handle,
+        .mouse_characteristic_handle = release.mouse_characteristic_handle,
+        .release_epoch = release.release_epoch,
+    };
+    cancel_ble_route_release_grace(identity);
+    ble_route_release_ = identity;
+    ble_route_release_phase_ = BleRouteReleasePhase::kDisconnecting;
+}
+
+void Controller::cancel_ble_route_release_grace(
+    BleRouteReleaseIdentity identity) {
+    ble_route_grace_armed_.store(false, std::memory_order_release);
+    ble_route_grace_due_.store(false, std::memory_order_release);
+    if (ble_backend_ != nullptr) {
+        ble_backend_->cancel_ble_route_release_grace(identity);
+    }
+}
+
+void Controller::drive_ble_route_retirement() {
+    if (runtime_ == nullptr || ble_backend_ == nullptr) {
+        return;
+    }
+    const auto release =
+        runtime_->state_machine().ble_route_authority_snapshot();
+    if (!release.coherent || !release.releasing || release.active) {
+        return;
+    }
+    const BleRouteReleaseIdentity identity{
+        .authority_epoch = release.authority_epoch,
+        .route_generation = release.route_generation,
+        .ble_generation = release.ble_generation,
+        .connection_handle = release.connection_handle,
+        .keyboard_characteristic_handle =
+            release.keyboard_characteristic_handle,
+        .mouse_characteristic_handle = release.mouse_characteristic_handle,
+        .release_epoch = release.release_epoch,
+    };
+    if (ble_route_disconnect_observed_.exchange(false,
+                                                std::memory_order_acq_rel)) {
+        complete_ble_route_release_on_disconnect({
+            .kind = BleEventKind::kDisconnect,
+            .generation = identity.ble_generation,
+            .connection_handle = identity.connection_handle,
+        });
+        return;
+    }
+    if (ble_route_release_phase_ == BleRouteReleasePhase::kNone) {
+        // A callback-side loss fences normal work immediately. Wait until its
+        // queued executor event has updated CCCD/suspend/security truth before
+        // deciding which exact safety notifications remain usable.
+        if (ble_route_loss_pending(identity.ble_generation) ||
+            ble_event_overflow_pending(identity.ble_generation)) {
+            return;
+        }
+        ble_route_release_ = identity;
+        const auto active_owner =
+            active_operation_.load(std::memory_order_acquire);
+        if (active_owner == ControlOperation::kRouteChange) {
+            ble_route_release_owner_ = active_owner;
+        }
+        submit_ble_safety_release(identity);
+        ble_route_release_phase_ = BleRouteReleasePhase::kGrace;
+        ble_route_grace_due_.store(false, std::memory_order_release);
+        ble_route_grace_armed_.store(true, std::memory_order_release);
+        if (ble_backend_->arm_ble_route_release_grace(identity) != 0) {
+            ble_route_grace_armed_.store(false, std::memory_order_release);
+            start_ble_route_disconnect(identity);
+        }
+        return;
+    }
+    if (ble_route_release_phase_ == BleRouteReleasePhase::kGrace &&
+        !ble_route_loss_pending(identity.ble_generation) &&
+        ble_route_grace_due_.exchange(false, std::memory_order_acq_rel)) {
+        start_ble_route_disconnect(identity);
+    }
+}
+
+void Controller::complete_ble_route_release_on_disconnect(BleEvent event) {
+    if (runtime_ == nullptr ||
+        (event.kind != BleEventKind::kDisconnect &&
+         event.kind != BleEventKind::kReset)) {
+        return;
+    }
+    const auto release =
+        runtime_->state_machine().ble_route_authority_snapshot();
+    const bool exact_physical_loss =
+        release.coherent && release.releasing && !release.active &&
+        release.ble_generation == event.generation &&
+        (event.kind == BleEventKind::kReset ||
+         release.connection_handle == event.connection_handle);
+    if (!exact_physical_loss) {
+        return;
+    }
+    const BleRouteReleaseIdentity identity{
+        .authority_epoch = release.authority_epoch,
+        .route_generation = release.route_generation,
+        .ble_generation = release.ble_generation,
+        .connection_handle = release.connection_handle,
+        .keyboard_characteristic_handle =
+            release.keyboard_characteristic_handle,
+        .mouse_characteristic_handle = release.mouse_characteristic_handle,
+        .release_epoch = release.release_epoch,
+    };
+    cancel_ble_route_release_grace(identity);
+    ble_route_disconnect_observed_.store(false, std::memory_order_release);
+    if (!runtime_->state_machine().complete_ble_route_release_if_matches(
+            release)) {
+        return;
+    }
+    const ControlOperation owner = ble_route_release_owner_;
+    ble_route_release_ = {};
+    ble_route_release_phase_ = BleRouteReleasePhase::kNone;
+    ble_route_release_owner_ = ControlOperation::kNone;
+    release_operation(owner);
 }
 
 hid_runtime::BleSubmitResult Controller::submit_runtime_ble_report(
@@ -768,6 +1055,13 @@ void Controller::process(Action action) {
     if (action.kind == ActionKind::kBleHidReport) {
         (void)state.process_ble_report(action.hid_interface, action.hid_work,
                                       submit_runtime_ble_report, this);
+        retire_ble_route_if_unready();
+        return;
+    }
+    if (action.kind == ActionKind::kBleRouteReleaseGrace) {
+        if (ble_route_release_identity_current(action.ble_route_release)) {
+            drive_ble_route_retirement();
+        }
         return;
     }
     if (action.kind == ActionKind::kPairingStatus) {
@@ -804,11 +1098,12 @@ void Controller::process(Action action) {
         return;
     }
     if (action.kind == ActionKind::kBleEvent) {
+        complete_ble_route_release_on_disconnect(action.ble_event);
         process_ble_event(action.ble_event);
-        retire_ble_route_if_unready();
         if (event_immediately_loses_ble_hid_readiness(action.ble_event)) {
             clear_ble_route_loss(action.ble_event.generation);
         }
+        retire_ble_route_if_unready();
         return;
     }
     if (action.kind == ActionKind::kBleEnable) {
@@ -1045,7 +1340,10 @@ void Controller::commit_persistent_store_failure(
                                       security.connection_handle);
     }
     if (current.connected) {
-        (void)ble_backend_->disconnect(handle);
+        const std::int32_t disconnect_result =
+            ble_backend_->disconnect(handle);
+        note_ble_route_disconnect_started(current.generation, handle,
+                                          disconnect_result);
     }
     const auto active = active_operation_.load(std::memory_order_acquire);
     const auto owner =
@@ -1226,7 +1524,10 @@ void Controller::fail_current_ble_queue_overflow() {
         ble_backend_->cancel_pairing_timeout();
         ble_backend_->mark_security_unhealthy(current.generation);
         if (current.connected) {
-            (void)ble_backend_->disconnect(handle);
+            const std::int32_t disconnect_result =
+                ble_backend_->disconnect(handle);
+            note_ble_route_disconnect_started(current.generation, handle,
+                                              disconnect_result);
         }
         const auto active = active_operation_.load(std::memory_order_acquire);
         const auto ble_owner =
@@ -1304,8 +1605,11 @@ bool Controller::consume_ble_overflow() {
             ble_backend_->cancel_pairing_timeout();
             ble_backend_->mark_security_unhealthy(current.generation);
             if (current.connected) {
-                (void)ble_backend_->disconnect(
-                    ble_state_.connection_handle());
+                const auto handle = ble_state_.connection_handle();
+                const std::int32_t disconnect_result =
+                    ble_backend_->disconnect(handle);
+                note_ble_route_disconnect_started(current.generation, handle,
+                                                  disconnect_result);
             }
             const auto active =
                 active_operation_.load(std::memory_order_acquire);
@@ -1380,6 +1684,8 @@ void Controller::terminate_security_connection(ble_pairing::LastResult result,
     ble_backend_->cancel_pairing_timeout();
     ble_backend_->retire_security(current.generation, handle);
     const std::int32_t disconnect_result = ble_backend_->disconnect(handle);
+    note_ble_route_disconnect_started(current.generation, handle,
+                                      disconnect_result);
     if (fatal) {
         ble_backend_->mark_security_unhealthy(current.generation);
         fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -3,
@@ -1868,6 +2174,15 @@ bool Controller::pairing_mailbox_zero_for_test() const {
         }
     }
     return true;
+}
+
+bool Controller::expire_ble_route_release_grace_for_test() {
+    return signal_ble_route_release_grace(ble_route_release_);
+}
+
+BleRouteReleaseIdentity
+Controller::ble_route_release_identity_for_test() const {
+    return ble_route_release_;
 }
 #else
 void Controller::task_entry(void *context) {

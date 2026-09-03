@@ -221,7 +221,11 @@ struct BleRouteAuthoritySnapshot {
     std::uint16_t connection_handle = kNoBleConnection;
     std::uint16_t keyboard_characteristic_handle = 0;
     std::uint16_t mouse_characteristic_handle = 0;
+    // The normal authority is active only in stable BLE. During retirement
+    // the exact tuple is retained solely as safety-release authority.
     bool active = false;
+    bool releasing = false;
+    std::uint32_t release_epoch = 0;
     bool coherent = true;
 };
 
@@ -324,9 +328,14 @@ class StateMachine {
     RouteTransitionOutcome request_route_none();
     RouteTransitionOutcome request_route_ble(BleRouteActivation activation);
     BleRouteAuthoritySnapshot ble_route_authority_snapshot() const;
+    bool ble_route_normal_authority_matches(
+        BleRouteAuthoritySnapshot expected) const;
+    bool ble_route_release_matches(BleRouteAuthoritySnapshot expected) const;
     bool retire_ble_route_if_matches(BleRouteAuthoritySnapshot expected,
                                      bool report_state_uncertain = false,
                                      Interface uncertain_interface = Interface::kKeyboard);
+    bool complete_ble_route_release_if_matches(
+        BleRouteAuthoritySnapshot expected);
     void terminalize_route_release_schedule_failure(hid_route::Snapshot stage_a);
     void complete_route_release(hid_route::Snapshot stage_a);
 
@@ -584,6 +593,8 @@ class StateMachine {
     std::atomic<std::uint16_t> ble_route_keyboard_handle_{0};
     std::atomic<std::uint16_t> ble_route_mouse_handle_{0};
     std::atomic_bool ble_route_active_{false};
+    std::atomic_bool ble_route_releasing_{false};
+    std::atomic<std::uint32_t> ble_route_release_epoch_{0};
     InterfaceState interfaces_[2]{};
     ReleaseAllTicket release_ticket_{};
     KeyboardReportTicket keyboard_ticket_{};
