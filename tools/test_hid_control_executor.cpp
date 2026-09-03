@@ -3100,7 +3100,6 @@ void test_u74c_grace_queue_full_has_sticky_progress() {
 
 void test_u74c_dropped_exact_disconnect_still_completes_route() {
     ReadyBleRouteFixture fixture(130);
-    begin_explicit_ble_route_retirement(fixture);
     for (std::size_t index = 0;
          index < hid_control_executor::Controller::kActionQueueDepth;
          ++index) {
@@ -3110,9 +3109,10 @@ void test_u74c_dropped_exact_disconnect_still_completes_route() {
             .connection_handle = fixture.connection,
         }));
     }
-    // The callback itself observed the exact physical Disconnect. Its route
-    // completion evidence survives queue overflow while QueueOverflow remains
-    // the stronger lifecycle diagnosis.
+    // C12 pre-grace variant: the callback itself observed the exact physical
+    // Disconnect while the route was still stable BLE. Its completion
+    // evidence survives queue overflow while QueueOverflow remains the
+    // stronger lifecycle diagnosis.
     assert(!fixture.ble.event(hid_control_executor::BleEventKind::kDisconnect,
                               fixture.connection));
     assert(fixture.controller.process_wake_cycle_for_test());

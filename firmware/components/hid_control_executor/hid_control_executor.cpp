@@ -245,7 +245,7 @@ bool Controller::signal_ble_event(BleEvent event) {
     if (event.kind == BleEventKind::kDisconnect && runtime_ != nullptr) {
         const auto release =
             runtime_->state_machine().ble_route_authority_snapshot();
-        if (release.coherent && release.releasing && !release.active &&
+        if (release.coherent && (release.active || release.releasing) &&
             release.ble_generation == event.generation &&
             release.connection_handle == event.connection_handle) {
             // The callback itself is an exact physical observation. Retain it
