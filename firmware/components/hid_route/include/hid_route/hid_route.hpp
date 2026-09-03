@@ -8,7 +8,7 @@ namespace hid_route {
 enum class OutputRoute : std::uint8_t {
     kNone,
     kUsb,
-    // Internal-only through U7.4B. Public route v1 remains none|usb.
+    // Public route v1 remains none|usb; route v2 adds BLE.
     kBle,
 };
 
@@ -51,8 +51,8 @@ class StateMachine final {
     // The compatibility policy is the only U7.2A caller of this transition.
     // It is non-blocking: a callback-side invalidation wins fail-closed.
     bool commit_usb_if_none();
-    // Internal-only BLE activation. Public route-v1 callers never reach this
-    // transition; they continue to reject BLE before entering route state.
+    // Route-v2 reaches this internal transition through the serialized
+    // controller; route-v1 still rejects BLE before entering route state.
     bool commit_ble_if_none();
 
     // Serialized route-controller transitions publish

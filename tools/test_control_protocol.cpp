@@ -349,10 +349,11 @@ struct RouteSource {
         if (source->result == control_protocol::HidRouteActionResult::kAccepted) {
             assert(source->authority != nullptr);
             ++source->authority->epoch;
-            if (desired == control_protocol::OutputRoute::kUsb) {
+            if (desired == control_protocol::OutputRoute::kUsb ||
+                desired == control_protocol::OutputRoute::kBle) {
                 ++source->status.generation;
-                source->status.desired = control_protocol::OutputRoute::kUsb;
-                source->status.active = control_protocol::OutputRoute::kUsb;
+                source->status.desired = desired;
+                source->status.active = desired;
                 source->status.transition = control_protocol::RouteTransition::kStable;
                 source->status.ready = true;
                 return control_protocol::HidRouteActionOutcome{
@@ -1009,7 +1010,8 @@ void test_identity_hello_and_info_shapes() {
              "protocol.hello-v1", "system.ping-v1", "system.info-v1",
              "usb.status-v1", "usb.exposure-control-v1", "hid.lease-v1", "hid.release-all-v1",
              "hid.keyboard-report-v1", "hid.mouse-report-v1", "firmware.identity-v1",
-             "hid.output-route-v1", "ble.exposure-control-v1",
+             "hid.output-route-v1", "hid.output-route-v2",
+             "ble.exposure-control-v1",
          }) {
         assert(count_occurrences(hello, std::string("\"") + std::string(capability) + "\"") == 1);
     }
@@ -1578,6 +1580,7 @@ void test_hid_route_schema_frozen_retry_and_errors() {
     const std::string hello = fixture.sink.last();
     const std::string session = extract_string(hello, "session");
     assert(count_occurrences(hello, "\"hid.output-route-v1\"") == 1);
+    assert(count_occurrences(hello, "\"hid.output-route-v2\"") == 1);
     assert(count_occurrences(hello, "-v1\"") == 13);
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
 
@@ -1664,6 +1667,97 @@ void test_hid_route_schema_frozen_retry_and_errors() {
                                 "{\"route\":\"usb\"}"));
         require_contains(failure.sink.last(), std::string("\"code\":\"") + code + "\"");
     }
+}
+
+void test_hid_route_v2_schema_retry_session_and_v1_ble_compatibility() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session = extract_string(fixture.sink.last(), "session");
+
+    fixture.payload(request(2, session, "hid.route.v2.status"));
+    require_contains(
+        fixture.sink.last(),
+        "\"result\":{\"desired\":\"none\",\"active\":\"none\","
+        "\"generation\":0,\"transition\":\"stable\",\"ready\":false}");
+
+    for (const char *params : {
+             "{}", "{\"route\":null}", "{\"route\":1}",
+             "{\"route\":\"wireless\"}", "{\"route\":\"BLE\"}",
+             "{\"route\":\"ble\",\"extra\":true}",
+         }) {
+        fixture.payload(request(3, session, "hid.route.v2.set", params));
+        require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    }
+    assert(fixture.route.set_calls == 0);
+
+    const std::string select_ble = request(
+        3, session, "hid.route.v2.set", "{\"route\":\"ble\"}");
+    fixture.payload(select_ble);
+    const std::string accepted_ble = fixture.sink.last();
+    require_contains(
+        accepted_ble,
+        "\"result\":{\"desired\":\"ble\",\"active\":\"ble\","
+        "\"generation\":1,\"transition\":\"stable\",\"ready\":true}");
+    assert(fixture.route.set_calls == 1);
+    fixture.payload(select_ble);
+    assert(fixture.sink.last() == accepted_ble);
+    assert(fixture.route.set_calls == 1);
+
+    fixture.payload(hello_request(1, kNonceB));
+    const std::string ble_session = extract_string(fixture.sink.last(), "session");
+    fixture.payload(request(1, ble_session, "hid.route.status"));
+    require_contains(fixture.sink.last(), "\"code\":\"HID_ROUTE_V2_REQUIRED\"");
+
+    fixture.route.result = control_protocol::HidRouteActionResult::kBusy;
+    fixture.payload(request(2, ble_session, "hid.route.set",
+                            "{\"route\":\"usb\"}"));
+    require_contains(fixture.sink.last(), "\"code\":\"HID_BUSY\"");
+    assert(fixture.route.status.active == control_protocol::OutputRoute::kBle);
+
+    fixture.route.result = control_protocol::HidRouteActionResult::kAccepted;
+    const std::string v1_retire = request(
+        3, ble_session, "hid.route.set", "{\"route\":\"none\"}");
+    fixture.payload(v1_retire);
+    const std::string retirement_response = fixture.sink.last();
+    require_contains(retirement_response,
+                     "\"code\":\"HID_ROUTE_V2_REQUIRED\"");
+    assert(fixture.route.status.desired == control_protocol::OutputRoute::kNone);
+    assert(fixture.route.status.active == control_protocol::OutputRoute::kBle);
+    assert(fixture.route.status.transition ==
+           control_protocol::RouteTransition::kReleasing);
+    fixture.payload(v1_retire);
+    assert(fixture.sink.last() == retirement_response);
+
+    Fixture noop;
+    noop.route.result = control_protocol::HidRouteActionResult::kNoOp;
+    noop.route.status.desired = control_protocol::OutputRoute::kBle;
+    noop.route.status.active = control_protocol::OutputRoute::kBle;
+    noop.route.status.ready = true;
+    noop.payload(hello_request(1, kNonceA));
+    const std::string noop_session = extract_string(noop.sink.last(), "session");
+    const std::string noop_request = request(
+        2, noop_session, "hid.route.v2.set", "{\"route\":\"ble\"}");
+    noop.payload(noop_request);
+    const std::string noop_response = noop.sink.last();
+    noop.payload(noop_request);
+    assert(noop.sink.last() == noop_response);
+    assert(noop.route.set_calls == 1);
+    noop.payload(request(2, noop_session, "hid.route.v2.set",
+                         "{\"route\":\"none\"}"));
+    require_contains(noop.sink.last(), "\"code\":\"REQUEST_ID_CONFLICT\"");
+    noop.payload(request(3, noop_session, "system.ping"));
+    require_contains(noop.sink.last(), "\"pong\":true");
+
+    Fixture failure;
+    failure.route.result = control_protocol::HidRouteActionResult::kNotReady;
+    failure.payload(hello_request(1, kNonceA));
+    const std::string failure_session =
+        extract_string(failure.sink.last(), "session");
+    failure.payload(request(2, failure_session, "hid.route.v2.set",
+                            "{\"route\":\"ble\"}"));
+    require_contains(failure.sink.last(), "\"code\":\"HID_NOT_READY\"");
+    failure.payload(request(3, failure_session, "system.ping"));
+    require_contains(failure.sink.last(), "\"pong\":true");
 }
 
 void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
@@ -1961,6 +2055,7 @@ int main() {
     test_keyboard_report_schema_result_and_cache();
     test_mouse_report_schema_result_and_cache();
     test_hid_route_schema_frozen_retry_and_errors();
+    test_hid_route_v2_schema_retry_session_and_v1_ble_compatibility();
     test_ble_exposure_schema_frozen_retry_and_authority_isolation();
     test_ble_pairing_status_exact_schema();
     test_ble_pairing_respond_parser_retry_and_errors();

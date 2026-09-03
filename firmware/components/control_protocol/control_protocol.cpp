@@ -23,9 +23,9 @@ constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -563,7 +563,8 @@ bool make_ble_exposure_status(control_session::ResponseFrame *frame,
 }
 
 const char *output_route_json(OutputRoute route) {
-    return route == OutputRoute::kUsb ? "usb" : "none";
+    return route == OutputRoute::kUsb ? "usb"
+         : route == OutputRoute::kBle ? "ble" : "none";
 }
 
 const char *route_transition_json(RouteTransition transition) {
@@ -590,6 +591,15 @@ bool make_hid_route_status(control_session::ResponseFrame *frame,
                         static_cast<unsigned long>(status.generation),
                         route_transition_json(status.transition),
                         json_bool(status.ready));
+}
+
+bool make_versioned_hid_route_status(control_session::ResponseFrame *frame,
+                                     ResponseSession session, std::int32_t id,
+                                     HidRouteStatus status, bool route_v2) {
+    return !route_v2 && status.active == OutputRoute::kBle
+               ? make_error(frame, session, true, id,
+                            "HID_ROUTE_V2_REQUIRED", "v2 required")
+               : make_hid_route_status(frame, session, id, status);
 }
 
 const char *release_state_json(ReleaseAllInterfaceState state) {
@@ -786,7 +796,8 @@ bool make_pairing_respond(control_session::ResponseFrame *frame,
                         static_cast<unsigned long>(pairing_id));
 }
 
-bool validate_route_set_params(const cJSON *params, OutputRoute *route) {
+bool validate_route_set_params(const cJSON *params, bool allow_ble,
+                               OutputRoute *route) {
     static constexpr const char *kFields[] = {"route"};
     std::string_view value;
     if (route == nullptr || !cJSON_IsObject(params) ||
@@ -800,6 +811,10 @@ bool validate_route_set_params(const cJSON *params, OutputRoute *route) {
     }
     if (value == "usb") {
         *route = OutputRoute::kUsb;
+        return true;
+    }
+    if (allow_ble && value == "ble") {
+        *route = OutputRoute::kBle;
         return true;
     }
     return false;
@@ -1279,6 +1294,15 @@ void Protocol::handle_frame(std::string_view payload) {
         return;
     }
 
+    bool route_v2 = false;
+    if (command == "hid.route.v2.status") {
+        command = "hid.route.status";
+        route_v2 = true;
+    } else if (command == "hid.route.v2.set") {
+        command = "hid.route.set";
+        route_v2 = true;
+    }
+
     // Attach/detach revoke the authority epoch as part of their accepted
     // transition. Their exact retry is therefore retained separately from the
     // normal epoch-scoped request cache and must replay identical bytes only.
@@ -1498,18 +1522,22 @@ void Protocol::handle_frame(std::string_view payload) {
     } else if (command == "hid.route.status") {
         if (!validate_no_params(params)) {
             make_error(&response, current_session, true, id, "INVALID_PARAMS",
-                       "hid.route.status accepts no params");
+                       route_v2 ? "invalid route"
+                                : "hid.route.status accepts no params");
         } else {
             semantically_valid = true;
-            completed = make_hid_route_status(
-                &response, current_session, id,
-                config_.hid_route_status_provider(config_.hid_route_status_context));
+            const HidRouteStatus status = config_.hid_route_status_provider(
+                config_.hid_route_status_context);
+            completed = make_versioned_hid_route_status(
+                &response, current_session, id, status, route_v2);
         }
     } else if (command == "hid.route.set") {
         OutputRoute desired{};
-        if (!validate_route_set_params(params, &desired)) {
+        if (!validate_route_set_params(params, route_v2, &desired)) {
             make_error(&response, current_session, true, id, "INVALID_PARAMS",
-                       "hid.route.set route must be none or usb");
+                       route_v2
+                           ? "invalid route"
+                           : "hid.route.set route must be none or usb");
         } else {
             semantically_valid = true;
             const HidRouteActionOutcome action =
@@ -1517,7 +1545,7 @@ void Protocol::handle_frame(std::string_view payload) {
             switch (action.action_result) {
                 case HidRouteActionResult::kBusy:
                     completed = make_error(&response, current_session, true, id,
-                                           "HID_BUSY", "control transition is active");
+                                           "HID_BUSY", "stable none needed");
                     break;
                 case HidRouteActionResult::kNotReady:
                     completed = make_error(&response, current_session, true, id,
@@ -1536,8 +1564,9 @@ void Protocol::handle_frame(std::string_view payload) {
                                                "HID route snapshot is unavailable");
                         break;
                     }
-                    completed = make_hid_route_status(&response, current_session, id,
-                                                      action.snapshot);
+                    completed = make_versioned_hid_route_status(
+                        &response, current_session, id, action.snapshot,
+                        route_v2);
                     if (completed &&
                         action.action_result == HidRouteActionResult::kAccepted) {
                         cache_control_transition_retry(session, id, payload, response);

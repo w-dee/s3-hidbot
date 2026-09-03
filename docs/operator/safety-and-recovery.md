@@ -5,9 +5,9 @@
 BLE exposure is an independent U7.3 control plane. It is uninitialized and
 non-advertising at boot; explicit enable may advertise/connect one peer, and
 disable retains the initialized stack in hidden idle. USB and BLE may be
-exposed together. BLE exposure never grants HID authority, never changes the
-USB route/session, and never emits keyboard or mouse notifications. Pairing,
-passkeys, bonding, and formal HOGP/security compliance remain deferred. A BLE
+exposed together. BLE exposure never grants HID authority; route v2 separately
+selects an already eligible BLE peer only from stable none. Direct USB/BLE
+switching, queued selection, and reconnect auto-restore are forbidden. A BLE
 `fault` with `recovery_required:true` requires reboot/human review rather than
 fabricated recovery.
 
@@ -27,7 +27,10 @@ readiness view. Repeated attach/detach can allocate and free TinyUSB resources.
 Exposure and HID output selection are independent. Mount/resume never selects
 USB; `hid-route-set usb` is required, and an actual selection requires a fresh
 hello before unsafe reports. `hid-route-set none` performs any required all-up
-on the old USB route and leaves the USB device mounted.
+on the old route and leaves the USB device mounted. BLE retirement first
+publishes `releasing`, makes one best-effort all-up attempt per interface,
+allows 100 ms for delivery, and reaches stable none only after exact physical
+loss. Stack acceptance is not peer acknowledgment.
 
 Detach preserves fail-closed uncertainty. `host_release_uncertain:true` means
 the old host state could not be proven released; a later attach requires a

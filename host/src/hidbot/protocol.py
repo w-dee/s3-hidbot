@@ -31,6 +31,8 @@ MAX_USB_GENERATION = 0xFFFF_FFFF
 MAX_UINT32 = 0xFFFF_FFFF
 MAX_BLE_KEY_SIZE = 16
 BLE_PAIRING_TRANSACTION_CAPABILITY = "ble.pairing-transaction-v1"
+HID_OUTPUT_ROUTE_V1_CAPABILITY = "hid.output-route-v1"
+HID_OUTPUT_ROUTE_V2_CAPABILITY = "hid.output-route-v2"
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 SOURCE_REVISION_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_SOURCE_REVISION_BYTES}}}\Z")
 APP_ELF_SHA256_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_APP_ELF_SHA256_BYTES}}}\Z")
@@ -55,7 +57,8 @@ OPTIONAL_CAPABILITIES = frozenset(
         "hid.keyboard-report-v1",
         "hid.mouse-report-v1",
         "firmware.identity-v1",
-        "hid.output-route-v1",
+        HID_OUTPUT_ROUTE_V1_CAPABILITY,
+        HID_OUTPUT_ROUTE_V2_CAPABILITY,
         "ble.exposure-control-v1",
         BLE_PAIRING_TRANSACTION_CAPABILITY,
     }
@@ -277,6 +280,23 @@ class HidRouteStatus:
     ready: bool
 
 
+class OutputRouteV2(str, Enum):
+    NONE = "none"
+    USB = "usb"
+    BLE = "ble"
+
+
+@dataclass(frozen=True)
+class HidRouteV2Status:
+    """Strict hid.output-route-v2 transaction snapshot."""
+
+    desired: OutputRouteV2
+    active: OutputRouteV2
+    generation: int
+    transition: Literal["stable", "releasing"]
+    ready: bool
+
+
 def _reject_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant {value}")
 
@@ -458,6 +478,26 @@ def build_hid_route_set_frame(
             "id": request_id,
             "session": session,
             "cmd": "hid.route.set",
+            "params": {"route": route.value},
+        }
+    )
+
+
+def build_hid_route_v2_set_frame(
+    request_id: int, session: str, route: OutputRouteV2
+) -> bytes:
+    if type(request_id) is not int or not 0 <= request_id <= MAX_ID:
+        raise ProtocolError("request id is invalid")
+    if not isinstance(session, str) or TOKEN_PATTERN.fullmatch(session) is None:
+        raise ProtocolError("session is invalid")
+    if not isinstance(route, OutputRouteV2):
+        raise ProtocolError("HID output route v2 is invalid")
+    return _serialize_request(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "session": session,
+            "cmd": "hid.route.v2.set",
             "params": {"route": route.value},
         }
     )
@@ -923,6 +963,43 @@ def validate_hid_route_status(value: Any) -> HidRouteStatus:
     if active is OutputRoute.NONE and ready:
         raise ProtocolError("HID route none cannot be ready")
     return HidRouteStatus(
+        desired=desired,
+        active=active,
+        generation=generation,
+        transition=cast(Literal["stable", "releasing"], transition),
+        ready=ready,
+    )
+
+
+def validate_hid_route_v2_status(value: Any) -> HidRouteV2Status:
+    fields = {"desired", "active", "generation", "transition", "ready"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProtocolError("hid.route.v2 status result fields are invalid")
+    try:
+        desired = OutputRouteV2(value["desired"])
+        active = OutputRouteV2(value["active"])
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("HID output route v2 value is invalid") from exc
+    generation = value["generation"]
+    transition = value["transition"]
+    ready = value["ready"]
+    if type(generation) is not int or not 0 <= generation <= MAX_USB_GENERATION:
+        raise ProtocolError("HID route generation is invalid")
+    if transition not in {"stable", "releasing"}:
+        raise ProtocolError("HID route transition is invalid")
+    if type(ready) is not bool:
+        raise ProtocolError("HID route readiness is invalid")
+    if transition == "releasing" and not (
+        desired is OutputRouteV2.NONE
+        and active in {OutputRouteV2.USB, OutputRouteV2.BLE}
+        and not ready
+    ):
+        raise ProtocolError("HID route v2 releasing state is invalid")
+    if transition == "stable" and desired is not active:
+        raise ProtocolError("HID route stable state is invalid")
+    if active is OutputRouteV2.NONE and ready:
+        raise ProtocolError("HID route none cannot be ready")
+    return HidRouteV2Status(
         desired=desired,
         active=active,
         generation=generation,

@@ -131,23 +131,28 @@ def main() -> int:
     public_sources = "\n".join(
         (control_protocol, control_protocol_header, host_protocol, host_client, host_cli)
     )
-    assert "hid.output-route-v2" not in public_sources
-    assert "hid.route.v2." not in public_sources
+    assert "hid.output-route-v2" in public_sources
+    assert "hid.route.v2.status" in public_sources
+    assert "hid.route.v2.set" in public_sources
     assert "hid.route.set route must be none or usb" in control_protocol
     assert 'value == "none"' in control_protocol
     assert 'value == "usb"' in control_protocol
-    assert 'value == "ble"' not in control_protocol
+    assert 'allow_ble && value == "ble"' in control_protocol
     output_route = re.search(
         r"enum class OutputRoute.*?\{(.*?)\};", control_protocol_header, re.DOTALL
     )
-    assert output_route is not None and "kBle" not in output_route.group(1)
+    assert output_route is not None and "kBle" in output_route.group(1)
     host_route = re.search(r"class OutputRoute.*?\n\n", host_protocol, re.DOTALL)
     assert host_route is not None and 'BLE = "ble"' not in host_route.group(0)
+    host_route_v2 = re.search(r"class OutputRouteV2.*?\n\n", host_protocol, re.DOTALL)
+    assert host_route_v2 is not None and 'BLE = "ble"' in host_route_v2.group(0)
 
     assert "activate_ble_route_internal" in executor
     assert "request_route_ble" in executor
     assert "desired == hid_route::OutputRoute::kBle" in executor
-    assert "return {};" in executor  # public request_route rejects kBle
+    assert "ActionKind::kRouteBleActivate" in executor
+    assert "route_rpc_result_ = activate_ble_route()" in executor
+    assert "ble_route_ready()" in executor
     assert "ActionKind::kBleHidReport" in executor
     assert "process_ble_report" in executor
     assert "submit_runtime_ble_report" in executor

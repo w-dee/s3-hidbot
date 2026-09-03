@@ -13,7 +13,12 @@ from hidbot.errors import (
     SessionLostError,
 )
 from hidbot.framing import FRAME_PREFIX, TRANSPORT_SYNC
-from hidbot.protocol import BASELINE_REQUIRED_CAPABILITIES, MAX_ID, OutputRoute
+from hidbot.protocol import (
+    BASELINE_REQUIRED_CAPABILITIES,
+    MAX_ID,
+    OutputRoute,
+    OutputRouteV2,
+)
 
 
 TOKEN = "0123456789abcdef0123456789abcdef"
@@ -308,6 +313,59 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             missing.hid_route_set("ble")
         self.assertEqual(missing._transport.writes, [])
+
+    def test_hid_route_v2_is_preferred_and_v1_fallback_rejects_ble_locally(self) -> None:
+        route_status = {
+            "desired": "ble",
+            "active": "ble",
+            "generation": 9,
+            "transition": "stable",
+            "ready": True,
+        }
+
+        def on_write(transport: FakeTransport, data: bytes) -> None:
+            if data == TRANSPORT_SYNC:
+                return
+            value = request_object(data)
+            if value["cmd"] == "protocol.hello":
+                transport.chunks.append(
+                    hello_response(
+                        value["id"],
+                        value["params"]["client_nonce"],
+                        capabilities=[
+                            *sorted(BASELINE_REQUIRED_CAPABILITIES),
+                            "hid.output-route-v1",
+                            "hid.output-route-v2",
+                        ],
+                    )
+                )
+            elif value["cmd"] == "hid.route.v2.status":
+                transport.chunks.append(response(value["id"], TOKEN, result=route_status))
+            elif value["cmd"] == "hid.route.v2.set":
+                self.assertEqual(value["params"], {"route": "ble"})
+                transport.chunks.append(response(value["id"], TOKEN, result=route_status))
+
+        transport = FakeTransport(on_write)
+        client = self.make_client(transport)
+        client.connect()
+        self.assertEqual(client.hid_route_protocol_version, 2)
+        self.assertEqual(client.hid_route_status().active, OutputRouteV2.BLE)
+        self.assertEqual(client.hid_route_set("ble").desired, OutputRouteV2.BLE)
+        commands = [request_object(frame)["cmd"] for frame in transport.writes
+                    if frame != TRANSPORT_SYNC]
+        self.assertEqual(
+            commands,
+            ["protocol.hello", "hid.route.v2.status", "hid.route.v2.set"],
+        )
+
+        fallback_transport = FakeTransport()
+        fallback = self.make_client(fallback_transport)
+        fallback._session = TOKEN
+        fallback._capabilities = ("hid.output-route-v1",)
+        self.assertEqual(fallback.hid_route_protocol_version, 1)
+        with self.assertRaises(CompatibilityError):
+            fallback.hid_route_set("ble")
+        self.assertEqual(fallback_transport.writes, [])
 
     def test_keyboard_report_returns_typed_result_and_canonical_params(self) -> None:
         def on_write(transport: FakeTransport, data: bytes) -> None:

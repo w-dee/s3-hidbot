@@ -28,10 +28,11 @@
     3–7, provenance doubt, serial ambiguity, unknown dual-cable topology, or
     HID uncertainty, `host_release_uncertain`, or `recovery_required`.
 13. Never commit or share machine-local serial paths or local configuration.
-14. Treat `ble-enable` and `ble-disable` as BLE exposure only. They do not
-    select or revoke the USB HID route/session, and `route=ble` remains invalid.
-15. U7.3 permits simultaneous USB and BLE exposure but never BLE HID output;
-    do not infer report delivery from advertising, connection, or subscription.
+14. Treat `ble-enable` and `ble-disable` as BLE exposure only. They never select
+    a route. Route-v2 BLE selection requires stable none and current eligibility.
+15. Never direct-switch USB and BLE or auto-select BLE after reconnect, CCCD
+    Restore, or security restoration. Do not infer report delivery from
+    advertising, connection, subscription, route selection, or stack acceptance.
 
 See [safety and recovery](safety-and-recovery.md) for the required bounded
 responses and [CLI reference](cli-reference.md) for exact syntax.

@@ -271,6 +271,7 @@ struct BleCommandOutcome {
 
 struct PairingStatusSnapshot {
     bool available = false;
+    bool ble_route_ready = false;
     ble_pairing::Snapshot pairing{};
     ble_security::Snapshot security{};
     ble_lifecycle::Generation generation = 0;
@@ -290,6 +291,7 @@ class Controller final : public usb_lifecycle::Executor,
         kBleEnable,
         kBleDisable,
         kBleEvent,
+        kRouteBleActivate,
         kPairingStatus,
         kPairingRespond,
         kBleHidReport,
@@ -314,8 +316,8 @@ class Controller final : public usb_lifecycle::Executor,
     CommandOutcome request_attach();
     CommandOutcome request_detach();
     RouteCommandOutcome request_route(hid_route::OutputRoute desired);
-    // Internal-only U7.4B route seam. It is intentionally absent from UART,
-    // host, and CLI surfaces and must run in the serialized owner context.
+    // Internal-only test seam. Production BLE activation enters through
+    // request_route() and is dispatched into the serialized owner context.
     RouteCommandOutcome activate_ble_route_internal();
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     hid_runtime::KeyboardReportResult keyboard_report(
@@ -332,7 +334,7 @@ class Controller final : public usb_lifecycle::Executor,
         std::uint8_t buttons, std::int8_t x, std::int8_t y,
         std::int8_t vertical, std::int8_t horizontal);
     ExposureSnapshot snapshot() const;
-    hid_runtime::RouteStatusSnapshot route_snapshot() const;
+    hid_runtime::RouteStatusSnapshot route_snapshot();
     BleCommandOutcome request_ble_enable();
     BleCommandOutcome request_ble_disable();
     ble_lifecycle::Snapshot ble_snapshot() const;
@@ -429,6 +431,8 @@ class Controller final : public usb_lifecycle::Executor,
     bool consume_ble_overflow();
     void reconcile_pairing_deadline();
     PairingStatusSnapshot current_pairing_status() const;
+    RouteCommandOutcome activate_ble_route();
+    bool ble_route_ready() const;
     void wipe_pairing_mailbox();
     void complete_pairing_rpc(std::uint32_t token);
     void begin_ble_hid_peer(ble_lifecycle::Generation generation,
@@ -513,6 +517,7 @@ class Controller final : public usb_lifecycle::Executor,
     PairingStatusSnapshot pairing_rpc_status_{};
     ble_pairing::RespondResult pairing_rpc_result_ =
         ble_pairing::RespondResult::kNotPending;
+    RouteCommandOutcome route_rpc_result_{};
     BleHidPeerSnapshot ble_hid_peer_{};
     enum class BleRouteReleasePhase : std::uint8_t {
         kNone,

@@ -12,16 +12,17 @@ HID output routing, the safety-only `hid.release_all` command, and the public ab
 `hid.keyboard.report` and relative `hid.mouse.report` commands. It implements
 `protocol.hello`, `system.ping`, `system.info`, `usb.status`,
 `usb.exposure.status`, `usb.attach`, `usb.detach`, `hid.route.status`,
-`hid.route.set`, `hid.release_all`,
+`hid.route.set`, `hid.route.v2.status`, `hid.route.v2.set`, `hid.release_all`,
 `hid.keyboard.report`, `hid.mouse.report`, `ble.exposure.status`, `ble.enable`,
 `ble.disable`, `ble.pairing.status`, and `ble.pairing.respond`. There is still no keyboard
-helper, high-level keyboard/mouse automation, asynchronous event, BLE route,
-GPIO action, or reset command. Primitive report CLI commands are documented
-below and remain explicitly unsafe.
+helper, high-level keyboard/mouse automation, asynchronous event, GPIO action,
+or reset command. Primitive report CLI commands are documented below and
+remain explicitly unsafe.
 
 U7.3 adds `ble.exposure.status`, `ble.enable`, and `ble.disable` under
-`ble.exposure-control-v1`; protocol remains 1 and the full identity hello has
-12 unique capabilities. BLE is uninitialized/non-advertising at boot and lazy
+`ble.exposure-control-v1`; protocol remains 1. With the later pairing and route
+extensions, the full identity hello has 14 unique capabilities. BLE is
+uninitialized/non-advertising at boot and lazy
 initialization occurs only after accepted enable. Normal disable retains the
 stack in hidden idle. BLE lifecycle generation is independent of USB route and
 session authority, so simultaneous USB and BLE exposure is valid and neither
@@ -49,7 +50,7 @@ internal model is exposed in Slice C by the firmware-only
 `ble.pairing.respond` commands. The full identity hello now has 13 unique
 capabilities. Slice D adds the strictly typed host API and explicit no-echo
 CLI for those frozen commands, without a firmware change. No BLE route or HID
-notification output is publicly reachable.
+notification output was publicly reachable at that U7.3 boundary.
 
 U7.4A adds an internal-only BLE HID output prerequisite without changing this
 public protocol. Keyboard and mouse CCCD evidence and HID Control Point suspend
@@ -139,8 +140,7 @@ only while the exact current BLE generation, connection, registered keyboard
 and mouse characteristic handles, composite CCCD state, Control Point state,
 security verification, persistent store, lifecycle, and fallback state are
 ready. The public `hid.output-route-v1` contract remains exactly `none` or
-`usb`: this slice adds no BLE UART value, host enum, CLI choice, hidden
-command, or route-v2 capability.
+`usb`; U7.4D adds a separate route-v2 surface rather than changing v1.
 
 Each BLE ticket is permanently bound to its HID authority epoch, route
 generation, BLE generation, exact connection, report-kind characteristic
@@ -186,8 +186,16 @@ connection handles cannot act on a newer tuple.
 Direct USB-to-BLE and BLE-to-USB route changes remain rejected: switching is
 only USB-to-none-to-BLE or BLE-to-none-to-USB. BLE exposure may advertise and
 reconnect after retirement, but reconnect, CCCD Restore, resumed Control Point,
-or restored security never reselects BLE. U7.4D still owns any future public
-BLE route API.
+or restored security never reselects BLE.
+
+U7.4D exposes the existing executor-owned route through
+`hid.output-route-v2`, `hid.route.v2.status`, and `hid.route.v2.set`. Both v1
+and v2 remain advertised. V2 adds `ble`, but activation still runs in the
+serialized owner and succeeds only from stable none with the exact eligible
+BLE tuple. It never enables advertising, pairs, queues a future selection, or
+auto-restores. V1 status returns `HID_ROUTE_V2_REQUIRED` while BLE is active or
+releasing; v1 `set none` may safely begin the same U7.4C retirement, while v1
+`set usb` cannot replace BLE directly.
 
 `ble.pairing.status` accepts omitted or empty params. Its exact result fields
 are `state`, `generation`, `connected`, `pairing_id`, `action`,
@@ -379,6 +387,7 @@ initial capability list:
   protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
   usb.exposure-control-v1, hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
   hid.mouse-report-v1, firmware.identity-v1, hid.output-route-v1,
+  hid.output-route-v2,
   ble.exposure-control-v1, ble.pairing-transaction-v1
 ```
 
@@ -389,7 +398,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1","hid.output-route-v1","ble.exposure-control-v1","ble.pairing-transaction-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1","hid.output-route-v1","hid.output-route-v2","ble.exposure-control-v1","ble.pairing-transaction-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
@@ -649,8 +658,8 @@ reconnect never select USB. Unsafe keyboard and mouse reports return
 
 `hid.route.status` accepts only omitted params or `{}`. `hid.route.set` accepts
 exactly `{"route":"none"}` or `{"route":"usb"}`. Missing/additional fields,
-non-string values, unknown strings, and `"ble"` are `INVALID_PARAMS`; U7.2B
-does not initialize or advertise BLE.
+non-string values, unknown strings, and `"ble"` are `INVALID_PARAMS`; v1
+syntax remains unchanged even when BLE exposure and route v2 are available.
 
 Both successful commands return exactly:
 
@@ -694,6 +703,22 @@ replay the immutable accepted response after session revocation; asynchronous
 completion cannot change it, and a fresh hello retires the proof. Stable
 none-to-none and ready USB-to-USB are no-ops with no generation, authority,
 session, release, safety, or executor change.
+
+The separate `hid.output-route-v2` capability uses `hid.route.v2.status` and
+`hid.route.v2.set` with the same five fields and retry/session rules. Its route
+set is exactly `none|usb|ble`. BLE selection requires an already connected,
+authenticated, persistently verified, composite-subscribed, unsuspended peer
+and stable none; failure returns `HID_NOT_READY` without changing the route.
+USB-to-BLE and BLE-to-USB return `HID_BUSY` until an explicit `set none` has
+completed. During BLE retirement, v2 reports `desired=none`, `active=ble`,
+`transition=releasing`, and `ready=false`; stable none is not reported before
+exact physical loss. Local `stack_accepted` results never claim peer delivery.
+While BLE is active or releasing, v1 status returns
+`HID_ROUTE_V2_REQUIRED` instead of fabricating none/USB. V1 `set none` may
+start the same BLE retirement and returns that version error for its
+unrepresentable frozen snapshot; its exact retry remains cached and the
+meaningful mutation invalidates the session. V1 `set usb` returns `HID_BUSY`
+until stable none, so an old client cannot directly replace BLE.
 
 ## Absolute keyboard reports
 
@@ -850,7 +875,7 @@ optional one-shot `ble_pairing_status()` and `ble_pairing_respond()` methods,
 safety-only `Client.release_all()` API, and the explicit
 `Client.keyboard_report()` and `Client.mouse_report()` primitive APIs. The CLI
 also exposes `usb-exposure-status`, `usb-attach`, `usb-detach`,
-`hid-route-status`, `hid-route-set none|usb`, and explicit `keyboard-report`
+`hid-route-status`, `hid-route-set none|usb|ble`, and explicit `keyboard-report`
 and `mouse-report` commands, each with command-local
 `--unsafe-hid`; no arbitrary raw command API exists. The hello result exposes
 read-only `lease_ms` metadata. Closing the client only closes the injected
@@ -881,7 +906,7 @@ failures become `TransportError`; request deadline expiry remains
 The CLI entry point is `hidbotctl`. It exposes `hello`, `ping`, `info`,
 `usb-status`, `usb-exposure-status`, explicit `usb-attach` and `usb-detach`,
 explicit `ble-pairing-status` and `ble-pairing-respond --pairing-id ID`,
-explicit `hid-route-status` and `hid-route-set none|usb`,
+explicit `hid-route-status` and `hid-route-set none|usb|ble`,
 and the safe `self-test` control-plane diagnostic through the diagnostic
 client methods, the safety recovery command `release-all` through
 `Client.release_all()`, artifact-only validation via `verify-artifact ARTIFACT`,
@@ -1038,7 +1063,8 @@ delivered.
 The existing Configuration 1, Boot Keyboard/Mouse interfaces, endpoints
 0x81/0x82, descriptors, and VID/PID are unchanged. The public HID commands are
 the safety-only `hid.release_all`, the unsafe `hid.keyboard.report` and
-`hid.mouse.report` primitives, and `hid.route.status` and `hid.route.set`.
+`hid.mouse.report` primitives, `hid.route.status` and `hid.route.set`, and
+`hid.route.v2.status` and `hid.route.v2.set`.
 The optional BOOT-button diagnostic remains build-time
 disabled by default and routes any enabled test report through the runtime.
 

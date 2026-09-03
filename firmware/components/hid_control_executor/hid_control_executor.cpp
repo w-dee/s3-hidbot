@@ -377,16 +377,44 @@ ExposureSnapshot Controller::snapshot() const {
     };
 }
 
-hid_runtime::RouteStatusSnapshot Controller::route_snapshot() const {
-    return runtime_ == nullptr ? hid_runtime::RouteStatusSnapshot{}
-                               : runtime_->state_machine().route_status_snapshot();
+hid_runtime::RouteStatusSnapshot Controller::route_snapshot() {
+    if (runtime_ == nullptr) {
+        return {};
+    }
+    auto snapshot = runtime_->state_machine().route_status_snapshot();
+    snapshot.ready = snapshot.ready ||
+                     request_pairing_status().ble_route_ready;
+    return snapshot;
 }
 
 RouteCommandOutcome Controller::request_route(hid_route::OutputRoute desired) {
     constexpr ControlOperation operation = ControlOperation::kRouteChange;
-    if (!initialized_ || desired == hid_route::OutputRoute::kBle ||
-        !claim_operation(operation)) {
+    if (!initialized_ || runtime_ == nullptr || !claim_operation(operation)) {
         return {};
+    }
+    if (desired == hid_route::OutputRoute::kBle) {
+        if (ble_backend_ == nullptr || ble_database_ == nullptr ||
+            pairing_rpc_pending_.load(std::memory_order_acquire) != 0) {
+            release_operation(operation);
+            return {};
+        }
+        constexpr std::uint32_t token = 0xffffffffU;
+        pairing_rpc_pending_.store(token, std::memory_order_release);
+        if (!enqueue(Action{.kind = ActionKind::kRouteBleActivate,
+                            .operation = operation,
+                            .mailbox_token = token})) {
+            pairing_rpc_pending_.store(0, std::memory_order_release);
+            release_operation(operation);
+            return {};
+        }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+        while (pairing_rpc_pending_.load(std::memory_order_acquire) == token &&
+               process_one_for_test()) {
+        }
+#else
+        (void)xSemaphoreTake(s_pairing_rpc_completion, portMAX_DELAY);
+#endif
+        return route_rpc_result_;
     }
     hid_runtime::RouteTransitionOutcome outcome =
         desired == hid_route::OutputRoute::kUsb
@@ -426,8 +454,7 @@ RouteCommandOutcome Controller::activate_ble_route_internal() {
     if (!initialized_ || runtime_ == nullptr || ble_backend_ == nullptr ||
         ble_database_ == nullptr ||
         active_operation_.load(std::memory_order_acquire) !=
-            ControlOperation::kNone ||
-        !ble_link_ready()) {
+            ControlOperation::kNone) {
         return RouteCommandOutcome{
             .action_result = hid_runtime::RouteTransitionResult::kNotReady,
             .snapshot_valid = runtime_ != nullptr,
@@ -436,8 +463,29 @@ RouteCommandOutcome Controller::activate_ble_route_internal() {
                             : runtime_->state_machine().route_status_snapshot(),
         };
     }
+    return activate_ble_route();
+}
+
+RouteCommandOutcome Controller::activate_ble_route() {
     hid_runtime::StateMachine &state = runtime_->state_machine();
     const auto route = state.route_snapshot();
+    if (ble_route_ready()) {
+        return RouteCommandOutcome{
+            .action_result = hid_runtime::RouteTransitionResult::kNoOp,
+            .snapshot_valid = true,
+            .snapshot = hid_runtime::RouteStatusSnapshot{
+                .route = route, .ready = true},
+        };
+    }
+    if (!ble_link_ready()) {
+        return RouteCommandOutcome{
+            .action_result = hid_runtime::RouteTransitionResult::kNotReady,
+            .snapshot_valid = runtime_ != nullptr,
+            .snapshot = runtime_ == nullptr
+                            ? hid_runtime::RouteStatusSnapshot{}
+                            : runtime_->state_machine().route_status_snapshot(),
+        };
+    }
     const auto peer = ble_hid_peer_;
     const hid_runtime::BleRouteActivation activation{
         .expected_authority_epoch = state.authority_epoch(),
@@ -454,15 +502,7 @@ RouteCommandOutcome Controller::activate_ble_route_internal() {
                                    .snapshot = outcome.snapshot};
     }
     const auto active = state.ble_route_authority_snapshot();
-    const auto peer_after = ble_hid_peer_;
-    const bool exact = ble_link_ready() && active.coherent && active.active &&
-                       active.ble_generation == peer_after.generation &&
-                       active.connection_handle == peer_after.connection_handle &&
-                       active.keyboard_characteristic_handle ==
-                           peer_after.handles.keyboard_value &&
-                       active.mouse_characteristic_handle ==
-                           peer_after.handles.mouse_value;
-    if (!exact) {
+    if (!ble_route_ready()) {
         (void)state.retire_ble_route_if_matches(active);
         drive_ble_route_retirement();
         return RouteCommandOutcome{
@@ -474,6 +514,27 @@ RouteCommandOutcome Controller::activate_ble_route_internal() {
     return RouteCommandOutcome{.action_result = outcome.action_result,
                                .snapshot_valid = outcome.snapshot_valid,
                                .snapshot = outcome.snapshot};
+}
+
+bool Controller::ble_route_ready() const {
+    if (runtime_ == nullptr) {
+        return false;
+    }
+    const hid_runtime::StateMachine &state = runtime_->state_machine();
+    const auto authority = state.ble_route_authority_snapshot();
+    const auto peer = ble_hid_peer_;
+    const auto route = state.route_snapshot();
+    return ble_link_ready() && route.coherent && !route.invalidation_pending &&
+           route.active == hid_route::OutputRoute::kBle &&
+           route.desired == hid_route::OutputRoute::kBle &&
+           route.transition == hid_route::Transition::kStable &&
+           route.generation == authority.route_generation &&
+           state.ble_route_normal_authority_matches(authority) &&
+           peer.generation == authority.ble_generation &&
+           peer.connection_handle == authority.connection_handle &&
+           peer.handles.keyboard_value ==
+               authority.keyboard_characteristic_handle &&
+           peer.handles.mouse_value == authority.mouse_characteristic_handle;
 }
 
 bool Controller::enqueue_ble_hid_work(hid_runtime::Interface interface,
@@ -680,22 +741,7 @@ void Controller::retire_ble_route_if_unready() {
         return;
     }
     if (authority.active) {
-        const auto peer = ble_hid_peer_;
-        const auto route = state.route_snapshot();
-        const bool exact_ready =
-            ble_link_ready() && peer.active && route.coherent &&
-            !route.invalidation_pending &&
-            route.active == hid_route::OutputRoute::kBle &&
-            route.desired == hid_route::OutputRoute::kBle &&
-            route.transition == hid_route::Transition::kStable &&
-            route.generation == authority.route_generation &&
-            state.ble_route_normal_authority_matches(authority) &&
-            peer.generation == authority.ble_generation &&
-            peer.connection_handle == authority.connection_handle &&
-            peer.handles.keyboard_value ==
-                authority.keyboard_characteristic_handle &&
-            peer.handles.mouse_value == authority.mouse_characteristic_handle;
-        if (!exact_ready) {
+        if (!ble_route_ready()) {
             (void)state.retire_ble_route_if_matches(authority);
         }
     }
@@ -1080,6 +1126,24 @@ void Controller::process(Action action) {
         // The action is only a wake hint. The exact callback already claimed
         // the retained timer owner and published the authoritative due bit.
         drive_ble_route_retirement();
+        return;
+    }
+    if (action.kind == ActionKind::kRouteBleActivate) {
+        if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
+            action.mailbox_token) {
+            release_operation(action.operation);
+            return;
+        }
+        if (active_operation_.load(std::memory_order_acquire) ==
+            action.operation) {
+            route_rpc_result_ = activate_ble_route();
+        } else {
+            route_rpc_result_ = {};
+        }
+        if (ble_route_release_owner_ != action.operation) {
+            release_operation(action.operation);
+        }
+        complete_pairing_rpc(action.mailbox_token);
         return;
     }
     if (action.kind == ActionKind::kPairingStatus) {
@@ -1776,6 +1840,7 @@ void Controller::reconcile_pairing_deadline() {
 PairingStatusSnapshot Controller::current_pairing_status() const {
     PairingStatusSnapshot result{};
     result.available = true;
+    result.ble_route_ready = ble_route_ready();
     result.pairing = pairing_state_.snapshot();
     const auto lifecycle = ble_state_.snapshot();
     result.generation = lifecycle.generation;

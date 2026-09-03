@@ -81,6 +81,7 @@ class FakeTransport:
         ]
         self.info_result: object = {"project": "s3-hidbot"}
         self.pairing_error: dict[str, str] | None = None
+        self.route_result: dict[str, object] | None = None
 
     def open(self) -> None:
         self.calls.append(("open",))
@@ -166,18 +167,21 @@ class FakeTransport:
                     "last_error": None,
                 }
             self.chunks.append(response(value["id"], TOKEN, result=result))
-        elif value["cmd"] in {"hid.route.status", "hid.route.set"}:
+        elif value["cmd"] in {
+            "hid.route.status", "hid.route.set",
+            "hid.route.v2.status", "hid.route.v2.set",
+        }:
             route = value["params"].get("route", "none")
             self.chunks.append(
                 response(
                     value["id"],
                     TOKEN,
-                    result={
+                    result=self.route_result or {
                         "desired": route,
                         "active": route,
                         "generation": 1 if route == "usb" else 0,
                         "transition": "stable",
-                        "ready": route == "usb",
+                        "ready": route != "none",
                     },
                 )
             )
@@ -585,6 +589,67 @@ class CliTests(unittest.TestCase):
             self.assertEqual(
                 self.wire_commands(calls), ["protocol.hello", wire_command]
             )
+
+    def test_hid_route_v2_ble_and_v1_only_rejection_are_explicit(self) -> None:
+        def enable_v2(transport: FakeTransport) -> None:
+            transport.hello_capabilities.append("hid.output-route-v2")
+
+        for argv, wire_command, desired in (
+            (["hid-route-status"], "hid.route.v2.status", "none"),
+            (["hid-route-set", "ble"], "hid.route.v2.set", "ble"),
+        ):
+            code, output, errors, calls = self.run_cli(
+                ["--port", "dummy-port", "--json", *argv],
+                configure_transport=enable_v2,
+            )
+            self.assertEqual(code, 0, argv)
+            self.assertEqual(errors, "", argv)
+            value = json.loads(output)
+            self.assertEqual(value["desired"], desired)
+            self.assertEqual(value["active"], desired)
+            self.assertEqual(value["ready"], desired != "none")
+            self.assertEqual(
+                self.wire_commands(calls), ["protocol.hello", wire_command]
+            )
+
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "hid-route-set", "ble"]
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(output, "")
+        self.assertIn("does not advertise BLE HID output routing", errors)
+        self.assertEqual(self.wire_commands(calls), ["protocol.hello"])
+
+        def releasing_v2(transport: FakeTransport) -> None:
+            transport.hello_capabilities.append("hid.output-route-v2")
+            transport.route_result = {
+                "desired": "none",
+                "active": "ble",
+                "generation": 11,
+                "transition": "releasing",
+                "ready": False,
+            }
+
+        code, output, errors, calls = self.run_cli(
+            ["--port", "dummy-port", "--json", "hid-route-status"],
+            configure_transport=releasing_v2,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(
+            json.loads(output),
+            {
+                "desired": "none",
+                "active": "ble",
+                "generation": 11,
+                "transition": "releasing",
+                "ready": False,
+            },
+        )
+        self.assertEqual(
+            self.wire_commands(calls),
+            ["protocol.hello", "hid.route.v2.status"],
+        )
 
     def test_ble_exposure_operator_commands_are_explicit(self) -> None:
         for command, wire_command, observed in (

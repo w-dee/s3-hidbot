@@ -21,19 +21,24 @@ from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
     BLE_PAIRING_TRANSACTION_CAPABILITY,
+    HID_OUTPUT_ROUTE_V1_CAPABILITY,
+    HID_OUTPUT_ROUTE_V2_CAPABILITY,
     BleExposureStatus,
     BlePairingRespondResult,
     BlePairingStatus,
     HidRouteStatus,
+    HidRouteV2Status,
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
     UsbExposureStatus,
     OutputRoute,
+    OutputRouteV2,
     Response,
     build_keyboard_report_frame,
     build_ble_pairing_respond_frame,
     build_hid_route_set_frame,
+    build_hid_route_v2_set_frame,
     build_mouse_report_frame,
     build_command_frame,
     build_hello_frame,
@@ -44,6 +49,7 @@ from .protocol import (
     validate_ble_pairing_respond_result,
     validate_ble_pairing_status,
     validate_hid_route_status,
+    validate_hid_route_v2_status,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
     validate_release_all_result,
@@ -132,6 +138,14 @@ class Client:
     @property
     def lease_ms(self) -> int | None:
         return self._lease_ms
+
+    @property
+    def hid_route_protocol_version(self) -> int | None:
+        if HID_OUTPUT_ROUTE_V2_CAPABILITY in self._capabilities:
+            return 2
+        if HID_OUTPUT_ROUTE_V1_CAPABILITY in self._capabilities:
+            return 1
+        return None
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -476,28 +490,63 @@ class Client:
                 # client-owned frame reference immediately after termination.
                 del frame
 
-    def hid_route_status(self) -> HidRouteStatus:
+    def hid_route_status(self) -> HidRouteStatus | HidRouteV2Status:
         """Return the coherent explicit HID output-route transaction state."""
 
         with self._lock:
-            self._require_capability_locked("hid.output-route-v1")
+            if HID_OUTPUT_ROUTE_V2_CAPABILITY in self._capabilities:
+                self._require_capability_locked(HID_OUTPUT_ROUTE_V2_CAPABILITY)
+                return validate_hid_route_v2_status(
+                    self._request_locked("hid.route.v2.status")
+                )
+            self._require_capability_locked(HID_OUTPUT_ROUTE_V1_CAPABILITY)
             return validate_hid_route_status(self._request_locked("hid.route.status"))
 
-    def hid_route_set(self, route: OutputRoute | str) -> HidRouteStatus:
-        """Select none or USB explicitly; reconnect after an actual transition."""
+    def hid_route_set(
+        self, route: OutputRoute | OutputRouteV2 | str
+    ) -> HidRouteStatus | HidRouteV2Status:
+        """Select a supported route; reconnect after an actual transition."""
 
         try:
-            selected = route if isinstance(route, OutputRoute) else OutputRoute(route)
+            selected = (
+                OutputRouteV2(route.value)
+                if isinstance(route, OutputRoute)
+                else route
+                if isinstance(route, OutputRouteV2)
+                else OutputRouteV2(route)
+            )
         except (TypeError, ValueError) as exc:
             raise ProtocolError("HID output route is invalid") from exc
         with self._lock:
-            self._require_capability_locked("hid.output-route-v1")
+            if HID_OUTPUT_ROUTE_V2_CAPABILITY in self._capabilities:
+                self._require_capability_locked(HID_OUTPUT_ROUTE_V2_CAPABILITY)
+                request_id, session = self._allocate_request_id_locked()
+                result: HidRouteStatus | HidRouteV2Status = (
+                    validate_hid_route_v2_status(
+                        self._request_frame_locked(
+                            request_id,
+                            session,
+                            build_hid_route_v2_set_frame(
+                                request_id, session, selected
+                            ),
+                        )
+                    )
+                )
+                self._invalidate_session()
+                return result
+            self._require_capability_locked(HID_OUTPUT_ROUTE_V1_CAPABILITY)
+            if selected is OutputRouteV2.BLE:
+                raise CompatibilityError(
+                    "peer does not advertise BLE HID output routing"
+                )
             request_id, session = self._allocate_request_id_locked()
             result = validate_hid_route_status(
                 self._request_frame_locked(
                     request_id,
                     session,
-                    build_hid_route_set_frame(request_id, session, selected),
+                    build_hid_route_set_frame(
+                        request_id, session, OutputRoute(selected.value)
+                    ),
                 )
             )
             # The exact result schema intentionally does not expose whether a

@@ -11,12 +11,14 @@ from hidbot.protocol import (
     BleExposureObserved,
     FirmwareIdentity,
     OutputRoute,
+    OutputRouteV2,
     HelloResponse,
     OPTIONAL_CAPABILITIES,
     REQUIRED_CAPABILITIES,
     SystemInfo,
     build_command_frame,
     build_hid_route_set_frame,
+    build_hid_route_v2_set_frame,
     build_keyboard_report_frame,
     build_mouse_report_frame,
     build_hello_frame,
@@ -24,6 +26,7 @@ from hidbot.protocol import (
     validate_release_all_result,
     validate_ble_exposure_status,
     validate_hid_route_status,
+    validate_hid_route_v2_status,
     validate_keyboard_report_result,
     validate_mouse_report_result,
     validate_usb_exposure_status,
@@ -100,6 +103,43 @@ class ProtocolTests(unittest.TestCase):
                 validate_hid_route_status(invalid)
         with self.assertRaises(ProtocolError):
             build_hid_route_set_frame(1, TOKEN, "ble")  # type: ignore[arg-type]
+
+    def test_hid_route_v2_builder_and_strict_status(self) -> None:
+        self.assertEqual(
+            build_hid_route_v2_set_frame(4, TOKEN, OutputRouteV2.BLE),
+            b'@HIDBOT {"v":1,"id":4,"session":"0123456789abcdef0123456789abcdef",'
+            b'"cmd":"hid.route.v2.set","params":{"route":"ble"}}\n',
+        )
+        for desired, active, transition, ready in (
+            ("ble", "ble", "stable", True),
+            ("none", "ble", "releasing", False),
+            ("usb", "usb", "stable", True),
+            ("none", "none", "stable", False),
+        ):
+            parsed = validate_hid_route_v2_status(
+                {
+                    "desired": desired,
+                    "active": active,
+                    "generation": 7,
+                    "transition": transition,
+                    "ready": ready,
+                }
+            )
+            self.assertEqual(parsed.active.value, active)
+        for invalid in (
+            {"desired": "future", "active": "future", "generation": 0,
+             "transition": "stable", "ready": False},
+            {"desired": "none", "active": "ble", "generation": 0,
+             "transition": "releasing", "ready": True},
+            {"desired": "usb", "active": "ble", "generation": 0,
+             "transition": "stable", "ready": False},
+            {"desired": "ble", "active": "ble", "generation": True,
+             "transition": "stable", "ready": True},
+        ):
+            with self.assertRaises(ProtocolError):
+                validate_hid_route_v2_status(invalid)
+        with self.assertRaises(ProtocolError):
+            build_hid_route_v2_set_frame(1, TOKEN, OutputRoute.USB)  # type: ignore[arg-type]
 
     def test_keyboard_report_builder_and_strict_result(self) -> None:
         frame = build_keyboard_report_frame(3, TOKEN, 2, [4, 5, 0xA4, 0xB0, 0xDD])

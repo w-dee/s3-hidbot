@@ -34,7 +34,7 @@ installation flow is in the project
 - Explicit BLE exposure control: `ble-enable` and `ble-disable`.
 - Explicit BLE pairing control: `ble-pairing-status` and
   `ble-pairing-respond --pairing-id ID`.
-- Explicit HID output routing: `hid-route-status` and `hid-route-set none|usb`.
+- Explicit HID output routing: `hid-route-status` and `hid-route-set none|usb|ble`.
 - UART diagnostic with safety action: `self-test`.
 - Explicit safety recovery: `release-all`.
 - Destructive provisioning: `flash-firmware ARTIFACT`.
@@ -56,11 +56,13 @@ result may retire control authority, so reconnect before later commands. The
 legacy `usb-status` command remains a basic readiness view.
 
 BLE is separately uninitialized and hidden at boot. `ble-enable` lazily starts
-BLE advertising and exposes a discoverable keyboard/mouse HID Service
-foundation; `ble-disable` returns it to hidden idle without changing USB or the
-selected HID route. USB and BLE can be exposed together. There is no BLE HID
-output or `ble` route yet, and the pairing controls do not provide bond
-administration or a formal HOGP/security compliance claim.
+BLE advertising; `ble-disable` returns it to hidden idle. Once a peer is
+connected, secured, composite-subscribed, and unsuspended, route-v2 firmware
+allows explicit `hid-route-set ble` from stable none. The client negotiates
+`hid.output-route-v2`, falls back to v1 for none/USB, and rejects BLE locally
+on v1-only firmware. Switching USB and BLE always requires an explicit stable
+none boundary, and reconnect or restored eligibility never auto-selects BLE.
+`ready` is route eligibility, not proof that a peer received a report.
 
 Pairing is an explicit operator transaction:
 

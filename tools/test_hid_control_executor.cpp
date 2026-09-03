@@ -2440,7 +2440,8 @@ struct ReadyBleRouteFixture {
         make_security_ready(ble);
         ble.refresh_security(connection);
         assert(controller.ble_link_ready());
-        const auto activation = controller.activate_ble_route_internal();
+        const auto activation =
+            controller.request_route(hid_route::OutputRoute::kBle);
         assert(activation.action_result ==
                hid_runtime::RouteTransitionResult::kAccepted);
         assert(runtime.state_machine().route_snapshot().active ==
@@ -2463,7 +2464,8 @@ void test_internal_ble_route_activation_and_exact_payloads() {
         assert(runtime.state_machine().route_snapshot().active ==
                hid_route::OutputRoute::kNone);
         assert(controller.request_route(hid_route::OutputRoute::kBle)
-                   .action_result == hid_runtime::RouteTransitionResult::kBusy);
+                   .action_result ==
+               hid_runtime::RouteTransitionResult::kNotReady);
     }
 
     ReadyBleRouteFixture fixture;
@@ -2480,6 +2482,16 @@ void test_internal_ble_route_activation_and_exact_payloads() {
            fixture.database.handles.keyboard_value);
     assert(authority.mouse_characteristic_handle ==
            fixture.database.handles.mouse_value);
+    const auto status = fixture.controller.route_snapshot();
+    assert(status.route.desired == hid_route::OutputRoute::kBle);
+    assert(status.route.active == hid_route::OutputRoute::kBle);
+    assert(status.route.transition == hid_route::Transition::kStable);
+    assert(status.ready);
+    const auto noop =
+        fixture.controller.request_route(hid_route::OutputRoute::kBle);
+    assert(noop.action_result == hid_runtime::RouteTransitionResult::kNoOp);
+    assert(noop.snapshot_valid && noop.snapshot.ready);
+    assert(noop.snapshot.route.generation == status.route.generation);
 
     const std::array<std::uint8_t, 6> keys{0x73, 0, 0, 0, 0, 0};
     assert(fixture.controller.queue_ble_keyboard_report(0x02, keys) ==
@@ -2950,6 +2962,11 @@ void test_u74c_normal_retirement_release_grace_and_cross_transport() {
     assert(releasing.active == hid_route::OutputRoute::kBle);
     assert(releasing.transition == hid_route::Transition::kReleasing);
     assert(releasing.generation == initial_route.generation);
+    const auto public_releasing = fixture.controller.route_snapshot();
+    assert(public_releasing.route.desired == hid_route::OutputRoute::kNone);
+    assert(public_releasing.route.active == hid_route::OutputRoute::kBle);
+    assert(public_releasing.route.transition == hid_route::Transition::kReleasing);
+    assert(!public_releasing.ready);
     assert(fixture.controller.queue_ble_mouse_report(1, 1, 1, 1, 1) ==
            hid_runtime::MouseReportBeginResult::kNotReady);
 
@@ -2999,6 +3016,7 @@ void test_u74c_normal_retirement_release_grace_and_cross_transport() {
     assert(none.active == hid_route::OutputRoute::kNone);
     assert(none.transition == hid_route::Transition::kStable);
     assert(none.generation == initial_route.generation + 1U);
+    assert(!fixture.controller.route_snapshot().ready);
     assert(!fixture.ble.route_release_grace_armed);
 
     // C18: USB can be selected only after exact BLE Disconnect established
@@ -3030,18 +3048,18 @@ void test_u74c_usb_none_ble_and_direct_switch_rejection() {
     subscribe_composite(controller, database, generation, connection);
     make_security_ready(ble);
     ble.refresh_security(connection);
-    assert(controller.activate_ble_route_internal().action_result ==
+    assert(controller.request_route(hid_route::OutputRoute::kBle).action_result ==
            hid_runtime::RouteTransitionResult::kBusy);
     assert(runtime.state_machine().route_snapshot().active ==
            hid_route::OutputRoute::kUsb);
 
     // C16: the existing USB release reaches observable stable none first,
-    // after which the internal BLE activation is legal.
+    // after which public BLE activation is legal.
     assert(controller.request_route(hid_route::OutputRoute::kNone)
                .action_result == hid_runtime::RouteTransitionResult::kAccepted);
     assert(runtime.state_machine().route_snapshot().active ==
            hid_route::OutputRoute::kNone);
-    assert(controller.activate_ble_route_internal().action_result ==
+    assert(controller.request_route(hid_route::OutputRoute::kBle).action_result ==
            hid_runtime::RouteTransitionResult::kAccepted);
 }
 

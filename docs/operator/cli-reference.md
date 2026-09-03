@@ -20,7 +20,7 @@ does not resolve a serial port or use them.
 | Explicit USB exposure control | `usb-attach`, `usb-detach` |
 | Explicit BLE exposure control | `ble-enable`, `ble-disable` |
 | Explicit BLE pairing control | `ble-pairing-status`, `ble-pairing-respond --pairing-id ID` |
-| Explicit HID output routing | `hid-route-status`, `hid-route-set none`, `hid-route-set usb` |
+| Explicit HID output routing | `hid-route-status`, `hid-route-set none|usb|ble` |
 | UART diagnostic with safety action | `self-test` |
 | Explicit safety recovery | `release-all` |
 | Destructive provisioning | `flash-firmware ARTIFACT` |
@@ -47,9 +47,10 @@ intentionally injects a key, button, or movement.
 | `hidbotctl ble-disable` | UART + `ble.exposure-control-v1` | Stop advertising/disconnect a peer and enter hidden idle while retaining the initialized stack. It does not change USB or its HID route/session. |
 | `hidbotctl ble-pairing-status` | UART + `ble.pairing-transaction-v1` | Read one strict pairing transaction snapshot. It does not poll, connect, or pair automatically. |
 | `hidbotctl ble-pairing-respond --pairing-id ID` | UART + controlling TTY + `ble.pairing-transaction-v1` | Prompt without echo for one six-ASCII-digit passkey and submit it to the exact nonzero pairing ID. There is deliberately no passkey argv, environment, config-file, or stdin-pipe mode. |
-| `hidbotctl hid-route-status` | UART + `hid.output-route-v1` | Read the coherent `desired`, `active`, `generation`, `transition`, and `ready` route snapshot. |
-| `hidbotctl hid-route-set none` | UART + `hid.output-route-v1` | Safely retire USB HID output while leaving USB exposure unchanged. An actual transition retires the session. |
-| `hidbotctl hid-route-set usb` | UART + `hid.output-route-v1` | Select an already mounted, safety-clear USB transport. Both endpoints must be ready. Establish a fresh session after an actual transition. |
+| `hidbotctl hid-route-status` | UART + route v2, or v1 fallback | Read `desired`, `active`, `generation`, `transition`, and `ready`; the host prefers `hid.output-route-v2`. |
+| `hidbotctl hid-route-set none` | UART + route v2, or v1 fallback | Safely retire the active USB or BLE route. BLE remains `releasing` until exact disconnect completes. |
+| `hidbotctl hid-route-set usb` | UART + route v2, or v1 fallback | Select an already mounted, safety-clear USB transport from stable none. |
+| `hidbotctl hid-route-set ble` | UART + `hid.output-route-v2` | Select an already connected, secured, composite-subscribed BLE peer from stable none. V1-only firmware is rejected locally. |
 | `hidbotctl self-test` | UART | Safe diagnostic sequence including `release-all`. |
 | `hidbotctl release-all` | UART | Explicit keyboard/mouse all-up recovery. |
 | `hidbotctl verify-firmware ARTIFACT` | Artifact + UART | Verify artifact first, then fresh hello and system info identity comparison. No flash or HID. |
@@ -76,9 +77,14 @@ retry is attempted; reboot or manual operator intervention is required.
 `ble-exposure-status` has exactly `desired`, `observed`, `generation`,
 `stack_ready`, `advertising`, `connected`, `recovery_required`, and
 `last_error`. BLE is uninitialized/non-advertising at cold boot. USB and BLE
-may be exposed simultaneously. There is no public BLE report-output selection,
-`route=ble`, bond administration, or formal HOGP/security compliance claim;
-the firmware's U7.4B BLE report route is internal-only.
+may be exposed simultaneously. Route v2 adds explicit BLE output selection
+without changing BLE exposure or pairing. It never enables, advertises, pairs,
+queues a future selection, or claims delivery merely because `ready=true`;
+NimBLE `stack_accepted` is not a peer acknowledgment. Direct USB-to-BLE and
+BLE-to-USB selection is rejected: first select none and wait for observable
+`stable`, then select the new route. Disconnect, restored security, CCCD
+Restore, and reconnect never auto-select BLE. Route-v1 remains `none|usb`;
+new clients fall back for those values only.
 
 The pairing workflow is deliberately manual: query `ble-pairing-status`, note
 its non-null `pairing_id`, run `ble-pairing-respond --pairing-id ID`, enter the

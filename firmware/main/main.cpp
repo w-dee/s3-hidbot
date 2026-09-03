@@ -295,10 +295,10 @@ control_protocol::BleExposureActionOutcome ble_disable(void *) {
 
 control_protocol::HidRouteStatus make_hid_route_status(
     hid_runtime::RouteStatusSnapshot snapshot) {
+    static_assert(static_cast<std::uint8_t>(hid_route::OutputRoute::kBle) ==
+                  static_cast<std::uint8_t>(control_protocol::OutputRoute::kBle));
     const auto route = [](hid_route::OutputRoute value) {
-        return value == hid_route::OutputRoute::kUsb
-                   ? control_protocol::OutputRoute::kUsb
-                   : control_protocol::OutputRoute::kNone;
+        return static_cast<control_protocol::OutputRoute>(value);
     };
     return control_protocol::HidRouteStatus{
         .desired = route(snapshot.route.desired),
@@ -318,9 +318,8 @@ control_protocol::HidRouteStatus hid_route_status(void *) {
 control_protocol::HidRouteActionOutcome hid_route_set(
     void *, control_protocol::OutputRoute desired) {
     const hid_control_executor::RouteCommandOutcome outcome =
-        s_usb_exposure.request_route(desired == control_protocol::OutputRoute::kUsb
-                                         ? hid_route::OutputRoute::kUsb
-                                         : hid_route::OutputRoute::kNone);
+        s_usb_exposure.request_route(
+            static_cast<hid_route::OutputRoute>(desired));
     const auto result = [](hid_runtime::RouteTransitionResult value) {
         switch (value) {
             case hid_runtime::RouteTransitionResult::kAccepted:

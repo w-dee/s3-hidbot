@@ -73,6 +73,15 @@ def main() -> int:
     assert "firmware_identity::Identity" in protocol_header
     assert "keyboard_report_provider" in protocol_header
     assert "mouse_report_provider" in protocol_header
+    assert 'command == "hid.route.v2.status"' in protocol
+    assert 'command == "hid.route.v2.set"' in protocol
+    assert "hid.output-route-v1" in protocol
+    assert "hid.output-route-v2" in protocol
+    assert "HID_ROUTE_V2_REQUIRED" in protocol
+    assert 'allow_ble && value == "ble"' in protocol
+    assert "kRouteBleActivate" in (
+        ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp"
+    ).read_text(encoding="utf-8")
     assert "tud_hid_n_keyboard_report" not in main_source
     assert "tud_hid_n_report" not in main_source
     print("PASS: U2 protocol/HID/UART static boundaries")

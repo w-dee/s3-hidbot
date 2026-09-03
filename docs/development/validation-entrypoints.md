@@ -125,6 +125,12 @@ restore. Static guards keep the public route-v1 vocabulary at `none|usb`,
 verify the dedicated timer, exact no-Report-ID payload sizes, and absence of a
 blocking grace delay. None of these checks accesses radio or hardware.
 
+U7.4D adds route-v2 protocol, executor activation, host negotiation, v1
+fallback, CLI BLE selection, strict v2 parsing, retry/session, stable-none,
+truthful releasing-status, and v1-under-BLE compatibility coverage. Route-v1
+remains exactly `none|usb`; v2 adds `ble` and is preferred only when its
+capability is advertised. These checks remain software-only.
+
 Run these commands from the repository root:
 
 ```text

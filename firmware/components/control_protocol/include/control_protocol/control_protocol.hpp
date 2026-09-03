@@ -166,6 +166,7 @@ using BlePairingRespondProvider = BlePairingRespondResult (*)(
 enum class OutputRoute : std::uint8_t {
     kNone,
     kUsb,
+    kBle,
 };
 
 enum class RouteTransition : std::uint8_t {

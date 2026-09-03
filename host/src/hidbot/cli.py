@@ -38,11 +38,12 @@ from .protocol import (
     BlePairingRespondResult,
     BlePairingStatus,
     HidRouteStatus,
+    HidRouteV2Status,
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
     UsbExposureStatus,
-    OutputRoute,
+    OutputRouteV2,
     validate_ble_pairing_respond_inputs,
     validate_keyboard_report_inputs,
     validate_mouse_report_inputs,
@@ -252,7 +253,7 @@ def _parser() -> argparse.ArgumentParser:
         ("ble-pairing-status", "show the current BLE pairing transaction"),
         ("ble-pairing-respond", "respond to one BLE pairing transaction"),
         ("hid-route-status", "show the explicit HID output route"),
-        ("hid-route-set", "select none or USB as the HID output route"),
+        ("hid-route-set", "select none, USB, or BLE as the HID output route"),
         ("release-all", "perform the safe all-up recovery operation"),
         (
             "self-test",
@@ -285,7 +286,7 @@ def _parser() -> argparse.ArgumentParser:
         if name == "hid-route-set":
             command.add_argument(
                 "route",
-                choices=[route.value for route in OutputRoute],
+                choices=[route.value for route in OutputRouteV2],
                 help="explicit HID output route",
             )
         if name == "ble-pairing-respond":
@@ -396,7 +397,7 @@ def _result_value(command: str, result: object) -> object:
         assert isinstance(result, BlePairingRespondResult)
         return asdict(result)
     if command in {"hid-route-status", "hid-route-set"}:
-        assert isinstance(result, HidRouteStatus)
+        assert isinstance(result, (HidRouteStatus, HidRouteV2Status))
         return asdict(result)
     return result
 

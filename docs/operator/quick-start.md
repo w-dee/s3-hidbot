@@ -164,11 +164,18 @@ observe `HID_NOT_READY` for HID while the route is none, run
 
 ## BLE exposure after a separate authorized hardware gate
 
-U7.3 BLE is uninitialized and non-advertising at boot. On development firmware
-that advertises `ble.exposure-control-v1`, `hidbotctl --json ble-enable`
-requests lazy BLE startup; poll `hidbotctl --json ble-exposure-status` for
-`advertising` or `connected`. `hidbotctl --json ble-disable` returns an
-initialized stack to hidden `idle`. These commands do not select an HID route
-or invalidate an active USB route/session, so USB and BLE may remain exposed
-together. Do not expect BLE keyboard/mouse output, pairing/passkey control,
-bonding, or formal HOGP/security compliance from U7.3.
+BLE is uninitialized and non-advertising at boot. `hidbotctl --json ble-enable`
+requests lazy startup; pairing remains a separate explicit transaction. After
+the peer is connected, secured, composite-subscribed, and unsuspended, select
+BLE only from observable stable none:
+
+```bash
+hidbotctl --json hid-route-status
+hidbotctl --json hid-route-set ble
+```
+
+The host uses route v2 when advertised. V1-only firmware supports none/USB and
+rejects BLE locally. Never treat route selection or `ready:true` as proof of
+peer delivery. To switch USB and BLE, select none and wait for `stable` before
+selecting the other transport. Disconnect/reconnect and restored eligibility
+do not restore the BLE route automatically.
