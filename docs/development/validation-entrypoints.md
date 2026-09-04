@@ -184,6 +184,15 @@ CCCD/RPA/CSFC postconditions. Executor coverage proves a startup persistent
 store fault prevents advertising and pairing while bond administration reports
 Storage. Existing ENOTCONN regressions remain in the same focused suites.
 
+The U7.5C pairing-order regression models the pinned ESP-NimBLE v5.5.4 fresh
+bond sequence: Pairing Complete is delivered before persistence, Identity
+Resolved can be delivered from inside persistence before either security
+record is written, and Encryption Change follows the synchronous OUR_SEC and
+PEER_SEC write attempts. The executor must tolerate temporary missing records
+at the first two events, then accept a complete verified pair or fail closed on
+genuinely missing, mismatched, or downgraded evidence at the post-persistence
+Encryption Change boundary. Static guards bind each event to that role.
+
 Run these commands from the repository root:
 
 ```text

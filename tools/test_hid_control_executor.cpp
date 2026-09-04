@@ -1718,6 +1718,9 @@ void test_gatt_cache_non_authoritative_refresh_results_and_independent_read() {
     assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
                      connection));
     assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     connection));
+    assert(controller.process_one_for_test());
     assert(ble.persist_gatt_schema_calls == 1);
     assert(ble.stored_gatt_schema_current);
     assert(ble.gatt_cache_refresh_calls == 0);
@@ -4191,6 +4194,14 @@ void run_persisted_bond_reread_failure(
     assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
                      handle, 0));
     assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().connected);
+    assert(!controller.ble_snapshot().recovery_required);
+    assert(controller.pairing_snapshot().live_state ==
+           ble_pairing::LiveState::kSecuring);
+    assert(ble.disconnect_calls == 0);
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     handle, 0));
+    assert(controller.process_one_for_test());
     assert_fatal_storage_terminal_state(controller, ble, handle,
                                         advertising_calls);
 }
@@ -4450,6 +4461,66 @@ void test_security_event_ordering_and_existing_bond() {
         generation - 1, 31, 0));
     assert(controller.process_one_for_test());
     assert(ble.refresh_security_calls == refreshes);
+}
+
+void test_pairing_completion_waits_for_post_persistence_event() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t handle = 32;
+    connect_ble(runtime, usb, ble, database, controller, handle);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kPasskeyAction,
+                     handle, 1));
+    assert(controller.process_one_for_test());
+    const auto pending = controller.pairing_snapshot();
+    const std::array<char, 6> secret = {'0', '0', '0', '1', '2', '3'};
+    assert(controller.respond_to_pairing(pending.generation, handle,
+                                         pending.pairing_id, secret) ==
+           ble_pairing::RespondResult::kAccepted);
+
+    // NimBLE exposes the successful link before it persists OUR_SEC and
+    // PEER_SEC. Pairing Complete and the in-persistence Identity Resolved
+    // event must therefore tolerate this temporary absence.
+    make_security_ready(ble);
+    ble.security_persisted = {};
+    assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
+                     handle, 0));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().connected);
+    assert(!controller.ble_snapshot().recovery_required);
+    assert(controller.pairing_snapshot().live_state ==
+           ble_pairing::LiveState::kSecuring);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kNone);
+    assert(ble.disconnect_calls == 0);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kIdentityResolved,
+                     handle, 0));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().connected);
+    assert(!controller.ble_snapshot().recovery_required);
+    assert(controller.pairing_snapshot().live_state ==
+           ble_pairing::LiveState::kSecuring);
+    assert(ble.disconnect_calls == 0);
+
+    // Encryption Change is queued after the synchronous bond persistence
+    // attempts. The same connection becomes ready once the complete pair is
+    // observable.
+    ble.security_persisted = {.our = valid_security_record(),
+                              .peer = valid_security_record()};
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     handle, 0));
+    assert(controller.process_one_for_test());
+    assert(controller.pairing_snapshot().live_state ==
+           ble_pairing::LiveState::kIdle);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kSucceeded);
+    assert(ble.security_ready_for_hid(controller.ble_snapshot().generation,
+                                     handle));
+    assert(ble.disconnect_calls == 0);
 }
 
 void test_timeout_repeat_store_and_disconnect_results() {
@@ -5068,6 +5139,11 @@ void test_policy_persistence_disconnect_disable_and_bounded_burst() {
         assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
                          handle, 0));
         assert(controller.process_one_for_test());
+        assert(controller.ble_snapshot().connected);
+        assert(ble.disconnect_calls == 0);
+        assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                         handle, 0));
+        assert(controller.process_one_for_test());
         assert(controller.pairing_snapshot().last_result ==
                (downgraded ? ble_pairing::LastResult::kSecurityPolicy
                            : ble_pairing::LastResult::kStorage));
@@ -5336,6 +5412,7 @@ int main() {
     test_pairing_input_response_and_initiation();
     test_public_pairing_rpc_mailbox_status_and_races();
     test_security_event_ordering_and_existing_bond();
+    test_pairing_completion_waits_for_post_persistence_event();
     test_missing_our_sec_is_fatal_storage_failure();
     test_missing_peer_sec_is_fatal_storage_failure();
     test_persisted_bond_reread_mismatch_is_fatal_storage_failure();

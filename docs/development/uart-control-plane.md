@@ -37,6 +37,16 @@ an identity-qualified reread of both NimBLE `OUR_SEC` and `PEER_SEC` records;
 the NimBLE bonded bit alone is insufficient. This foundation adds no UART
 pairing command or capability and is not yet connected to HID output routing.
 
+For fresh bonding, the pinned ESP-NimBLE v5.5.4 stack publishes Pairing
+Complete before it writes the new OUR_SEC and PEER_SEC records, and may publish
+Identity Resolved from inside that persistence path. These events retain
+connection-local progress but cannot make temporary record absence a storage
+failure. The subsequent successful Encryption Change event is the
+post-persistence boundary: firmware then requires the complete
+identity-qualified record pair and fails closed if it is genuinely absent,
+mismatched, or below policy. A lost post-persistence event remains bounded by
+the existing queue-overflow and pairing-timeout recovery paths.
+
 The internal Slice B controller serializes security work on the existing HID
 control executor. Its only live states are `idle`, `securing`, and
 `waiting_input`; completion and failure are retained separately as a bounded

@@ -519,7 +519,7 @@ class Controller final : public usb_lifecycle::Executor,
     void terminate_security_connection(ble_pairing::LastResult result,
                                        bool fatal);
     void reconcile_security(std::uint16_t connection_handle,
-                            bool pairing_complete_seen);
+                            bool terminal_evidence_ready);
     void reconcile_gatt_cache();
     bool event_targets_current_ble_authority(BleEvent event) const;
     void mark_ble_event_overflow(BleEvent event);

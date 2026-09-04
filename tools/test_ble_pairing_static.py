@@ -254,6 +254,34 @@ def main() -> int:
     assert "ble_pairing::kInputTimeoutMs" in transport
     assert "cJSON" not in transport
 
+    event_processor = re.search(
+        r"void Controller::process_ble_event\(BleEvent event\) \{(.*?)"
+        r"\n\}\n\n#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST", executor, re.S)
+    assert event_processor
+    event_body = event_processor.group(1)
+    encryption_case = re.search(
+        r"case BleEventKind::kEncryptionChange:(.*?)"
+        r"case BleEventKind::kPairingComplete:", event_body, re.S)
+    pairing_case = re.search(
+        r"case BleEventKind::kPairingComplete:(.*?)"
+        r"case BleEventKind::kIdentityResolved:", event_body, re.S)
+    identity_case = re.search(
+        r"case BleEventKind::kIdentityResolved:(.*?)"
+        r"case BleEventKind::kRepeatPairing:", event_body, re.S)
+    assert encryption_case and pairing_case and identity_case
+    assert "reconcile_security(event.connection_handle, true);" in \
+        encryption_case.group(1)
+    assert "pairing_complete_seen_ = true;" in pairing_case.group(1)
+    assert "reconcile_security(" not in pairing_case.group(1)
+    assert "reconcile_security(event.connection_handle, false);" in \
+        identity_case.group(1)
+    reconciliation = re.search(
+        r"void Controller::reconcile_security\(.*?\) \{(.*?)"
+        r"\n\}\n\nvoid Controller::reconcile_gatt_cache", executor, re.S)
+    assert reconciliation
+    assert "terminal_evidence_ready && pairing_complete_seen_" in \
+        reconciliation.group(1)
+
     for exposed in ("ble.pairing.status", "ble.pairing.respond",
                     "ble.pairing-transaction-v1"):
         assert exposed in protocol

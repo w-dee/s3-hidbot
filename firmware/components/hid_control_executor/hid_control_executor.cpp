@@ -1942,13 +1942,12 @@ bool Controller::reconcile_security_disconnect_absent(
 }
 
 void Controller::reconcile_security(std::uint16_t connection_handle,
-                                    bool pairing_complete_seen) {
+                                    bool terminal_evidence_ready) {
     const auto current = ble_state_.snapshot();
     if (!current.connected || current.generation != ble_state_.generation() ||
         connection_handle != ble_state_.connection_handle()) {
         return;
     }
-    pairing_complete_seen_ = pairing_complete_seen_ || pairing_complete_seen;
     ble_backend_->refresh_security(connection_handle);
     if (ble_backend_->security_ready_for_hid(current.generation,
                                              connection_handle)) {
@@ -1961,9 +1960,9 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
         return;
     }
     const auto security = ble_backend_->security_snapshot();
-    if (pairing_complete_seen_ && security.coherent && security.connected &&
-        security.encrypted && security.identity_resolved &&
-        security.store_healthy) {
+    if (terminal_evidence_ready && pairing_complete_seen_ &&
+        security.coherent && security.connected && security.encrypted &&
+        security.identity_resolved && security.store_healthy) {
         if (!security.authenticated ||
             security.key_size != ble_security::kRequiredKeySize) {
             terminate_security_connection(
@@ -2323,7 +2322,12 @@ void Controller::process_ble_event(BleEvent event) {
                     ble_pairing::LastResult::kSmpFailed, false);
                 return;
             }
-            reconcile_security(event.connection_handle, false);
+            // ESP-NimBLE v5.5.4 publishes Encryption Change only after its
+            // successful bonding path has completed the synchronous OUR_SEC
+            // and PEER_SEC persistence attempts. This is the first event at
+            // which an absent record is terminal evidence rather than a
+            // transient store ordering gap.
+            reconcile_security(event.connection_handle, true);
             return;
         case BleEventKind::kPairingComplete:
             if (event.generation != ble_state_.generation() ||
@@ -2335,7 +2339,12 @@ void Controller::process_ble_event(BleEvent event) {
                     ble_pairing::LastResult::kSmpFailed, false);
                 return;
             }
-            reconcile_security(event.connection_handle, true);
+            // ESP-NimBLE v5.5.4 publishes Pairing Complete before persisting
+            // the new bond and can publish Identity Resolved from inside that
+            // persistence path before either security record is written.
+            // Retain completion here, but wait for the subsequent Encryption
+            // Change before treating an absent persisted record as fatal.
+            pairing_complete_seen_ = true;
             return;
         case BleEventKind::kIdentityResolved:
             if (event.generation == ble_state_.generation() &&
