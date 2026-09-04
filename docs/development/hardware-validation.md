@@ -274,3 +274,6 @@ PHYSICAL MEASUREMENT**, never a software PASS.
   and CI checks.
 - [`uart-control-plane.md`](uart-control-plane.md) — normative protocol and
   runtime safety contract.
+- [`qualification-harness.md`](qualification-harness.md) — repository-owned
+  bounded qualification primitives and privacy-safe evidence format for later
+  approved physical gates.

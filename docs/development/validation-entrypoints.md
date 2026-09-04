@@ -145,6 +145,16 @@ executor tests remain independent layers of coverage. This closes the former
 deferred malformed HID Control Point executable GATT-harness gap without
 changing firmware build inputs.
 
+U7.6B adds the hardware-free `tools/test-qualification-harness.sh` suite to
+`test-static.sh`. It exercises bounded monotonic polling, fresh UART session
+authority, artifact/source identity, route/exposure/bond invariants,
+identity-based evdev rediscovery, F24/`REL_X` checkpoint rules, bounded btmon
+process control, privacy-safe JSON evidence, read-only BlueZ inspection, and
+independent main/cleanup outcomes through fakes. It opens no serial, evdev, or
+Bluetooth device and performs no BlueZ mutation. The architecture and later
+physical invocation boundary are documented in
+[`qualification-harness.md`](qualification-harness.md).
+
 The bonded GATT-cache regression extends the executor and BLE HID static
 entrypoints with legacy missing-revision migration, stale-cache readiness
 inhibition, exact per-connection Service Changed eligibility and bounded call
@@ -376,5 +386,7 @@ Those are separate gates documented in
   evidence scope.
 - [`firmware-artifacts.md`](firmware-artifacts.md) — U6.3A artifact format and
   provenance contract.
+- [`qualification-harness.md`](qualification-harness.md) — reusable physical
+  qualification machinery, safety boundaries, and evidence schema.
 - [`uart-control-plane.md`](uart-control-plane.md) — protocol/runtime
   contract.
