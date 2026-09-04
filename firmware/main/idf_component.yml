@@ -1,12 +1,7 @@
 ## IDF Component Manager Manifest File
 dependencies:
   espressif/esp_tinyusb:
-    version: "^2.0.0"
+    git: https://github.com/w-dee/esp-usb.git
+    path: device/esp_tinyusb
+    version: 94a4d44b5760b8f6ab1a3ce56c92a101fe2bc17f
   idf: "^5.0"
-overrides:
-  - espressif/tinyusb:
-      with:
-        espressif/tinyusb:
-          git: https://github.com/w-dee/tinyusb.git
-          version: 0b02e68af7a654d5099d8a230291ce19403833ae
-      reason: "U7.6D runtime fault hook required for fail-closed USB lifecycle handling"

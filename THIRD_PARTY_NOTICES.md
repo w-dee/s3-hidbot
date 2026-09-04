@@ -9,10 +9,14 @@ Release assets; it does not alter the firmware-bundle schema.
 ## Evidence used
 
 - The project is MIT licensed: LICENSE.
-- firmware/dependencies.lock locks ESP-IDF 5.5.4, espressif/esp_tinyusb
-  2.2.1, and espressif/tinyusb 0.21.0~1.
-- firmware/main/idf_component.yml directly selects esp_tinyusb; its component
-  manifest publicly selects TinyUSB.
+- firmware/dependencies.lock locks ESP-IDF 5.5.4, the manifest-only
+  `w-dee/esp-usb` compatibility fork at exact commit
+  94a4d44b5760b8f6ab1a3ce56c92a101fe2bc17f, and the repaired
+  `w-dee/tinyusb` fork at exact commit
+  0b02e68af7a654d5099d8a230291ce19403833ae.
+- firmware/main/idf_component.yml directly selects that immutable
+  esp_tinyusb Git component; its component manifest publicly selects the
+  immutable TinyUSB Git component.
 - The release firmware builder records the effective dependency lock and the
   build-tool versions in the verified bundle manifest. The release procedure
   does not change the locked dependency set.
@@ -32,11 +36,12 @@ available in those inputs.
 - ESP-IDF 5.5.4, including the ESP-IDF source components contributing to this
   profile, is supplied with an Apache License 2.0 LICENSE at the ESP-IDF
   repository root. Upstream: <https://github.com/espressif/esp-idf>.
-- Espressif ESP TinyUSB 2.2.1 is identified by
-  firmware/managed_components/espressif__esp_tinyusb/idf_component.yml; its
-  supplied LICENSE is Apache License 2.0. Upstream source commit:
-  8e779566ef71d43928cbf7e125e8eb54bab3f542 in
-  <https://github.com/espressif/esp-usb>.
+- Espressif ESP TinyUSB 2.2.1 is supplied under the Apache License 2.0.
+  Upstream source commit 8e779566ef71d43928cbf7e125e8eb54bab3f542 is
+  in <https://github.com/espressif/esp-usb>. The build uses the
+  manifest-only `w-dee/esp-usb` compatibility fork at exact commit
+  94a4d44b5760b8f6ab1a3ce56c92a101fe2bc17f; its executable sources are
+  unchanged from that upstream commit.
 - Espressif target PHY library is an ESP-IDF component contributing to the
   profile. Its supplied component-library LICENSE is Apache License 2.0.
 
@@ -45,8 +50,11 @@ Apache License 2.0 text:
 
 ## TinyUSB
 
-TinyUSB 0.21.0~1 is a public dependency of ESP TinyUSB in the locked component
-metadata. The supplied component license reads:
+TinyUSB is a public dependency of ESP TinyUSB. The repaired build uses the
+`w-dee/tinyusb` fork at exact commit
+0b02e68af7a654d5099d8a230291ce19403833ae, based on upstream source commit
+7049c58a0e895acc92c6407574b05b5536eddfc8 in
+<https://github.com/espressif/tinyusb>. The supplied component license reads:
 
 > The MIT License (MIT)
 >
@@ -70,8 +78,8 @@ metadata. The supplied component license reads:
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 > SOFTWARE.
 
-Upstream: <https://github.com/espressif/tinyusb>, locked source commit
-7049c58a0e895acc92c6407574b05b5536eddfc8.
+The fork adds the project-required runtime-fault hook and diagnostic-output
+override seams; the exact fork commit above is the locked build source.
 
 ## FreeRTOS and cJSON
 

@@ -1,5 +1,7 @@
 """Pure Python host-side control-plane core for s3-hidbot."""
 
+from typing import TYPE_CHECKING, Any
+
 from .client import Client, HelloResult
 from .protocol import (
     CompatibilityResult,
@@ -36,7 +38,20 @@ from .errors import (
     TransportError,
 )
 from .flashing import FlashExecutionResult
-from .serial_transport import PySerialTransport
+
+if TYPE_CHECKING:
+    from .serial_transport import PySerialTransport
+
+
+def __getattr__(name: str) -> Any:
+    """Load the optional hardware transport only when the public API is used."""
+
+    if name == "PySerialTransport":
+        from .serial_transport import PySerialTransport
+
+        globals()[name] = PySerialTransport
+        return PySerialTransport
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "Client",

@@ -357,7 +357,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         notices = NOTICES.read_text(encoding="utf-8")
         for required in (
             "ESP TinyUSB 2.2.1",
-            "TinyUSB 0.21.0~1",
+            "w-dee/esp-usb",
+            "94a4d44b5760b8f6ab1a3ce56c92a101fe2bc17f",
+            "w-dee/tinyusb",
+            "0b02e68af7a654d5099d8a230291ce19403833ae",
             "FreeRTOS",
             "cJSON",
             "Mbed TLS",

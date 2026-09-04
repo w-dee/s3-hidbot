@@ -4,6 +4,7 @@ import unittest
 
 import serial
 
+import hidbot
 from hidbot.errors import TransportError
 from hidbot.serial_transport import PySerialTransport
 
@@ -70,6 +71,9 @@ class RecordingSerial:
 
 
 class SerialTransportTests(unittest.TestCase):
+    def test_package_root_preserves_public_transport_export(self) -> None:
+        self.assertIs(hidbot.PySerialTransport, PySerialTransport)
+
     def make_transport(self, events: list[tuple[str, object]]) -> tuple[PySerialTransport, RecordingSerial]:
         holder: list[RecordingSerial] = []
 
