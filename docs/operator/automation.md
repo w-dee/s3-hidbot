@@ -33,6 +33,15 @@
 15. Never direct-switch USB and BLE or auto-select BLE after reconnect, CCCD
     Restore, or security restoration. Do not infer report delivery from
     advertising, connection, subscription, route selection, or stack acceptance.
+16. Treat the three-bond limit as fixed capacity. Never select or remove a
+    bond automatically to recover `last_result:"store_full"`; an operator must
+    identify and authorize one exact opaque bond ID.
+17. Firmware bond removal does not remove the host-side pairing record. Never
+    mutate BlueZ or another host's records as an implicit continuation.
+18. Retry transport-safe diagnostics only after resolving the transport cause.
+    Session-semantic failures require a fresh hello; lifecycle rejections
+    require observed convergence. Never blindly replay a normal HID report
+    whose delivery result is ambiguous.
 
 See [safety and recovery](safety-and-recovery.md) for the required bounded
 responses and [CLI reference](cli-reference.md) for exact syntax.

@@ -20,6 +20,8 @@ from validate_release_build_run import (
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / ".github" / "workflows" / "release-build.yml"
 DRAFT = ROOT / ".github" / "workflows" / "release-draft.yml"
+FIRMWARE_ARTIFACT = ROOT / ".github" / "workflows" / "firmware-artifact.yml"
+NONHARDWARE = ROOT / ".github" / "workflows" / "nonhardware.yml"
 NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
 PIN = re.compile(r"uses:\s+actions/[A-Za-z0-9_.-]+@([0-9a-f]{40})")
 WORKFLOW_PATH = ".github/workflows/release-build.yml"
@@ -196,6 +198,22 @@ class ReleaseWorkflowTests(unittest.TestCase):
             actions = PIN.findall(workflow)
             self.assertTrue(actions)
             self.assertNotRegex(workflow, r"actions/[A-Za-z0-9_.-]+@v[0-9]")
+
+    def test_generic_workflows_derive_product_names_without_version_literals(self) -> None:
+        for path in (BUILD, FIRMWARE_ARTIFACT, NONHARDWARE):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("0.1.0", text, str(path.relative_to(ROOT)))
+        self.assertIn("tools/release_contract.py", self.build)
+        self.assertIn("product-version:", self.build)
+        self.assertIn("firmware-name:", self.build)
+        self.assertIn("wheel-name:", self.build)
+        self.assertIn("sdist-name:", self.build)
+        self.assertIn("PRODUCT_VERSION", self.build)
+
+    def test_v010_recovery_workflow_remains_explicitly_version_locked(self) -> None:
+        self.assertIn("release-notes-v0.1.0.md", self.draft)
+        self.assertIn("EXPECTED_TAG_OBJECT_SHA", self.draft)
+        self.assertIn("RECOVERY_WORKFLOW_COMMIT", self.draft)
 
     def test_selected_tag_build_metadata_must_match_every_immutable_field(self) -> None:
         contract = read_release_contract(ROOT)

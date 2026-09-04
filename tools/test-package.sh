@@ -5,6 +5,9 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 python_bin=${PYTHON_BIN:-python3}
 temporary_directory=$(mktemp -d)
 trap 'rm -rf "$temporary_directory"' EXIT
+product_version=$("$python_bin" "$repository_root/tools/release_contract.py" \
+    --source-root "$repository_root" | "$python_bin" -c \
+    'import json,sys; print(json.load(sys.stdin)["version"])')
 
 find_repository_artifact() {
     git -C "$repository_root" ls-files --cached --others --exclude-standard -- host \
@@ -56,7 +59,7 @@ fi
 cat "$twine_log"
 
 "$tools_python" - "$wheel_one" "$sdist_one" "$wheel_two" "$sdist_two" \
-    "$repository_root/LICENSE" "$repository_root/host/LICENSE" <<'PY'
+    "$repository_root/LICENSE" "$repository_root/host/LICENSE" "$product_version" <<'PY'
 from __future__ import annotations
 
 import re
@@ -65,7 +68,7 @@ import tarfile
 import zipfile
 from pathlib import PurePosixPath
 
-wheel_one, sdist_one, wheel_two, sdist_two, root_license, package_license = sys.argv[1:]
+wheel_one, sdist_one, wheel_two, sdist_two, root_license, package_license, product_version = sys.argv[1:]
 
 
 def wheel_contents(path: str) -> dict[str, bytes]:
@@ -125,7 +128,7 @@ assert not any("/build/" in name or "/dist/" in name for name in wheel)
 metadata_name = next(name for name in wheel if name.endswith(".dist-info/METADATA"))
 metadata = wheel[metadata_name].decode("utf-8")
 assert "Name: s3-hidbot-host\n" in metadata
-assert "Version: 0.1.0\n" in metadata
+assert f"Version: {product_version}\n" in metadata
 assert "Requires-Python: >=3.11\n" in metadata
 assert "Requires-Dist: pyserial<4,>=3.5\n" in metadata
 assert "Provides-Extra: flash\n" in metadata
@@ -208,10 +211,11 @@ install_and_smoke() {
     "$python_bin" -m venv "$venv_directory"
     "$venv_python" -m pip install --disable-pip-version-check --no-input "$artifact"
     "$venv_python" -m pip check
-    env -u PYTHONPATH "$venv_python" - "$artifact" <<'PY'
+    env -u PYTHONPATH EXPECTED_VERSION="$product_version" "$venv_python" - "$artifact" <<'PY'
 from __future__ import annotations
 
 import sys
+import os
 from importlib.metadata import version
 from pathlib import Path
 
@@ -220,7 +224,7 @@ import hidbot
 from hidbot.artifact import verify_bundle_archive
 from hidbot.firmware_verification import compare_firmware_identity
 
-assert version("s3-hidbot-host") == "0.1.0"
+assert version("s3-hidbot-host") == os.environ["EXPECTED_VERSION"]
 assert not hasattr(hidbot, "__version__")
 assert "site-packages" in Path(hidbot.__file__).parts
 assert callable(verify_bundle_archive)

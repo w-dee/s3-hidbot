@@ -23,14 +23,20 @@ Then use:
 
 ## Fixture boundary
 
-Development U7.3 firmware can explicitly expose a discoverable BLE HID
+Current development firmware can explicitly expose a discoverable BLE HID
 Service with `ble-enable` and hide it with `ble-disable`. BLE is uninitialized
 and non-advertising at boot, accepts at most one connection, and is independent
-of native USB exposure. USB and BLE may be exposed simultaneously. This is a
-BLE HID Service foundation only: BLE HID output, `route=ble`, pairing/passkey
-control, bonding, and formal HOGP/security compliance are not implemented.
+of native USB exposure. USB and BLE may be exposed simultaneously. Route v2
+selects `none`, `usb`, or an eligible secured `ble` peer; switching transports
+must converge through stable `none`, and normal reports are never delivered to
+both transports. Pairing is authenticated passkey entry with a 16-byte key.
+Firmware stores at most three verified bonds, never evicts one automatically,
+and exposes exact opaque-ID list/removal commands.
 
-Only the Freenove ESP32-S3 WROOM Board / FNK0085 is supported. With the board
+Only the Freenove ESP32-S3 WROOM Board / FNK0085 with ESP32-S3-WROOM-1 has
+physical qualification evidence. Its validated board implementation has
+8 MiB flash and 8 MiB PSRAM; the canonical firmware needs at least 4 MiB flash
+and does not require external PSRAM. With the board
 front-facing and its ESP32-S3 module at the top, the left USB-C under EN/RST is
 the CH343 programming/control port. The right USB-C under BOOT is native
 USB-OTG/HID. Provisioning and `verify-firmware` use only the left port.

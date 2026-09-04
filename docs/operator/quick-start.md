@@ -1,9 +1,11 @@
 # Linux-first clean-room quick start
 
-This is the currently physically validated operator path. The code and package
-are intended to be portable, but CI and accepted fixture validation are
-currently Linux-only. macOS and Windows-specific operator procedures are not
-yet validated.
+This is the currently physically validated Linux-first operator path. The code
+and package are intended to be portable, but CI, provisioning, and host-side
+evdev procedures remain Linux-first. Named Android devices have only scoped
+BLE peer evidence in the development hardware matrix; they do not establish a
+general Android operator procedure. macOS and Windows-specific operator
+procedures are not validated.
 
 ## Before starting
 
@@ -179,3 +181,27 @@ rejects BLE locally. Never treat route selection or `ready:true` as proof of
 peer delivery. To switch USB and BLE, select none and wait for `stable` before
 selecting the other transport. Disconnect/reconnect and restored eligibility
 do not restore the BLE route automatically.
+
+## Converge to a safe/quiescent state
+
+Use a fresh control session, inspect status, and converge explicitly:
+
+```bash
+hidbotctl --json release-all
+hidbotctl --json hid-route-set none
+# poll until active/desired are none and transition is stable
+hidbotctl --json hid-route-status
+hidbotctl --json ble-disable
+# poll until hidden, idle, disconnected, and non-advertising
+hidbotctl --json ble-exposure-status
+```
+
+Route `none` prevents normal HID delivery; it does not require native USB to
+be detached. `release-all` and route retirement are best-effort device-side
+safety operations, not proof that a host consumed an all-up report. If any
+command result is lost or ambiguous, do not blindly replay a normal HID
+report. Establish a fresh session, read route/exposure state, and continue only
+after lifecycle convergence. Stop for operator diagnosis on
+`recovery_required`, persistent uncertainty, or inability to establish the
+all-up/route-none state. Routine recovery must not erase NVS or remove all
+Bluetooth records.

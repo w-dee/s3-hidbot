@@ -12,9 +12,14 @@ macro-automation product.
 
 ## Supported fixture
 
-The validated fixture is the **Freenove ESP32-S3 WROOM Board / FNK0085**.
+The physically qualified fixture is the **Freenove ESP32-S3 WROOM Board /
+FNK0085**, using its ESP32-S3-WROOM-1 module and board implementation with
+8 MiB flash and 8 MiB PSRAM.
 Evidence applies to that board and the documented scope only; it is not a
 claim about arbitrary ESP32-S3 boards.
+
+The canonical firmware targets a minimum 4 MiB flash envelope and does not
+require external PSRAM. Those build minima do not qualify another board.
 
 With the board viewed from the front and the ESP32-S3 module at the top:
 
@@ -100,9 +105,9 @@ and interoperability testing. They do not represent a project-owned USB-IF
 allocation or certification, a production or commercial identifier allocation,
 or identifiers suitable for a user's product or redistribution.
 
-If future Bluetooth functionality appears in the source, that alone does not
-represent Bluetooth SIG qualification or listing, trademark authorization, or
-assignment of a project-specific Company Identifier.
+The presence of current or future Bluetooth functionality in the source does
+not represent Bluetooth SIG qualification or listing, trademark authorization,
+or assignment of a project-specific Company Identifier.
 
 The existing MIT License does not add a non-commercial-use restriction.
 Open-source copyright permission is separate from external identifier,
@@ -155,10 +160,14 @@ Contributors should use the development documentation instead:
   build coverage.
 - `HARDWARE VALIDATED`: FNK0085 UART control, composite enumeration,
   `release-all`, F24 keyboard sentinel, and one small relative mouse movement
-  on Linux.
+  on Linux; scoped BLE HID, secure bond lifecycle, three-bond capacity,
+  StoreFull/no-eviction behavior, and exact slot reuse on the documented lab
+  peers.
 - `HARDWARE DEFERRED`: mouse buttons, wheel/pan, physical failure races,
   long-duration soak, and board electrical conclusions.
 
-The package is intended to be portable, but CI and accepted physical fixture
-validation are currently Linux-only. Platform-specific macOS and Windows
-operator instructions are not yet validated.
+The package is intended to be portable, but CI, provisioning instructions,
+and host-side evdev qualification remain Linux-first. Named Android devices
+appear only as scoped BLE peer evidence in the hardware matrix; this is not a
+general Android operator-platform claim. Platform-specific macOS and Windows
+operator instructions are not validated.

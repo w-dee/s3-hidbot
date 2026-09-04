@@ -73,6 +73,9 @@ def main() -> int:
         raise AssertionError("nested Git safe-directory environment must not reach artifact builds")
     _required(text, r"SOURCE_DATE_EPOCH", "explicit SOURCE_DATE_EPOCH")
     _required(text, r"S3_HIDBOT_SOURCE_REVISION", "explicit source revision")
+    _required(text, r"tools/release_contract\.py", "derived future artifact name")
+    if "0.1.0" in text:
+        raise AssertionError("generic firmware artifact workflow must not hardcode a product version")
     _required(text, r"tools/privacy_lint\.py\s+--tracked", "repository privacy scan")
     _required(text, r"tools/test_firmware_artifact\.py", "artifact privacy and verifier tests")
 
@@ -83,6 +86,10 @@ def main() -> int:
         raise AssertionError("both independent bundles must use the official verifier")
     _required(text, r'build_one\s+"\$artifact_root/a/', "independent build A")
     _required(text, r'build_one\s+"\$artifact_root/b/', "independent build B")
+    if text.count("runs-on:") != 1 or text.count("container:") != 1:
+        raise AssertionError("resource enforcement must not add a job or container")
+    if "resource-gate" in text or "resource_gate" in text:
+        raise AssertionError("resource enforcement belongs inside the canonical builder")
     _required(text, r"sha256sum", "archive hash comparison")
     _required(text, r"\n\s+cmp\s+\"\$artifact_root/a/", "byte-identical archive comparison")
     _required(text, r"find \"\$artifact_root/extract-a\"", "payload comparison")

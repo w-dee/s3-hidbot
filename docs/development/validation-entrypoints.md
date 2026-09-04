@@ -270,6 +270,15 @@ artifact builds to verify byte-for-byte reproducibility. It does not use or
 modify the ordinary `firmware/build` directory and removes all temporary
 outputs when it exits.
 
+Each existing artifact-profile build invokes the repository-owned resource
+checker immediately after ESP-IDF produces its application BIN and link map.
+The checker uses actual application BIN bytes and ESP-IDF v5.5.4 structured
+size output for DRAM/DIRAM `.data + .bss`; missing, malformed, or over-limit
+data fails closed. Its focused fixtures run in `test-static.sh`. This insertion
+adds no checkout, container, firmware build, or artifact transfer to CI; it
+adds only the size-tool parse/check to each of the two already-required
+reproducibility builds.
+
 The three release helper tests are stdlib-only and run from
 `test-static.sh`. They validate strict firmware/host release versions and
 derived names, annotated-tag peeling, candidate/tag firmware exact-equality
@@ -345,7 +354,9 @@ of duplicating their test logic.
   digest, explicit source revision and `SOURCE_DATE_EPOCH`, two independent
   artifact builds, official verification, byte-identical comparison, privacy
   checks, and one temporary Actions artifact upload. It does not flash
-  hardware or publish a GitHub Release.
+  hardware or publish a GitHub Release. Resource limits are checked inside
+  each existing artifact build, before comparison and upload, without a new
+  job or build.
 - Release preparation (`release-build.yml`, U6.6A): manual exact-commit
   candidates and `v*` tag pushes build temporary `release-assets` only, with
   `contents: read`. It reuses the canonical firmware and host builders,

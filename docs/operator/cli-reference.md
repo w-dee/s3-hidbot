@@ -105,15 +105,27 @@ Typed API callers own the lifetime of their original passkey string; no claim
 is made about interpreter allocator, pyserial, or kernel copies.
 
 The firmware stores at most three bonds and never evicts one automatically.
+Every accepted bond requires authenticated pairing, a 16-byte key, and
+persistent verification. Capacity exhaustion is reported as pairing
+`last_result:"store_full"`; firmware keeps all three existing bonds and does
+not choose a victim.
 Use `ble-bond-list` to obtain the exact opaque ID. Before removal, select route
 `none` if BLE is active, wait for stable retirement, and run `ble-disable` until
 BLE is hidden, idle, disconnected, and non-advertising. A stable USB route may
-remain active and is not changed by removal. Successful removal verifies that
-both NimBLE security records and the exact peer's HID schema revision are gone;
+remain active and is not changed by removal. Removal is ineligible while a BLE
+route is active or releasing, route state is uncertain, a peer is connected,
+advertising is active, a pairing transaction is active, or persistent storage
+is already untrustworthy; `BLE_BOND_BUSY`, `BLE_NOT_READY`, or
+`BLE_BOND_STORAGE` reports the corresponding safe rejection. Successful
+removal verifies that both NimBLE security records and the exact peer's HID
+schema revision are gone;
 unrelated bonds are preserved. The host OS maintains a separate pairing
 record, so this command does not unpair BlueZ or any other host stack. The next
 encounter requires firmware-side pairing again and may require a separately
 authorized host-side cleanup if that host retains stale bond state.
+
+See the [operator-visible error taxonomy](safety-and-recovery.md#operator-visible-error-taxonomy)
+before retrying a failed lifecycle, pairing, bond, or HID operation.
 
 ## Artifact and firmware identity
 

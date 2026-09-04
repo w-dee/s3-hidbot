@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+import tomllib
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
 DISTRIBUTION_NAME = "s3-hidbot-host"
-DISTRIBUTION_VERSION = "0.1.0"
-WHEEL_BASENAME = "s3_hidbot_host-0.1.0-py3-none-any.whl"
-CHECKSUM_BASENAME = f"{WHEEL_BASENAME}.sha256"
-DIST_INFO = "s3_hidbot_host-0.1.0.dist-info"
+_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 REQUIRED_MODULES = frozenset(
     {
         "hidbot/__init__.py",
@@ -59,12 +57,41 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def checksum_text(digest: str, wheel_basename: str) -> str:
+def validate_distribution_version(value: str) -> str:
+    if _VERSION.fullmatch(value) is None:
+        raise HostArtifactError("distribution version must be strict X.Y.Z")
+    return value
+
+
+def read_distribution_version(source_root: Path) -> str:
+    try:
+        data = tomllib.loads((source_root / "host" / "pyproject.toml").read_text(encoding="utf-8"))
+        version = data["project"]["version"]
+    except (FileNotFoundError, KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
+        raise HostArtifactError("could not read host distribution version") from exc
+    if not isinstance(version, str):
+        raise HostArtifactError("host distribution version must be a string")
+    return validate_distribution_version(version)
+
+
+def wheel_basename(distribution_version: str) -> str:
+    return f"s3_hidbot_host-{validate_distribution_version(distribution_version)}-py3-none-any.whl"
+
+
+def checksum_basename(distribution_version: str) -> str:
+    return f"{wheel_basename(distribution_version)}.sha256"
+
+
+def dist_info_name(distribution_version: str) -> str:
+    return f"s3_hidbot_host-{validate_distribution_version(distribution_version)}.dist-info"
+
+
+def checksum_text(digest: str, wheel_name: str, distribution_version: str) -> str:
     if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise HostArtifactError("checksum digest must be 64 lowercase hexadecimal characters")
-    if wheel_basename != WHEEL_BASENAME:
+    if wheel_name != wheel_basename(distribution_version):
         raise HostArtifactError("checksum wheel basename is not canonical")
-    return f"{digest}  {wheel_basename}\n"
+    return f"{digest}  {wheel_name}\n"
 
 
 def _metadata_value(metadata: str, field: str) -> str:
@@ -75,9 +102,9 @@ def _metadata_value(metadata: str, field: str) -> str:
     raise HostArtifactError(f"wheel metadata is missing {field}")
 
 
-def validate_wheel(wheel: Path, distribution_version: str = DISTRIBUTION_VERSION) -> None:
-    expected_basename = f"s3_hidbot_host-{distribution_version}-py3-none-any.whl"
-    dist_info = f"s3_hidbot_host-{distribution_version}.dist-info"
+def validate_wheel(wheel: Path, distribution_version: str) -> None:
+    expected_basename = wheel_basename(distribution_version)
+    dist_info = dist_info_name(distribution_version)
     if wheel.name != expected_basename:
         raise HostArtifactError(f"unexpected wheel filename: {wheel.name}")
     try:
@@ -146,22 +173,18 @@ def validate_wheel(wheel: Path, distribution_version: str = DISTRIBUTION_VERSION
         raise HostArtifactError("wheel console entry point does not match")
 
 
-def _validate_wheel(wheel: Path) -> None:
-    """Backward-compatible canonical-development-wheel wrapper."""
-
-    validate_wheel(wheel)
-
-
-def validate_artifact_directory(directory: Path) -> HostWheelArtifact:
+def validate_artifact_directory(directory: Path, distribution_version: str) -> HostWheelArtifact:
     if not directory.is_dir():
         raise HostArtifactError(f"artifact directory does not exist: {directory}")
     entries = sorted(directory.iterdir())
-    expected = {WHEEL_BASENAME, CHECKSUM_BASENAME}
+    expected_wheel = wheel_basename(distribution_version)
+    expected_checksum = checksum_basename(distribution_version)
+    expected = {expected_wheel, expected_checksum}
     actual = {path.name for path in entries}
     if actual != expected or len(entries) != 2 or not all(path.is_file() for path in entries):
         raise HostArtifactError(f"artifact directory must contain only wheel and checksum: {sorted(actual)}")
-    wheel = directory / WHEEL_BASENAME
-    checksum = directory / CHECKSUM_BASENAME
+    wheel = directory / expected_wheel
+    checksum = directory / expected_checksum
     try:
         text = checksum.read_text(encoding="ascii")
     except UnicodeDecodeError as error:
@@ -174,5 +197,5 @@ def validate_artifact_directory(directory: Path) -> HostWheelArtifact:
     digest = sha256_file(wheel)
     if text[:64] != digest:
         raise HostArtifactError("checksum digest does not match wheel")
-    _validate_wheel(wheel)
+    validate_wheel(wheel, distribution_version)
     return HostWheelArtifact(wheel=wheel, checksum=checksum, digest=digest)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ CLI_SOURCE = ROOT / "host/src/hidbot/cli.py"
 README = ROOT / "README.md"
 RELEASE_NOTES = ROOT / "docs/development/release-notes-v0.1.0.md"
 RELEASE_NOTES_RENDERER = ROOT / "tools/render_release_notes.py"
+FUTURE_RELEASE_NOTES = ROOT / "docs/development/release-notes-v0.2.0.md"
 IDENTIFIER_QUALIFICATION_MARKERS = (
     "project-specific USB-IF VID/PID assignment",
     "project-specific Bluetooth SIG Company Identifier",
@@ -123,6 +125,7 @@ def main() -> int:
     automation = documents["automation.md"]
     readme = README.read_text(encoding="utf-8")
     release_notes = RELEASE_NOTES.read_text(encoding="utf-8")
+    future_release_notes = FUTURE_RELEASE_NOTES.read_text(encoding="utf-8")
 
     for command in _command_names():
         _require(cli, f"`{command}", f"public command {command!r} in CLI reference")
@@ -166,7 +169,38 @@ def main() -> int:
     ):
         _require(all_text, unknown, f"explicit unknown: {unknown}")
     _require(all_text, "**UNKNOWN**", "explicit hardware-unknown marker")
-    _require(all_text, "Linux-only", "physical validation platform limit")
+    _require(all_text, "Linux-first", "physical validation platform limit")
+    for marker in ("ESP32-S3-WROOM-1", "8 MiB flash", "8 MiB PSRAM", "minimum 4 MiB flash"):
+        _require(readme + all_text, marker, f"board/support scope {marker}")
+    _require(readme + all_text, "does not require external PSRAM", "external PSRAM is optional")
+
+    _require(documents["README.md"], "Route v2", "current BLE route contract")
+    _require(documents["README.md"], "never evicts", "three-bond no-eviction contract")
+    for marker in ("authenticated pairing", "16-byte key", 'last_result:"store_full"'):
+        _require(cli + all_text, marker, f"BLE security contract {marker}")
+    for marker in (
+        "Supported safe/quiescent state",
+        "Operator-visible error taxonomy",
+        "SESSION_MISMATCH",
+        "BLE_BOND_STORAGE",
+        "must not be blindly retried",
+    ):
+        _require(safety, marker, f"safe-state/error contract {marker}")
+
+    current_facing = readme + "\n" + all_text
+    obsolete = re.compile(
+        r"(?:BLE HID output|BLE notification|pairing|bonding|multi-peer).{0,60}"
+        r"(?:not implemented|not yet implemented|remain out of scope)",
+        re.IGNORECASE,
+    )
+    for paragraph in re.split(r"\n\s*\n", current_facing):
+        if obsolete.search(paragraph) and not re.search(
+            r"v0\.1\.0|historical|earlier milestone", paragraph, re.IGNORECASE
+        ):
+            raise AssertionError(f"obsolete current-state claim is not historicalized: {paragraph!r}")
+
+    for marker in ("PREPARATION ONLY", "have not occurred", "not a claim"):
+        _require(future_release_notes, marker, f"unreleased v0.2.0 qualification boundary {marker}")
 
     _require(automation, "stdout JSON", "automation JSON guidance")
     _require(automation, "FLASHED_VERIFICATION_FAILED", "phase-aware flash failure")

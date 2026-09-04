@@ -32,7 +32,11 @@ def main() -> int:
     required(producer, r"python-version:\s*[\"']3\.12[\"']", "fixed producer Python 3.12")
     required(producer, r"tools/build_host_artifact\.py", "canonical producer helper")
     required(producer, r"tools/test_host_artifact\.py", "artifact validation")
-    required(producer, r"actions/upload-artifact@v4", "upload-artifact v4")
+    required(
+        producer,
+        r"actions/upload-artifact@[0-9a-f]{40}\s+# v4\.6\.2",
+        "immutable upload-artifact v4.6.2",
+    )
     required(producer, r"name:\s*host-package", "stable artifact name")
     required(producer, r"retention-days:\s*14", "14-day retention")
     if ".tar.gz" in producer or "--sdist" in producer:
@@ -40,7 +44,11 @@ def main() -> int:
 
     required(consumer, r"needs:\s*host-package-producer", "consumer depends on producer")
     required(consumer, r"python-version:\s*\[\"3\.11\",\s*\"3\.12\"\]", "consumer Python matrix")
-    required(consumer, r"actions/download-artifact@v4", "download-artifact v4")
+    required(
+        consumer,
+        r"actions/download-artifact@[0-9a-f]{40}\s+# v4\.3\.0",
+        "immutable download-artifact v4.3.0",
+    )
     required(consumer, r"name:\s*host-package", "same artifact download name")
     required(consumer, r"sha256sum\s+--check\s+--strict", "checksum verification before install")
     required(consumer, r"python\s+-m\s+venv", "fresh consumer virtual environment")
@@ -63,7 +71,11 @@ def main() -> int:
         r"python-version:\s*\[\"3\.11\",\s*\"3\.12\"\]",
         "flash consumer Python matrix",
     )
-    required(flash_consumer, r"actions/download-artifact@v4", "flash consumer artifact download")
+    required(
+        flash_consumer,
+        r"actions/download-artifact@[0-9a-f]{40}\s+# v4\.3\.0",
+        "immutable flash consumer artifact download",
+    )
     required(flash_consumer, r"sha256sum\s+--check\s+--strict", "flash consumer checksum verification")
     required(flash_consumer, r'pip\s+install[^\n]*\$\{wheel\}\[flash\]', "flash extra install")
     required(flash_consumer, r"consumer_python.*-m\s+esptool\s+version", "esptool version smoke")

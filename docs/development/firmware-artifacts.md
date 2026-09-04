@@ -42,6 +42,26 @@ ESP-IDF flash default, remains structurally verifiable historical evidence but
 is not a positive target for the C4 flash gate. A new source revision and
 canonical artifact are required for that gate.
 
+### Authoritative resource gates
+
+The artifact-profile build is also the resource authority. Application flash
+usage is the actual generated application `.bin` file size. Static RAM is the
+ESP-IDF v5.5.4 size JSON sum of DRAM and DIRAM `.data` plus `.bss`; it is not a
+normal-profile estimate or a text-summary approximation.
+
+The machine limits are application `<= 664592` bytes and static RAM
+`<= 39832` bytes. The pre-U7.6C1 U7.5C artifact-profile reference measured
+646896 and 37064 bytes respectively. `tools/firmware_resource_gate.py` rejects
+missing files, tool failure, malformed or unexpected size JSON, invalid
+measurements, and either limit excess. It prints each measured value, limit,
+remaining margin, and PASS/FAIL.
+
+The canonical artifact builder runs this checker immediately after every
+already-required authoritative build and before staging or upload. The two
+existing reproducibility builds therefore each enforce the gate. No resource
+job, checkout, container, artifact transfer, or measurement-only firmware
+build is added.
+
 ## Bundle layout
 
 The output is a deterministic `.tar.gz` with one top-level directory named:

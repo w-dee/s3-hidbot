@@ -18,7 +18,10 @@ The validation vocabulary is deliberately narrow:
 ## Board and port roles
 
 The validated development fixture is the Freenove ESP32-S3 WROOM Board /
-FNK0085. See the [official Freenove board material](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board)
+FNK0085 with ESP32-S3-WROOM-1. The validated board implementation has 8 MiB
+flash and 8 MiB PSRAM. The canonical firmware targets a minimum 4 MiB flash
+and does not require external PSRAM; these minima do not qualify other boards.
+See the [official Freenove board material](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board)
 for the board's published resources.
 
 ```text
@@ -81,6 +84,9 @@ boards, operating systems, or future firmware.
 | F24 keyboard report path | `HARDWARE VALIDATED` | F24/HID usage `0x73` sentinel report path with Linux evdev machine-observed `KEY_F24` value `1` (DOWN) and value `0` (UP), explicit release recovery, and no claim that F24 is globally side-effect-free. |
 | Relative `REL_X` mouse report path | `HARDWARE VALIDATED` | Small positive relative movement observed once per accepted report; no claim about pointer acceleration or exact screen pixels. |
 | U5.4.3 raw `REL_X` physical smoke | `HARDWARE VALIDATED` | Linux evdev machine-observed `EV_REL/REL_X/+1` followed by `EV_SYN/SYN_REPORT` after one submitted report; the one-shot path completed with no retry, inverse movement, or reconnect/resend. |
+| BLE HID route and repaired Report Map | `HARDWARE VALIDATED` | FNK0085 with a Linux/BlueZ 5.72 host: exact repaired descriptor, F24 DOWN/UP, no repeat, stable route retirement, and bond-preserving reconnect. This is not a general Linux or HOGP-host claim. |
+| Authenticated bond lifecycle | `HARDWARE VALIDATED` | FNK0085 lab evidence covers authenticated pairing, 16-byte keys, exact opaque-ID removal, crash-safe persistent absence, stale host-record behavior, and exact slot reuse. |
+| Three-bond capacity / no eviction | `HARDWARE VALIDATED` | One Linux/BlueZ peer plus named lab Xperia, Lenovo, and Moto Android fixtures were used across the accepted sequence: three verified bonds, `store_full` with the set preserved, exact removal, slot reuse, reconnect, and reboot persistence. No blanket Android/device qualification is claimed. |
 | Mouse buttons | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Wheel / pan | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Physical `report_failed` injection | `HARDWARE DEFERRED` | No accepted hardware injection or recovery evidence yet. |
@@ -228,15 +234,17 @@ is explicitly intended. The controlled Mouse-report diagnostic is build-time
 opt-in; default firmware does not configure GPIO0 or send HID reports in
 response to a BOOT-button press.
 
-## Deferred U7.3 BLE qualification gate
+## Historical U7.3 BLE qualification gate
 
-Software implementation stops before this gate. A future explicitly
-authorized run must use the exact qualified feature artifact and must not infer
+The text in this section records the pre-U7.4/U7.5 gate and its early failure;
+it is not current capability status. At that time, software implementation
+stopped before the gate. The planned run was required to use the exact feature artifact and not infer
 success from software tests. It must confirm cold boot is non-advertising,
 explicit enable/service discovery, one connection, CCCD observation without
 notifications, disconnect/re-advertise, stack-retained disable, five cycles,
 and simultaneous USB exposure without route mutation. Pairing/bonding and BLE
-HID output remain out of scope.
+HID output were out of scope for that historical gate. Current scoped BLE
+evidence is recorded in the matrix above.
 
 The first physical attempt at source revision
 `dac08c7dfd9819c4a3dbb6e38b06ec227b369e37` remains **FAIL / SERVICE DB

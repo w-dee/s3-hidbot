@@ -37,6 +37,7 @@ from firmware_artifact import (
     verify_bundle_directory,
     write_deterministic_json,
 )
+from firmware_resource_gate import ResourceGateError, measure_and_enforce
 
 
 _TOOL_VERSION_CANDIDATE = re.compile(
@@ -161,12 +162,21 @@ def build(args: argparse.Namespace) -> Path:
             raise ArtifactError("generated flash plan is missing required images") from exc
         app_bin = build_dir / app_bin_relative
         app_elf = app_bin.with_suffix(".elf")
+        app_map = app_bin.with_suffix(".map")
         bootloader = build_dir / bootloader_relative
         partition_table = build_dir / partition_relative
         effective_sdkconfig = sdkconfig
-        for required in (app_bin, app_elf, bootloader, partition_table, effective_sdkconfig):
+        for required in (app_bin, app_elf, app_map, bootloader, partition_table, effective_sdkconfig):
             if required.is_symlink() or not required.is_file():
                 raise ArtifactError("fresh build output is missing a required artifact")
+        try:
+            measure_and_enforce(
+                app_bin,
+                app_map,
+                Path(idf_path) / "tools" / "idf_size.py",
+            )
+        except ResourceGateError as exc:
+            raise ArtifactError(str(exc)) from exc
 
         bundle_name = f"{PROJECT}-firmware-{version}-{TARGET}-{profile}"
         staging = temporary_root / bundle_name

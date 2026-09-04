@@ -20,10 +20,15 @@ tar -C "$repository_root" \
     -cf - host/LICENSE host/MANIFEST.in host/README.md host/pyproject.toml host/src/hidbot host/tests \
     | tar -C "$source_root" -xf -
 artifact_directory="$temporary_directory/artifact"
+product_version=$("$python_bin" "$repository_root/tools/release_contract.py" \
+    --source-root "$repository_root" | "$python_bin" -c \
+    'import json,sys; print(json.load(sys.stdin)["version"])')
+wheel_name="s3_hidbot_host-${product_version}-py3-none-any.whl"
 "$tools_python" "$repository_root/tools/build_host_artifact.py" \
     --source-root "$source_root" "$artifact_directory"
-"$tools_python" "$repository_root/tools/test_host_artifact.py" "$artifact_directory"
-artifact_sha256=$(sha256sum "$artifact_directory/s3_hidbot_host-0.1.0-py3-none-any.whl" | awk '{print $1}')
+"$tools_python" "$repository_root/tools/test_host_artifact.py" \
+    --version "$product_version" "$artifact_directory"
+artifact_sha256=$(sha256sum "$artifact_directory/$wheel_name" | awk '{print $1}')
 
 "$python_bin" -m venv "$temporary_directory/consumer-venv"
 consumer_python="$temporary_directory/consumer-venv/bin/python"
@@ -31,14 +36,15 @@ consumer_cli="$temporary_directory/consumer-venv/bin/hidbotctl"
 PIP_CACHE_DIR="$temporary_directory/pip-cache" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     "$consumer_python" -m pip install --no-input \
-    "$artifact_directory/s3_hidbot_host-0.1.0-py3-none-any.whl"
+    "$artifact_directory/$wheel_name"
 "$consumer_python" -m pip check
-env -u PYTHONPATH "$consumer_python" -c '
+env -u PYTHONPATH EXPECTED_VERSION="$product_version" "$consumer_python" -c '
+import os
 from importlib.metadata import version
 from pathlib import Path
 import hidbot
 
-assert version("s3-hidbot-host") == "0.1.0"
+assert version("s3-hidbot-host") == os.environ["EXPECTED_VERSION"]
 assert "site-packages" in Path(hidbot.__file__).parts
 '
 env -u PYTHONPATH "$consumer_cli" --help >/dev/null
@@ -52,7 +58,7 @@ if [[ "$consumer_status" -ne 2 ]]; then
 fi
 
 mapfile -t artifacts < <(find "$artifact_directory" -maxdepth 1 -type f -printf '%f\n' | sort)
-expected=(s3_hidbot_host-0.1.0-py3-none-any.whl s3_hidbot_host-0.1.0-py3-none-any.whl.sha256)
+expected=("$wheel_name" "$wheel_name.sha256")
 if [[ "${artifacts[*]}" != "${expected[*]}" ]]; then
     echo "unexpected canonical host artifact contents: ${artifacts[*]}" >&2
     exit 1

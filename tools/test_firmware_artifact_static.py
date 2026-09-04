@@ -70,6 +70,11 @@ def main() -> int:
     assert "verify_bundle_directory" in builder
     assert "verify_bundle_archive" in builder
     assert "create_deterministic_tar_gz" in builder
+    assert "measure_and_enforce" in builder
+    assert 'Path(idf_path) / "tools" / "idf_size.py"' in builder
+    artifact_build = builder.index('[idf_py, "-B", str(build_dir)')
+    assert artifact_build < builder.index("measure_and_enforce(")
+    assert builder.index("measure_and_enforce(") < builder.index("staging = temporary_root")
     assert "git rev-parse" not in builder
     assert "git describe" not in builder
     assert ".git" not in builder

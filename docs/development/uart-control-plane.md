@@ -34,8 +34,10 @@ input, bonding, 16-byte keys, Secure Connections with authenticated legacy
 fallback, and a three-bond persistent NVS store. Capacity exhaustion is
 fail-closed and never evicts an existing bond. Project bond readiness requires
 an identity-qualified reread of both NimBLE `OUR_SEC` and `PEER_SEC` records;
-the NimBLE bonded bit alone is insufficient. This foundation adds no UART
-pairing command or capability and is not yet connected to HID output routing.
+the NimBLE bonded bit alone is insufficient. At the U7.5A foundation boundary
+this added no UART pairing command or capability and was not yet connected to
+HID output routing. Later U7.4/U7.5 slices described below supply the current
+public pairing, BLE route, and bond administration contracts.
 
 For fresh bonding, the pinned ESP-NimBLE v5.5.4 stack publishes Pairing
 Complete before it writes the new OUR_SEC and PEER_SEC records, and may publish
@@ -628,23 +630,27 @@ must not treat `boot_id` or the control session as firmware identity.
   compatibility and does not describe desired exposure, install state, or
   recovery.
 
-## Explicit BLE exposure control
+## Historical U7.3 BLE exposure boundary
 
-The three BLE commands accept only omitted or empty-object params. Their exact
+At the U7.3 milestone, the three BLE commands accepted only omitted or
+empty-object params. Their exact
 result has no additional fields:
 
 ```json
 {"desired":"hidden|exposed","observed":"uninitialized|enabling|idle|advertising|connected|disabling|fault","generation":0,"stack_ready":false,"advertising":false,"connected":false,"recovery_required":false,"last_error":null}
 ```
 
-`last_error`, when present, contains exactly `operation` (`enable`, `disable`,
+In that historical schema, `last_error`, when present, contains exactly
+`operation` (`enable`, `disable`,
 or `runtime`) and signed integer `code`. Addresses, handles, MTU, CCCD, and
 pairing/security data are never public. Accepted transitions return a frozen
 Stage-A snapshot and use the existing normal retry cache. Ordinary BLE
-enable/disable does not invalidate a USB HID session. `hid.route.set` still
-accepts only `none|usb`; BLE connection/subscription does not make HID ready.
+enable/disable did not invalidate a USB HID session. `hid.route.set` still
+accepted only `none|usb`; BLE connection/subscription did not make HID ready
+at that milestone. Current route-v2 behavior is defined in the later route
+section below.
 
-The project-owned 0x1812 database is a discoverable BLE HID Service foundation:
+The U7.3 project-owned 0x1812 database was a discoverable BLE HID Service foundation:
 HID Information bytes `11 01 00 00` mean HID 1.11, country 0, and no remote
 wake/normally-connectable flag; the Report Map defines keyboard Report ID 1
 (8-byte logical input) and mouse Report ID 2 (5-byte logical input). Both input

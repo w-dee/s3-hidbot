@@ -12,14 +12,21 @@ import zipfile
 from pathlib import Path
 
 from host_artifact import (
-    CHECKSUM_BASENAME,
-    DIST_INFO,
     REQUIRED_MODULES,
-    WHEEL_BASENAME,
     HostArtifactError,
+    checksum_basename,
     checksum_text,
+    dist_info_name,
+    read_distribution_version,
     validate_artifact_directory,
+    wheel_basename,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_VERSION = "1.2.3"
+WHEEL_BASENAME = wheel_basename(FIXTURE_VERSION)
+CHECKSUM_BASENAME = checksum_basename(FIXTURE_VERSION)
+DIST_INFO = dist_info_name(FIXTURE_VERSION)
 
 
 def _write_valid_artifact(directory: Path) -> Path:
@@ -31,7 +38,7 @@ def _write_valid_artifact(directory: Path) -> Path:
             f"{DIST_INFO}/METADATA",
             "Metadata-Version: 2.1\n"
             "Name: s3-hidbot-host\n"
-            "Version: 0.1.0\n"
+            f"Version: {FIXTURE_VERSION}\n"
             "Requires-Python: >=3.11\n"
             "Requires-Dist: pyserial<4,>=3.5\n"
             "Provides-Extra: flash\n"
@@ -45,7 +52,9 @@ def _write_valid_artifact(directory: Path) -> Path:
         archive.writestr(f"{DIST_INFO}/RECORD", "")
         archive.writestr(f"{DIST_INFO}/licenses/LICENSE", "MIT License\n")
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
-    (directory / CHECKSUM_BASENAME).write_text(checksum_text(digest, wheel.name), encoding="ascii")
+    (directory / CHECKSUM_BASENAME).write_text(
+        checksum_text(digest, wheel.name, FIXTURE_VERSION), encoding="ascii"
+    )
     return wheel
 
 
@@ -56,7 +65,7 @@ def _replace_member(directory: Path, member: str, content: bytes | str) -> None:
             archive.writestr(member, content)
     wheel = directory / WHEEL_BASENAME
     (directory / CHECKSUM_BASENAME).write_text(
-        checksum_text(hashlib.sha256(wheel.read_bytes()).hexdigest(), wheel.name),
+        checksum_text(hashlib.sha256(wheel.read_bytes()).hexdigest(), wheel.name, FIXTURE_VERSION),
         encoding="ascii",
     )
 
@@ -73,12 +82,12 @@ class HostArtifactTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         mutate(directory)
         with self.assertRaises(HostArtifactError):
-            validate_artifact_directory(directory)
+            validate_artifact_directory(directory, FIXTURE_VERSION)
 
     def test_valid(self) -> None:
         temporary, directory = self.artifact()
         self.addCleanup(temporary.cleanup)
-        result = validate_artifact_directory(directory)
+        result = validate_artifact_directory(directory, FIXTURE_VERSION)
         self.assertEqual(result.wheel.name, WHEEL_BASENAME)
 
     def test_checksum_mismatch(self) -> None:
@@ -117,7 +126,7 @@ class HostArtifactTests(unittest.TestCase):
             _replace_member(
                 directory,
                 f"{DIST_INFO}/METADATA",
-                "Name: other\nVersion: 0.1.0\nRequires-Python: >=3.11\n"
+                f"Name: other\nVersion: {FIXTURE_VERSION}\nRequires-Python: >=3.11\n"
                 "Requires-Dist: pyserial<4,>=3.5\n",
             )
 
@@ -155,9 +164,11 @@ class HostArtifactTests(unittest.TestCase):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact_directory", nargs="?", type=Path)
+    parser.add_argument("--version", dest="distribution_version")
     args = parser.parse_args()
     if args.artifact_directory is not None:
-        validate_artifact_directory(args.artifact_directory)
+        distribution_version = args.distribution_version or read_distribution_version(ROOT)
+        validate_artifact_directory(args.artifact_directory, distribution_version)
         print("PASS: canonical host artifact validation")
         return 0
     result = unittest.main(argv=[__file__], exit=False)

@@ -31,6 +31,11 @@ jobs:
     name: Build immutable release candidate assets
     runs-on: ubuntu-latest
     timeout-minutes: 70
+    outputs:
+      product-version: ${{ steps.contract.outputs.product-version }}
+      firmware-name: ${{ steps.contract.outputs.firmware-name }}
+      wheel-name: ${{ steps.contract.outputs.wheel-name }}
+      sdist-name: ${{ steps.contract.outputs.sdist-name }}
     container:
       image: *esp_idf_container_image
     steps:
@@ -110,13 +115,18 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Enforce release version authority and static guards
+        id: contract
         env:
           GIT_CONFIG_COUNT: "1"
           GIT_CONFIG_KEY_0: safe.directory
           GIT_CONFIG_VALUE_0: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          python3 tools/release_contract.py --source-root "$GITHUB_WORKSPACE"
+          contract=$(python3 tools/release_contract.py --source-root "$GITHUB_WORKSPACE")
+          python3 -c 'import json,sys; json.load(sys.stdin)' <<<"$contract"
+          {
+            python3 -c 'import json,sys; value=json.load(sys.stdin); print("product-version=" + value["version"]); print("firmware-name=" + value["firmware_archive"]); print("wheel-name=" + value["host_wheel"]); print("sdist-name=" + value["host_sdist"])' <<<"$contract"
+          } >> "$GITHUB_OUTPUT"
           ./tools/test-static.sh
           python3 tools/test_privacy_lint.py
           python3 tools/privacy_lint.py --tracked
@@ -129,7 +139,7 @@ jobs:
           artifact_root="$RUNNER_TEMP/s3-hidbot-release-build"
           mkdir -p "$artifact_root/a" "$artifact_root/b" "$artifact_root/release-assets"
           printf 'RELEASE_BUILD_DIR=%s\n' "$artifact_root" >> "$GITHUB_ENV"
-          artifact_name=$(python3 -c 'import json,subprocess; print(json.loads(subprocess.check_output(["python3", "tools/release_contract.py"]))["firmware_archive"])')
+          artifact_name="${{ steps.contract.outputs.firmware-name }}"
 
           build_one() {
             local output="$1"
@@ -176,6 +186,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      PRODUCT_VERSION: ${{ needs.build.outputs.product-version }}
+      FIRMWARE_NAME: ${{ needs.build.outputs.firmware-name }}
+      WHEEL_NAME: ${{ needs.build.outputs.wheel-name }}
+      SDIST_NAME: ${{ needs.build.outputs.sdist-name }}
     strategy:
       fail-fast: false
       matrix:
@@ -197,9 +212,9 @@ jobs:
         run: |
           set -euo pipefail
           asset_directory="$RUNNER_TEMP/release-assets"
-          firmware="s3-hidbot-firmware-0.1.0-esp32s3-freenove-fnk0085.tar.gz"
-          wheel="s3_hidbot_host-0.1.0-py3-none-any.whl"
-          sdist="s3_hidbot_host-0.1.0.tar.gz"
+          firmware="$FIRMWARE_NAME"
+          wheel="$WHEEL_NAME"
+          sdist="$SDIST_NAME"
           expected=(
             "$firmware" "$firmware.sha256"
             "$wheel" "$wheel.sha256"
@@ -223,7 +238,7 @@ jobs:
           wheel_cli="$wheel_venv/bin/hidbotctl"
           "$wheel_python" -m pip install --disable-pip-version-check --no-input "$asset_directory/$wheel"
           "$wheel_python" -m pip check
-          env -u PYTHONPATH "$wheel_python" -c 'from importlib.metadata import version; from pathlib import Path; import hidbot; assert version("s3-hidbot-host") == "0.1.0"; assert "site-packages" in Path(hidbot.__file__).parts'
+          env -u PYTHONPATH "$wheel_python" -c 'import os; from importlib.metadata import version; from pathlib import Path; import hidbot; assert version("s3-hidbot-host") == os.environ["PRODUCT_VERSION"]; assert "site-packages" in Path(hidbot.__file__).parts'
           env -u PYTHONPATH "$wheel_cli" --help >/dev/null
           env -u PYTHONPATH "$wheel_cli" verify-artifact "$asset_directory/$firmware" >/dev/null
           sdist_venv="$RUNNER_TEMP/release-sdist"
@@ -231,7 +246,7 @@ jobs:
           sdist_python="$sdist_venv/bin/python"
           "$sdist_python" -m pip install --disable-pip-version-check --no-input "$asset_directory/$sdist"
           "$sdist_python" -m pip check
-          env -u PYTHONPATH "$sdist_python" -c 'from importlib.metadata import version; import hidbot; assert version("s3-hidbot-host") == "0.1.0"; assert "site-packages" in hidbot.__file__'
+          env -u PYTHONPATH "$sdist_python" -c 'import os; from importlib.metadata import version; import hidbot; assert version("s3-hidbot-host") == os.environ["PRODUCT_VERSION"]; assert "site-packages" in hidbot.__file__'
           flash_venv="$RUNNER_TEMP/release-flash"
           python -m venv "$flash_venv"
           flash_python="$flash_venv/bin/python"
