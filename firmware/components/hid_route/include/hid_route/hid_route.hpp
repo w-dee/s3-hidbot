@@ -48,8 +48,8 @@ class StateMachine final {
     Snapshot snapshot() const;
     bool matches(OutputRoute route, Generation generation) const;
 
-    // The compatibility policy is the only U7.2A caller of this transition.
-    // It is non-blocking: a callback-side invalidation wins fail-closed.
+    // The runtime route controller is the only production caller of this
+    // transition. It is non-blocking: callback invalidation wins fail-closed.
     bool commit_usb_if_none();
     // Route-v2 reaches this internal transition through the serialized
     // controller; route-v1 still rejects BLE before entering route state.

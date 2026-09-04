@@ -1,7 +1,7 @@
 # Third-party notices for the release asset set
 
-This is a factual inventory for the locked 0.1.0 FNK0085 / ESP32-S3 firmware
-build and the accompanying host distributions. It is not a legal opinion or a
+This is a factual inventory for the 0.2.0 FNK0085 / ESP32-S3 firmware build
+and accompanying host distributions. It is not a legal opinion or a
 statement that this list answers every redistribution question. The release
 workflow attaches this file and the project LICENSE as separate, checksummed
 Release assets; it does not alter the firmware-bundle schema.

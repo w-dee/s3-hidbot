@@ -68,9 +68,9 @@ struct TransitionOutcome {
     Snapshot snapshot{};
 };
 
-// The only future owner of install/connect/disconnect side effects.  U7.1A
-// deliberately supplies no hardware implementation; the fake in native tests
-// proves transition ordering without calling TinyUSB.
+// The only owner of install/connect/disconnect side effects. Production uses
+// the serialized control executor; the fake in native tests proves transition
+// ordering without calling TinyUSB.
 class Executor {
   public:
     virtual ~Executor() = default;
@@ -83,11 +83,11 @@ class StateMachine {
   public:
     StateMachine();
 
-    // U7.1B begins with no native USB stack. UART remains independently
+    // Cold boot begins with no native USB stack. UART remains independently
     // available through the CH343 path.
     void initialize_hidden_boot_policy();
 
-    // Future control-plane intent. These are internal only in U7.1A.
+    // Control-plane lifecycle intent; hardware effects remain executor-owned.
     TransitionOutcome request_attach(Executor &executor);
     TransitionOutcome request_detach(Executor &executor);
 

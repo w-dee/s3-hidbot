@@ -24,14 +24,14 @@ ROOT = Path(__file__).resolve().parents[1]
 class ReleaseContractTests(unittest.TestCase):
     def test_authoritative_versions_and_names(self) -> None:
         contract = read_release_contract(ROOT)
-        self.assertEqual(contract.version, "0.1.0")
-        self.assertEqual(contract.tag, "v0.1.0")
+        self.assertEqual(contract.version, "0.2.0")
+        self.assertEqual(contract.tag, "v0.2.0")
         self.assertEqual(
             contract.firmware_archive,
-            "s3-hidbot-firmware-0.1.0-esp32s3-freenove-fnk0085.tar.gz",
+            "s3-hidbot-firmware-0.2.0-esp32s3-freenove-fnk0085.tar.gz",
         )
-        self.assertEqual(contract.host_wheel, "s3_hidbot_host-0.1.0-py3-none-any.whl")
-        self.assertEqual(contract.host_sdist, "s3_hidbot_host-0.1.0.tar.gz")
+        self.assertEqual(contract.host_wheel, "s3_hidbot_host-0.2.0-py3-none-any.whl")
+        self.assertEqual(contract.host_sdist, "s3_hidbot_host-0.2.0.tar.gz")
         self.assertEqual(len(contract.distributable_assets), 6)
 
     def test_release_versions_reject_development_and_malformed_values(self) -> None:

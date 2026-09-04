@@ -288,7 +288,7 @@ void StateMachine::on_mount() {
         // USB exposure is independent from the selected HID transport. A USB
         // mount invalidates the shared authority epoch, but it must not erase
         // BLE-held logical state before the control executor retires that BLE
-        // route. U7.4C will own the eventual BLE release operation.
+        // route. The serialized control executor owns the BLE release operation.
         for (InterfaceState &interface_state : interfaces_) {
             interface_state.slot_state.store(kSlotEmpty,
                                              std::memory_order_release);
@@ -450,8 +450,8 @@ UsbTransitionOutcome StateMachine::request_usb_attach(usb_lifecycle::Executor &e
             .runtime = pre_transition_runtime,
         };
     }
-    // Request intent is the fail-closed authority boundary. U7.1A does not
-    // invoke an executor in firmware, so this has no current USB behavior.
+    // Request intent is the fail-closed authority boundary. The executor owns
+    // the asynchronous USB lifecycle side effects.
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);

@@ -22,8 +22,8 @@ enum class ReportKind : std::uint8_t {
     kSafetyMouse,
 };
 
-// BLE remains an internal-only transport in U7.4B. Public route selection is
-// still limited to none/USB; the serialized control executor owns BLE work.
+// Public route v2 selects USB or BLE transport only through the serialized
+// control executor; report work remains transport-owned and fenced.
 enum class HidTransport : std::uint8_t {
     kUsb,
     kBle,
@@ -317,8 +317,8 @@ class StateMachine {
     void on_resume();
     void set_ready(Interface interface, bool ready);
 
-    // U7.1A internal-only future lifecycle boundary. It does not issue USB
-    // hardware calls; U7.1B will connect it to the executor implementation.
+    // Internal lifecycle boundary. It does not issue USB hardware calls;
+    // hardware effects remain exclusive to the executor implementation.
     UsbTransitionOutcome request_usb_attach(usb_lifecycle::Executor &executor);
     UsbTransitionOutcome request_usb_detach(usb_lifecycle::Executor &executor);
     usb_lifecycle::Snapshot usb_lifecycle_snapshot() const;

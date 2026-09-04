@@ -1,8 +1,8 @@
 # s3-hidbot v0.2.0 — unreleased draft
 
-Status: **PREPARATION ONLY**. The coordinated product version bump, exact
-candidate artifact, final physical release-candidate qualification, soak, tag,
-and GitHub Release have not occurred.
+Status: **RELEASE-CANDIDATE PREPARATION ONLY**. The source version is 0.2.0.
+U7.6D physical soak, final release-candidate decision, tag, and GitHub Release
+remain pending.
 
 Changes completed on the development line include:
 
@@ -28,5 +28,5 @@ PSRAM is not required. Accepted evidence for specific Linux/BlueZ and named
 lab Android peers is not a claim that other boards, hosts, or operating
 systems are qualified.
 
-Final release wording and asset identities must be regenerated only after the
-U7.6C2 coordinated version bump and subsequent authorized qualification gates.
+Final release wording and asset identities must be accepted only after the
+subsequent authorized qualification gates.

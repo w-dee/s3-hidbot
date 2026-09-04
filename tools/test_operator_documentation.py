@@ -199,7 +199,7 @@ def main() -> int:
         ):
             raise AssertionError(f"obsolete current-state claim is not historicalized: {paragraph!r}")
 
-    for marker in ("PREPARATION ONLY", "have not occurred", "not a claim"):
+    for marker in ("PREPARATION ONLY", "remain pending", "not a claim"):
         _require(future_release_notes, marker, f"unreleased v0.2.0 qualification boundary {marker}")
 
     _require(automation, "stdout JSON", "automation JSON guidance")

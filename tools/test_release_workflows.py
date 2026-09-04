@@ -220,13 +220,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
         document = run_document(
             run_id=123,
             event="push",
-            head_branch="v0.1.0",
+            head_branch=contract.tag,
             head_sha="a" * 40,
         )
         validate_release_build_run(
             document,
             repository="w-dee/s3-hidbot",
-            tag="v0.1.0",
+            tag=contract.tag,
             version=contract.version,
             commit="a" * 40,
             run_id="123",
@@ -236,7 +236,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             validate_release_build_run(
                 document,
                 repository="w-dee/s3-hidbot",
-                tag="v0.1.0",
+                tag=contract.tag,
                 version=contract.version,
                 commit="a" * 40,
                 run_id="123",

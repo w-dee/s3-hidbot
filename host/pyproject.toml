@@ -1,6 +1,6 @@
 [project]
 name = "s3-hidbot-host"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pure host-side s3-hidbot UART control-plane core"
 readme = "README.md"
 license = {file = "LICENSE"}

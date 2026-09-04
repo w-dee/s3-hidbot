@@ -54,8 +54,8 @@ struct Snapshot {
     bool id_exhausted = false;
 };
 
-// Mutations are executor-owned. Atomic publication keeps the future status
-// seam fixed-size and safe for bounded cross-task snapshots.
+// Mutations are executor-owned. Atomic publication keeps the public status
+// snapshot fixed-size and safe for bounded cross-task observation.
 class StateMachine {
   public:
     void begin_connection(ble_lifecycle::Generation generation,
