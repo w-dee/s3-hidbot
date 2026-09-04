@@ -49,9 +49,18 @@ def main() -> int:
     assert "tud_hid_n_mouse_report" not in (main_source + protocol + transport)
     assert "extern \"C\" void tud_sof_cb" in main_source
     assert "service_sof()" in main_source
-    assert "tud_sof_cb_enable(true)" in mount_body
-    assert mount_body.index("state_machine_.on_mount()") < mount_body.index("tud_sof_cb_enable(true)")
-    assert "tud_sof_cb_enable(true)" not in main_source
+    sof_start = runtime.index("void Runtime::enable_sof_after_mount()")
+    sof_end = runtime.index("void Runtime::on_unmount()", sof_start)
+    sof_body = runtime[sof_start:sof_end]
+    assert "tud_sof_cb_enable(true)" not in mount_body
+    assert sof_body.count("tud_sof_cb_enable(true)") == 1
+    attached_start = main_source.index("case TINYUSB_EVENT_ATTACHED:")
+    attached_end = main_source.index("break;", attached_start)
+    attached_body = main_source[attached_start:attached_end]
+    assert attached_body.rstrip().endswith("s_hid_runtime.enable_sof_after_mount();")
+    assert attached_body.index("s_hid_runtime.on_mount()") < attached_body.index(
+        "s_hid_runtime.enable_sof_after_mount()"
+    )
     assert "on_report_complete" in main_source and "on_report_failed" in main_source
     assert "report_type == HID_REPORT_TYPE_INPUT" in main_source
     assert "uart_control_transport::on_hid_safety_failure()" in main_source

@@ -25,6 +25,12 @@ grep -Fq "target: esp32s3" "$repository_root/firmware/dependencies.lock"
     idf.py build
 )
 
+# Component Manager has now materialized the exact locked TinyUSB source.
+# Re-run the runtime-fault static guard here so the dependency hook and debug
+# override cannot be skipped merely because Tier A starts from a clean checkout.
+S3_HIDBOT_REQUIRE_TINYUSB_SOURCE=1 \
+    "${PYTHON_BIN:-python3}" "$repository_root/tools/test_usb_runtime_fault_static.py"
+
 config_env="$repository_root/firmware/build/config.env"
 test -f "$config_env"
 grep -Fq '"IDF_TARGET": "esp32s3"' "$config_env"

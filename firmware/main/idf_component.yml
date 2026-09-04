@@ -3,3 +3,10 @@ dependencies:
   espressif/esp_tinyusb:
     version: "^2.0.0"
   idf: "^5.0"
+overrides:
+  - espressif/tinyusb:
+      with:
+        espressif/tinyusb:
+          git: https://github.com/w-dee/tinyusb.git
+          version: 0b02e68af7a654d5099d8a230291ce19403833ae
+      reason: "U7.6D runtime fault hook required for fail-closed USB lifecycle handling"

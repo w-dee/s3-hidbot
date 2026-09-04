@@ -162,8 +162,18 @@ class MouseReportResult:
 
 @dataclass(frozen=True)
 class UsbExposureLastError:
-    operation: Literal["install", "uninstall"]
+    operation: Literal["install", "uninstall", "runtime"]
     code: int
+
+
+USB_RUNTIME_ERROR_TINYUSB_DIAGNOSTIC = -0x7601
+USB_RUNTIME_ERROR_TINYUSB_EVENT_QUEUE_OVERFLOW = -0x7602
+USB_RUNTIME_ERROR_CODES = frozenset(
+    {
+        USB_RUNTIME_ERROR_TINYUSB_DIAGNOSTIC,
+        USB_RUNTIME_ERROR_TINYUSB_EVENT_QUEUE_OVERFLOW,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -811,12 +821,15 @@ def validate_usb_exposure_status(value: Any) -> UsbExposureStatus:
             raise ProtocolError("USB exposure last_error fields are invalid")
         operation = raw_last_error["operation"]
         code = raw_last_error["code"]
-        if operation not in {"install", "uninstall"}:
+        if operation not in {"install", "uninstall", "runtime"}:
             raise ProtocolError("USB exposure last_error operation is invalid")
         if type(code) is not int or not -(2**31) <= code <= 2**31 - 1:
             raise ProtocolError("USB exposure last_error code is invalid")
+        if operation == "runtime" and code not in USB_RUNTIME_ERROR_CODES:
+            raise ProtocolError("USB exposure runtime error code is invalid")
         last_error = UsbExposureLastError(
-            operation=cast(Literal["install", "uninstall"], operation), code=code
+            operation=cast(Literal["install", "uninstall", "runtime"], operation),
+            code=code,
         )
     return UsbExposureStatus(
         desired=cast(Literal["hidden", "exposed"], desired),

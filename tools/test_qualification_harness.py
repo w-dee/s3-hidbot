@@ -304,6 +304,24 @@ class InvariantTests(unittest.TestCase):
             validate_usb_exposure(dict(good, mouse_ready=False))["observed"],
             "mounted",
         )
+        runtime_fault = {
+            **good,
+            "desired": "hidden",
+            "observed": "driver_not_installed",
+            "mounted": False,
+            "keyboard_ready": False,
+            "mouse_ready": False,
+            "recovery_required": True,
+            "last_error": {"operation": "runtime", "code": -0x7602},
+        }
+        self.assertEqual(
+            validate_usb_exposure(runtime_fault)["last_error"]["operation"],
+            "runtime",
+        )
+        with self.assertRaises(QualificationError):
+            validate_usb_exposure(
+                {**runtime_fault, "last_error": {"operation": "runtime", "code": -1}}
+            )
         with self.assertRaises(QualificationError):
             validate_usb_exposure(dict(good, mounted=False))
 

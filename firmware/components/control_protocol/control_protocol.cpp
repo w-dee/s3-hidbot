@@ -473,7 +473,15 @@ const char *usb_exposure_observed_json(UsbExposureObserved observed) {
 }
 
 const char *usb_exposure_operation_json(UsbExposureOperation operation) {
-    return operation == UsbExposureOperation::kUninstall ? "uninstall" : "install";
+    switch (operation) {
+        case UsbExposureOperation::kUninstall:
+            return "uninstall";
+        case UsbExposureOperation::kRuntime:
+            return "runtime";
+        case UsbExposureOperation::kInstall:
+        default:
+            return "install";
+    }
 }
 
 bool make_usb_exposure_status(control_session::ResponseFrame *frame,

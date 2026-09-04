@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "freertos/task.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
@@ -79,9 +80,15 @@ control_protocol::UsbExposureStatus make_usb_exposure_status(
         }
     };
     const auto operation = [](usb_lifecycle::LifecycleOperation value) {
-        return value == usb_lifecycle::LifecycleOperation::kUninstall
-                   ? control_protocol::UsbExposureOperation::kUninstall
-                   : control_protocol::UsbExposureOperation::kInstall;
+        switch (value) {
+            case usb_lifecycle::LifecycleOperation::kUninstall:
+                return control_protocol::UsbExposureOperation::kUninstall;
+            case usb_lifecycle::LifecycleOperation::kRuntime:
+                return control_protocol::UsbExposureOperation::kRuntime;
+            case usb_lifecycle::LifecycleOperation::kInstall:
+            default:
+                return control_protocol::UsbExposureOperation::kInstall;
+        }
     };
     return control_protocol::UsbExposureStatus{
         .desired = desired(snapshot.lifecycle.desired),
@@ -636,23 +643,27 @@ void usb_event_handler(tinyusb_event_t *event, void *argument) {
         case TINYUSB_EVENT_ATTACHED:
             s_hid_runtime.on_mount();
             uart_control_transport::on_hid_lifecycle_invalidation();
-            ESP_LOGI(kLogTag, "USB HID mounted");
+            s_usb_exposure.signal_usb_lifecycle_event(
+                hid_control_executor::UsbLifecycleEvent::kMounted);
+            s_hid_runtime.enable_sof_after_mount();
             break;
         case TINYUSB_EVENT_DETACHED:
             s_hid_runtime.on_unmount();
             uart_control_transport::on_hid_lifecycle_invalidation();
-            ESP_LOGI(kLogTag, "USB HID unmounted");
+            s_usb_exposure.signal_usb_lifecycle_event(
+                hid_control_executor::UsbLifecycleEvent::kUnmounted);
             break;
         case TINYUSB_EVENT_SUSPENDED:
             s_hid_runtime.on_suspend();
             uart_control_transport::on_hid_lifecycle_invalidation();
-            ESP_LOGI(kLogTag, "USB HID suspended (remote wakeup: %s)",
-                     event->suspended.remote_wakeup ? "enabled" : "disabled");
+            s_usb_exposure.signal_usb_lifecycle_event(
+                hid_control_executor::UsbLifecycleEvent::kSuspended);
             break;
         case TINYUSB_EVENT_RESUMED:
             s_hid_runtime.on_resume();
             uart_control_transport::on_hid_lifecycle_invalidation();
-            ESP_LOGI(kLogTag, "USB HID resumed");
+            s_usb_exposure.signal_usb_lifecycle_event(
+                hid_control_executor::UsbLifecycleEvent::kResumed);
             break;
         default:
             break;
@@ -702,6 +713,36 @@ class TinyUsbLifecycleBackend final : public hid_control_executor::Backend {
 TinyUsbLifecycleBackend s_usb_backend;
 
 }  // namespace
+
+extern "C" int s3_hidbot_tinyusb_debug_printf(const char *, ...) {
+    s_usb_exposure.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kDiagnostic,
+        UINT32_MAX, xPortInIsrContext());
+    return 0;
+}
+
+extern "C" void tud_event_queue_overflow_cb(uint8_t, uint32_t event_id,
+                                              bool in_isr) {
+    s_usb_exposure.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+        event_id, in_isr);
+}
+
+extern "C" uint16_t const *__real_tud_descriptor_string_cb(
+    uint8_t index, uint16_t langid);
+
+extern "C" uint16_t const *__wrap_tud_descriptor_string_cb(
+    uint8_t index, uint16_t langid) {
+    constexpr std::size_t kStringCount =
+        sizeof(kHidStringDescriptors) / sizeof(kHidStringDescriptors[0]);
+    if (index >= kStringCount || kHidStringDescriptors[index] == nullptr) {
+        s_usb_exposure.signal_usb_runtime_fault(
+            hid_control_executor::UsbRuntimeFaultReason::kDiagnostic,
+            UINT32_MAX, false);
+        return nullptr;
+    }
+    return __real_tud_descriptor_string_cb(index, langid);
+}
 
 extern "C" void tud_sof_cb(uint32_t) {
     s_hid_runtime.service_sof();

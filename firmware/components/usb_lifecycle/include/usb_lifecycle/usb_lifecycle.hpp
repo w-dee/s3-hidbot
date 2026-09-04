@@ -39,7 +39,11 @@ enum class TransitionResult : std::uint8_t {
 enum class LifecycleOperation : std::uint8_t {
     kInstall,
     kUninstall,
+    kRuntime,
 };
+
+inline constexpr std::int32_t kTinyUsbRuntimeDiagnosticError = -0x7601;
+inline constexpr std::int32_t kTinyUsbEventQueueOverflowError = -0x7602;
 
 struct LastError {
     bool present = false;
@@ -103,6 +107,14 @@ class StateMachine {
     void complete_uninstall_success();
     void complete_uninstall_failure(std::int32_t error_code);
 
+    // Callback/ISR-safe Stage A for a boot-lifetime TinyUSB runtime fault.
+    // The first call closes normal admission without performing teardown;
+    // the serialized executor owns the subsequent safety and uninstall work.
+    bool begin_runtime_fault(std::int32_t error_code);
+    void update_runtime_fault(std::int32_t error_code);
+    void complete_runtime_fault(bool driver_uninstalled);
+    bool runtime_fault_pending() const;
+
     // TinyUSB callbacks reconcile observations. They never change desired
     // intent. A false return means an obsolete observation was ignored.
     bool observe_mount();
@@ -151,6 +163,7 @@ class StateMachine {
     std::atomic<std::uint8_t> last_error_operation_{0};
     std::atomic_bool last_error_present_{false};
     std::atomic_bool teardown_boundary_started_{false};
+    std::atomic_bool runtime_fault_pending_{false};
     std::atomic<std::uint8_t> state_{0};
 };
 

@@ -50,6 +50,7 @@ enum class UsbExposureObserved : std::uint8_t {
 enum class UsbExposureOperation : std::uint8_t {
     kInstall,
     kUninstall,
+    kRuntime,
 };
 
 struct UsbExposureLastError {

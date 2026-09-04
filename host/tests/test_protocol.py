@@ -227,6 +227,15 @@ class ProtocolTests(unittest.TestCase):
         assert parsed.last_error is not None
         self.assertEqual(parsed.last_error.operation, "uninstall")
         self.assertEqual(parsed.last_error.code, -7)
+        runtime = validate_usb_exposure_status(
+            {
+                **value,
+                "last_error": {"operation": "runtime", "code": -0x7602},
+            }
+        )
+        assert runtime.last_error is not None
+        self.assertEqual(runtime.last_error.operation, "runtime")
+        self.assertEqual(runtime.last_error.code, -0x7602)
         for invalid in (
             {},
             {**value, "generation": -1},
@@ -234,6 +243,7 @@ class ProtocolTests(unittest.TestCase):
             {**value, "mounted": 1},
             {**value, "observed": "connected"},
             {**value, "last_error": {"operation": "remove", "code": 1}},
+            {**value, "last_error": {"operation": "runtime", "code": -1}},
             {**value, "last_error": {"operation": "install", "code": True}},
             {**value, "extra": False},
         ):

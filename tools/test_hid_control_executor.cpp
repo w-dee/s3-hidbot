@@ -757,6 +757,142 @@ void test_real_queue_failure_is_recovery_fault_and_releases_guard() {
     assert(controller.active_operation_for_test() == ControlOperation::kNone);
 }
 
+void test_tinyusb_runtime_fault_is_immediate_bounded_and_executor_owned() {
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    complete_attach(runtime, backend, controller);
+    mount_ready(runtime);
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    const auto authority = runtime.state_machine().authority_epoch();
+    const auto generation = controller.snapshot().lifecycle.generation;
+
+    controller.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kDiagnostic,
+        UINT32_MAX, false);
+    const auto immediate = controller.snapshot();
+    assert(immediate.lifecycle.desired ==
+           usb_lifecycle::DesiredExposure::kHidden);
+    assert(immediate.lifecycle.observed ==
+           usb_lifecycle::ObservedState::kDetaching);
+    assert(!immediate.lifecycle.recovery_required);
+    assert(!immediate.runtime.keyboard_ready);
+    assert(!immediate.runtime.mouse_ready);
+    assert(!controller.route_snapshot().ready);
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kUsb);
+    assert(runtime.state_machine().authority_epoch() == authority);
+
+    controller.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+        17U, true);
+    controller.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kDiagnostic,
+        UINT32_MAX, false);
+    const auto retained = controller.usb_runtime_fault_snapshot();
+    assert(retained.reason ==
+           hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow);
+    assert(retained.first_event_id == 17U);
+    assert(retained.occurrences == 3U);
+    assert(retained.observed_in_isr);
+    assert(runtime.state_machine().authority_epoch() == authority);
+    assert(controller.snapshot().lifecycle.generation == generation);
+    assert(backend.uninstall_calls == 0);
+
+    assert(controller.process_wake_cycle_for_test());
+    const auto terminal = controller.snapshot();
+    assert(backend.uninstall_calls == 1);
+    assert(terminal.lifecycle.desired ==
+           usb_lifecycle::DesiredExposure::kHidden);
+    assert(terminal.lifecycle.observed ==
+           usb_lifecycle::ObservedState::kDriverNotInstalled);
+    assert(terminal.lifecycle.recovery_required);
+    assert(terminal.lifecycle.last_error.present);
+    assert(terminal.lifecycle.last_error.operation ==
+           usb_lifecycle::LifecycleOperation::kRuntime);
+    assert(terminal.lifecycle.last_error.code ==
+           usb_lifecycle::kTinyUsbEventQueueOverflowError);
+    assert(terminal.lifecycle.generation == generation + 1U);
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kNone);
+    assert(runtime.state_machine().authority_epoch() == authority + 1U);
+
+    controller.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+        99U, true);
+    assert(controller.process_wake_cycle_for_test());
+    assert(backend.uninstall_calls == 1);
+    assert(runtime.state_machine().authority_epoch() == authority + 1U);
+    assert(controller.snapshot().lifecycle.generation == generation + 1U);
+    assert(controller.usb_runtime_fault_snapshot().first_event_id == 17U);
+}
+
+void test_tinyusb_runtime_fault_occurrence_counter_saturates() {
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    complete_attach(runtime, backend, controller);
+    mount_ready(runtime);
+    controller.set_usb_runtime_fault_occurrences_for_test(UINT32_MAX - 1U);
+    controller.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+        1U, true);
+    controller.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+        2U, true);
+    assert(controller.usb_runtime_fault_snapshot().occurrences == UINT32_MAX);
+    assert(controller.usb_runtime_fault_snapshot().first_event_id == 1U);
+}
+
+void test_tinyusb_runtime_fault_preserves_primary_when_uninstall_fails() {
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    complete_attach(runtime, backend, controller);
+    mount_ready(runtime);
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    const auto authority = runtime.state_machine().authority_epoch();
+    const auto generation = controller.snapshot().lifecycle.generation;
+    backend.uninstall_result = {
+        .kind = hid_control_executor::BackendResultKind::kUninstallFailure,
+        .error_code = -77,
+    };
+
+    controller.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+        23U, true);
+    assert(controller.process_wake_cycle_for_test());
+
+    const auto failed = controller.snapshot();
+    assert(backend.uninstall_calls == 1);
+    assert(failed.lifecycle.desired ==
+           usb_lifecycle::DesiredExposure::kHidden);
+    assert(failed.lifecycle.observed ==
+           usb_lifecycle::ObservedState::kDetaching);
+    assert(failed.lifecycle.recovery_required);
+    assert(failed.lifecycle.last_error.present);
+    assert(failed.lifecycle.last_error.operation ==
+           usb_lifecycle::LifecycleOperation::kRuntime);
+    assert(failed.lifecycle.last_error.code ==
+           usb_lifecycle::kTinyUsbEventQueueOverflowError);
+    assert(failed.lifecycle.generation == generation + 1U);
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kNone);
+    assert(runtime.state_machine().authority_epoch() == authority + 1U);
+
+    controller.signal_usb_runtime_fault(
+        hid_control_executor::UsbRuntimeFaultReason::kDiagnostic,
+        UINT32_MAX, false);
+    assert(controller.process_wake_cycle_for_test());
+    assert(backend.uninstall_calls == 1);
+    assert(controller.snapshot().lifecycle.last_error.code ==
+           usb_lifecycle::kTinyUsbEventQueueOverflowError);
+    assert(controller.snapshot().lifecycle.generation == generation + 1U);
+    assert(runtime.state_machine().authority_epoch() == authority + 1U);
+}
+
 void test_callback_invalidation_obsoletes_action_and_releases_guard() {
     hid_runtime::Runtime runtime;
     FakeBackend backend;
@@ -5408,6 +5544,9 @@ int main() {
     test_schedule_requires_matching_preclaimed_owner();
     test_backend_failures_release_guard();
     test_real_queue_failure_is_recovery_fault_and_releases_guard();
+    test_tinyusb_runtime_fault_is_immediate_bounded_and_executor_owned();
+    test_tinyusb_runtime_fault_occurrence_counter_saturates();
+    test_tinyusb_runtime_fault_preserves_primary_when_uninstall_fails();
     test_callback_invalidation_obsoletes_action_and_releases_guard();
     test_route_zero_work_is_synchronous_and_never_uninstalls_usb();
     test_route_release_owns_guard_and_blocks_detach_before_stage_a();

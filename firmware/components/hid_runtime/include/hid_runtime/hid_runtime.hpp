@@ -353,6 +353,10 @@ class StateMachine {
     UsbGeneration begin_usb_uninstall();
     void complete_usb_uninstall_success();
     void complete_usb_uninstall_failure(std::int32_t error_code);
+    bool begin_usb_runtime_fault(std::int32_t error_code);
+    void commit_usb_runtime_fault_shutdown();
+    void update_usb_runtime_fault(std::int32_t error_code);
+    void complete_usb_runtime_fault(bool driver_uninstalled);
     // Called only by the shared control executor after old-route all-up work
     // received its bounded opportunity and before USB teardown advances its
     // independent generation.
@@ -616,6 +620,10 @@ class Runtime {
     }
     void initialize();
     void on_mount();
+    // Called by the mount callback only after all project state and task
+    // notifications have been published. This must remain the callback's
+    // final substantive operation.
+    void enable_sof_after_mount();
     void on_unmount();
     void on_suspend();
     void on_resume();

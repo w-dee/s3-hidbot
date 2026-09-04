@@ -2040,6 +2040,61 @@ void StateMachine::complete_usb_uninstall_failure(std::int32_t error_code) {
     usb_lifecycle_.complete_uninstall_failure(error_code);
 }
 
+bool StateMachine::begin_usb_runtime_fault(std::int32_t error_code) {
+    if (!usb_lifecycle_.begin_runtime_fault(error_code)) {
+        return false;
+    }
+
+    // This is the callback/ISR-side gate: one atomic update immediately
+    // closes normal endpoint readiness. Route and ticket retirement remain in
+    // the serialized executor rather than expanding this timing-sensitive
+    // path.
+    status_bits_.fetch_and(
+        static_cast<std::uint8_t>(~(kKeyboardReadyBit | kMouseReadyBit)),
+        std::memory_order_acq_rel);
+    return true;
+}
+
+void StateMachine::commit_usb_runtime_fault_shutdown() {
+    const hid_route::Snapshot active_route = route_.snapshot();
+    if (active_route.coherent &&
+        active_route.active == hid_route::OutputRoute::kUsb) {
+        (void)route_.invalidate_if_matches(active_route);
+    }
+    cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
+    authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (!ble_route_authority_snapshot().releasing) {
+        release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    for (InterfaceState &interface_state : interfaces_) {
+        const bool needs_safety =
+            interface_state.logical_state_held.load(std::memory_order_acquire) ||
+            interface_state.in_flight.load(std::memory_order_acquire) ||
+            interface_state.host_state_uncertain.load(std::memory_order_acquire);
+        if (needs_safety) {
+            interface_state.safety_required.store(true,
+                                                  std::memory_order_release);
+            interface_state.host_state_uncertain.store(
+                true, std::memory_order_release);
+        }
+        interface_state.in_flight.store(false, std::memory_order_release);
+        std::uint8_t expected = kSlotReady;
+        interface_state.slot_state.compare_exchange_strong(
+            expected, kSlotCanceled, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+}
+
+void StateMachine::update_usb_runtime_fault(std::int32_t error_code) {
+    usb_lifecycle_.update_runtime_fault(error_code);
+}
+
+void StateMachine::complete_usb_runtime_fault(bool driver_uninstalled) {
+    usb_lifecycle_.complete_runtime_fault(driver_uninstalled);
+}
+
 void StateMachine::complete_usb_detach_route_invalidation(hid_route::Snapshot old_route) {
     (void)route_.invalidate_if_matches(old_route);
 }
@@ -2713,15 +2768,17 @@ void Runtime::initialize() {
 
 void Runtime::on_mount() {
     state_machine_.on_mount();
-    // The ESP32-S3 DWC2 controller clears its SOF enable state during the
-    // enumeration bus reset. Re-arm only after TinyUSB reports this mount so
-    // every configured attach gets the task-affine readiness refresh.
-    tud_sof_cb_enable(true);
     result_bits_.store(0, std::memory_order_release);
     if (AuthorityEventSink *sink =
             authority_event_sink_.load(std::memory_order_acquire)) {
         sink->signal_hid_authority_change();
     }
+}
+void Runtime::enable_sof_after_mount() {
+    // The ESP32-S3 DWC2 controller clears its SOF enable state during the
+    // enumeration bus reset. The production mount callback invokes this only
+    // after publishing every project state and notification.
+    tud_sof_cb_enable(true);
 }
 void Runtime::on_unmount() {
     state_machine_.on_unmount();

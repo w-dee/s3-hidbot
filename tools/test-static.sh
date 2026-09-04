@@ -16,6 +16,7 @@ python_bin=${PYTHON_BIN:-python3}
 "$python_bin" "$repository_root/tools/test_ble_pairing_static.py"
 "$python_bin" "$repository_root/tools/test_ble_bond_administration_static.py"
 "$python_bin" "$repository_root/tools/test_uart_control_transport_static.py"
+"$python_bin" "$repository_root/tools/test_usb_runtime_fault_static.py"
 "$python_bin" "$repository_root/tools/test_documentation.py"
 "$python_bin" "$repository_root/tools/test_operator_documentation.py"
 "$python_bin" "$repository_root/tools/test_firmware_artifact_static.py"

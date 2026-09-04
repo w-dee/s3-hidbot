@@ -155,6 +155,16 @@ Bluetooth device and performs no BlueZ mutation. The architecture and later
 physical invocation boundary are documented in
 [`qualification-harness.md`](qualification-harness.md).
 
+U7.6D adds callback no-console, mount/SOF ordering, TinyUSB diagnostic-sink,
+event-queue overflow-hook, boot-lifetime fault-latch, immediate admission
+closure, single executor-owned teardown, and strict USB runtime-error coverage.
+The focused native tests use no USB device. The static guard checks the exact
+pinned TinyUSB source seam resolved by Component Manager and rejects any
+return to direct runtime diagnostic output. Tier A always checks the
+project-owned callbacks and sink; `test-firmware.sh` reruns the same guard
+after dependency materialization to make the external queue-hook check
+mandatory without adding another firmware build.
+
 The bonded GATT-cache regression extends the executor and BLE HID static
 entrypoints with legacy missing-revision migration, stale-cache readiness
 inhibition, exact per-connection Service Changed eligibility and bounded call

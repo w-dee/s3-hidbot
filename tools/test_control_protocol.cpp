@@ -1261,13 +1261,21 @@ void test_usb_exposure_commands_schema_and_lifecycle_retry_cache() {
                     "\",\"cmd\":\"usb.exposure.status\"}");
     require_contains(fixture.sink.last(),
                      "\"last_error\":{\"operation\":\"uninstall\",\"code\":-7}");
+    fixture.exposure.status.last_error.operation =
+        control_protocol::UsbExposureOperation::kRuntime;
+    fixture.exposure.status.last_error.code =
+        usb_lifecycle::kTinyUsbEventQueueOverflowError;
+    fixture.payload(request(2, session_c, "usb.exposure.status"));
+    require_contains(
+        fixture.sink.last(),
+        "\"last_error\":{\"operation\":\"runtime\",\"code\":-30210}");
     const int attach_calls_before_invalid = fixture.exposure.attach_calls;
     const int detach_calls_before_invalid = fixture.exposure.detach_calls;
-    fixture.payload(request(2, session_c, "usb.attach", "{\"unexpected\":true}"));
+    fixture.payload(request(3, session_c, "usb.attach", "{\"unexpected\":true}"));
     require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
-    fixture.payload(request(3, session_c, "usb.detach", "{\"unexpected\":true}"));
+    fixture.payload(request(4, session_c, "usb.detach", "{\"unexpected\":true}"));
     require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
-    fixture.payload(request(4, session_c, "usb.exposure.status", "{\"unexpected\":true}"));
+    fixture.payload(request(5, session_c, "usb.exposure.status", "{\"unexpected\":true}"));
     require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
     assert(fixture.exposure.attach_calls == attach_calls_before_invalid);
     assert(fixture.exposure.detach_calls == detach_calls_before_invalid);

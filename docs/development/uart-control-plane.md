@@ -425,6 +425,13 @@ and therefore cannot repair a pre-existing LF-less partial console line. The
 project's normal diagnostic output is LF-terminated ESP_LOG; future
 project-owned diagnostic output should preserve that invariant.
 
+Recoverable TinyUSB runtime diagnostics are inside this guarantee. The pinned
+TinyUSB integration routes them to a fixed project fault latch and emits no
+UART bytes in TinyUSB task or ISR context; human-readable fault logging is
+deferred to the existing HID control executor. A panic, watchdog, brownout, or
+reset remains a catastrophic boot/session boundary and is not required to
+preserve an in-progress machine frame.
+
 The previous implementation called `uart_write_bytes()` directly after
 `fflush()`. Although the UART driver `tx_mux` serialized that call, it bypassed
 the UART VFS write lock held by normal console output and could split a
@@ -780,7 +787,7 @@ The protocol version remains `1`.
 }
 ```
 
-`last_error` is `null` or exactly `{ "operation": "install|uninstall",
+`last_error` is `null` or exactly `{ "operation": "install|uninstall|runtime",
 "code": <signed integer> }`. At cold boot the state is `hidden` plus
 `driver_not_installed`, generation zero, all runtime booleans false, no
 safety/uncertainty/recovery, and `last_error:null`.
@@ -809,6 +816,17 @@ bytes retries replay that response without a second lifecycle action. Other
 subsequent control requires a fresh hello. `usb.attach` during detaching and
 `usb.detach` during attaching return the established `HID_BUSY` taxonomy; no
 in-flight transition is reversed.
+
+A boot-lifetime TinyUSB runtime diagnostic fail-closes exposure as
+`hidden`/`detaching`, revokes unsafe authority once, and wakes the existing
+executor without console output from TinyUSB context. The executor performs
+the bounded safety opportunity and one uninstall, then retains
+`recovery_required:true` with operation `runtime`. Exact project codes are
+`-30209` for a generic TinyUSB runtime diagnostic and `-30210` for device
+event-queue overflow. A later generic diagnostic cannot replace the more
+specific overflow cause, and teardown failure cannot replace the original
+runtime cause. Recovery requires an operator reset; no automatic attach or
+route restoration occurs.
 
 Unexpected unmount while still exposed revokes unsafe authority, advances the
 generation once, and publishes `disconnected`; a later mount uses that fresh

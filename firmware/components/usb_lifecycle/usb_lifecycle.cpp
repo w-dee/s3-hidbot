@@ -15,6 +15,7 @@ void StateMachine::initialize_hidden_boot_policy() {
     generation_.store(0, std::memory_order_release);
     uncertainty_generation_.store(0, std::memory_order_release);
     teardown_boundary_started_.store(false, std::memory_order_release);
+    runtime_fault_pending_.store(false, std::memory_order_release);
     clear_last_error();
     state_.store(encode(ObservedState::kDriverNotInstalled), std::memory_order_release);
 }
@@ -216,6 +217,53 @@ void StateMachine::complete_uninstall_failure(std::int32_t error_code) {
         record_error(LifecycleOperation::kUninstall, error_code);
         set_recovery_required(true);
     }
+}
+
+bool StateMachine::begin_runtime_fault(std::int32_t error_code) {
+    bool expected = false;
+    if (!runtime_fault_pending_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return false;
+    }
+
+    // Publish the immutable primary cause before Stage A becomes observable.
+    record_error(LifecycleOperation::kRuntime, error_code);
+    teardown_boundary_started_.store(false, std::memory_order_release);
+    std::uint8_t current = state_.load(std::memory_order_acquire);
+    do {
+        const std::uint8_t next = static_cast<std::uint8_t>(
+            (current & static_cast<std::uint8_t>(~kDesiredBit)) |
+            kSafetyPendingBit);
+        const std::uint8_t detaching = static_cast<std::uint8_t>(
+            (next & ((1U << kObservedShift) - 1U)) |
+            encode(ObservedState::kDetaching));
+        if (state_.compare_exchange_weak(current, detaching,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+            return true;
+        }
+    } while (true);
+}
+
+void StateMachine::update_runtime_fault(std::int32_t error_code) {
+    if (runtime_fault_pending_.load(std::memory_order_acquire)) {
+        record_error(LifecycleOperation::kRuntime, error_code);
+    }
+}
+
+void StateMachine::complete_runtime_fault(bool driver_uninstalled) {
+    if (!runtime_fault_pending_.load(std::memory_order_acquire)) {
+        return;
+    }
+    set_recovery_required(true);
+    if (driver_uninstalled) {
+        set_observed(ObservedState::kDriverNotInstalled);
+    }
+}
+
+bool StateMachine::runtime_fault_pending() const {
+    return runtime_fault_pending_.load(std::memory_order_acquire);
 }
 
 bool StateMachine::observe_mount() {

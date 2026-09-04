@@ -5,9 +5,11 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_log.h"
 #endif
 
 #include <cstring>
+#include <limits>
 
 #include "secure_memory/secure_memory.hpp"
 
@@ -19,6 +21,7 @@ constexpr std::uint32_t kLifecycleTaskStackBytes = 4096;
 constexpr std::size_t kLifecycleTaskStackDepth =
     kLifecycleTaskStackBytes / sizeof(StackType_t);
 constexpr UBaseType_t kLifecycleTaskPriority = tskIDLE_PRIORITY + 3;
+constexpr char kLogTag[] = "hid_control";
 
 StaticQueue_t s_queue_storage;
 std::uint8_t s_queue_bytes[Controller::kActionQueueDepth *
@@ -1159,6 +1162,170 @@ void Controller::request_executor_wake() {
 #endif
 }
 
+void Controller::request_executor_wake_from_isr() {
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    native_executor_wake_pending_.store(true, std::memory_order_release);
+#else
+    if (s_executor_task != nullptr) {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        vTaskNotifyGiveFromISR(s_executor_task, &higher_priority_task_woken);
+        portYIELD_FROM_ISR(higher_priority_task_woken);
+    }
+#endif
+}
+
+void Controller::signal_usb_runtime_fault(UsbRuntimeFaultReason reason,
+                                          std::uint32_t event_id,
+                                          bool in_isr) {
+    bool occurrence_recorded = false;
+    for (std::uint8_t attempt = 0; attempt < 4U; ++attempt) {
+        std::uint32_t count =
+            usb_runtime_fault_occurrences_.load(std::memory_order_acquire);
+        if (count == std::numeric_limits<std::uint32_t>::max() ||
+            usb_runtime_fault_occurrences_.compare_exchange_weak(
+                count, count + 1U, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            occurrence_recorded = true;
+            break;
+        }
+    }
+    if (!occurrence_recorded) {
+        // Contention itself means the exact count is no longer useful. Keep
+        // callback work bounded and conservatively saturate the diagnostic.
+        usb_runtime_fault_occurrences_.store(
+            std::numeric_limits<std::uint32_t>::max(),
+            std::memory_order_release);
+    }
+    if (in_isr) {
+        usb_runtime_fault_in_isr_.store(true, std::memory_order_release);
+    }
+
+    if (reason == UsbRuntimeFaultReason::kEventQueueOverflow) {
+        std::uint32_t no_event = UINT32_MAX;
+        (void)usb_runtime_fault_event_.compare_exchange_strong(
+            no_event, event_id, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        // The queue-overflow classification is more specific than the generic
+        // diagnostic sink, so it may replace kNone or kDiagnostic directly.
+        usb_runtime_fault_reason_.store(
+            UsbRuntimeFaultReason::kEventQueueOverflow,
+            std::memory_order_release);
+    } else {
+        UsbRuntimeFaultReason none = UsbRuntimeFaultReason::kNone;
+        (void)usb_runtime_fault_reason_.compare_exchange_strong(
+            none, UsbRuntimeFaultReason::kDiagnostic,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    const UsbRuntimeFaultReason retained =
+        usb_runtime_fault_reason_.load(std::memory_order_acquire);
+    const std::int32_t code =
+        retained == UsbRuntimeFaultReason::kEventQueueOverflow
+            ? usb_lifecycle::kTinyUsbEventQueueOverflowError
+            : usb_lifecycle::kTinyUsbRuntimeDiagnosticError;
+    if (runtime_ != nullptr) {
+        if (!runtime_->state_machine().begin_usb_runtime_fault(code)) {
+            runtime_->state_machine().update_usb_runtime_fault(code);
+        }
+    }
+    if (in_isr) {
+        request_executor_wake_from_isr();
+    } else {
+        request_executor_wake();
+    }
+}
+
+void Controller::signal_usb_lifecycle_event(UsbLifecycleEvent event) {
+    usb_lifecycle_log_bits_.fetch_or(static_cast<std::uint8_t>(event),
+                                     std::memory_order_acq_rel);
+    request_executor_wake();
+}
+
+UsbRuntimeFaultSnapshot Controller::usb_runtime_fault_snapshot() const {
+    return UsbRuntimeFaultSnapshot{
+        .reason = usb_runtime_fault_reason_.load(std::memory_order_acquire),
+        .first_event_id =
+            usb_runtime_fault_event_.load(std::memory_order_acquire),
+        .occurrences =
+            usb_runtime_fault_occurrences_.load(std::memory_order_acquire),
+        .observed_in_isr =
+            usb_runtime_fault_in_isr_.load(std::memory_order_acquire),
+    };
+}
+
+bool Controller::reconcile_usb_runtime_fault() {
+    const UsbRuntimeFaultSnapshot fault = usb_runtime_fault_snapshot();
+    if (fault.reason == UsbRuntimeFaultReason::kNone || runtime_ == nullptr ||
+        backend_ == nullptr) {
+        return false;
+    }
+    const std::int32_t code =
+        fault.reason == UsbRuntimeFaultReason::kEventQueueOverflow
+            ? usb_lifecycle::kTinyUsbEventQueueOverflowError
+            : usb_lifecycle::kTinyUsbRuntimeDiagnosticError;
+    runtime_->state_machine().update_usb_runtime_fault(code);
+    if (usb_runtime_fault_committed_) {
+        return false;
+    }
+    usb_runtime_fault_committed_ = true;
+    active_operation_.store(ControlOperation::kNone,
+                            std::memory_order_release);
+    runtime_->state_machine().commit_usb_runtime_fault_shutdown();
+#ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (fault.reason == UsbRuntimeFaultReason::kEventQueueOverflow) {
+        ESP_LOGE(kLogTag,
+                 "TinyUSB event queue overflow; event=%lu count=%lu isr=%s",
+                 static_cast<unsigned long>(fault.first_event_id),
+                 static_cast<unsigned long>(fault.occurrences),
+                 fault.observed_in_isr ? "yes" : "no");
+    } else {
+        ESP_LOGE(kLogTag, "TinyUSB runtime diagnostic; count=%lu isr=%s",
+                 static_cast<unsigned long>(fault.occurrences),
+                 fault.observed_in_isr ? "yes" : "no");
+    }
+#endif
+
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    const hid_runtime::LifecycleSafetyResult safety =
+        runtime_->state_machine().begin_lifecycle_detach_safety();
+    if (safety != hid_runtime::LifecycleSafetyResult::kClean) {
+        runtime_->state_machine().mark_lifecycle_detach_uncertain(
+            runtime_->state_machine().attach_generation());
+    }
+#else
+    (void)runtime_->run_lifecycle_detach_safety();
+#endif
+    runtime_->state_machine().begin_usb_uninstall();
+    const BackendResult result = backend_->uninstall();
+    const bool uninstalled = result.kind == BackendResultKind::kSuccess;
+    if (uninstalled) {
+        runtime_->state_machine().on_driver_uninstalled();
+    }
+    runtime_->state_machine().complete_usb_runtime_fault(uninstalled);
+    return true;
+}
+
+void Controller::reconcile_usb_lifecycle_logs() {
+    const std::uint8_t events =
+        usb_lifecycle_log_bits_.exchange(0, std::memory_order_acq_rel);
+#ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if ((events & static_cast<std::uint8_t>(UsbLifecycleEvent::kMounted)) != 0) {
+        ESP_LOGI(kLogTag, "USB HID mounted");
+    }
+    if ((events & static_cast<std::uint8_t>(UsbLifecycleEvent::kUnmounted)) != 0) {
+        ESP_LOGI(kLogTag, "USB HID unmounted");
+    }
+    if ((events & static_cast<std::uint8_t>(UsbLifecycleEvent::kSuspended)) != 0) {
+        ESP_LOGI(kLogTag, "USB HID suspended");
+    }
+    if ((events & static_cast<std::uint8_t>(UsbLifecycleEvent::kResumed)) != 0) {
+        ESP_LOGI(kLogTag, "USB HID resumed");
+    }
+#else
+    (void)events;
+#endif
+}
+
 void Controller::signal_hid_authority_change() {
     request_executor_wake();
 }
@@ -1186,6 +1353,7 @@ void Controller::process(Action action) {
         release_operation(action.operation);
         return;
     }
+    (void)reconcile_usb_runtime_fault();
     const bool suppress_ble_event = reconcile_ble_fallbacks(&action);
     retire_ble_route_if_unready();
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
@@ -2475,10 +2643,13 @@ bool Controller::process_wake_cycle_for_test() {
                                                 std::memory_order_acq_rel)) {
         return false;
     }
+    (void)reconcile_usb_runtime_fault();
     Action action{};
     while (dequeue_one_for_test(action)) {
         process(action);
     }
+    (void)reconcile_usb_runtime_fault();
+    reconcile_usb_lifecycle_logs();
     (void)reconcile_ble_fallbacks(nullptr);
     retire_ble_route_if_unready();
     return true;
@@ -2566,6 +2737,11 @@ bool Controller::reconcile_security_disconnect_absent_for_test(
     return reconcile_security_disconnect_absent(generation,
                                                 connection_handle);
 }
+
+void Controller::set_usb_runtime_fault_occurrences_for_test(
+    std::uint32_t value) {
+    usb_runtime_fault_occurrences_.store(value, std::memory_order_release);
+}
 #else
 void Controller::task_entry(void *context) {
     static_cast<Controller *>(context)->task_loop();
@@ -2579,6 +2755,7 @@ void Controller::task_loop() {
         // the queue and fallback atomics. A notification given before this
         // wait remains pending, closing the check-then-sleep race.
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        (void)reconcile_usb_runtime_fault();
         Action action{};
         while (xQueueReceive(s_action_queue, &action, 0) == pdPASS) {
             process(action);
@@ -2586,6 +2763,8 @@ void Controller::task_loop() {
         // Catch publication while the last action was active. If publication
         // instead races after this check, its retained notification makes the
         // next wait return immediately.
+        (void)reconcile_usb_runtime_fault();
+        reconcile_usb_lifecycle_logs();
         (void)reconcile_ble_fallbacks(nullptr);
         retire_ble_route_if_unready();
     }

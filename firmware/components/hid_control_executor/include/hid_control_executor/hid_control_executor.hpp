@@ -36,6 +36,26 @@ struct BackendResult {
     std::int32_t error_code = 0;
 };
 
+enum class UsbRuntimeFaultReason : std::uint8_t {
+    kNone,
+    kDiagnostic,
+    kEventQueueOverflow,
+};
+
+struct UsbRuntimeFaultSnapshot {
+    UsbRuntimeFaultReason reason = UsbRuntimeFaultReason::kNone;
+    std::uint32_t first_event_id = UINT32_MAX;
+    std::uint32_t occurrences = 0;
+    bool observed_in_isr = false;
+};
+
+enum class UsbLifecycleEvent : std::uint8_t {
+    kMounted = 1U << 0,
+    kUnmounted = 1U << 1,
+    kSuspended = 1U << 2,
+    kResumed = 1U << 3,
+};
+
 // Only Controller's dedicated control task invokes this backend. The
 // concrete firmware backend owns the public esp_tinyusb calls; native tests
 // use a deterministic fake and never link TinyUSB.
@@ -455,6 +475,12 @@ class Controller final : public usb_lifecycle::Executor,
         BleRouteReleaseIdentity identity) override;
     void signal_ble_lifecycle_handoff_failure() override;
     void signal_hid_authority_change() override;
+    // TinyUSB callback/ISR seam. It performs only bounded lock-free state
+    // publication plus a task notification; teardown remains task-owned.
+    void signal_usb_runtime_fault(UsbRuntimeFaultReason reason,
+                                  std::uint32_t event_id, bool in_isr);
+    void signal_usb_lifecycle_event(UsbLifecycleEvent event);
+    UsbRuntimeFaultSnapshot usb_runtime_fault_snapshot() const;
 
     // Internal BLE adapter seams. The general runtime reaches these only via
     // an exact U7.4B ticket in the serialized control-owner context; UART,
@@ -496,12 +522,16 @@ class Controller final : public usb_lifecycle::Executor,
     bool reconcile_security_disconnect_absent_for_test(
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle);
+    void set_usb_runtime_fault_occurrences_for_test(std::uint32_t value);
 #endif
 
   private:
     void process(Action action);
     bool enqueue(Action action);
     void request_executor_wake();
+    void request_executor_wake_from_isr();
+    bool reconcile_usb_runtime_fault();
+    void reconcile_usb_lifecycle_logs();
     bool reconcile_ble_fallbacks(const Action *action);
     bool claim_operation(ControlOperation operation);
     void release_operation(ControlOperation operation);
@@ -607,6 +637,17 @@ class Controller final : public usb_lifecycle::Executor,
     // Executor-owned acknowledgment of the boot-lifetime backend latch.
     // The callback-side latch itself remains monotonic and authoritative.
     bool persistent_store_failure_committed_ = false;
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+    static_assert(std::atomic<std::uint8_t>::is_always_lock_free);
+    static_assert(std::atomic<UsbRuntimeFaultReason>::is_always_lock_free);
+    static_assert(std::atomic_bool::is_always_lock_free);
+    std::atomic<UsbRuntimeFaultReason> usb_runtime_fault_reason_{
+        UsbRuntimeFaultReason::kNone};
+    std::atomic<std::uint32_t> usb_runtime_fault_event_{UINT32_MAX};
+    std::atomic<std::uint32_t> usb_runtime_fault_occurrences_{0};
+    std::atomic_bool usb_runtime_fault_in_isr_{false};
+    std::atomic<std::uint8_t> usb_lifecycle_log_bits_{0};
+    bool usb_runtime_fault_committed_ = false;
     bool pairing_complete_seen_ = false;
     bool pairing_terminal_committed_ = false;
     std::uint64_t pairing_deadline_us_ = 0;

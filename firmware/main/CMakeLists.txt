@@ -5,3 +5,6 @@ idf_component_register(
 )
 
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)
+target_link_options(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=tud_descriptor_string_cb"
+)

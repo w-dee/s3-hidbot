@@ -216,6 +216,53 @@ void test_noops_conflicts_and_wrap_boundary() {
     assert(action(lifecycle.request_detach(executor)) == usb_lifecycle::TransitionResult::kBusy);
 }
 
+void test_runtime_fault_is_sticky_fail_closed_and_preserves_primary_cause() {
+    usb_lifecycle::StateMachine lifecycle;
+    FakeExecutor executor;
+    assert(action(lifecycle.request_attach(executor)) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    lifecycle.complete_install_success();
+    assert(lifecycle.observe_mount());
+    const auto generation = lifecycle.generation();
+
+    assert(lifecycle.begin_runtime_fault(
+        usb_lifecycle::kTinyUsbRuntimeDiagnosticError));
+    const auto stage_a = lifecycle.snapshot();
+    assert(stage_a.desired == usb_lifecycle::DesiredExposure::kHidden);
+    assert(stage_a.observed == usb_lifecycle::ObservedState::kDetaching);
+    assert(stage_a.safety_pending);
+    assert(!stage_a.recovery_required);
+    assert(stage_a.last_error.present);
+    assert(stage_a.last_error.operation ==
+           usb_lifecycle::LifecycleOperation::kRuntime);
+    assert(stage_a.last_error.code ==
+           usb_lifecycle::kTinyUsbRuntimeDiagnosticError);
+    assert(!lifecycle.accepts_hid(true));
+    assert(!lifecycle.begin_runtime_fault(
+        usb_lifecycle::kTinyUsbEventQueueOverflowError));
+    assert(lifecycle.generation() == generation);
+
+    lifecycle.update_runtime_fault(
+        usb_lifecycle::kTinyUsbEventQueueOverflowError);
+    assert(lifecycle.begin_uninstall() == generation + 1U);
+    lifecycle.complete_runtime_fault(true);
+    const auto terminal = lifecycle.snapshot();
+    assert(terminal.observed ==
+           usb_lifecycle::ObservedState::kDriverNotInstalled);
+    assert(terminal.recovery_required);
+    assert(terminal.last_error.present);
+    assert(terminal.last_error.operation ==
+           usb_lifecycle::LifecycleOperation::kRuntime);
+    assert(terminal.last_error.code ==
+           usb_lifecycle::kTinyUsbEventQueueOverflowError);
+    assert(action(lifecycle.request_attach(executor)) ==
+           usb_lifecycle::TransitionResult::kBusy);
+
+    lifecycle.complete_uninstall_failure(-7);
+    assert(lifecycle.snapshot().last_error.code ==
+           usb_lifecycle::kTinyUsbEventQueueOverflowError);
+}
+
 }  // namespace
 
 int main() {
@@ -228,4 +275,5 @@ int main() {
     test_zero_work_clear_preserves_real_uncertainty();
     test_external_unmount_advances_once_and_later_mount_reuses_generation();
     test_noops_conflicts_and_wrap_boundary();
+    test_runtime_fault_is_sticky_fail_closed_and_preserves_primary_cause();
 }

@@ -217,11 +217,17 @@ def main() -> int:
     )
     assert tinyusb_dependency is not None
     # A dependency change must explicitly revalidate the USB descriptor range.
-    assert "version: 0.21.0~1" in tinyusb_dependency.group(1)
     assert (
-        "component_hash: a72b7d67472914ab76309340fd50d578b31e310963d45ad0f81144bde3314752"
+        "version: 0b02e68af7a654d5099d8a230291ce19403833ae"
         in tinyusb_dependency.group(1)
     )
+    assert (
+        "component_hash: 06494427af49510651de7d0935b449a27fdd35ae1cfdd1361a732d4877263223"
+        in tinyusb_dependency.group(1)
+    )
+    assert "git: https://github.com/w-dee/tinyusb.git" in tinyusb_dependency.group(1)
+    assert "path: ." in tinyusb_dependency.group(1)
+    assert "type: git" in tinyusb_dependency.group(1)
     if TINYUSB_HID.is_file():
         tinyusb_hid = TINYUSB_HID.read_text(encoding="utf-8")
         usb_keyboard = macro_body(tinyusb_hid, "TUD_HID_REPORT_DESC_KEYBOARD")

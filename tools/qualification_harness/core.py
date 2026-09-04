@@ -12,6 +12,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from hidbot.protocol import USB_RUNTIME_ERROR_CODES
+
 
 _BOND_ID = re.compile(r"[0-9a-f]{32}\Z")
 _PRIVATE_MARKERS = (
@@ -401,8 +403,10 @@ def validate_usb_exposure(value: Any) -> dict[str, Any]:
         error = snapshot["last_error"]
         if not isinstance(error, dict) or set(error) != {"operation", "code"}:
             raise QualificationError("USB last-error schema is invalid")
-        if error["operation"] not in {"install", "uninstall"} or type(error["code"]) is not int:
+        if error["operation"] not in {"install", "uninstall", "runtime"} or type(error["code"]) is not int:
             raise QualificationError("USB last-error value is invalid")
+        if error["operation"] == "runtime" and error["code"] not in USB_RUNTIME_ERROR_CODES:
+            raise QualificationError("USB runtime error code is invalid")
     return snapshot
 
 
