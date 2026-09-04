@@ -12,6 +12,7 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 "$repository_root/tools/test-ble-security.sh"
 "$repository_root/tools/test-ble-pairing.sh"
 "$repository_root/tools/test-hid-route.sh"
+"$repository_root/tools/test-ble-hid-control-point-gatt.sh"
 "$repository_root/tools/test-hid-control-executor.sh"
 "$repository_root/tools/test-hid-runtime.sh"
 "$repository_root/tools/test-firmware-identity.sh"

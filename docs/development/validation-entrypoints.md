@@ -131,6 +131,20 @@ truthful releasing-status, and v1-under-BLE compatibility coverage. Route-v1
 remains exactly `none|usb`; v2 adds `ble` and is preferred only when its
 capability is advertised. These checks remain software-only.
 
+U7.6A adds `tools/test-ble-hid-control-point-gatt.sh` to the canonical native
+suite. It compiles the real production `ble_hid_service.cpp`, captures the HID
+Control Point callback, opaque argument, and assigned value handle through the
+normal service-registration path, and invokes that callback with controlled
+ESP-NimBLE access contexts and mbuf chains. The test covers valid Suspend and
+Exit Suspend events, malformed lengths and values, wrong operations, flatten
+failure and returned-length mismatch, sink rejection, exact fencing metadata,
+and a zero-length head followed by a one-byte fragment. Its minimal fake API is
+isolated under `tools/fakes/`, guarded as test-only, and pinned to the
+repository's ESP-IDF v5.5.4 lock. Existing static source guards and downstream
+executor tests remain independent layers of coverage. This closes the former
+deferred malformed HID Control Point executable GATT-harness gap without
+changing firmware build inputs.
+
 The bonded GATT-cache regression extends the executor and BLE HID static
 entrypoints with legacy missing-revision migration, stale-cache readiness
 inhibition, exact per-connection Service Changed eligibility and bounded call
