@@ -4283,6 +4283,81 @@ void test_store_full_remains_recoverable_and_readvertises() {
     assert(ble.advertising_calls == advertising_calls + 1);
 }
 
+void test_store_full_coalesces_racing_smp_terminal_event() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t handle = 87;
+    connect_ble(runtime, usb, ble, database, controller, handle);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kStoreFull, handle));
+    assert(controller.process_one_for_test());
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kStoreFull);
+    assert(ble.disconnect_calls == 1);
+    assert(!controller.ble_snapshot().recovery_required);
+
+    // NimBLE can report the failed SMP transaction before the Disconnect
+    // callback from StoreFull teardown. A second physical Disconnect attempt
+    // would collide with the already-owned watchdog (ESP_ERR_INVALID_STATE).
+    ble.disconnect_result = 259;
+    assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
+                     handle, 1));
+    assert(controller.process_one_for_test());
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kStoreFull);
+    assert(ble.disconnect_calls == 1);
+    assert(controller.ble_snapshot().connected);
+    assert(!controller.ble_snapshot().recovery_required);
+
+    ble.disconnect_result = 0;
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, handle));
+    assert(controller.process_one_for_test());
+    const auto recovered = controller.ble_snapshot();
+    assert(recovered.observed == ble_lifecycle::ObservedState::kAdvertising);
+    assert(recovered.advertising && !recovered.connected);
+    assert(!recovered.recovery_required);
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kStoreFull);
+}
+
+void test_first_pairing_terminal_result_ignores_late_security_success() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    constexpr std::uint16_t handle = 88;
+    connect_ble(runtime, usb, ble, database, controller, handle);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kPairingComplete,
+                     handle, 1));
+    assert(controller.process_one_for_test());
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kSmpFailed);
+    assert(ble.disconnect_calls == 1);
+
+    // Once teardown owns the connection, a late success observation cannot
+    // revive HID readiness or replace the first terminal diagnosis.
+    make_security_ready(ble);
+    const int refreshes = ble.refresh_security_calls;
+    assert(ble.event(hid_control_executor::BleEventKind::kEncryptionChange,
+                     handle, 0));
+    assert(controller.process_one_for_test());
+    assert(controller.pairing_snapshot().last_result ==
+           ble_pairing::LastResult::kSmpFailed);
+    assert(ble.disconnect_calls == 1);
+    assert(ble.refresh_security_calls == refreshes);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, handle));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kAdvertising);
+    assert(!controller.ble_snapshot().recovery_required);
+}
+
 void test_pairing_input_response_and_initiation() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
@@ -5418,6 +5493,8 @@ int main() {
     test_persisted_bond_reread_mismatch_is_fatal_storage_failure();
     test_low_level_storage_error_is_global_even_with_stale_identity();
     test_store_full_remains_recoverable_and_readvertises();
+    test_store_full_coalesces_racing_smp_terminal_event();
+    test_first_pairing_terminal_result_ignores_late_security_success();
     test_timeout_repeat_store_and_disconnect_results();
     test_store_full_disconnect_failure_terminalizes_recovery();
     test_pairing_timeout_disconnect_failure_terminalizes_recovery();

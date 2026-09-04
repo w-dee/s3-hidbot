@@ -47,6 +47,13 @@ identity-qualified record pair and fails closed if it is genuinely absent,
 mismatched, or below policy. A lost post-persistence event remains bounded by
 the existing queue-overflow and pairing-timeout recovery paths.
 
+Failed SMP can publish multiple connection-local terminal events before the
+first requested disconnect completes. The first terminal result owns that
+connection's bounded teardown; later Pairing Complete, Encryption Change, or
+StoreFull observations cannot overwrite it or start a competing Disconnect
+watchdog. A persistent Storage failure remains independently boot-global and
+fail-closed.
+
 The internal Slice B controller serializes security work on the existing HID
 control executor. Its only live states are `idle`, `securing`, and
 `waiting_input`; completion and failure are retained separately as a bounded

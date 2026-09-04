@@ -1894,6 +1894,16 @@ void Controller::terminate_security_connection(ble_pairing::LastResult result,
     if (!current.connected || ble_backend_ == nullptr) {
         return;
     }
+    // One failed SMP transaction can publish StoreFull, Pairing Complete, and
+    // Encryption Change terminal events before the first Disconnect callback
+    // is consumed. The first connection-local result owns the already-bounded
+    // teardown; later events must neither overwrite it nor try to arm a second
+    // Disconnect watchdog for the same authority. Persistent Storage failure
+    // remains a separate boot-global fail-closed path.
+    if (pairing_terminal_committed_) {
+        return;
+    }
+    pairing_terminal_committed_ = true;
     const auto handle = ble_state_.connection_handle();
     pairing_deadline_us_ = 0;
     wipe_pairing_mailbox();
@@ -1946,6 +1956,9 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
     const auto current = ble_state_.snapshot();
     if (!current.connected || current.generation != ble_state_.generation() ||
         connection_handle != ble_state_.connection_handle()) {
+        return;
+    }
+    if (pairing_terminal_committed_) {
         return;
     }
     ble_backend_->refresh_security(connection_handle);
@@ -2159,6 +2172,7 @@ bool Controller::reconcile_ble_disconnect(BleEvent event, bool expected) {
     pairing_deadline_us_ = 0;
     wipe_pairing_mailbox();
     pairing_complete_seen_ = false;
+    pairing_terminal_committed_ = false;
     (void)pairing_state_.disconnect(event.generation,
                                     event.connection_handle);
     ble_backend_->retire_security(event.generation,
@@ -2221,6 +2235,7 @@ void Controller::process_ble_event(BleEvent event) {
                                            event.connection_handle)) {
                 begin_ble_hid_peer(event.generation, event.connection_handle);
                 pairing_complete_seen_ = false;
+                pairing_terminal_committed_ = false;
                 pairing_deadline_us_ = 0;
                 wipe_pairing_mailbox();
                 pairing_state_.begin_connection(event.generation,
@@ -2274,6 +2289,7 @@ void Controller::process_ble_event(BleEvent event) {
                                               ble_state_.connection_handle());
             }
             pairing_complete_seen_ = false;
+            pairing_terminal_committed_ = false;
             if (!ble_state_.begin_reset_recovery(event.generation, event.status)) {
                 release_operation(active_operation_.load(std::memory_order_acquire));
                 return;

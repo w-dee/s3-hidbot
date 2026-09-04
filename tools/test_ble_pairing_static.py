@@ -281,6 +281,17 @@ def main() -> int:
     assert reconciliation
     assert "terminal_evidence_ready && pairing_complete_seen_" in \
         reconciliation.group(1)
+    assert "if (pairing_terminal_committed_)" in reconciliation.group(1)
+    termination = re.search(
+        r"void Controller::terminate_security_connection\(.*?\) \{(.*?)"
+        r"\n\}\n\nbool Controller::reconcile_security_disconnect_absent",
+        executor,
+        re.S,
+    )
+    assert termination
+    assert "if (pairing_terminal_committed_)" in termination.group(1)
+    assert "pairing_terminal_committed_ = true;" in termination.group(1)
+    assert event_body.count("pairing_terminal_committed_ = false;") >= 2
 
     for exposed in ("ble.pairing.status", "ble.pairing.respond",
                     "ble.pairing-transaction-v1"):

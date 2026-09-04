@@ -608,6 +608,7 @@ class Controller final : public usb_lifecycle::Executor,
     // The callback-side latch itself remains monotonic and authoritative.
     bool persistent_store_failure_committed_ = false;
     bool pairing_complete_seen_ = false;
+    bool pairing_terminal_committed_ = false;
     std::uint64_t pairing_deadline_us_ = 0;
     struct PairingMailbox {
         ble_lifecycle::Generation generation = 0;

@@ -192,6 +192,10 @@ PEER_SEC write attempts. The executor must tolerate temporary missing records
 at the first two events, then accept a complete verified pair or fail closed on
 genuinely missing, mismatched, or downgraded evidence at the post-persistence
 Encryption Change boundary. Static guards bind each event to that role.
+The same executor suite injects StoreFull followed by a racing failed Pairing
+Complete before Disconnect delivery. It requires the first StoreFull result and
+single physical teardown to remain authoritative, followed by nonfatal
+readvertising; the second event cannot create a same-watchdog lifecycle fault.
 
 Run these commands from the repository root:
 
