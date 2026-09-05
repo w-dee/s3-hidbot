@@ -34,8 +34,8 @@ def main() -> int:
     required(producer, r"tools/test_host_artifact\.py", "artifact validation")
     required(
         producer,
-        r"actions/upload-artifact@[0-9a-f]{40}\s+# v4\.6\.2",
-        "immutable upload-artifact v4.6.2",
+        r"actions/upload-artifact@[0-9a-f]{40}\s+# v6\.0\.0",
+        "immutable upload-artifact v6.0.0",
     )
     required(producer, r"name:\s*host-package", "stable artifact name")
     required(producer, r"retention-days:\s*14", "14-day retention")
@@ -46,8 +46,8 @@ def main() -> int:
     required(consumer, r"python-version:\s*\[\"3\.11\",\s*\"3\.12\"\]", "consumer Python matrix")
     required(
         consumer,
-        r"actions/download-artifact@[0-9a-f]{40}\s+# v4\.3\.0",
-        "immutable download-artifact v4.3.0",
+        r"actions/download-artifact@[0-9a-f]{40}\s+# v7\.0\.0",
+        "immutable download-artifact v7.0.0",
     )
     required(consumer, r"name:\s*host-package", "same artifact download name")
     required(consumer, r"sha256sum\s+--check\s+--strict", "checksum verification before install")
@@ -73,7 +73,7 @@ def main() -> int:
     )
     required(
         flash_consumer,
-        r"actions/download-artifact@[0-9a-f]{40}\s+# v4\.3\.0",
+        r"actions/download-artifact@[0-9a-f]{40}\s+# v7\.0\.0",
         "immutable flash consumer artifact download",
     )
     required(flash_consumer, r"sha256sum\s+--check\s+--strict", "flash consumer checksum verification")

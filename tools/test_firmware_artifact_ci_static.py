@@ -13,8 +13,8 @@ EXPECTED_CONTAINER = (
     "espressif/idf:v5.5.4@sha256:"
     "b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b"
 )
-CHECKOUT_SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
-UPLOAD_SHA = "ea165f8d65b6e75b540449e92b4886f43607fa02"
+CHECKOUT_SHA = "93cb6efe18208431cddfb8368fd83d5badbf9bfd"
+UPLOAD_SHA = "b7c566a772e6b6bfb58ed0dc250532a479d7789f"
 
 
 def _required(text: str, pattern: str, description: str) -> None:
