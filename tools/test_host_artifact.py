@@ -36,9 +36,11 @@ def _write_valid_artifact(directory: Path) -> Path:
             archive.writestr(module, "# fixture\n")
         archive.writestr(
             f"{DIST_INFO}/METADATA",
-            "Metadata-Version: 2.1\n"
+            "Metadata-Version: 2.4\n"
             "Name: s3-hidbot-host\n"
             f"Version: {FIXTURE_VERSION}\n"
+            "License-Expression: MIT\n"
+            "License-File: LICENSE\n"
             "Requires-Python: >=3.11\n"
             "Requires-Dist: pyserial<4,>=3.5\n"
             "Provides-Extra: flash\n"
@@ -142,6 +144,33 @@ class HostArtifactTests(unittest.TestCase):
             )
 
         self.assert_rejected(mutate)
+
+    def test_wrong_license_metadata(self) -> None:
+        def mutate(directory: Path) -> None:
+            _replace_member(
+                directory,
+                f"{DIST_INFO}/METADATA",
+                "Metadata-Version: 2.4\n"
+                "Name: s3-hidbot-host\n"
+                f"Version: {FIXTURE_VERSION}\n"
+                "License-Expression: Apache-2.0\n"
+                "License-File: LICENSE\n"
+                "Requires-Python: >=3.11\n"
+                "Requires-Dist: pyserial<4,>=3.5\n"
+                "Provides-Extra: flash\n"
+                'Requires-Dist: esptool<5,>=4.12; extra == "flash"\n',
+            )
+
+        self.assert_rejected(mutate)
+
+    def test_missing_license_file(self) -> None:
+        self.assert_rejected(
+            lambda directory: _replace_member(
+                directory,
+                f"{DIST_INFO}/licenses/LICENSE",
+                b"",
+            )
+        )
 
     def test_non_pure_tag(self) -> None:
         def mutate(directory: Path) -> None:

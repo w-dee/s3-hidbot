@@ -154,6 +154,8 @@ def validate_wheel(wheel: Path, distribution_version: str) -> None:
     if metadata is None or wheel_metadata is None or entry_points is None:
         raise HostArtifactError("wheel is missing required dist-info metadata")
     decoded_metadata = metadata.decode("utf-8")
+    if _metadata_value(decoded_metadata, "Metadata-Version") != "2.4":
+        raise HostArtifactError("wheel core metadata version does not match")
     if _metadata_value(decoded_metadata, "Name") != DISTRIBUTION_NAME:
         raise HostArtifactError("wheel distribution metadata does not match")
     if _metadata_value(decoded_metadata, "Version") != distribution_version:
@@ -166,6 +168,13 @@ def validate_wheel(wheel: Path, distribution_version: str) -> None:
         raise HostArtifactError("wheel flash extra metadata is missing")
     if "Requires-Dist: esptool<5,>=4.12; extra == \"flash\"" not in decoded_metadata:
         raise HostArtifactError("wheel flash dependency metadata does not match")
+    if _metadata_value(decoded_metadata, "License-Expression") != "MIT":
+        raise HostArtifactError("wheel SPDX license expression does not match")
+    if _metadata_value(decoded_metadata, "License-File") != "LICENSE":
+        raise HostArtifactError("wheel license file metadata does not match")
+    license_text = payload.get(f"{dist_info}/licenses/LICENSE")
+    if license_text is None or b"MIT License" not in license_text:
+        raise HostArtifactError("wheel MIT license file is missing")
     decoded_wheel = wheel_metadata.decode("utf-8")
     if "Root-Is-Purelib: true" not in decoded_wheel or "Tag: py3-none-any" not in decoded_wheel:
         raise HostArtifactError("wheel tag is not py3-none-any pure Python")

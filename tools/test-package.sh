@@ -31,9 +31,19 @@ for build_number in 1 2; do
         "$stage_host/"
     cp -R "$repository_root/host/src/hidbot" "$stage_host/src/hidbot"
     cp -R "$repository_root/host/tests" "$stage_host/tests"
-    "$tools_python" -m build \
+    build_log="$temporary_directory/build-$build_number.log"
+    if ! "$tools_python" -m build \
         --outdir "$temporary_directory/dist-$build_number" \
-        "$stage_host"
+        "$stage_host" >"$build_log" 2>&1; then
+        cat "$build_log" >&2
+        exit 1
+    fi
+    if grep -q 'SetuptoolsDeprecationWarning' "$build_log"; then
+        cat "$build_log" >&2
+        echo "setuptools deprecation warning reproduced during package build" >&2
+        exit 1
+    fi
+    cat "$build_log"
 done
 
 wheel_one=$(find "$temporary_directory/dist-1" -maxdepth 1 -type f -name '*.whl' -print -quit)
@@ -133,7 +143,10 @@ assert "Requires-Python: >=3.11\n" in metadata
 assert "Requires-Dist: pyserial<4,>=3.5\n" in metadata
 assert "Provides-Extra: flash\n" in metadata
 assert 'Requires-Dist: esptool<5,>=4.12; extra == "flash"\n' in metadata
-assert any(line.startswith("License: MIT") for line in metadata.splitlines())
+assert "Metadata-Version: 2.4\n" in metadata
+assert "License-Expression: MIT\n" in metadata
+assert "License-File: LICENSE\n" in metadata
+assert not any(line.startswith("License:") for line in metadata.splitlines())
 assert "Description-Content-Type: text/markdown\n" in metadata
 entry_points_name = next(name for name in wheel if name.endswith(".dist-info/entry_points.txt"))
 assert b"hidbotctl = hidbot.cli:main" in wheel[entry_points_name]
