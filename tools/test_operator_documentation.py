@@ -17,7 +17,7 @@ CLI_SOURCE = ROOT / "host/src/hidbot/cli.py"
 README = ROOT / "README.md"
 RELEASE_NOTES = ROOT / "docs/development/release-notes-v0.1.0.md"
 RELEASE_NOTES_RENDERER = ROOT / "tools/render_release_notes.py"
-FUTURE_RELEASE_NOTES = ROOT / "docs/development/release-notes-v0.2.0.md"
+PUBLISHED_RELEASE_NOTES = ROOT / "docs/development/release-notes-v0.2.0.md"
 IDENTIFIER_QUALIFICATION_MARKERS = (
     "project-specific USB-IF VID/PID assignment",
     "project-specific Bluetooth SIG Company Identifier",
@@ -125,7 +125,7 @@ def main() -> int:
     automation = documents["automation.md"]
     readme = README.read_text(encoding="utf-8")
     release_notes = RELEASE_NOTES.read_text(encoding="utf-8")
-    future_release_notes = FUTURE_RELEASE_NOTES.read_text(encoding="utf-8")
+    published_release_notes = PUBLISHED_RELEASE_NOTES.read_text(encoding="utf-8")
 
     for command in _command_names():
         _require(cli, f"`{command}", f"public command {command!r} in CLI reference")
@@ -199,8 +199,24 @@ def main() -> int:
         ):
             raise AssertionError(f"obsolete current-state claim is not historicalized: {paragraph!r}")
 
-    for marker in ("PREPARATION ONLY", "remain pending", "not a claim"):
-        _require(future_release_notes, marker, f"unreleased v0.2.0 qualification boundary {marker}")
+    for marker in (
+        "Status: **PUBLISHED**",
+        "releases/tag/v0.2.0",
+        "a2522a90b6ad58fdfb075f6325102b576b1d636e",
+        "b2f87b8c52e155d1bd4acf0bc765f33dad172dfc",
+        "33913669093",
+        "exactly 10 public assets",
+        "immutable v0.2.0 tag retains the pre-publication version",
+    ):
+        _require(published_release_notes, marker, f"published v0.2.0 history {marker}")
+    for stale_marker in (
+        "unreleased draft",
+        "PREPARATION ONLY",
+        "remain pending",
+        "subsequent authorized qualification gates",
+    ):
+        if stale_marker in published_release_notes:
+            raise AssertionError(f"stale v0.2.0 release-note wording: {stale_marker}")
 
     _require(automation, "stdout JSON", "automation JSON guidance")
     _require(automation, "FLASHED_VERIFICATION_FAILED", "phase-aware flash failure")
