@@ -14,17 +14,33 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main() -> int:
     program = r'''\
+import io
 import sys
 
 import hidbot
 assert "hidbot.serial_transport" not in sys.modules
 from hidbot import protocol
+from hidbot import cli
+from hidbot import provisioning_workflow
 import qualification_harness
 
 assert protocol.PROTOCOL_VERSION == 1
+assert callable(provisioning_workflow.run_post_flash_provisioning)
 assert qualification_harness.QualificationError is not None
 assert "hidbot.serial_transport" not in sys.modules
 assert "PySerialTransport" in hidbot.__all__
+
+output = io.StringIO()
+error_output = io.StringIO()
+assert cli.main(
+    ["verify-artifact", "missing-artifact"],
+    environ={},
+    output=output,
+    error_output=error_output,
+) == 2
+assert output.getvalue() == ""
+assert error_output.getvalue().startswith("artifact error:")
+assert "hidbot.serial_transport" not in sys.modules
 
 try:
     hidbot.PySerialTransport
@@ -51,7 +67,10 @@ else:
             + result.stdout
             + result.stderr
         )
-    print("PASS: host protocol and qualification imports are pyserial-independent")
+    print(
+        "PASS: host protocol, CLI artifact verification, provisioning, and qualification "
+        "imports are pyserial-independent"
+    )
     return 0
 
 

@@ -30,7 +30,6 @@ from .provisioning_workflow import (
     VerificationPhaseClassification,
     run_post_flash_provisioning,
 )
-from .serial_transport import PySerialTransport
 from .provisioning import stage_and_verify_firmware_bundle
 from .protocol import (
     BLE_BOND_ADMINISTRATION_CAPABILITY,
@@ -64,6 +63,14 @@ from .firmware_verification import (
 DEFAULT_BAUD = 115200
 DEFAULT_TIMEOUT = 1.0
 DEFAULT_ATTEMPTS = 3
+
+
+def _default_transport_factory(*args: Any, **kwargs: Any) -> Any:
+    """Resolve pyserial only when a command actually constructs a transport."""
+
+    from .serial_transport import PySerialTransport
+
+    return PySerialTransport(*args, **kwargs)
 
 
 class _ExplicitValueAction(argparse.Action):
@@ -698,7 +705,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     environ: Mapping[str, str] | None = None,
-    transport_factory: Callable[..., PySerialTransport] = PySerialTransport,
+    transport_factory: Callable[..., Any] = _default_transport_factory,
     flash_executor: Callable[..., FlashExecutionResult] = execute_flash,
     provisioning_workflow_runner: Callable[..., ProvisioningWorkflowResult] = run_post_flash_provisioning,
     output: TextIO | None = None,

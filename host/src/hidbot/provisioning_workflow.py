@@ -31,7 +31,6 @@ from .firmware_verification import (
 from .flashing import FlashExecutionResult, execute_flash
 from .protocol import validate_system_info
 from .provisioning import VerifiedFirmwareBundle
-from .serial_transport import PySerialTransport
 
 
 CONTROL_UART_BAUD = 115200
@@ -128,6 +127,14 @@ Sleeper = Callable[[float], None]
 FlashExecutor = Callable[..., FlashExecutionResult]
 TransportFactory = Callable[..., _Transport]
 ClientFactory = Callable[[_Transport, float, int], _Client]
+
+
+def _default_transport_factory(*args: object, **kwargs: object) -> _Transport:
+    """Resolve pyserial only when post-flash verification needs UART."""
+
+    from .serial_transport import PySerialTransport
+
+    return PySerialTransport(*args, **kwargs)
 
 
 def _default_client_factory(transport: _Transport, timeout: float, attempts: int) -> Client:
@@ -235,7 +242,7 @@ def run_post_flash_provisioning(
     port: str,
     *,
     flash_executor: FlashExecutor = execute_flash,
-    transport_factory: TransportFactory = PySerialTransport,
+    transport_factory: TransportFactory = _default_transport_factory,
     client_factory: ClientFactory = _default_client_factory,
     clock: Clock = time.monotonic,
     sleeper: Sleeper = time.sleep,
