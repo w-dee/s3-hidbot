@@ -21,6 +21,37 @@ normal `firmware/sdkconfig.defaults` with
 `CONFIG_APP_REPRODUCIBLE_BUILD=y` only for artifact builds. An existing
 `firmware/build` directory is never an artifact input.
 
+Production builds additionally require an isolated ESP-IDF v5.5.4 source tree
+prepared with the exact repository-owned
+`tools/sdk-patches/nimble-dle-last.patch`. The preparation verifier rejects a
+dirty, already-patched, or revision-mismatched source and verifies the locked
+ESP-IDF, NimBLE, controller, source-file, archive, and patch identities. A
+shared SDK must not be patched. All required submodules must already be present;
+preparation does not fetch them.
+
+The resulting SDK reports the build-observed runtime string `v5.5.4-dirty`.
+That suffix records the deliberate source patch; it is not sufficient
+provenance on its own. Artifact manifest version 2 records the runtime string
+and exact verified production-SDK identity. Existing version 1 artifacts remain
+readable and immutable.
+
+The production patch suppresses only ESP-NimBLE's automatic post-Connect DLE
+tail. The firmware control owner retains this successful-connect host API
+sequence:
+
+```text
+connection update
+-> security initiation API
+-> LE Set Data Length (251 octets, 0x4290 / 17040 us)
+```
+
+There is one admitted direct Set Data Length call and no retry. This is host
+API sequencing, not a claim that encryption completion precedes DLE or that RF
+and controller execution have a stronger order. The associated public issue is
+`#19057 / IDFGH-18248`: ESP32-S3 BLE bonded reconnect encryption timeout
+depends on LE Set Data Length host-call ordering. No claim is made here about
+the issue's current status.
+
 ## Memory envelope and fixture profile
 
 The firmware deliberately targets a conservative minimum envelope of **4 MiB
@@ -91,9 +122,11 @@ All names are relative POSIX paths. Absolute paths, drive prefixes, empty or
 checks that its target is `esp32s3`, its three image entries map to listed
 payloads, and all paths remain inside the bundle.
 
-## Manifest schema v1
+## Manifest schemas
 
-`manifest.json` is strict and has exactly these top-level fields:
+Version 1 remains readable historical input. Current production artifacts use
+version 2 to add the verified production-SDK identity while retaining strict
+top-level validation. The common manifest fields are:
 
 ```text
 artifact_manifest_version

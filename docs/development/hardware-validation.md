@@ -93,6 +93,39 @@ boards, operating systems, or future firmware.
 | Physical HID-not-ready / timeout race | `HARDWARE DEFERRED` | Semantics are covered by native tests; physical race evidence is not established. |
 | Long-duration soak | `HARDWARE DEFERRED` | No soak-duration claim. |
 
+## Retained-reconnect production qualification
+
+The exact transferred production source and artifact established the following
+scoped results on the documented fixture:
+
+```text
+BONDED_RECONNECT_PRODUCT_BEHAVIOR_PHYSICAL_PASS = YES
+NONINSTRUMENTED_PRODUCTION_SMOKE_PASS = YES
+PRODUCTION_RETAINED_BOND_RECONNECT_PASS = YES
+PRODUCTION_0X08_TIMEOUT_OBSERVED = NO
+PRODUCTION_PAIR_FALLBACK_OBSERVED = NO
+RETAINED_DLE_LAST_PHYSICAL_PASS = YES
+RETAINED_STABILITY_PHYSICAL_PASS = YES
+```
+
+These results do not close the separate fresh-to-retained campaign. Preserve
+its unestablished scopes exactly:
+
+```text
+FRESH_PAIR_PHYSICAL_PASS = YES
+FRESH_SECURITY_ANCHOR_PHYSICAL_PASS = NOT_ESTABLISHED
+FRESH_DLE_LAST_PHYSICAL_PASS = NOT_ESTABLISHED
+FRESH_STABILITY_PHYSICAL_PASS = NOT_ESTABLISHED
+F_POST_PHYSICAL_PASS = NOT_ESTABLISHED
+COMBINED_FRESH_TO_RETAINED_PHYSICAL_PASS = NOT_ESTABLISHED
+```
+
+Accordingly, this repository does not claim a full fresh-to-retained
+qualification PASS. Product retained-reconnect success was established before
+the later stability/final-containment verdict; those are separate durable
+campaign facts, so a later containment failure would not erase an already
+established product verdict.
+
 The corresponding native/CI coverage is authoritative in
 [`validation-entrypoints.md`](validation-entrypoints.md); protocol and safety
 semantics are authoritative in [`uart-control-plane.md`](uart-control-plane.md).

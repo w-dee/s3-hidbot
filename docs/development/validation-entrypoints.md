@@ -16,8 +16,11 @@ contain a separate hidden test recipe.
   `twine` tools and resolves the package dependency while validating fresh
   wheel/sdist environments.
 - `test-control-protocol.sh`, `test-firmware.sh`, and `test-nonhardware.sh`
-  require an activated ESP-IDF v5.5.4 environment. Keep activation paths in
-  local shell configuration; do not add them to this repository.
+  require an activated isolated production ESP-IDF v5.5.4 environment prepared
+  with `tools/prepare_production_sdk.py`. Keep activation paths in local shell
+  configuration; do not add them to this repository. Preparation and validation
+  are local-only and require the stock checkout's submodules to be available
+  already.
 - The ESP-IDF project root is `firmware/`.
 - `test-hardware-hid.sh` runs the U5.4.1-U5.4.3 Linux HID
   observer/discovery and keyboard/mouse smoke orchestration unit tests without touching

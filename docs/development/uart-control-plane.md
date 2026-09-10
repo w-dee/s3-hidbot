@@ -286,15 +286,28 @@ unsafe-live-state, and storage/postcondition failures are respectively
 `BLE_BOND_NOT_FOUND`, `BLE_BOND_AMBIGUOUS`, `BLE_BOND_BUSY`, and
 `BLE_BOND_STORAGE`.
 
-Removal first deletes, commits, and rereads the exact resolved identity's
-`hid_schema` revision as absent, then invokes NimBLE's exact-peer deletion.
+Removal first validates bounded persistent slots and saves and rereads a
+versioned exact-identity delete intent in `hid_bond_tx`. It then deletes,
+commits, and rereads the exact resolved identity's `hid_schema` revision as
+absent, and invokes NimBLE's exact-peer deletion.
 Success is returned only after rereading `OUR_SEC`, `PEER_SEC`, CCCD,
 peer-address/RPA, CSFC, and schema metadata as absent, relisting one fewer
-bond, and proving all other public bond IDs remain unchanged. If companion
+bond, proving durable target absence directly in the supported NVS slot
+representation (including NVS-only auxiliary records), clearing and rereading
+the intent as absent, and proving all other public bond IDs remain unchanged.
+A successful read of an unexpectedly present record is a failure, not success.
+If companion
 deletion fails, peer-security deletion does not begin. If peer deletion fails
 after companion deletion, the schema is not recreated: a remaining security
 bond is conservatively stale and the persistent Storage failure remains
-fail-closed. A partial deletion is therefore never false success. NimBLE's
+fail-closed for that boot. The intent remains across partial failures. On the
+next BLE initialization, before NimBLE RAM restoration or controller startup,
+only that explicitly journaled target is completed using key-level NVS erases
+and durable verification. There is no rollback and no automatic cleanup of
+unjournaled peers; malformed state or a new I/O failure remains fail-closed.
+An intent-creation error can either leave the original bond intact or leave
+a durable intent that is safely completed at restart. This is resumable
+deletion, not an atomic multi-key NVS transaction. NimBLE's
 delete-all iterator ends each record class with
 `BLE_HS_ENOENT`; the wrapper returns that sentinel to NimBLE without treating
 normal exhaustion as a storage fault. Other delete errors remain fatal, and

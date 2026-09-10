@@ -46,6 +46,11 @@ port, start Bluetooth, mutate a bond, or run `sudo`. The evidence destination
 must not already exist, preventing an earlier qualification record from being
 silently overwritten.
 
+Possession of SSH configuration, `known_hosts`, cached routes, routing
+availability, prior access, or historical tooling state does not authorize a
+remote qualification endpoint or jump route. Every endpoint and route requires
+explicit authorization for the current task.
+
 ## Safety boundaries
 
 - BlueZ support is fixed to read-only target-name inspection. There is no
@@ -120,6 +125,35 @@ qualification carry-forward requires exact source SHA, runtime ELF, actual
 flashed payloads, flash offsets/settings/reset semantics, and partition
 geometry. A different outer archive or non-runtime provenance payload alone
 does not invalidate otherwise exact physical evidence.
+
+## Campaign contracts versus reusable infrastructure
+
+An accepted asynchronous `ble.enable` response establishes Stage A only:
+
+```text
+desired=exposed
+observed=enabling
+stack_ready=false
+recovery_required=false
+last_error=null
+```
+
+Qualification then uses bounded read-only `ble.exposure.status` polling to
+establish convergence and advertising readiness. It must not require immediate
+`stack_ready=true` from the accepted mutation response.
+
+Connection-scoped `encrypted`, `authenticated`, and `bonded` flags may retire
+on disconnect. They cannot replace persistent bond inventory when establishing
+retained-bond authority after disconnect.
+
+Campaign runners may require durable operation intent, invocation reservation,
+returned-plus-outcome state, ambiguity classification, product verdicts, and
+continuation lineage. Those are campaign contracts, not guarantees of the
+generic `tools/rp-test` `OperationBudget`. In particular, the durable product
+retained-reconnect verdict and the stability/final-containment/full-smoke
+verdict are separate; product PASS is not erased by a later containment
+failure. Sealed campaign runners remain functional artifacts rather than
+maintained generic tooling.
 
 ## Intentionally deferred
 

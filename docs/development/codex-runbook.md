@@ -1,5 +1,43 @@
 # Codex development runbook
 
+## Production DLE-LAST SDK
+
+Firmware builds require a fresh isolated ESP-IDF v5.5.4 tree carrying the exact
+`tools/sdk-patches/nimble-dle-last.patch`. Do not patch a shared SDK. With the
+ordinary clean v5.5.4 environment active:
+
+```sh
+production_sdk_parent=$(mktemp -d)
+python3 tools/prepare_production_sdk.py --source "$IDF_PATH" --output "$production_sdk_parent/sdk"
+export IDF_PATH="$production_sdk_parent/sdk"
+export PATH="$IDF_PATH/tools:$PATH"
+./tools/test-firmware.sh
+```
+
+The same verifier runs during CMake configuration and every incremental build,
+and before artifact creation. Preparation rejects dirty/already-patched input;
+verification accepts only the locked revisions, unchanged controller archive,
+and exact single-file patch. All submodules must already be available in the
+stock checkout. `firmware/production-sdk.lock.json` describes the effective
+dependency; manifest version 2 embeds that identity. Version 1 release artifacts
+remain readable and immutable. CI uses this same preparation and verifier,
+with independent prepared SDK locations for reproducibility builds.
+
+The SDK's actual runtime version string is `v5.5.4-dirty`. Version 2 artifacts
+record this build-observed string so exact runtime identity comparison remains
+valid. The dirty suffix is not dependency provenance: the separately verified
+revision, patch, source and archive hashes supply that identity. No UART field
+or protocol version is added for this purpose.
+
+Only the automatic successful-CONNECT DLE tail is suppressed. The existing
+control owner calls update, connected heap checkpoint, security initiation,
+then one admitted direct Set Data Length (251 octets, 17040 us). DLE errors do
+not add retries or teardown. Admission is retired by disconnect, reset or hide;
+a command already admitted before retirement may still be in flight. This is
+host API sequencing, not an RF/controller ordering or physical qualification
+claim. Both fresh pairing and retained-bond reconnect require a separate
+full-product physical gate. No diagnostic counters are part of production.
+
 ## Scope
 
 `AGENTS.md` defines stable repository invariants. This runbook explains the

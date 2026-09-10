@@ -30,10 +30,18 @@ returns opaque exact IDs without addresses or keys. `ble-bond-remove BOND_ID`
 is permitted only with BLE initialized and disabled to hidden idle, no BLE
 route retirement in progress, no connection or pairing transaction, and a
 trustworthy store. It removes only that peer's `OUR_SEC`, `PEER_SEC`, and HID
-schema revision, verifies absence, and preserves every other bond. A partial
-failure becomes fatal Storage/recovery state and is not reported as success.
+schema revision and related auxiliary records through a versioned persistent
+exact-target intent. It verifies durable target absence, clears the intent only
+after that verification, and preserves every other bond. A partial failure
+leaves the exact intent available for startup resumption and becomes fatal
+Storage/recovery state for that boot; it is not reported as success.
 The operation does not remove the host OS's separate pairing record; never
 infer BlueZ cleanup from firmware success.
+
+After an interrupted removal, do not blindly retry the public command, erase
+NVS, delete all peers, or choose another bond. Restart handling may resume only
+the explicitly recorded target. If the journal is malformed or completion
+fails again, stop and diagnose the persistent Storage state.
 
 The CH343 USB-UART path controls and programs the fixture. The separate native
 USB-OTG path presents HID to a DUT host. Provisioning and identity verification
