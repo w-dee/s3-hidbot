@@ -240,14 +240,57 @@ cross-workflow byte-identical host archives is made.
 
 The candidate firmware becomes physical-release evidence only after a separate
 authorized hardware gate. A later tag build must compare its firmware archive
-with the physically validated candidate and require exact bytes before a draft
-can be created. The manual `release-draft.yml` requires both the exact
-successful pre-tag candidate run ID recorded at that hardware gate and the
-exact successful tag-build run ID. It independently proves that each run built
-the immutable tagged commit, rechecks both exact asset sets, and compares their
-firmware archives byte-for-byte before creating only a GitHub draft. It never
-publishes a Release. The human v0.1.0 procedure requires an annotated,
-unsigned `v0.1.0` tag; lightweight tags are rejected.
+with the physically validated candidate and require exact bytes before release
+publication can begin. Release tags are annotated and unsigned; lightweight
+tags are rejected.
+
+For v0.2.1, publication uses a bounded, explicitly authorized CLI/API mission,
+not an automated publication workflow. Before any mutation, the operator fixes
+the exact version and tag, annotated tag object, peeled source commit,
+candidate and tag/recovery run IDs, attempts, workflow revisions and artifact
+IDs, candidate physical-gate evidence, release-note body hash, and the names,
+count, sizes and SHA-256 values of the selected assets. Mutable `main` is not
+release authority. Both runs must be successful repository-owned Release
+builds for the fixed source; both complete asset sets are reverified, and the
+candidate and tag firmware archives must be exact bytes. The selected tag-build
+set contains exactly ten uploaded assets: firmware archive, wheel, sdist,
+LICENSE, THIRD_PARTY_NOTICES.md, and one adjacent SHA-256 sidecar for each.
+GitHub-generated source archives are not part of that count.
+
+Immediately before draft creation, read-only checks must prove that the tag
+and source remain fixed and that no draft or public Release exists for the tag.
+An authentication or query failure is not evidence of absence. One stable,
+non-prerelease draft is created, its returned Release ID is retained, and each
+of the ten selected assets is uploaded at most once without overwrite or
+clobber. The draft is never recreated automatically. Read-back must prove the
+same ID, tag, title, exact note body and hash, `draft=true`,
+`prerelease=false`, ten exact asset names, and successful upload state. All ten
+assets are then downloaded into a fresh location and compared by hash and
+bytes with the fixed tag-build inputs.
+
+Publishing requires separate explicit human authorization after that draft
+verification. The single mutation may only transition the same verified draft
+to public; it may not replace assets, alter notes or tag, or change prerelease
+state. Public metadata is read back and all ten public assets are downloaded
+again for the same exact verification. If creation, upload, or publication has
+an unknown outcome after a timeout, transport failure, or lost response, the
+mutation is not retried blindly: state is recovered with read-only queries and
+any corrective mutation requires new bounded authorization.
+
+`.github/workflows/release-draft.yml` remains historical v0.1.0 recovery
+machinery and is not the normal v0.2.1 publication path. It is retained without
+generalization because its fixed tag, source, workflow, and artifact identities
+describe that historical recovery only.
+
+The v0.2.1 sequence is: prepare and commit the version and release notes; push
+and require exact main CI success; dispatch `release-build.yml` with that exact
+commit; verify its run and assets; perform the separately authorized exact
+candidate physical gate; review the evidence; create annotated unsigned tag
+`v0.2.1` at the same commit and push it normally; require the tag Release build
+to succeed; prove candidate/tag firmware equality and both asset sets; obtain
+human authorization to create and populate one draft; perform draft read-back
+and fresh-download verification; obtain separate publication authorization;
+publish only that draft; then read back and freshly verify the public assets.
 
 The local artifact contract remains valid when `build.container_image` is
 `null`; only the dedicated CI workflow supplies immutable container

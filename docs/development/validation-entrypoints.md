@@ -391,11 +391,17 @@ of duplicating their test logic.
   `contents: read`. It reuses the canonical firmware and host builders,
   compares two firmware builds byte-for-byte, verifies the exact asset set,
   and uses checkout-free Python 3.11/3.12 consumers. It never creates a
-  Release. The separate manual `release-draft.yml` has the narrowly necessary
-  `contents: write` and `actions: read` permissions; it accepts explicit
-  successful candidate and tag-build run IDs for the same tagged commit,
-  requires their firmware archives to be exact bytes, and creates an
-  unpublished draft only.
+  Release. For v0.2.1, a separately authorized bounded CLI/API mission fixes
+  the exact tag object, peeled source, candidate and tag/recovery runs and
+  artifacts, candidate physical evidence, note hash, and ten-asset manifest.
+  It verifies both asset sets and exact candidate/tag firmware equality before
+  creating one stable draft and uploading each selected tag-build asset once.
+  The draft's ID, metadata, body, and asset set are read back, and all assets
+  are freshly downloaded and compared before separate human authorization may
+  publish only that draft. Public metadata and downloads are verified again.
+  Unknown mutation outcomes are resolved by read-only queries before any newly
+  authorized recovery action. The existing `release-draft.yml` remains
+  historical v0.1.0 recovery machinery and is not the v0.2.1 path.
 
 The workflows run on pushes to every branch and on pull requests. The artifact
 workflow also supports manual `workflow_dispatch` runs. They cancel
