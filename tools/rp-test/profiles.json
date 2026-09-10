@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "assets": {},
+  "profiles": {
+    "host-only": {"assets": [], "python_adapter": null, "startup_attempts": 0, "opportunistic_probe_seconds": 2.0, "reset_readiness_seconds": 12.0, "start_state": "unknown", "hardware_checks": []},
+    "reference": {"assets": [], "python_adapter": null, "startup_attempts": 1, "opportunistic_probe_seconds": 2.0, "reset_readiness_seconds": 12.0, "start_state": "unknown", "hardware_checks": ["serial_private_resolution", "protocol_readiness", "exact_identity"]}
+  }
+}

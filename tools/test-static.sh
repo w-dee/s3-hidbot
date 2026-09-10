@@ -32,6 +32,7 @@ python_bin=${PYTHON_BIN:-python3}
 "$python_bin" "$repository_root/tools/test_release_workflows.py"
 "$python_bin" "$repository_root/tools/test_post_flash_provisioning_static.py"
 "$repository_root/tools/test-qualification-harness.sh"
+"$repository_root/tools/test-rp-test-infra.sh"
 "$repository_root/tools/test-hardware-hid.sh"
 
 echo "PASS: static validation suite"

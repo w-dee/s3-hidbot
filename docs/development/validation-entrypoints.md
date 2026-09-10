@@ -50,6 +50,20 @@ command; it never uploads or publishes an artifact.
 
 ## Entrypoints
 
+`tools/test-rp-test-infra.sh` validates persistent rp-test bootstrap decisions,
+content-addressed caches, warm profiles, bounded startup readiness, operation
+budgets, private durable capsules, retention/purge/export, locks and disk guards
+using temporary host roots and synthetic protocol peers. It is included in
+`test-static.sh` and performs no device, BlueZ, network or privileged operations.
+Actual appliance bootstrap/cache/doctor commands are separate host-administration
+operations; see `tools/rp-test/README.md` for their explicit boundaries.
+Its generic operation budget durably consumes authority before callback
+invocation and suppresses automatic replay after uncertain execution. It does
+not promise exactly-once physical execution, callback-return or outcome
+persistence, or terminal-result synthesis after abrupt process death. Resume
+must reconstruct the budget from the same capsule while holding the physical
+lock. Richer operation/outcome ledgers remain campaign contracts.
+
 U7.4A extends deterministic `tools/test-hid-control-executor.sh` and
 `tools/test_ble_hid_service_static.py` coverage. They verify generation-owned
 CCCD and Control Point state, combined security readiness, bounded callback
