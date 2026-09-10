@@ -16,6 +16,7 @@ trap 'rm -f "$temporary_directory/test_hid_control_executor"; rmdir "$temporary_
   -I"$repository_root/firmware/components/ble_lifecycle/include" \
   -I"$repository_root/firmware/components/ble_pairing/include" \
   -I"$repository_root/firmware/components/ble_security/include" \
+  -I"$repository_root/firmware/components/ble_transport" \
   -I"$repository_root/firmware/components/secure_memory/include" \
   "$repository_root/tools/test_hid_control_executor.cpp" \
   "$repository_root/firmware/components/hid_control_executor/hid_control_executor.cpp" \

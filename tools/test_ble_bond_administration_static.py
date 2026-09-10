@@ -19,6 +19,7 @@ def function(source: str, signature: str, next_signature: str) -> str:
 def main() -> int:
     transport = (ROOT / "firmware/components/ble_transport/ble_transport.cpp").read_text()
     recovery = (ROOT / "firmware/components/ble_transport/persistent_store_recovery.hpp").read_text()
+    deletion = (ROOT / "firmware/components/ble_transport/bond_delete_transaction.hpp").read_text()
     executor = (ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp").read_text()
     protocol = (ROOT / "firmware/components/control_protocol/control_protocol.cpp").read_text()
     protocol_header = (ROOT / "firmware/components/control_protocol/include/control_protocol/control_protocol.hpp").read_text()
@@ -94,6 +95,15 @@ def main() -> int:
         assert required in removal
     for forbidden in ("delete_all_bonds", "remove_oldest", "round_robin"):
         assert forbidden not in removal.lower()
+    assert "return our_status != BLE_HS_ENOENT ? our_status" not in removal
+    assert "run_journaled_removal" in removal
+    for status in ("our_status", "peer_status", "schema_status"):
+        assert f"absence_status({status}," in removal
+    assert "if (deletion_status != 0)" in removal
+    for required in ("begin_delete_intent", "target_delete_scan",
+                     "verify_durable_target_absent", "finish_delete_intent",
+                     "resume_exact_deletion", '"hid_bond_tx"', '"delete_v1"'):
+        assert required in deletion
 
     store_delete = function(
         transport, "int Backend::store_delete(", "int Backend::store_status("
@@ -124,6 +134,9 @@ def main() -> int:
         assert required in initialization
     assert initialization.index("ble_store_config_init()") < initialization.index(
         "recover_orphan_schema_records()")
+    assert initialization.index("nvs_flash_init()") < initialization.index("resume_exact_deletion")
+    assert initialization.index("resume_exact_deletion") < initialization.index("nimble_port_init()")
+    assert "nvs_erase_all" not in deletion
     assert initialization.index(
         "ble_hs_cfg.store_delete_cb = store_delete") < initialization.index(
             "recover_orphan_schema_records()")

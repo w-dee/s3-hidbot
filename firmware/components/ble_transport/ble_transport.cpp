@@ -1,6 +1,7 @@
 #include "ble_transport/ble_transport.hpp"
 
 #include "persistent_store_recovery.hpp"
+#include "bond_delete_transaction.hpp"
 #include "store_delete_result.hpp"
 
 #include <array>
@@ -434,6 +435,84 @@ std::int32_t verify_peer_auxiliary_absent(const ble_addr_t &identity) {
                        : status;
 }
 
+// The bounded persistent deletion seam is pinned to the supported SDK ABI.
+static_assert(sizeof(ble_addr_t) == 7);
+static_assert(sizeof(ble_store_value_sec) == 88);
+static_assert(sizeof(ble_store_value_cccd) == 16);
+static_assert(sizeof(ble_store_value_rpa_rec) == 14);
+static_assert(sizeof(ble_store_value_csfc) == 8);
+static_assert(offsetof(ble_store_value_sec, peer_addr) == 0);
+static_assert(offsetof(ble_store_value_cccd, peer_addr) == 0);
+static_assert(offsetof(ble_store_value_rpa_rec, peer_addr) == 7);
+static_assert(offsetof(ble_store_value_csfc, peer_addr) == 0);
+
+struct PersistentDeleteStore {
+    detail::DeleteRead read(const char *ns, const char *key,
+                            std::uint8_t *bytes, std::size_t capacity) {
+        nvs_handle_t handle{};
+        int status = nvs_open(ns, NVS_READONLY, &handle);
+        if (status == ESP_ERR_NVS_NOT_FOUND) return {};
+        if (status) return {.status = status};
+        std::size_t size = capacity;
+        status = nvs_get_blob(handle, key, bytes, &size);
+        nvs_close(handle);
+        if (status == ESP_ERR_NVS_NOT_FOUND) return {};
+        return {.status = status, .present = status == 0, .size = size};
+    }
+    int write(const char *ns, const char *key, const std::uint8_t *bytes,
+               std::size_t size) {
+        nvs_handle_t handle{};
+        int status = nvs_open(ns, NVS_READWRITE, &handle);
+        if (status) return status;
+        status = nvs_set_blob(handle, key, bytes, size);
+        if (!status) status = nvs_commit(handle);
+        nvs_close(handle);
+        return status;
+    }
+    int erase(const char *ns, const char *key) {
+        nvs_handle_t handle{};
+        int status = nvs_open(ns, NVS_READWRITE, &handle);
+        if (status) return status;
+        status = nvs_erase_key(handle, key);
+        if (!status) status = nvs_commit(handle);
+        nvs_close(handle);
+        return status;
+    }
+    int validate_layout() {
+        nvs_handle_t handle{};
+        int status = nvs_open(kNimbleStoreNamespace, NVS_READONLY, &handle);
+        if (status == ESP_ERR_NVS_NOT_FOUND) return 0;
+        if (status) return status;
+        nvs_iterator_t iterator = nullptr;
+        status = nvs_entry_find_in_handle(handle, NVS_TYPE_ANY, &iterator);
+        while (!status) {
+            nvs_entry_info_t info{};
+            status = nvs_entry_info(iterator, &info);
+            if (status) break;
+            bool recognized = false;
+            if (!detail::deletion_slot(info.key, recognized) ||
+                (recognized && info.type != NVS_TYPE_BLOB)) {
+                status = ESP_ERR_INVALID_STATE;
+                break;
+            }
+            status = nvs_entry_next(&iterator);
+        }
+        nvs_release_iterator(iterator);
+        nvs_close(handle);
+        return status == ESP_ERR_NVS_NOT_FOUND ? 0 : status;
+    }
+    int delete_schema(const detail::StoreIdentity &identity) {
+        return delete_schema_revision_verified(nimble_identity(identity));
+    }
+    int verify_schema_absent(const detail::StoreIdentity &identity) {
+        std::uint8_t revision{};
+        return detail::absence_status(
+            read_schema_revision(nimble_identity(identity), revision),
+            ESP_ERR_NVS_NOT_FOUND, ESP_ERR_INVALID_STATE);
+    }
+    void wipe(void *bytes, std::size_t size) { secure_memory::zero(bytes, size); }
+};
+
 bool peer_identity(std::uint16_t connection_handle, ble_addr_t &identity) {
     ble_gap_conn_desc descriptor{};
     if (ble_gap_conn_find(connection_handle, &descriptor) != 0) {
@@ -481,6 +560,15 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     if (result != ESP_OK) {
         instance_ = nullptr;
         sink_ = nullptr;
+        return result;
+    }
+    // Finish only an explicitly journaled exact-user deletion, before the
+    // RAM store is restored and before the controller/host can start.
+    PersistentDeleteStore deletion_store;
+    result = detail::resume_exact_deletion(deletion_store);
+    if (result != ESP_OK) {
+        observe_store_failure(ble_security::StoreFailureKind::kDelete,
+                              result, true, ble_lifecycle::kNoConnection);
         return result;
     }
     result = nimble_port_init();
@@ -1461,14 +1549,19 @@ hid_control_executor::BleBondRemoveResult Backend::remove_bond(
     }
 
     hid_control_executor::BleBondListResult after{};
-    const auto transaction = detail::run_schema_first_removal(
+    PersistentDeleteStore deletion_store;
+    const int deletion_status = detail::run_journaled_removal(
+        deletion_store, model_identity(target), [&]() -> std::int32_t {
+        const auto transaction = detail::run_schema_first_removal(
         [&target]() -> std::int32_t {
             return delete_schema_revision_verified(target);
         },
         [&target]() -> std::int32_t {
             return ble_store_util_delete_peer(&target);
         },
-        [&]() -> std::int32_t {
+        []() -> std::int32_t { return 0; });
+        return transaction.status;
+        }, [&]() -> std::int32_t {
             ble_store_key_sec key{};
             key.peer_addr = target;
             ble_store_value_sec our_value{};
@@ -1513,16 +1606,19 @@ hid_control_executor::BleBondRemoveResult Backend::remove_bond(
                 }
                 others_preserved = found;
             }
-            return our_status != BLE_HS_ENOENT ? our_status
-                 : peer_status != BLE_HS_ENOENT ? peer_status
-                 : auxiliary_status != 0 ? auxiliary_status
-                 : schema_status != ESP_ERR_NVS_NOT_FOUND ? schema_status
-                 : !others_preserved ? BLE_HS_ESTORE_FAIL
-                                     : 0;
+            for (const int check : {
+                     detail::absence_status(our_status, BLE_HS_ENOENT, BLE_HS_ESTORE_FAIL),
+                     detail::absence_status(peer_status, BLE_HS_ENOENT, BLE_HS_ESTORE_FAIL),
+                     auxiliary_status,
+                     detail::absence_status(schema_status, ESP_ERR_NVS_NOT_FOUND, BLE_HS_ESTORE_FAIL),
+                     others_preserved ? 0 : BLE_HS_ESTORE_FAIL}) {
+                if (check != 0) return check;
+            }
+            return 0;
         });
-    if (transaction.status != 0) {
+    if (deletion_status != 0) {
         observe_store_failure(ble_security::StoreFailureKind::kDelete,
-                              transaction.status, true,
+                              deletion_status, true,
                               ble_lifecycle::kNoConnection);
         result.kind = Kind::kStorageFailure;
         return result;

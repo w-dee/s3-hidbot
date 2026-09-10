@@ -4,6 +4,13 @@
 #include <cstring>
 #include <limits>
 #include <utility>
+#include <functional>
+
+// Reuse the same persistent fault model and actual transaction engine at the
+// real executor boundary; no physical interfaces or target SDK are involved.
+#define BOND_DELETE_TEST_FIXTURE_ONLY
+#include "test_bond_delete_transaction.cpp"
+#undef BOND_DELETE_TEST_FIXTURE_ONLY
 
 #include "ble_hid_service/ble_hid_service.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
@@ -294,8 +301,18 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         ++bond_remove_calls;
         last_bond_id = bond_id;
         bond_remove_result.bond_id = bond_id;
+        if (bond_delete_operation) {
+            const int status = bond_delete_operation();
+            if (status) {
+                security_inhibit.inhibit(active_generation,
+                    ble_lifecycle::kNoConnection, true);
+                bond_remove_result.kind =
+                    hid_control_executor::BleBondRemoveResultKind::kStorageFailure;
+            }
+        }
         return bond_remove_result;
     }
+    std::function<int()> bond_delete_operation;
     void record_heap_checkpoint(HeapCheckpoint checkpoint) override {
         ++heap_checkpoint_calls;
         last_heap_checkpoint = checkpoint;
@@ -5414,6 +5431,36 @@ void test_policy_persistence_disconnect_disable_and_bounded_burst() {
     }
 }
 
+void test_journaled_deletion_faults_at_executor_boundary() {
+    auto success = bond_delete_test::fixture();
+    assert(bond_delete_test::remove(success) == 0);
+    for (bool after : {false, true}) for (int cut = 0; cut < success.calls; ++cut) {
+        auto store = bond_delete_test::fixture();
+        const auto preserved = bond_delete_test::preserved(store.disk);
+        store.cut = cut; store.after = after;
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        hide_ble(runtime, usb, ble, database, controller);
+        ble.bond_delete_operation = [&] { return bond_delete_test::remove(store); };
+        const auto id = executor_bond_id('a');
+        assert(controller.request_bond_remove(id).kind ==
+               hid_control_executor::BleBondRemoveResultKind::kStorageFailure);
+        assert(controller.request_bond_list().kind ==
+               hid_control_executor::BleBondListResultKind::kStorageFailure);
+        assert(controller.ble_snapshot().recovery_required);
+        assert(controller.request_bond_remove(id).kind ==
+               hid_control_executor::BleBondRemoveResultKind::kStorageFailure);
+        assert(ble.bond_remove_calls == 1 && ble.bond_list_calls == 0);
+        assert(bond_delete_test::preserved(store.disk) == preserved);
+        store.cut = -1; store.calls = 0;
+        assert(ble_transport::detail::resume_exact_deletion(store) == 0);
+        assert(bond_delete_test::preserved(store.disk) == preserved);
+    }
+}
+
 void test_bond_administration_serialization_and_safety_policy() {
     const auto id = executor_bond_id('a');
     {
@@ -5763,4 +5810,5 @@ int main() {
     test_queue_burst_overflow_and_id_wrap_fail_closed();
     test_policy_persistence_disconnect_disable_and_bounded_burst();
     test_bond_administration_serialization_and_safety_policy();
+    test_journaled_deletion_faults_at_executor_boundary();
 }

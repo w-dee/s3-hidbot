@@ -365,7 +365,11 @@ def main() -> int:
     assert missing_revision is not None and "Kind::kStale" in missing_revision.group(1)
     assert "descriptor.peer_id_addr" in transport
     assert "identity.type" in transport and "identity.val[index]" in transport
-    assert transport.count("nvs_erase_key(handle, key)") == 1
+    # Schema deletion plus the bounded, journaled exact-target adapter only.
+    assert transport.count("nvs_erase_key(handle, key)") == 2
+    deletion_adapter = transport.split("struct PersistentDeleteStore {", 1)[1].split("bool peer_identity(", 1)[0]
+    assert deletion_adapter.count("nvs_erase_key(handle, key)") == 1
+    assert "detail::run_journaled_removal" in transport
     store_delete_start = transport.index("int Backend::store_delete(")
     store_delete_end = transport.index("int Backend::store_status(")
     store_delete = transport[store_delete_start:store_delete_end]
