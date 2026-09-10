@@ -298,6 +298,8 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: IDF-independent native C++ tests
         run: ./tools/test-native.sh
+      - name: Production SDK negative and artifact identity tests
+        run: python3 tools/test_production_sdk.py
 
   firmware:
     name: Tier C - ESP-IDF firmware
@@ -312,4 +314,7 @@ jobs:
         shell: bash
         run: |
           source "$IDF_PATH/export.sh"
+          python3 tools/prepare_production_sdk.py --source "$IDF_PATH" --output "$RUNNER_TEMP/production-sdk"
+          export IDF_PATH="$RUNNER_TEMP/production-sdk"
+          export PATH="$IDF_PATH/tools:$PATH"
           ./tools/test-firmware.sh

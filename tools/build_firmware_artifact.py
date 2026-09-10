@@ -38,6 +38,7 @@ from firmware_artifact import (
     write_deterministic_json,
 )
 from firmware_resource_gate import ResourceGateError, measure_and_enforce
+from prepare_production_sdk import verify as verify_production_sdk
 
 
 _TOOL_VERSION_CANDIDATE = re.compile(
@@ -124,6 +125,7 @@ def build(args: argparse.Namespace) -> Path:
     idf_py = shutil.which("idf.py")
     if not idf_path or idf_py is None:
         raise ArtifactError("ESP-IDF v5.5.4 must be active (IDF_PATH and idf.py are required)")
+    effective_dependency = verify_production_sdk(Path(idf_path), source_root)
     idf_version = _version_number([idf_py, "--version"], "ESP-IDF")
     if idf_version != "5.5.4":
         raise ArtifactError(f"expected ESP-IDF v5.5.4, got {idf_version}")
@@ -154,6 +156,10 @@ def build(args: argparse.Namespace) -> Path:
         if not flasher_path.is_file():
             raise ArtifactError("ESP-IDF did not produce flasher_args.json")
         flasher = load_json_bytes(flasher_path.read_bytes(), "flasher_args.json")
+        description = load_json_bytes((build_dir / "project_description.json").read_bytes(), "project_description.json")
+        runtime_idf_version = description.get("git_revision")
+        if runtime_idf_version != IDF_VERSION + "-dirty":
+            raise ArtifactError("unexpected prepared SDK runtime IDF version")
         try:
             app_bin_relative = flasher["app"]["file"]
             bootloader_relative = flasher["bootloader"]["file"]
@@ -204,7 +210,7 @@ def build(args: argparse.Namespace) -> Path:
             for path, role in sorted(role_by_path.items())
         }
         manifest: dict[str, Any] = {
-            "artifact_manifest_version": 1,
+            "artifact_manifest_version": 2,
             "project": PROJECT,
             "firmware": {
                 "version": version,
@@ -212,7 +218,7 @@ def build(args: argparse.Namespace) -> Path:
                 "source_revision": source_revision,
                 "target": TARGET,
                 "build_profile": profile,
-                "idf_version": IDF_VERSION,
+                "idf_version": runtime_idf_version,
             },
             "runtime_identity": {"app_elf_sha256": files[next(path for path, role in role_by_path.items() if role == "application_elf")]["sha256"]},
             "build": {
@@ -228,6 +234,7 @@ def build(args: argparse.Namespace) -> Path:
                 },
             },
             "provenance": {
+                "production_sdk": effective_dependency,
                 "dependencies_lock_sha256": files["provenance/dependencies.lock"]["sha256"],
                 "effective_sdkconfig_sha256": files["provenance/sdkconfig"]["sha256"],
             },

@@ -223,7 +223,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, tuple[str, str]
         },
         "manifest",
     )
-    if manifest["artifact_manifest_version"] != SCHEMA_VERSION:
+    if type(manifest["artifact_manifest_version"]) is not int or manifest["artifact_manifest_version"] not in (1, 2):
         raise _error("unsupported artifact manifest version")
     if manifest["project"] != PROJECT:
         raise _error("artifact project is incompatible")
@@ -240,7 +240,8 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, tuple[str, str]
     if firmware["protocol_version"] != PROTOCOL_VERSION:
         raise _error("unsupported protocol version")
     validate_source_revision(firmware["source_revision"])
-    if firmware["target"] != TARGET or firmware["idf_version"] != IDF_VERSION:
+    expected_idf = IDF_VERSION if manifest["artifact_manifest_version"] == 1 else IDF_VERSION + "-dirty"
+    if firmware["target"] != TARGET or firmware["idf_version"] != expected_idf:
         raise _error("firmware target or IDF version is incompatible")
     validate_profile(firmware["build_profile"])
 
@@ -273,7 +274,22 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, tuple[str, str]
     provenance = manifest["provenance"]
     if not isinstance(provenance, dict):
         raise _error("provenance must be an object")
-    _require_keys(provenance, {"dependencies_lock_sha256", "effective_sdkconfig_sha256"}, "provenance")
+    provenance_keys = {"dependencies_lock_sha256", "effective_sdkconfig_sha256"}
+    if manifest["artifact_manifest_version"] == 2:
+        provenance_keys.add("production_sdk")
+        sdk = provenance.get("production_sdk")
+        if not isinstance(sdk, dict):
+            raise _error("production SDK provenance must be an object")
+        revisions = {"idf_revision", "nimble_revision", "controller_revision"}
+        hashes = {"controller_archive_sha256", "patch_sha256", "pre_source_sha256", "post_source_sha256"}
+        _require_keys(sdk, revisions | hashes, "production_sdk")
+        for key in revisions:
+            validate_source_revision(sdk[key])
+        for key in hashes:
+            validate_hash(sdk[key])
+        if sdk["idf_revision"] != "735507283d5b2f9fb363a1901172dbd9e847945d":
+            raise _error("production SDK base is incompatible")
+    _require_keys(provenance, provenance_keys, "provenance")
     validate_hash(provenance["dependencies_lock_sha256"])
     validate_hash(provenance["effective_sdkconfig_sha256"])
 

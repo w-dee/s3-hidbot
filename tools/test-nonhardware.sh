@@ -10,6 +10,7 @@ if [[ -z "${IDF_PATH:-}" ]] || ! command -v idf.py >/dev/null 2>&1; then
 fi
 
 "$repository_root/tools/test-static.sh"
+"$python_bin" "$repository_root/tools/test_production_sdk.py"
 "$python_bin" "$repository_root/tools/test_privacy_lint.py"
 "$python_bin" "$repository_root/tools/privacy_lint.py" --tracked
 "$repository_root/tools/test-host.sh"

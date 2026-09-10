@@ -240,6 +240,8 @@ class BleEventSink {
     virtual ~BleEventSink() = default;
     // Callback-safe: implementations must use bounded, zero-wait signaling.
     virtual bool signal_ble_event(BleEvent event) = 0;
+    // Reset retires DLE before backend generation/watchdog work begins.
+    virtual void retire_dle_on_reset(ble_lifecycle::Generation generation) = 0;
     virtual bool signal_ble_route_release_grace(
         BleRouteReleaseIdentity identity) = 0;
     // Called only after a Reset, post-Reset Sync, or one-shot lifecycle timeout
@@ -299,6 +301,8 @@ class BleBackend {
     virtual std::int32_t configure_connection(
         std::uint16_t connection_handle) = 0;
     virtual std::int32_t initiate_security(
+        std::uint16_t connection_handle) = 0;
+    virtual std::int32_t set_connection_data_length(
         std::uint16_t connection_handle) = 0;
     virtual std::int32_t inject_passkey(std::uint16_t connection_handle,
                                        std::uint32_t passkey) = 0;
@@ -474,6 +478,7 @@ class Controller final : public usb_lifecycle::Executor,
     bool signal_ble_route_release_grace(
         BleRouteReleaseIdentity identity) override;
     void signal_ble_lifecycle_handoff_failure() override;
+    void retire_dle_on_reset(ble_lifecycle::Generation generation) override;
     void signal_hid_authority_change() override;
     // TinyUSB callback/ISR seam. It performs only bounded lock-free state
     // publication plus a task notification; teardown remains task-owned.
@@ -610,6 +615,13 @@ class Controller final : public usb_lifecycle::Executor,
     BleBackend *ble_backend_ = nullptr;
     BleDatabase *ble_database_ = nullptr;
     ble_lifecycle::StateMachine ble_state_{};
+    // Protected by the short DLE admission critical section, never across HCI.
+    void observe_dle_event(BleEvent event);
+    bool claim_dle(BleEvent event);
+    ble_lifecycle::Generation dle_generation_ = 0;
+    std::uint16_t dle_connection_ = ble_lifecycle::kNoConnection;
+    bool dle_seen_ = false;
+    bool dle_available_ = false;
     ble_pairing::StateMachine pairing_state_{};
     bool initialized_ = false;
     std::atomic<ControlOperation> active_operation_{ControlOperation::kNone};

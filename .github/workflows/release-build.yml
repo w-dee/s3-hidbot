@@ -136,6 +136,7 @@ jobs:
           set -euo pipefail
           source "$IDF_PATH/export.sh"
           test "$(idf.py --version)" = "ESP-IDF v5.5.4"
+          stock_sdk="$IDF_PATH"
           artifact_root="$RUNNER_TEMP/s3-hidbot-release-build"
           mkdir -p "$artifact_root/a" "$artifact_root/b" "$artifact_root/release-assets"
           printf 'RELEASE_BUILD_DIR=%s\n' "$artifact_root" >> "$GITHUB_ENV"
@@ -143,6 +144,10 @@ jobs:
 
           build_one() {
             local output="$1"
+            local prepared_sdk="${output}.sdk"
+            python3 tools/prepare_production_sdk.py --source "$stock_sdk" --output "$prepared_sdk"
+            export IDF_PATH="$prepared_sdk"
+            export PATH="$IDF_PATH/tools:$PATH"
             python3 tools/build_firmware_artifact.py \
               --output "$output" \
               --source-root "$GITHUB_WORKSPACE" \

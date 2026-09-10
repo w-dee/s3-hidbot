@@ -73,6 +73,7 @@ void require(bool condition, std::string_view case_name,
 
 class RecordingSink final : public hid_control_executor::BleEventSink {
   public:
+    void retire_dle_on_reset(ble_lifecycle::Generation) override {}
     bool signal_ble_event(hid_control_executor::BleEvent event) override {
         ++call_count;
         last_event = event;

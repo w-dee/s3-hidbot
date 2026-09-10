@@ -12,6 +12,7 @@
 #include "esp_idf_version.h"
 #include "esp_log.h"
 #include "host/ble_gap.h"
+#include "host/ble_esp_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_sm.h"
 #include "host/ble_store.h"
@@ -711,6 +712,10 @@ void Backend::on_sync() {
 
 void Backend::on_reset(int reason) {
     if (instance_ != nullptr) {
+        if (instance_->sink_ != nullptr) {
+            instance_->sink_->retire_dle_on_reset(
+                instance_->generation_.load(std::memory_order_acquire));
+        }
         // Retire callback identity immediately. The serialized state owner
         // advances by the same single uint32 step when it consumes this event,
         // so a following sync callback already carries the new identity.
@@ -1045,6 +1050,10 @@ std::int32_t Backend::configure_connection(std::uint16_t connection_handle) {
     parameters.min_ce_len = 0;
     parameters.max_ce_len = 0;
     return ble_gap_update_params(connection_handle, &parameters);
+}
+
+std::int32_t Backend::set_connection_data_length(std::uint16_t connection_handle) {
+    return ble_hs_hci_util_set_data_len(connection_handle, 251, 0x4290);
 }
 
 std::int32_t Backend::initiate_security(std::uint16_t connection_handle) {

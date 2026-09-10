@@ -77,6 +77,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         }
         if (advertising_result == 0) {
             ++advertising_calls;
+            if (advertising_hook != nullptr) { advertising_hook(*this); }
         }
         return advertising_result;
     }
@@ -121,14 +122,24 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         return orphan_terminate_result;
     }
     std::int32_t configure_connection(std::uint16_t connection_handle) override {
+        dle_order = dle_order * 10 + 1;
         ++configure_connection_calls;
         last_configured_connection = connection_handle;
         return configure_connection_result;
     }
     std::int32_t initiate_security(std::uint16_t connection_handle) override {
+        dle_order = dle_order * 10 + 2;
         ++initiate_security_calls;
         last_connection = connection_handle;
+        if (security_hook != nullptr) { security_hook(*this); }
         return initiate_security_result;
+    }
+    std::int32_t set_connection_data_length(std::uint16_t connection_handle) override {
+        dle_order = dle_order * 10 + 3;
+        ++dle_calls;
+        last_dle_connection = connection_handle;
+        if (dle_hook != nullptr) { dle_hook(*this); }
+        return dle_result;
     }
     std::int32_t inject_passkey(std::uint16_t connection_handle,
                                 std::uint32_t passkey) override {
@@ -343,6 +354,13 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     int cancel_route_release_grace_calls = 0;
     int orphan_terminate_calls = 0;
     int configure_connection_calls = 0;
+    unsigned dle_order = 0;
+    int dle_calls = 0;
+    int dle_result = 0;
+    std::uint16_t last_dle_connection = 0;
+    void (*security_hook)(FakeBleBackend &) = nullptr;
+    void (*advertising_hook)(FakeBleBackend &) = nullptr;
+    void (*dle_hook)(FakeBleBackend &) = nullptr;
     int initiate_security_calls = 0;
     int inject_calls = 0;
     int arm_pairing_timeout_calls = 0;
@@ -5535,7 +5553,107 @@ void test_bond_administration_serialization_and_safety_policy() {
 
 }  // namespace
 
+void test_dle_last_order_admission_and_retirement() {
+    using Kind = hid_control_executor::BleEventKind;
+    {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        ble.advertising_hook = [](FakeBleBackend &b) {
+            assert(b.event(Kind::kConnect, 23));
+        };
+        advertise_ble(runtime, usb, ble, database, controller);
+        assert(controller.process_one_for_test());
+        assert(controller.ble_snapshot().connected);
+        assert(ble.dle_calls == 1 && ble.dle_order == 123);
+    }
+    for (int scenario = 0; scenario != 8; ++scenario) {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        advertise_ble(runtime, usb, ble, database, controller);
+        const auto old_generation = ble.active_generation;
+        if (scenario == 1) {
+            ble.security_hook = [](FakeBleBackend &b) {
+                assert(b.event(Kind::kDisconnect, b.last_connection));
+            };
+        } else if (scenario == 2) {
+            ble.dle_hook = [](FakeBleBackend &b) {
+                assert(b.event(Kind::kDisconnect, b.last_connection));
+            };
+        } else if (scenario == 3) {
+            ble.security_hook = [](FakeBleBackend &b) {
+                b.sink->retire_dle_on_reset(b.active_generation);
+            };
+        } else if (scenario == 4) {
+            ble.security_hook = [](FakeBleBackend &b) {
+                auto *owner = static_cast<hid_control_executor::Controller *>(b.sink);
+                assert(owner->request_ble_disable().action_result ==
+                       ble_lifecycle::TransitionResult::kAccepted);
+            };
+        } else if (scenario == 5) {
+            ble.initiate_security_result = -94;
+        } else if (scenario == 6) {
+            ble.configure_connection_result = -95;
+            ble.dle_result = -96;
+        } else if (scenario == 7) {
+            ble.security_hook = [](FakeBleBackend &b) {
+                assert(b.event(Kind::kDisconnect, 24)); // wrong handle cannot retire 23
+            };
+        }
+        assert(ble.event(Kind::kConnect, 23));
+        assert(controller.process_one_for_test());
+        const bool skipped = scenario == 1 || scenario == 3 || scenario == 4;
+        assert(ble.dle_calls == (skipped ? 0 : 1));
+        assert(ble.dle_order == (skipped ? 12U : 123U));
+        if (!skipped) { assert(ble.last_dle_connection == 23); }
+        if (scenario == 0 || scenario == 6) {
+            assert(ble.disconnect_calls == 0);
+            assert(!controller.ble_snapshot().recovery_required);
+            for (auto kind : {Kind::kConnect, Kind::kIdentityResolved,
+                              Kind::kPairingComplete, Kind::kEncryptionChange}) {
+                assert(ble.event(kind, 23));
+                assert(controller.process_one_for_test());
+                assert(ble.dle_calls == 1);
+            }
+        }
+        if (scenario == 1 || scenario == 2) {
+            assert(controller.process_one_for_test()); // retired disconnect
+            assert(ble.active_generation != old_generation);
+            const int prior = ble.dle_calls;
+            assert(ble.event_for_generation(Kind::kConnect, old_generation, 23));
+            assert(controller.process_one_for_test());
+            assert(ble.dle_calls == prior);
+            ble.security_hook = nullptr;
+            ble.dle_hook = nullptr;
+            ble.dle_order = 0;
+            assert(ble.event(Kind::kConnect, 23)); // numeric handle reuse
+            assert(controller.process_one_for_test());
+            assert(ble.dle_calls == prior + 1 && ble.dle_order == 123);
+        }
+    }
+
+    // A terminal callback can precede queued CONNECT adoption. A duplicate
+    // callback must not rearm the retired same-generation eligibility.
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    advertise_ble(runtime, usb, ble, database, controller);
+    assert(ble.event(Kind::kConnect, 23));
+    assert(ble.event(Kind::kDisconnect, 23));
+    assert(ble.event(Kind::kConnect, 23));
+    assert(controller.process_one_for_test());
+    assert(ble.dle_calls == 0);
+}
+
 int main() {
+    test_dle_last_order_admission_and_retirement();
     test_install_and_uninstall_are_task_owned_and_serialized();
     test_route_owner_blocks_attach_before_lifecycle_stage_a();
     test_route_owner_blocks_detach_before_lifecycle_stage_a();

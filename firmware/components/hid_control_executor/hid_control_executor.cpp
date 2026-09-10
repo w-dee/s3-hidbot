@@ -6,6 +6,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#else
+#include <mutex>
 #endif
 
 #include <cstring>
@@ -15,6 +17,20 @@
 
 namespace hid_control_executor {
 namespace {
+
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+std::mutex s_dle_mux;
+struct DleLock {
+    DleLock() { s_dle_mux.lock(); }
+    ~DleLock() { s_dle_mux.unlock(); }
+};
+#else
+portMUX_TYPE s_dle_mux = portMUX_INITIALIZER_UNLOCKED;
+struct DleLock {
+    DleLock() { portENTER_CRITICAL(&s_dle_mux); }
+    ~DleLock() { portEXIT_CRITICAL(&s_dle_mux); }
+};
+#endif
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
 constexpr std::uint32_t kLifecycleTaskStackBytes = 4096;
@@ -105,7 +121,14 @@ BleCommandOutcome Controller::request_ble_disable() {
         !claim_operation(operation)) {
         return {};
     }
-    const ble_lifecycle::TransitionOutcome outcome = ble_state_.begin_disable();
+    const ble_lifecycle::TransitionOutcome outcome = [this] {
+        DleLock lock;
+        const auto transition = ble_state_.begin_disable();
+        if (transition.action_result == ble_lifecycle::TransitionResult::kAccepted) {
+            dle_available_ = false;
+        }
+        return transition;
+    }();
     if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
         const Action item{.kind = ActionKind::kBleDisable,
                           .operation = operation};
@@ -304,7 +327,59 @@ BleBondRemoveResult Controller::request_bond_remove(const BondId &bond_id) {
     return bond_remove_rpc_result_;
 }
 
+void Controller::retire_dle_on_reset(ble_lifecycle::Generation generation) {
+    DleLock lock;
+    if (generation == ble_state_.generation()) {
+        dle_seen_ = true;
+        dle_generation_ = generation;
+        dle_available_ = false;
+    }
+}
+
+void Controller::observe_dle_event(BleEvent event) {
+    DleLock lock;
+    const auto current = ble_state_.snapshot();
+    // CONNECT can arrive before start_advertising() returns to its owner.
+    // Publish provisional eligibility; executor acceptance and claim remain
+    // mandatory. Do not require the owner's Advertising publication yet.
+    if (event.kind == BleEventKind::kConnect && event.status == 0 &&
+        current.generation == event.generation &&
+        current.desired == ble_lifecycle::DesiredExposure::kExposed &&
+        !current.connected && !current.recovery_required &&
+        event.connection_handle != ble_lifecycle::kNoConnection &&
+        (!dle_seen_ || dle_generation_ != event.generation)) {
+        dle_generation_ = event.generation;
+        dle_connection_ = event.connection_handle;
+        dle_seen_ = true;
+        dle_available_ = true;
+    } else if (event.generation == dle_generation_ &&
+               (event.kind == BleEventKind::kReset ||
+                (event.kind == BleEventKind::kDisconnect &&
+                 event.connection_handle == dle_connection_))) {
+        dle_available_ = false;
+    }
+}
+
+bool Controller::claim_dle(BleEvent event) {
+    DleLock lock;
+    const auto current = ble_state_.snapshot();
+    const bool valid = dle_available_ && dle_generation_ == event.generation &&
+        dle_connection_ == event.connection_handle &&
+        current.generation == event.generation && current.connected &&
+        current.desired == ble_lifecycle::DesiredExposure::kExposed &&
+        !current.recovery_required &&
+        ble_state_.connection_handle() == event.connection_handle &&
+        !ble_event_overflow_pending(event.generation) &&
+        !ble_lifecycle_handoff_failure_.load(std::memory_order_acquire) &&
+        !ble_backend_->persistent_store_failure_observed();
+    // Never rearm in executor begin_security: a terminal callback may already
+    // have retired the connection while its CONNECT was waiting in the queue.
+    dle_available_ = false;
+    return valid;
+}
+
 bool Controller::signal_ble_event(BleEvent event) {
+    observe_dle_event(event);
     mark_ble_route_loss(event);
     const Action item{.kind = ActionKind::kBleEvent, .ble_event = event};
     if (enqueue(item)) {
@@ -2415,6 +2490,12 @@ void Controller::process_ble_event(BleEvent event) {
                     BleBackend::HeapCheckpoint::kConnected);
                 const std::int32_t result =
                     ble_backend_->initiate_security(event.connection_handle);
+                if (claim_dle(event)) {
+                    // Admission is consumed even on error. No product retry or
+                    // teardown solely for DLE; SDK HCI fault handling remains.
+                    (void)ble_backend_->set_connection_data_length(
+                        event.connection_handle);
+                }
                 if (result != 0) {
                     terminate_security_connection(
                         ble_pairing::LastResult::kSmpFailed, false);

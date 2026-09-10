@@ -36,6 +36,8 @@ class Backend final : public hid_control_executor::BleBackend {
         std::uint16_t connection_handle) override;
     std::int32_t initiate_security(
         std::uint16_t connection_handle) override;
+    std::int32_t set_connection_data_length(
+        std::uint16_t connection_handle) override;
     std::int32_t inject_passkey(std::uint16_t connection_handle,
                                 std::uint32_t passkey) override;
     std::uint64_t monotonic_time_us() const override;

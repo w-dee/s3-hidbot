@@ -1,0 +1,9 @@
+{
+  "idf_revision": "735507283d5b2f9fb363a1901172dbd9e847945d",
+  "nimble_revision": "5c1a43ca3d205c3d5183e57dedce335fb6a81155",
+  "controller_revision": "ebd6043a8e3c3bbde45ee483895303b9c1229ab5",
+  "controller_archive_sha256": "ff3538c403108897cf34a74b45251ad2a3d0e1beab70979c2e332832cbf04a6e",
+  "patch_sha256": "8af824b0c032dc308b8112f9a65ad6c84680674bce0e898bd1c7c60d6aecd126",
+  "pre_source_sha256": "ff09f152b63d86147d3065c131da4b9107bdcac90ffa492aaff3675fb54237ea",
+  "post_source_sha256": "d9c010b2e94bbb606f2d5c8ecd61e2ddda987695633ab6818dab2478d02c2197"
+}
