@@ -53,8 +53,10 @@ command; it never uploads or publishes an artifact.
 `tools/test-rp-test-infra.sh` validates persistent rp-test bootstrap decisions,
 content-addressed caches, warm profiles, bounded startup readiness, operation
 budgets, private durable capsules, retention/purge/export, locks and disk guards
-using temporary host roots and synthetic protocol peers. It is included in
-`test-static.sh` and performs no device, BlueZ, network or privileged operations.
+using temporary host roots and synthetic protocol peers. It runs as a separate
+host-only step in `privacy-lint.yml` and is deliberately excluded from
+container-oriented artifact static guards. It performs no device, BlueZ,
+network or privileged operations.
 Actual appliance bootstrap/cache/doctor commands are separate host-administration
 operations; see `tools/rp-test/README.md` for their explicit boundaries.
 Its generic operation budget durably consumes authority before callback

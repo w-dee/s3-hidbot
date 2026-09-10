@@ -9,6 +9,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/firmware-artifact.yml"
+PRIVACY_WORKFLOW = ROOT / ".github/workflows/privacy-lint.yml"
+STATIC_SUITE = ROOT / "tools/test-static.sh"
 EXPECTED_CONTAINER = (
     "espressif/idf:v5.5.4@sha256:"
     "b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b"
@@ -24,6 +26,8 @@ def _required(text: str, pattern: str, description: str) -> None:
 
 def main() -> int:
     text = WORKFLOW.read_text(encoding="utf-8")
+    privacy_text = PRIVACY_WORKFLOW.read_text(encoding="utf-8")
+    static_text = STATIC_SUITE.read_text(encoding="utf-8")
     _required(text, r"^name:\s*Firmware artifact\s*$", "dedicated workflow name")
     for trigger in ("push:", "pull_request:", "workflow_dispatch:"):
         _required(text, rf"^\s*{re.escape(trigger)}\s*$", trigger)
@@ -78,6 +82,12 @@ def main() -> int:
         raise AssertionError("generic firmware artifact workflow must not hardcode a product version")
     _required(text, r"tools/privacy_lint\.py\s+--tracked", "repository privacy scan")
     _required(text, r"tools/test_firmware_artifact\.py", "artifact privacy and verifier tests")
+
+    rp_test_runner = "./tools/test-rp-test-infra.sh"
+    if "test-rp-test-infra.sh" in static_text or "test-rp-test-infra.sh" in text:
+        raise AssertionError("host-only rp-test suite must not run in the artifact container")
+    if privacy_text.count(rp_test_runner) != 1:
+        raise AssertionError("privacy workflow must run the host-only rp-test suite exactly once")
 
     _required(text, r"build_one\(\)\s*\{", "canonical builder function")
     if text.count("tools/build_firmware_artifact.py") != 1:
