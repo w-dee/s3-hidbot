@@ -87,7 +87,8 @@ boards, operating systems, or future firmware.
 | BLE HID route and repaired Report Map | `HARDWARE VALIDATED` | FNK0085 with a Linux/BlueZ 5.72 host: exact repaired descriptor, F24 DOWN/UP, no repeat, stable route retirement, and bond-preserving reconnect. This is not a general Linux or HOGP-host claim. |
 | Authenticated bond lifecycle | `HARDWARE VALIDATED` | FNK0085 lab evidence covers authenticated pairing, 16-byte keys, exact opaque-ID removal, crash-safe persistent absence, stale host-record behavior, and exact slot reuse. |
 | Three-bond capacity / no eviction | `HARDWARE VALIDATED` | One Linux/BlueZ peer plus named lab Xperia, Lenovo, and Moto Android fixtures were used across the accepted sequence: three verified bonds, `store_full` with the set preserved, exact removal, slot reuse, reconnect, and reboot persistence. No blanket Android/device qualification is claimed. |
-| Mouse buttons | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
+| Mouse left button in HID Sequence Executor v1 | `HARDWARE VALIDATED` | The USB-only sequence checkpoint observed exactly one `BTN_LEFT` down/up pair after the F24 pair, with no extra input events and a final all-up cleanup. This does not qualify the other mouse buttons or arbitrary sequences. |
+| Other mouse buttons | `HARDWARE DEFERRED` | No accepted hardware evidence yet for right, middle, backward, or forward buttons. |
 | Wheel / pan | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Physical `report_failed` injection | `HARDWARE DEFERRED` | No accepted hardware injection or recovery evidence yet. |
 | Physical HID-not-ready / timeout race | `HARDWARE DEFERRED` | Semantics are covered by native tests; physical race evidence is not established. |
@@ -125,6 +126,74 @@ qualification PASS. Product retained-reconnect success was established before
 the later stability/final-containment verdict; those are separate durable
 campaign facts, so a later containment failure would not erase an already
 established product verdict.
+
+## USB-only HID Sequence Executor v1 checkpoint
+
+The bounded USB-only sequence executor passed its scoped physical checkpoint
+on the documented Freenove fixture:
+
+```text
+classification = PASS_USB_SEQUENCE_PHYSICAL_QUALIFICATION
+firmware source authority = 7e19052f12d00ad2d2173b17911c24db0ab0c103
+firmware subtree = c43486957327ab39fe98f8d304fcc697fbedae7a
+qualification tooling authority = cfc9ead8f18180497bfb37352617baa14a3752ed
+artifact cache key = 66c6f8b2c47f0346b9dc572adcb965fae7af1510e2e32fe8e091a7e0be09a667
+artifact application SHA-256 = 80ccd1562e626c1197c14145c8c47e483c700a926527a31058a084009c544040
+artifact archive SHA-256 = 4889315f3355b77b62c08a972c29ea9616df6934d00554f1e588bf1cddd19656
+```
+
+The committed firmware authority and qualification-tooling authority are
+distinct. The mission wrapper was ephemeral evidence, not committed source:
+
+```text
+wrapper logical identity = usb-sequence-v1-physical-v2
+wrapper SHA-256 = 6ffdd7c2f272ad11b16743e7367acbab4f1b4811b6d15d9c56bf7a825eee4a79
+remote capsule identity = 20260911T123953Z-8ea9c296f7da
+remote capsule runner digest = 54899e3bbe83afa6a4bcbbcd1e8d6cbbd5177a865d43f6a3642c455eaac1ac83
+remote capsule lifecycle = PASS / SUCCESS -> RESOLVED -> ACKNOWLEDGED
+```
+
+The exact workload was
+`w500;d150;kp115;kr115;w700;mpL;mrL`: seven tokens with a declared
+scheduled duration of 1650 ms. Exactly one `hid.sequence.start` was issued,
+with no retry. The accepted sequence ID was 1. Earlier preparation stopped
+before sequence admission and did not consume another physical sequence
+attempt. USB exposure was already mounted with both HID endpoints ready in
+the passing capsule; the prerequisite attach had occurred once, without
+retry, before that capsule.
+
+The host made zero control calls during the 2401.049 ms post-admission silence
+interval. Linux input observation then established exactly this order, with no
+unexpected event:
+
+```text
+KEY_F24 down -> KEY_F24 up -> BTN_LEFT down -> BTN_LEFT up
+acceptance -> KEY_F24 down = 443.242 ms
+KEY_F24 down -> KEY_F24 up = 151.974 ms
+KEY_F24 up -> BTN_LEFT down = 859.164 ms
+BTN_LEFT down -> BTN_LEFT up = 143.969 ms
+```
+
+These observations satisfy the approved timing windows, including the
+MCU-local long-gap criterion. They are not an exact 700 ms measurement because
+the observer timestamps also include USB, host, and input-delivery latency.
+The sole post-silence status returned `completed`, `started=true`,
+`executed=7`, `failed_token=null`, and `code=null`.
+
+Cleanup returned Keyboard and Mouse `already_up`, restored a stable `none`
+route, and completed a clean 250 ms quiet tail. Final held state was `ALL_UP`,
+the boot ID remained continuous, and no reset, panic, or fatal runtime fault
+was observed. No flash occurred in the passing run.
+
+This checkpoint covers whole-sequence admission, MCU-local timing, USB F24 and
+left-button output, host-silence independence, terminal status, and final
+all-up cleanup for this one workload. It does not newly qualify BLE execution,
+pairing, retained reconnect, bond lifecycle, other sequence programs, other
+mouse buttons, held-state cases, mid-sequence interruption, or invalid input.
+
+```text
+BLE_REQUALIFICATION_PERFORMED = NO
+```
 
 The corresponding native/CI coverage is authoritative in
 [`validation-entrypoints.md`](validation-entrypoints.md); protocol and safety
