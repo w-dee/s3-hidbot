@@ -14,6 +14,7 @@ import sys
 from common import ROOT, DIGEST, MIN_FREE, TOKEN, InfraError, atomic_json, check_mode, cli_error, fsync_dir, lock, need, no_links, private_dir, read_json, sha, tree_files, verify_marker
 
 RUN_ID = re.compile(r'\d{8}T\d{6}Z-[0-9a-f]{12}\Z')
+CAPSULE_PROFILES = ('bond-delete', 'combined-fresh-reconnect', 'recovery', 'synthetic', 'usb-sequence-v1')
 TRANSITIONS = {'ACTIVE': {'UNRESOLVED', 'RESOLVED'}, 'UNRESOLVED': {'RESOLVED'}, 'RESOLVED': {'PURGE_ELIGIBLE'}, 'PURGE_ELIGIBLE': set()}
 RAW = ('HCI', 'UART', 'NVS')
 
@@ -61,8 +62,12 @@ def unseal_runner_directories_for_purge(path):
     for p in [path, *sorted((q for q in path.rglob('*') if q.is_dir()), reverse=True)]:
         os.chmod(p, 0o700)
 
+def validate_capsule_profile(profile):
+    need(isinstance(profile, str) and TOKEN.fullmatch(profile) and profile in CAPSULE_PROFILES,
+         'PROFILE_INVALID')
+
 def create(root, profile, runner, digests):
-    need(isinstance(profile, str) and TOKEN.fullmatch(profile), 'PROFILE_INVALID')
+    validate_capsule_profile(profile)
     need(set(digests) == {'functional', 'firmware', 'parser'} and all(DIGEST.fullmatch(v) for v in digests.values()), 'RUN_DIGESTS_INVALID')
     need(shutil.disk_usage(root).free >= MIN_FREE, 'FORENSIC_STORAGE_LOW')
     source = no_links(runner)
@@ -97,8 +102,8 @@ def validate_capsule(path):
     m = read_json(path / 'manifest.json')
     need(set(m) == {'schema', 'run_id', 'profile', 'created', 'runner_sha256', 'digests'}
          and m['schema'] in (1, 2) and RUN_ID.fullmatch(m['run_id'])
-         and isinstance(m['profile'], str) and TOKEN.fullmatch(m['profile'])
          and DIGEST.fullmatch(m['runner_sha256']), 'CAPSULE_SCHEMA_INVALID')
+    validate_capsule_profile(m['profile'])
     for p in tree_files(path):
         relative = p.relative_to(path)
         check_mode(p, 0o400 if m['schema'] == 2 and relative.parts[0] == 'runner' else 0o600)

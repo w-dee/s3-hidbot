@@ -52,8 +52,8 @@ class Fixture(unittest.TestCase):
         (source / 'SHA256SUMS').write_text(''.join(common.sha(p) + '  ' + str(p.relative_to(source)) + '\n' for p in files))
         return common.sha(source / 'SHA256SUMS')
 
-    def create(self):
-        return capsule.create(self.root, 'synthetic', self.source, self.digests)['run_id']
+    def create(self, profile='synthetic'):
+        return capsule.create(self.root, profile, self.source, self.digests)['run_id']
 
     def entry(self):
         cache.import_tree(self.root, 'tooling', self.digest, self.source)
@@ -435,6 +435,40 @@ class StartupTests(unittest.TestCase):
 
 
 class CapsuleTests(Fixture):
+    def test_fixed_capsule_profile_policy(self):
+        expected = ('bond-delete', 'combined-fresh-reconnect', 'recovery', 'synthetic', 'usb-sequence-v1')
+        self.assertEqual(capsule.CAPSULE_PROFILES, expected)
+        for profile in expected:
+            path = capsule.run_path(self.root, self.create(profile))
+            self.assertEqual(capsule.validate_capsule(path)['profile'], profile)
+
+    def test_unknown_capsule_profile_fails_closed(self):
+        with self.assertRaisesRegex(common.InfraError, 'PROFILE_INVALID'):
+            self.create('unknown-fixture')
+        path = capsule.run_path(self.root, self.create())
+        manifest = common.read_json(path / 'manifest.json')
+        manifest['profile'] = 'unknown-fixture'
+        common.atomic_json(path / 'manifest.json', manifest)
+        with self.assertRaisesRegex(common.InfraError, 'PROFILE_INVALID'):
+            capsule.validate_capsule(path)
+
+    def test_invalid_capsule_profile_token_fails_closed(self):
+        with self.assertRaisesRegex(common.InfraError, 'PROFILE_INVALID'):
+            self.create('invalid/profile')
+        path = capsule.run_path(self.root, self.create())
+        manifest = common.read_json(path / 'manifest.json')
+        manifest['profile'] = 'invalid/profile'
+        common.atomic_json(path / 'manifest.json', manifest)
+        with self.assertRaisesRegex(common.InfraError, 'PROFILE_INVALID'):
+            capsule.validate_capsule(path)
+
+    def test_capsule_and_warm_preflight_profile_namespaces_are_separate(self):
+        warm_profiles = common.read_json(preflight.PROFILES)['profiles']
+        self.assertIn('synthetic', capsule.CAPSULE_PROFILES)
+        self.assertNotIn('synthetic', warm_profiles)
+        self.assertIn('reference', warm_profiles)
+        self.assertNotIn('reference', capsule.CAPSULE_PROFILES)
+
     def test_capsule_low_space_refuses_creation(self):
         with patch.object(shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(1, 1, 0)), self.assertRaisesRegex(common.InfraError, 'FORENSIC_STORAGE_LOW'):
             self.create()

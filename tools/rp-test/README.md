@@ -77,6 +77,11 @@ defaults. It contains no campaign artifact selector, runner digest, preserved
 identity, private cache key, or recovery default. A separately authorized
 mission may import exact content through `cache.py` and validate a mission-local
 profile, but private identifiers and campaign digests stay outside the repository.
+These warm-preflight profiles are a separate namespace from capsule profiles.
+Capsule mission identifiers use the fixed `CAPSULE_PROFILES` allowlist in
+`run_capsule.py`; a new capsule mission requires an explicit source allowlist
+change, focused tests, review, and normal runner deployment. A name in one
+namespace does not authorize or configure the other.
 For a profile that uses a cached Python adapter, warm preflight can also verify
 the required `hidbot` source modules inside that exact cache hit.
 It does not assume that the persistent qualification venv contains the project
