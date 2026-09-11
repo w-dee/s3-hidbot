@@ -580,10 +580,50 @@ completed-request cache.
 
 Native USB HID lifecycle publication is a control-session safety boundary.
 Physical cable removal is not guaranteed to yield an immediate TinyUSB unmount
-on every board because this firmware does not yet include a board-specific
-VBUS monitor. The guarantee begins when firmware publishes a suspend, resume,
-unmount, or mount lifecycle event, not when a host physically notices cable
-removal.
+on the FNK0085 because both USB connectors share one board power rail and the
+current hardware has no independent native-port VBUS observation. Per-port
+VBUS discrimination would require hardware modification and is not a firmware
+feature on this board.
+
+TinyUSB suspend and unmount remain the authoritative primary paths. As a
+bounded safety fallback, the existing HID control executor observes a wrapping
+32-bit SOF heartbeat only while USB is exposed, mounted, unsuspended, and the
+stable active HID route is USB. It samples every 10 ms while armed. If the
+heartbeat remains unchanged for 100 ms, it rechecks the exact attach,
+authority, route generation, route state, lifecycle state, and heartbeat, then
+claims the exact old route writer and admission gate, rechecks external
+authority while that claim is held, and only then retires the old USB route
+and HID authority. A stale snapshot has no ticket, epoch, readiness, session,
+or diagnostic side effect. A same-route writer conflict remains fail-closed
+and is re-evaluated by the existing executor wait cycle. The counter uses
+relaxed atomic ordering because it is activity evidence only; acquire/release
+state and exact generation checks remain the authority barriers.
+
+Pending route invalidation distinguishes an exact-generation conditional SOF
+request from a durable lifecycle request. The watchdog retains a private token
+while blocked by a route writer and may withdraw only that token if heartbeat
+or authority later changes. Suspend, unmount, and runtime fail-close requests
+are independently durable: writer release retires their target generation (or
+proves it already superseded) before ordinary route admission can reopen.
+Resume changes lifecycle truth but cannot cancel an earlier suspend retirement.
+If the route is still being published and therefore cannot provide a coherent
+generation snapshot, the lifecycle event instead advances an exact
+route-publication cut. The publisher consumes that cut before opening
+admission, so a complete suspend/resume or unmount/remount round trip inside
+the publication window cannot resurrect the overlapping route. The cut is
+consumed with that publication and does not block a later explicit selection.
+
+SOF loss is not proof of physical unplug, unmount, or suspend. The fallback
+therefore leaves `mounted` and `suspended` unchanged, clears endpoint
+readiness, cancels old tickets, preserves unconfirmed host state as safety
+work, records an internal `sof_stall` diagnostic, and requests the existing
+nonblocking UART session/cache cleanup. Host suspend, reset, or reboot may
+intentionally produce the same conservative route retirement. SOF recovery,
+resume, or remount never restores that route; reuse requires a fresh control
+session and explicit route selection. With 10 ms sampling, the nominal
+software observation bound is 100--110 ms after the last SOF plus executor
+scheduling delay. This implementation constant is not a physically qualified
+cable-removal acceptance limit.
 
 `hid_runtime` owns a lock-free fixed-width atomic authority epoch. It advances
 on every suspend, resume, unmount, and mount. A successful hello captures that
@@ -1495,7 +1535,7 @@ hardware gate must capture bounded synthetic common-writer frames alongside
 ordinary logs and verify byte integrity, count, and sequence while ignoring
 non-protocol text. That test must not send a HID report.
 
-The authority-epoch barrier intentionally does not claim that every physical
-OTG cable removal will generate an immediate firmware lifecycle event. The
-current board integration has no verified VBUS-comparator GPIO path, so adding
-board-evidenced VBUS monitoring remains a future optional hardware improvement.
+The authority-epoch barrier and SOF fallback intentionally do not claim that a
+physical OTG cable removal was identified. Direct electrical discrimination of
+the native connector's VBUS is unavailable on the current FNK0085 hardware and
+would require a separately reviewed hardware modification.

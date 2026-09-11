@@ -199,6 +199,43 @@ The corresponding native/CI coverage is authoritative in
 [`validation-entrypoints.md`](validation-entrypoints.md); protocol and safety
 semantics are authoritative in [`uart-control-plane.md`](uart-control-plane.md).
 
+## Native USB logical link-activity fence
+
+The post-checkpoint product implementation adds a software-only SOF-stall
+safety fallback. TinyUSB suspend and unmount remain authoritative. Only while
+the stable active HID route is USB does the existing control executor sample a
+32-bit SOF heartbeat every 10 ms. One unchanged 100 ms interval causes an
+exact-generation/authority claim followed by route, ticket, and authority
+fencing. A stale watchdog snapshot cannot retire a replacement route or
+invalidate its tickets/session.
+
+If a route writer is temporarily busy, the SOF request is generation-scoped
+and cancelable only by its exact watchdog token. Suspend, unmount, and runtime
+fail-close invalidations use a separate durable generation-scoped handoff;
+resume cannot discard a suspend retirement that arrived while the watchdog
+held the writer.
+
+Suspend, unmount, and runtime fail-close also publish a route-publication cut
+before relying on a coherent route snapshot. If one overlaps an in-flight USB
+route publication, that exact publication is aborted or retired before its
+admission gate opens. A suspend/resume or unmount/remount round trip cannot
+erase the cut; later reuse still requires a fresh explicit route selection.
+
+This result means `USB link activity lost`; it does not mean that firmware
+observed a physical cable removal, per-port VBUS loss, unmount, or suspend.
+The FNK0085 USB connectors share the board power rail, so true per-port VBUS
+discrimination is unavailable without hardware modification. The fallback
+publishes neither fake `mounted=false` nor fake `suspended=true`, and normal
+SOF/lifecycle recovery does not restore the old route.
+
+The implementation and deterministic boundary coverage are software evidence
+only. The following remains **HARDWARE DEFERRED**: continuous control-USB
+power, active native USB route, physical removal of only the native cable, and
+measurement of last SOF, first suspend/unmount/watchdog callback or fallback,
+route/authority fence latency, continuous boot identity, UART availability,
+and absence of reset/panic. Do not infer a physical latency acceptance bound
+from the 100 ms implementation constant.
+
 ## U5.4 read-only event observer and F24 smoke
 
 The observer/discovery and F24 orchestration are implemented and native-tested.

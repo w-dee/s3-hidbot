@@ -55,7 +55,16 @@ enum class UsbLifecycleEvent : std::uint8_t {
     kUnmounted = 1U << 1,
     kSuspended = 1U << 2,
     kResumed = 1U << 3,
+    kSofStall = 1U << 4,
 };
+
+inline constexpr std::uint32_t kUsbSofStallTimeoutMs = 100;
+inline constexpr std::uint32_t kUsbSofWatchdogSampleMs = 10;
+
+// The executor invokes this only after the runtime has already advanced its
+// atomic HID authority. The production sink performs nonblocking eventual
+// UART session/cache cleanup; it does not call back into the executor.
+using UsbLinkStallSink = void (*)();
 
 // Only Controller's dedicated control task invokes this backend. The
 // concrete firmware backend owns the public esp_tinyusb calls; native tests
@@ -504,7 +513,8 @@ class Controller final : public usb_lifecycle::Executor,
 
     bool initialize(hid_runtime::Runtime *runtime, Backend *backend,
                     BleBackend *ble_backend = nullptr,
-                    BleDatabase *ble_database = nullptr);
+                    BleDatabase *ble_database = nullptr,
+                    UsbLinkStallSink usb_link_stall_sink = nullptr);
 
     CommandOutcome request_attach();
     CommandOutcome request_detach();
@@ -620,6 +630,11 @@ class Controller final : public usb_lifecycle::Executor,
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle);
     void set_usb_runtime_fault_occurrences_for_test(std::uint32_t value);
+    bool service_usb_sof_watchdog_for_test(std::uint32_t now_ms);
+    bool usb_sof_watchdog_armed_for_test() const;
+    using SofWatchdogBeforeFenceHook = void (*)(Controller &controller);
+    void set_sof_watchdog_before_fence_hook_for_test(
+        SofWatchdogBeforeFenceHook hook);
 #endif
 
   private:
@@ -628,6 +643,8 @@ class Controller final : public usb_lifecycle::Executor,
     void request_executor_wake();
     void request_executor_wake_from_isr();
     bool reconcile_usb_runtime_fault();
+    bool reconcile_usb_sof_watchdog(std::uint32_t now_ms);
+    void disarm_usb_sof_watchdog();
     void reconcile_usb_lifecycle_logs();
     bool reconcile_ble_fallbacks(const Action *action);
     bool claim_operation(ControlOperation operation);
@@ -706,6 +723,7 @@ class Controller final : public usb_lifecycle::Executor,
     Backend *backend_ = nullptr;
     BleBackend *ble_backend_ = nullptr;
     BleDatabase *ble_database_ = nullptr;
+    UsbLinkStallSink usb_link_stall_sink_ = nullptr;
     ble_lifecycle::StateMachine ble_state_{};
     // Protected by the short DLE admission critical section, never across HCI.
     void observe_dle_event(BleEvent event);
@@ -752,6 +770,14 @@ class Controller final : public usb_lifecycle::Executor,
     std::atomic_bool usb_runtime_fault_in_isr_{false};
     std::atomic<std::uint8_t> usb_lifecycle_log_bits_{0};
     bool usb_runtime_fault_committed_ = false;
+    struct UsbSofWatchdogState {
+        hid_runtime::UsbLinkWatchdogSnapshot identity{};
+        // While pending, this word stores the exact conditional route token;
+        // otherwise it stores the last heartbeat-progress timestamp.
+        std::uint32_t last_progress_ms = 0;
+        bool armed = false;
+        bool pending = false;
+    } usb_sof_watchdog_{};
     bool pairing_complete_seen_ = false;
     bool pairing_terminal_committed_ = false;
     std::uint64_t pairing_deadline_us_ = 0;
@@ -798,6 +824,7 @@ class Controller final : public usb_lifecycle::Executor,
     BleEnqueueFailurePhase ble_enqueue_failure_phase_ =
         BleEnqueueFailurePhase::kBeforeGenericFallback;
     ProcessAfterReconciliationHook process_after_reconciliation_hook_ = nullptr;
+    SofWatchdogBeforeFenceHook sof_watchdog_before_fence_hook_ = nullptr;
 #endif
 };
 

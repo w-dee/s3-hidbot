@@ -60,7 +60,10 @@ def main() -> int:
     task_loop = re.search(
         r"void Controller::task_loop\(\) \{(.*?)\n\}", executor, re.S)
     assert task_loop
-    assert "ulTaskNotifyTake(pdTRUE, portMAX_DELAY)" in task_loop.group(1)
+    assert "usb_sof_watchdog_.armed" in task_loop.group(1)
+    assert "pdMS_TO_TICKS(kUsbSofWatchdogSampleMs)" in task_loop.group(1)
+    assert ": portMAX_DELAY" in task_loop.group(1)
+    assert "ulTaskNotifyTake(pdTRUE, wait_ticks)" in task_loop.group(1)
     assert "xQueueReceive(s_action_queue, &action, 0)" in task_loop.group(1)
     assert "reconcile_ble_fallbacks(nullptr);" in task_loop.group(1)
     for obsolete in ("std::atomic_bool ble_event_overflow_{",

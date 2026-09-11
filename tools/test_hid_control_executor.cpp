@@ -591,6 +591,168 @@ void hold_f24(hid_runtime::Runtime &runtime, ReportSink &sink) {
     assert(runtime.state_machine().report_complete(0));
 }
 
+int usb_link_stall_notifications = 0;
+hid_runtime::StateMachine *sof_boundary_state = nullptr;
+
+enum class UsbStallInterleave {
+    kNone,
+    kReplacement,
+    kSofProgress,
+    kSuspend,
+    kSuspendResume,
+    kUnmount,
+    kRuntimeFault,
+};
+
+UsbStallInterleave usb_stall_interleave = UsbStallInterleave::kNone;
+hid_control_executor::Controller *usb_stall_interleave_controller = nullptr;
+hid_runtime::SequenceAuthority old_stall_sequence{};
+hid_runtime::SequenceAuthority replacement_stall_sequence{};
+hid_runtime::HidTicketId replacement_keyboard_ticket = 0;
+hid_runtime::HidTicketId replacement_mouse_ticket = 0;
+hid_runtime::AuthorityEpoch replacement_authority = 0;
+hid_route::Generation replacement_route_generation = 0;
+std::uint32_t replacement_release_epoch = 0;
+
+void count_usb_link_stall_notification() {
+    ++usb_link_stall_notifications;
+}
+
+void advance_sof_at_watchdog_boundary(
+    hid_control_executor::Controller &) {
+    assert(sof_boundary_state != nullptr);
+    sof_boundary_state->note_sof_activity();
+}
+
+void interleave_before_usb_stall_route_claim(
+    hid_runtime::StateMachine *state) {
+    assert(state != nullptr);
+    const UsbStallInterleave interleave = usb_stall_interleave;
+    usb_stall_interleave = UsbStallInterleave::kNone;
+    if (interleave == UsbStallInterleave::kReplacement) {
+        assert(state->request_route_none().action_result ==
+               hid_runtime::RouteTransitionResult::kAccepted);
+        state->end_sequence(old_stall_sequence);
+        assert(state->request_route_usb().action_result ==
+               hid_runtime::RouteTransitionResult::kAccepted);
+        hid_runtime::ConfirmedHidState confirmed{};
+        assert(state->begin_sequence(&confirmed,
+                                     &replacement_stall_sequence) ==
+               hid_runtime::SequenceAdmissionResult::kAccepted);
+        assert(state->begin_keyboard_report(
+                   0, {5, 0, 0, 0, 0, 0}, replacement_stall_sequence,
+                   &replacement_keyboard_ticket, 202) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(state->begin_mouse_report(
+                   1, 0, 0, 0, 0, replacement_stall_sequence,
+                   &replacement_mouse_ticket, 202) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        replacement_authority = state->authority_epoch();
+        replacement_route_generation = state->route_snapshot().generation;
+        replacement_release_epoch =
+            replacement_stall_sequence.release_epoch;
+        return;
+    }
+    if (interleave == UsbStallInterleave::kSofProgress) {
+        state->note_sof_activity();
+        return;
+    }
+    if (interleave == UsbStallInterleave::kSuspend) {
+        state->on_suspend();
+        return;
+    }
+    if (interleave == UsbStallInterleave::kSuspendResume) {
+        state->on_suspend();
+        state->on_resume();
+        return;
+    }
+    if (interleave == UsbStallInterleave::kUnmount) {
+        state->on_unmount();
+        return;
+    }
+    if (interleave == UsbStallInterleave::kRuntimeFault) {
+        assert(usb_stall_interleave_controller != nullptr);
+        usb_stall_interleave_controller->signal_usb_runtime_fault(
+            hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+            91U, true);
+        assert(usb_stall_interleave_controller
+                   ->process_wake_cycle_for_test());
+        return;
+    }
+    assert(false);
+}
+
+enum class PendingWriterInterleave {
+    kNone,
+    kSuspend,
+    kSuspendResume,
+    kUnmount,
+    kRuntimeFault,
+};
+
+PendingWriterInterleave pending_writer_interleave =
+    PendingWriterInterleave::kNone;
+hid_runtime::Runtime *pending_writer_runtime = nullptr;
+hid_control_executor::Controller *pending_writer_controller = nullptr;
+std::uint32_t pending_writer_now_ms = 0;
+
+void request_watchdog_while_route_writer_is_held(
+    hid_route::StateMachine &route) {
+    assert(pending_writer_runtime != nullptr);
+    assert(pending_writer_controller != nullptr);
+    assert(!pending_writer_controller->service_usb_sof_watchdog_for_test(
+        pending_writer_now_ms));
+    assert(route.snapshot().invalidation_pending);
+
+    const PendingWriterInterleave interleave = pending_writer_interleave;
+    pending_writer_interleave = PendingWriterInterleave::kNone;
+    if (interleave == PendingWriterInterleave::kSuspend ||
+        interleave == PendingWriterInterleave::kSuspendResume) {
+        pending_writer_runtime->state_machine().on_suspend();
+        if (interleave == PendingWriterInterleave::kSuspendResume) {
+            pending_writer_runtime->state_machine().on_resume();
+        }
+    } else if (interleave == PendingWriterInterleave::kUnmount) {
+        pending_writer_runtime->state_machine().on_unmount();
+    } else if (interleave == PendingWriterInterleave::kRuntimeFault) {
+        pending_writer_controller->signal_usb_runtime_fault(
+            hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+            92U, true);
+        assert(pending_writer_controller->process_wake_cycle_for_test());
+    }
+}
+
+void prepare_active_usb_watchdog(
+    hid_runtime::Runtime &runtime, FakeBackend &backend,
+    hid_control_executor::Controller &controller) {
+    assert(controller.initialize(&runtime, &backend, nullptr, nullptr,
+                                 count_usb_link_stall_notification));
+    assert(action(controller.request_attach()) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    mount_ready(runtime);
+    runtime.state_machine().note_sof_activity();
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+}
+
+void force_watchdog_pending_behind_route_writer(
+    hid_runtime::Runtime &runtime,
+    hid_control_executor::Controller &controller,
+    PendingWriterInterleave interleave = PendingWriterInterleave::kNone) {
+    assert(!controller.service_usb_sof_watchdog_for_test(0));
+    pending_writer_runtime = &runtime;
+    pending_writer_controller = &controller;
+    pending_writer_now_ms = hid_control_executor::kUsbSofStallTimeoutMs;
+    pending_writer_interleave = interleave;
+    runtime.state_machine().set_route_writer_acquired_hook_for_test(
+        request_watchdog_while_route_writer_is_held);
+    assert(runtime.state_machine().request_route_none().action_result ==
+           hid_runtime::RouteTransitionResult::kBusy);
+    pending_writer_runtime = nullptr;
+    pending_writer_controller = nullptr;
+}
+
 void test_install_and_uninstall_are_task_owned_and_serialized() {
     hid_runtime::Runtime runtime;
     FakeBackend backend;
@@ -928,6 +1090,570 @@ void test_tinyusb_runtime_fault_preserves_primary_when_uninstall_fails() {
            usb_lifecycle::kTinyUsbEventQueueOverflowError);
     assert(controller.snapshot().lifecycle.generation == generation + 1U);
     assert(runtime.state_machine().authority_epoch() == authority + 1U);
+}
+
+void test_sof_watchdog_progress_short_gap_and_exact_timeout() {
+    usb_link_stall_notifications = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    const auto initial_authority = runtime.state_machine().authority_epoch();
+
+    assert(!controller.service_usb_sof_watchdog_for_test(1000));
+    assert(controller.usb_sof_watchdog_armed_for_test());
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        1000 + hid_control_executor::kUsbSofStallTimeoutMs - 1U));
+    runtime.state_machine().note_sof_activity();
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        1000 + hid_control_executor::kUsbSofStallTimeoutMs));
+    assert(runtime.state_machine().authority_epoch() == initial_authority);
+
+    const std::uint32_t progress_time =
+        1000 + hid_control_executor::kUsbSofStallTimeoutMs;
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        progress_time + hid_control_executor::kUsbSofStallTimeoutMs - 1U));
+    assert(controller.service_usb_sof_watchdog_for_test(
+        progress_time + hid_control_executor::kUsbSofStallTimeoutMs));
+    assert(!controller.usb_sof_watchdog_armed_for_test());
+    assert(usb_link_stall_notifications == 1);
+    assert(runtime.state_machine().authority_epoch() == initial_authority + 1U);
+    const auto status = runtime.state_machine().status();
+    assert(status.mounted && !status.suspended);
+    assert(!status.keyboard_ready && !status.mouse_ready);
+    assert(runtime.state_machine().usb_lifecycle_snapshot().observed ==
+           usb_lifecycle::ObservedState::kMounted);
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        progress_time + hid_control_executor::kUsbSofStallTimeoutMs + 1U));
+    assert(usb_link_stall_notifications == 1);
+}
+
+void test_sof_watchdog_fresh_99_100_101_ms_boundaries() {
+    for (const std::uint32_t elapsed :
+         {hid_control_executor::kUsbSofStallTimeoutMs - 1U,
+          hid_control_executor::kUsbSofStallTimeoutMs,
+          hid_control_executor::kUsbSofStallTimeoutMs + 1U}) {
+        usb_link_stall_notifications = 0;
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        prepare_active_usb_watchdog(runtime, backend, controller);
+        const auto authority = runtime.state_machine().authority_epoch();
+        assert(!controller.service_usb_sof_watchdog_for_test(500));
+        const bool expected_fence =
+            elapsed >= hid_control_executor::kUsbSofStallTimeoutMs;
+        assert(controller.service_usb_sof_watchdog_for_test(500 + elapsed) ==
+               expected_fence);
+        assert(usb_link_stall_notifications ==
+               (expected_fence ? 1 : 0));
+        assert(runtime.state_machine().authority_epoch() ==
+               authority + (expected_fence ? 1U : 0U));
+    }
+}
+
+void test_stale_watchdog_cannot_touch_replacement_route_tickets_or_sequence() {
+    usb_link_stall_notifications = 0;
+    replacement_stall_sequence = {};
+    replacement_keyboard_ticket = 0;
+    replacement_mouse_ticket = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    hid_runtime::ConfirmedHidState confirmed{};
+    assert(runtime.state_machine().begin_sequence(
+               &confirmed, &old_stall_sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    assert(!controller.service_usb_sof_watchdog_for_test(0));
+
+    usb_stall_interleave = UsbStallInterleave::kReplacement;
+    runtime.state_machine().set_before_usb_stall_route_claim_hook_for_test(
+        interleave_before_usb_stall_route_claim);
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        hid_control_executor::kUsbSofStallTimeoutMs));
+
+    const auto route = runtime.state_machine().route_snapshot();
+    assert(route.coherent && !route.invalidation_pending);
+    assert(route.desired == hid_route::OutputRoute::kUsb);
+    assert(route.active == hid_route::OutputRoute::kUsb);
+    assert(route.transition == hid_route::Transition::kStable);
+    assert(route.generation == replacement_route_generation);
+    assert(runtime.state_machine().authority_epoch() ==
+           replacement_authority);
+    const auto status = runtime.state_machine().status();
+    assert(status.mounted && !status.suspended);
+    assert(status.keyboard_ready && status.mouse_ready);
+    assert(runtime.state_machine().sequence_authority_current(
+        replacement_stall_sequence));
+    assert(replacement_stall_sequence.release_epoch ==
+           replacement_release_epoch);
+
+    hid_runtime::KeyboardReportSnapshot keyboard{};
+    hid_runtime::MouseReportSnapshot mouse{};
+    assert(runtime.state_machine().keyboard_report_snapshot(
+        replacement_keyboard_ticket, &keyboard));
+    assert(keyboard.state ==
+           hid_runtime::KeyboardReportTicketState::kPublished);
+    assert(runtime.state_machine().mouse_report_snapshot(
+        replacement_mouse_ticket, &mouse));
+    assert(mouse.state == hid_runtime::MouseReportTicketState::kPublished);
+    assert(usb_link_stall_notifications == 0);
+    assert(controller.usb_sof_watchdog_armed_for_test());
+    runtime.state_machine().end_sequence(replacement_stall_sequence);
+}
+
+void test_sof_watchdog_pending_then_applies_exactly_once() {
+    usb_link_stall_notifications = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    const auto original = runtime.state_machine().route_snapshot();
+    const auto authority = runtime.state_machine().authority_epoch();
+
+    force_watchdog_pending_behind_route_writer(runtime, controller);
+    const auto pending = runtime.state_machine().route_snapshot();
+    assert(pending.active == hid_route::OutputRoute::kUsb);
+    assert(pending.generation == original.generation);
+    assert(pending.invalidation_pending);
+    assert(runtime.state_machine().authority_epoch() == authority);
+    assert(usb_link_stall_notifications == 0);
+
+    assert(controller.service_usb_sof_watchdog_for_test(
+        hid_control_executor::kUsbSofStallTimeoutMs +
+        hid_control_executor::kUsbSofWatchdogSampleMs));
+    const auto retired = runtime.state_machine().route_snapshot();
+    assert(retired.active == hid_route::OutputRoute::kNone);
+    assert(retired.generation == original.generation + 1U);
+    assert(!retired.invalidation_pending);
+    assert(runtime.state_machine().authority_epoch() == authority + 1U);
+    assert(usb_link_stall_notifications == 1);
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        hid_control_executor::kUsbSofStallTimeoutMs +
+        2U * hid_control_executor::kUsbSofWatchdogSampleMs));
+    assert(usb_link_stall_notifications == 1);
+}
+
+void test_sof_watchdog_pending_then_stale_cancels_only_its_request() {
+    usb_link_stall_notifications = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    hid_runtime::ConfirmedHidState confirmed{};
+    hid_runtime::SequenceAuthority sequence{};
+    assert(runtime.state_machine().begin_sequence(&confirmed, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    hid_runtime::HidTicketId keyboard_ticket = 0;
+    hid_runtime::HidTicketId mouse_ticket = 0;
+    assert(runtime.state_machine().begin_keyboard_report(
+               0, {4, 0, 0, 0, 0, 0}, sequence, &keyboard_ticket, 301) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(runtime.state_machine().begin_mouse_report(
+               1, 1, 0, 0, 0, sequence, &mouse_ticket, 301) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    const auto original = runtime.state_machine().route_snapshot();
+    const auto authority = runtime.state_machine().authority_epoch();
+
+    force_watchdog_pending_behind_route_writer(runtime, controller);
+    runtime.state_machine().note_sof_activity();
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        hid_control_executor::kUsbSofStallTimeoutMs +
+        hid_control_executor::kUsbSofWatchdogSampleMs));
+
+    const auto current = runtime.state_machine().route_snapshot();
+    assert(current.active == hid_route::OutputRoute::kUsb);
+    assert(current.generation == original.generation);
+    assert(!current.invalidation_pending);
+    assert(runtime.state_machine().authority_epoch() == authority);
+    assert(runtime.state_machine().sequence_authority_current(sequence));
+    hid_runtime::KeyboardReportSnapshot keyboard{};
+    hid_runtime::MouseReportSnapshot mouse{};
+    assert(runtime.state_machine().keyboard_report_snapshot(keyboard_ticket,
+                                                             &keyboard));
+    assert(keyboard.state ==
+           hid_runtime::KeyboardReportTicketState::kPublished);
+    assert(runtime.state_machine().mouse_report_snapshot(mouse_ticket, &mouse));
+    assert(mouse.state == hid_runtime::MouseReportTicketState::kPublished);
+    assert(usb_link_stall_notifications == 0);
+    assert(controller.usb_sof_watchdog_armed_for_test());
+    runtime.state_machine().end_sequence(sequence);
+}
+
+void test_sof_watchdog_pending_cannot_cancel_durable_invalidators() {
+    for (const PendingWriterInterleave interleave :
+         {PendingWriterInterleave::kSuspend,
+          PendingWriterInterleave::kSuspendResume,
+          PendingWriterInterleave::kUnmount,
+          PendingWriterInterleave::kRuntimeFault}) {
+        usb_link_stall_notifications = 0;
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        prepare_active_usb_watchdog(runtime, backend, controller);
+
+        force_watchdog_pending_behind_route_writer(runtime, controller,
+                                                   interleave);
+        const auto route = runtime.state_machine().route_snapshot();
+        assert(route.coherent && !route.invalidation_pending);
+        assert(route.active == hid_route::OutputRoute::kNone);
+        assert(!controller.service_usb_sof_watchdog_for_test(
+            hid_control_executor::kUsbSofStallTimeoutMs +
+            hid_control_executor::kUsbSofWatchdogSampleMs));
+        assert(usb_link_stall_notifications == 0);
+        assert(!controller.usb_sof_watchdog_armed_for_test());
+        const auto status = runtime.state_machine().status();
+        if (interleave == PendingWriterInterleave::kSuspend) {
+            assert(status.mounted && status.suspended);
+        } else if (interleave == PendingWriterInterleave::kSuspendResume) {
+            assert(status.mounted && !status.suspended);
+            runtime.state_machine().note_sof_activity();
+            runtime.state_machine().set_ready(
+                hid_runtime::Interface::kKeyboard, true);
+            runtime.state_machine().set_ready(
+                hid_runtime::Interface::kMouse, true);
+            assert(runtime.state_machine().route_snapshot().active ==
+                   hid_route::OutputRoute::kNone);
+        } else {
+            assert(!status.mounted && !status.suspended);
+        }
+        if (interleave == PendingWriterInterleave::kRuntimeFault) {
+            assert(controller.snapshot().lifecycle.recovery_required);
+            assert(backend.uninstall_calls == 1);
+        }
+    }
+}
+
+void test_authoritative_internal_lifecycle_races_beat_stale_watchdog() {
+    for (const UsbStallInterleave interleave :
+         {UsbStallInterleave::kSuspend, UsbStallInterleave::kUnmount,
+          UsbStallInterleave::kRuntimeFault}) {
+        usb_link_stall_notifications = 0;
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        prepare_active_usb_watchdog(runtime, backend, controller);
+        assert(!controller.service_usb_sof_watchdog_for_test(0));
+        const auto authority = runtime.state_machine().authority_epoch();
+
+        usb_stall_interleave = interleave;
+        usb_stall_interleave_controller = &controller;
+        runtime.state_machine().set_before_usb_stall_route_claim_hook_for_test(
+            interleave_before_usb_stall_route_claim);
+        assert(!controller.service_usb_sof_watchdog_for_test(
+            hid_control_executor::kUsbSofStallTimeoutMs));
+        usb_stall_interleave_controller = nullptr;
+
+        assert(usb_link_stall_notifications == 0);
+        assert(!controller.usb_sof_watchdog_armed_for_test());
+        assert(runtime.state_machine().authority_epoch() == authority + 1U);
+        assert(runtime.state_machine().route_snapshot().active ==
+               hid_route::OutputRoute::kNone);
+        const auto status = runtime.state_machine().status();
+        if (interleave == UsbStallInterleave::kSuspend) {
+            assert(status.mounted && status.suspended);
+        } else {
+            assert(!status.mounted && !status.suspended);
+        }
+        if (interleave == UsbStallInterleave::kRuntimeFault) {
+            assert(controller.snapshot().lifecycle.recovery_required);
+            assert(backend.uninstall_calls == 1);
+        }
+    }
+}
+
+void test_authoritative_lifecycle_handoff_after_exact_route_claim() {
+    for (const UsbStallInterleave interleave :
+         {UsbStallInterleave::kSuspend, UsbStallInterleave::kUnmount,
+          UsbStallInterleave::kRuntimeFault}) {
+        usb_link_stall_notifications = 0;
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        prepare_active_usb_watchdog(runtime, backend, controller);
+        assert(!controller.service_usb_sof_watchdog_for_test(0));
+        const auto authority = runtime.state_machine().authority_epoch();
+
+        usb_stall_interleave = interleave;
+        usb_stall_interleave_controller = &controller;
+        runtime.state_machine().set_after_usb_stall_route_claim_hook_for_test(
+            interleave_before_usb_stall_route_claim);
+        assert(!controller.service_usb_sof_watchdog_for_test(
+            hid_control_executor::kUsbSofStallTimeoutMs));
+        usb_stall_interleave_controller = nullptr;
+
+        assert(usb_link_stall_notifications == 0);
+        assert(!controller.usb_sof_watchdog_armed_for_test());
+        assert(runtime.state_machine().authority_epoch() == authority + 1U);
+        const auto route = runtime.state_machine().route_snapshot();
+        assert(route.coherent && !route.invalidation_pending);
+        assert(route.active == hid_route::OutputRoute::kNone);
+        const auto status = runtime.state_machine().status();
+        if (interleave == UsbStallInterleave::kSuspend) {
+            assert(status.mounted && status.suspended);
+        } else {
+            assert(!status.mounted && !status.suspended);
+        }
+    }
+}
+
+void test_claim_held_suspend_resume_retires_without_watchdog_effects() {
+    usb_link_stall_notifications = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    assert(!controller.service_usb_sof_watchdog_for_test(0));
+    const auto authority = runtime.state_machine().authority_epoch();
+
+    usb_stall_interleave = UsbStallInterleave::kSuspendResume;
+    runtime.state_machine().set_after_usb_stall_route_claim_hook_for_test(
+        interleave_before_usb_stall_route_claim);
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        hid_control_executor::kUsbSofStallTimeoutMs));
+
+    assert(usb_link_stall_notifications == 0);
+    assert(!controller.usb_sof_watchdog_armed_for_test());
+    assert(runtime.state_machine().authority_epoch() == authority + 2U);
+    const auto route = runtime.state_machine().route_snapshot();
+    assert(route.coherent && !route.invalidation_pending);
+    assert(route.active == hid_route::OutputRoute::kNone);
+    const auto status = runtime.state_machine().status();
+    assert(status.mounted && !status.suspended);
+    runtime.state_machine().note_sof_activity();
+    runtime.state_machine().set_ready(hid_runtime::Interface::kKeyboard, true);
+    runtime.state_machine().set_ready(hid_runtime::Interface::kMouse, true);
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+}
+
+void test_sof_watchdog_final_recheck_and_time_wrap() {
+    usb_link_stall_notifications = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    const auto authority = runtime.state_machine().authority_epoch();
+    const std::uint32_t start = UINT32_MAX - 40U;
+    assert(!controller.service_usb_sof_watchdog_for_test(start));
+
+    sof_boundary_state = &runtime.state_machine();
+    controller.set_sof_watchdog_before_fence_hook_for_test(
+        advance_sof_at_watchdog_boundary);
+    const std::uint32_t boundary =
+        start + hid_control_executor::kUsbSofStallTimeoutMs;
+    assert(!controller.service_usb_sof_watchdog_for_test(boundary));
+    assert(usb_link_stall_notifications == 0);
+    assert(runtime.state_machine().authority_epoch() == authority);
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kUsb);
+
+    controller.set_sof_watchdog_before_fence_hook_for_test(nullptr);
+    sof_boundary_state = nullptr;
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        boundary + hid_control_executor::kUsbSofStallTimeoutMs - 1U));
+    assert(controller.service_usb_sof_watchdog_for_test(
+        boundary + hid_control_executor::kUsbSofStallTimeoutMs));
+    assert(usb_link_stall_notifications == 1);
+}
+
+void test_sof_progress_inside_stall_transition_window_is_stale() {
+    usb_link_stall_notifications = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    const auto authority = runtime.state_machine().authority_epoch();
+    const auto route = runtime.state_machine().route_snapshot();
+    assert(!controller.service_usb_sof_watchdog_for_test(0));
+
+    usb_stall_interleave = UsbStallInterleave::kSofProgress;
+    runtime.state_machine().set_before_usb_stall_route_claim_hook_for_test(
+        interleave_before_usb_stall_route_claim);
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        hid_control_executor::kUsbSofStallTimeoutMs));
+    assert(usb_link_stall_notifications == 0);
+    assert(runtime.state_machine().authority_epoch() == authority);
+    assert(runtime.state_machine().route_snapshot().generation ==
+           route.generation);
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kUsb);
+    assert(controller.usb_sof_watchdog_armed_for_test());
+}
+
+void test_sof_progress_after_exact_claim_withdraws_conditionally() {
+    usb_link_stall_notifications = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    const auto authority = runtime.state_machine().authority_epoch();
+    const auto original = runtime.state_machine().route_snapshot();
+    assert(!controller.service_usb_sof_watchdog_for_test(0));
+
+    usb_stall_interleave = UsbStallInterleave::kSofProgress;
+    runtime.state_machine().set_after_usb_stall_route_claim_hook_for_test(
+        interleave_before_usb_stall_route_claim);
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        hid_control_executor::kUsbSofStallTimeoutMs));
+
+    const auto route = runtime.state_machine().route_snapshot();
+    assert(route.coherent && !route.invalidation_pending);
+    assert(route.active == hid_route::OutputRoute::kUsb);
+    assert(route.generation == original.generation);
+    assert(runtime.state_machine().authority_epoch() == authority);
+    assert(usb_link_stall_notifications == 0);
+    assert(controller.usb_sof_watchdog_armed_for_test());
+}
+
+void test_sof_watchdog_disarms_for_authoritative_and_ineligible_states() {
+    for (const bool suspend : {false, true}) {
+        usb_link_stall_notifications = 0;
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        prepare_active_usb_watchdog(runtime, backend, controller);
+        assert(!controller.service_usb_sof_watchdog_for_test(0));
+        if (suspend) {
+            runtime.state_machine().on_suspend();
+        } else {
+            runtime.state_machine().on_unmount();
+        }
+        assert(!controller.service_usb_sof_watchdog_for_test(
+            hid_control_executor::kUsbSofStallTimeoutMs));
+        assert(!controller.usb_sof_watchdog_armed_for_test());
+        assert(usb_link_stall_notifications == 0);
+    }
+
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &backend));
+    assert(!controller.service_usb_sof_watchdog_for_test(0));
+    assert(!controller.usb_sof_watchdog_armed_for_test());
+    complete_attach(runtime, backend, controller);
+    mount_ready(runtime);
+    assert(!controller.service_usb_sof_watchdog_for_test(10));
+    assert(!controller.usb_sof_watchdog_armed_for_test());
+
+    {
+        hid_runtime::Runtime attaching_runtime;
+        FakeBackend attaching_backend;
+        hid_control_executor::Controller attaching_controller;
+        assert(attaching_controller.initialize(&attaching_runtime,
+                                                &attaching_backend));
+        assert(action(attaching_controller.request_attach()) ==
+               usb_lifecycle::TransitionResult::kAccepted);
+        assert(attaching_controller.snapshot().lifecycle.observed ==
+               usb_lifecycle::ObservedState::kAttaching);
+        assert(!attaching_controller.service_usb_sof_watchdog_for_test(20));
+        assert(!attaching_controller.usb_sof_watchdog_armed_for_test());
+    }
+
+    {
+        usb_link_stall_notifications = 0;
+        hid_runtime::Runtime detaching_runtime;
+        FakeBackend detaching_backend;
+        hid_control_executor::Controller detaching_controller;
+        prepare_active_usb_watchdog(detaching_runtime, detaching_backend,
+                                    detaching_controller);
+        assert(!detaching_controller.service_usb_sof_watchdog_for_test(0));
+        detaching_backend.uninstall_result = {
+            .kind = hid_control_executor::BackendResultKind::kUninstallFailure,
+            .error_code = -88,
+        };
+        assert(action(detaching_controller.request_detach()) ==
+               usb_lifecycle::TransitionResult::kAccepted);
+        assert(detaching_controller.process_one_for_test());
+        assert(detaching_runtime.state_machine().usb_lifecycle_snapshot().observed ==
+               usb_lifecycle::ObservedState::kDetaching);
+        assert(!detaching_controller.service_usb_sof_watchdog_for_test(
+            hid_control_executor::kUsbSofStallTimeoutMs));
+        assert(!detaching_controller.usb_sof_watchdog_armed_for_test());
+        assert(usb_link_stall_notifications == 0);
+    }
+}
+
+void test_sof_watchdog_new_generation_and_resume_require_fresh_route() {
+    usb_link_stall_notifications = 0;
+    hid_runtime::Runtime runtime;
+    FakeBackend backend;
+    hid_control_executor::Controller controller;
+    prepare_active_usb_watchdog(runtime, backend, controller);
+    assert(!controller.service_usb_sof_watchdog_for_test(0));
+    const auto old_generation = runtime.state_machine().attach_generation();
+
+    runtime.state_machine().on_suspend();
+    runtime.state_machine().on_resume();
+    runtime.state_machine().set_ready(hid_runtime::Interface::kKeyboard, true);
+    runtime.state_machine().set_ready(hid_runtime::Interface::kMouse, true);
+    assert(runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(!controller.service_usb_sof_watchdog_for_test(200));
+    assert(!controller.usb_sof_watchdog_armed_for_test());
+
+    runtime.state_machine().on_unmount();
+    runtime.state_machine().on_mount();
+    assert(runtime.state_machine().attach_generation() != old_generation);
+    runtime.state_machine().set_ready(hid_runtime::Interface::kKeyboard, true);
+    runtime.state_machine().set_ready(hid_runtime::Interface::kMouse, true);
+    runtime.state_machine().note_sof_activity();
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    assert(!controller.service_usb_sof_watchdog_for_test(300));
+    assert(controller.usb_sof_watchdog_armed_for_test());
+    runtime.state_machine().note_sof_activity();
+    assert(!controller.service_usb_sof_watchdog_for_test(
+        300 + hid_control_executor::kUsbSofStallTimeoutMs));
+    assert(usb_link_stall_notifications == 0);
+}
+
+void test_sof_watchdog_and_event_queue_overflow_are_idempotent() {
+    {
+        usb_link_stall_notifications = 0;
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        prepare_active_usb_watchdog(runtime, backend, controller);
+        assert(!controller.service_usb_sof_watchdog_for_test(0));
+
+        controller.signal_usb_runtime_fault(
+            hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+            31U, true);
+        assert(controller.process_wake_cycle_for_test());
+        assert(!controller.service_usb_sof_watchdog_for_test(
+            hid_control_executor::kUsbSofStallTimeoutMs));
+        assert(!controller.usb_sof_watchdog_armed_for_test());
+        assert(usb_link_stall_notifications == 0);
+        assert(backend.uninstall_calls == 1);
+        assert(controller.route_snapshot().route.active ==
+               hid_route::OutputRoute::kNone);
+    }
+
+    {
+        usb_link_stall_notifications = 0;
+        hid_runtime::Runtime runtime;
+        FakeBackend backend;
+        hid_control_executor::Controller controller;
+        prepare_active_usb_watchdog(runtime, backend, controller);
+        assert(!controller.service_usb_sof_watchdog_for_test(0));
+
+        assert(controller.service_usb_sof_watchdog_for_test(
+            hid_control_executor::kUsbSofStallTimeoutMs));
+        assert(usb_link_stall_notifications == 1);
+        controller.signal_usb_runtime_fault(
+            hid_control_executor::UsbRuntimeFaultReason::kEventQueueOverflow,
+            32U, true);
+        assert(controller.process_wake_cycle_for_test());
+        assert(!controller.service_usb_sof_watchdog_for_test(
+            hid_control_executor::kUsbSofStallTimeoutMs + 1U));
+        assert(usb_link_stall_notifications == 1);
+        assert(backend.uninstall_calls == 1);
+        assert(controller.route_snapshot().route.active ==
+               hid_route::OutputRoute::kNone);
+    }
 }
 
 void test_callback_invalidation_obsoletes_action_and_releases_guard() {
@@ -5883,6 +6609,21 @@ int main() {
     test_tinyusb_runtime_fault_is_immediate_bounded_and_executor_owned();
     test_tinyusb_runtime_fault_occurrence_counter_saturates();
     test_tinyusb_runtime_fault_preserves_primary_when_uninstall_fails();
+    test_sof_watchdog_progress_short_gap_and_exact_timeout();
+    test_sof_watchdog_fresh_99_100_101_ms_boundaries();
+    test_stale_watchdog_cannot_touch_replacement_route_tickets_or_sequence();
+    test_sof_watchdog_pending_then_applies_exactly_once();
+    test_sof_watchdog_pending_then_stale_cancels_only_its_request();
+    test_sof_watchdog_pending_cannot_cancel_durable_invalidators();
+    test_authoritative_internal_lifecycle_races_beat_stale_watchdog();
+    test_authoritative_lifecycle_handoff_after_exact_route_claim();
+    test_claim_held_suspend_resume_retires_without_watchdog_effects();
+    test_sof_watchdog_final_recheck_and_time_wrap();
+    test_sof_progress_inside_stall_transition_window_is_stale();
+    test_sof_progress_after_exact_claim_withdraws_conditionally();
+    test_sof_watchdog_disarms_for_authoritative_and_ineligible_states();
+    test_sof_watchdog_new_generation_and_resume_require_fresh_route();
+    test_sof_watchdog_and_event_queue_overflow_are_idempotent();
     test_callback_invalidation_obsoletes_action_and_releases_guard();
     test_route_zero_work_is_synchronous_and_never_uninstalls_usb();
     test_route_release_owns_guard_and_blocks_detach_before_stage_a();

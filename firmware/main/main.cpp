@@ -137,6 +137,12 @@ std::uint64_t sequence_now(void *) {
     return static_cast<std::uint64_t>(esp_timer_get_time());
 }
 
+void notify_usb_link_stall() {
+    // Runtime authority is already fenced. Keep protocol/session mutation in
+    // the UART RX task through its existing nonblocking lifecycle signal.
+    uart_control_transport::on_hid_lifecycle_invalidation();
+}
+
 control_protocol::UsbStatus usb_status(void *) {
     const hid_runtime::StatusSnapshot status = s_hid_runtime.status_snapshot();
     return control_protocol::UsbStatus{status.mounted, status.suspended,
@@ -959,7 +965,8 @@ extern "C" void app_main() {
     }
     s_hid_runtime.initialize();
     if (!s_usb_exposure.initialize(&s_hid_runtime, &s_usb_backend,
-                                   &s_ble_backend, &s_ble_hid_database)) {
+                                   &s_ble_backend, &s_ble_hid_database,
+                                   notify_usb_link_stall)) {
         ESP_LOGE(kLogTag, "USB lifecycle task initialization failed");
         std::abort();
     }

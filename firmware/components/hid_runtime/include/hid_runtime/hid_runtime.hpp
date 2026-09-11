@@ -242,6 +242,23 @@ struct MouseReportResult {
 using AuthorityEpoch = std::uint32_t;
 using UsbGeneration = usb_lifecycle::Generation;
 using RouteGeneration = hid_route::Generation;
+using SofHeartbeat = std::uint32_t;
+
+// Internal evidence for the bounded SOF-stall safety fence. This is not a
+// physical-disconnect or lifecycle-state claim: every identity must still
+// match immediately before the runtime retires USB HID authority.
+struct UsbLinkWatchdogSnapshot {
+    UsbGeneration attach_generation = 0;
+    AuthorityEpoch authority_epoch = 0;
+    RouteGeneration route_generation = 0;
+    SofHeartbeat sof_heartbeat = 0;
+};
+
+enum class UsbLinkStallResult : std::uint8_t {
+    kApplied,
+    kStale,
+    kPending,
+};
 
 struct ConfirmedHidState {
     KeyboardState keyboard{};
@@ -376,6 +393,12 @@ class StateMachine {
     void on_suspend();
     void on_resume();
     void set_ready(Interface interface, bool ready);
+    void note_sof_activity();
+    SofHeartbeat sof_heartbeat() const;
+    bool usb_link_watchdog_snapshot(UsbLinkWatchdogSnapshot *snapshot) const;
+    UsbLinkStallResult on_usb_link_stall(
+        UsbLinkWatchdogSnapshot expected,
+        hid_route::ConditionalInvalidationToken *conditional_token);
 
     // Internal lifecycle boundary. It does not issue USB hardware calls;
     // hardware effects remain exclusive to the executor implementation.
@@ -535,6 +558,20 @@ class StateMachine {
     void set_inside_ticket_cancel_hook_for_test(TestHook hook);
     void set_inside_ticket_finalize_hook_for_test(TestHook hook);
     void set_before_terminal_ticket_publish_hook_for_test(TestHook hook);
+    void set_sof_heartbeat_for_test(SofHeartbeat heartbeat);
+    void set_before_usb_stall_route_claim_hook_for_test(TestHook hook);
+    void set_after_usb_stall_route_claim_hook_for_test(TestHook hook);
+    void set_before_usb_route_commit_hook_for_test(TestHook hook);
+#ifdef HID_ROUTE_NATIVE_TEST
+    void set_route_generation_published_hook_for_test(
+        hid_route::StateMachine::GenerationPublishedHook hook);
+    void set_route_writer_acquired_hook_for_test(
+        hid_route::StateMachine::WriterAcquiredHook hook);
+    void set_route_usb_publication_before_release_hook_for_test(
+        hid_route::StateMachine::WriterAcquiredHook hook);
+    void set_route_usb_publication_after_release_hook_for_test(
+        hid_route::StateMachine::WriterAcquiredHook hook);
+#endif
 #endif
 
   private:
@@ -682,6 +719,7 @@ class StateMachine {
     static_assert(std::atomic<AuthorityEpoch>::is_always_lock_free);
     static_assert(std::atomic<UsbGeneration>::is_always_lock_free);
     static_assert(std::atomic<RouteGeneration>::is_always_lock_free);
+    static_assert(std::atomic<SofHeartbeat>::is_always_lock_free);
     static_assert(std::atomic<std::uint16_t>::is_always_lock_free);
     usb_lifecycle::StateMachine usb_lifecycle_{};
     hid_route::StateMachine route_{};
@@ -695,6 +733,9 @@ class StateMachine {
     std::atomic<AuthorityEpoch> release_request_authority_epoch_{0};
     std::atomic<std::uint32_t> release_request_epoch_{0};
     std::atomic<std::uint8_t> status_bits_{0};  // mounted, suspended, kbd-ready, mouse-ready
+    // Activity evidence only. Relaxed ordering is sufficient because this
+    // counter does not publish lifecycle or route fields.
+    std::atomic<SofHeartbeat> sof_heartbeat_{0};
     std::atomic_bool release_requested_{false};
     std::atomic<std::uint32_t> sequence_generation_{0};
     std::atomic<std::uint32_t> next_sequence_generation_{1};
@@ -725,6 +766,9 @@ class StateMachine {
     TestHook inside_ticket_cancel_hook_ = nullptr;
     TestHook inside_ticket_finalize_hook_ = nullptr;
     TestHook before_terminal_ticket_publish_hook_ = nullptr;
+    TestHook before_usb_stall_route_claim_hook_ = nullptr;
+    TestHook after_usb_stall_route_claim_hook_ = nullptr;
+    TestHook before_usb_route_commit_hook_ = nullptr;
 #endif
 };
 

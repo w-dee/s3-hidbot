@@ -48,12 +48,23 @@ QueueHandle_t s_action_queue = nullptr;
 TaskHandle_t s_executor_task = nullptr;
 StaticSemaphore_t s_pairing_rpc_completion_storage;
 SemaphoreHandle_t s_pairing_rpc_completion = nullptr;
+static_assert(portTICK_PERIOD_MS == 10);
+static_assert(pdMS_TO_TICKS(kUsbSofWatchdogSampleMs) > 0);
 #endif
+
+bool same_usb_link_watchdog_identity(
+    const hid_runtime::UsbLinkWatchdogSnapshot &left,
+    const hid_runtime::UsbLinkWatchdogSnapshot &right) {
+    return left.attach_generation == right.attach_generation &&
+           left.authority_epoch == right.authority_epoch &&
+           left.route_generation == right.route_generation;
+}
 
 }  // namespace
 
 bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
-                            BleBackend *ble_backend, BleDatabase *ble_database) {
+                            BleBackend *ble_backend, BleDatabase *ble_database,
+                            UsbLinkStallSink usb_link_stall_sink) {
     if (initialized_) {
         return true;
     }
@@ -64,6 +75,7 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
     backend_ = backend;
     ble_backend_ = ble_backend;
     ble_database_ = ble_database;
+    usb_link_stall_sink_ = usb_link_stall_sink;
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     s_action_queue = xQueueCreateStatic(kActionQueueDepth, sizeof(Action), s_queue_bytes,
                                         &s_queue_storage);
@@ -597,6 +609,13 @@ RouteCommandOutcome Controller::request_route(hid_route::OutputRoute desired) {
         }
     } else {
         release_operation(operation);
+    }
+    if (desired == hid_route::OutputRoute::kUsb &&
+        outcome.action_result == hid_runtime::RouteTransitionResult::kAccepted &&
+        !outcome.async_required) {
+        // A direct task notification arms the existing executor-owned SOF
+        // watchdog without adding queue traffic or a dedicated task.
+        request_executor_wake();
     }
     return RouteCommandOutcome{.action_result = outcome.action_result,
                                .snapshot_valid = outcome.snapshot_valid,
@@ -1434,6 +1453,113 @@ bool Controller::reconcile_usb_runtime_fault() {
     return true;
 }
 
+void Controller::disarm_usb_sof_watchdog() {
+    usb_sof_watchdog_ = {};
+}
+
+bool Controller::reconcile_usb_sof_watchdog(std::uint32_t now_ms) {
+    if (runtime_ == nullptr) {
+        disarm_usb_sof_watchdog();
+        return false;
+    }
+
+    hid_runtime::UsbLinkWatchdogSnapshot current{};
+    if (!runtime_->state_machine().usb_link_watchdog_snapshot(&current)) {
+        if (usb_sof_watchdog_.armed && usb_sof_watchdog_.pending) {
+            hid_route::ConditionalInvalidationToken conditional_token =
+                usb_sof_watchdog_.last_progress_ms;
+            const hid_runtime::UsbLinkStallResult result =
+                runtime_->state_machine().on_usb_link_stall(
+                    usb_sof_watchdog_.identity, &conditional_token);
+            if (result == hid_runtime::UsbLinkStallResult::kPending) {
+                usb_sof_watchdog_.last_progress_ms = conditional_token;
+                return false;
+            }
+            if (result == hid_runtime::UsbLinkStallResult::kApplied) {
+                disarm_usb_sof_watchdog();
+                usb_lifecycle_log_bits_.fetch_or(
+                    static_cast<std::uint8_t>(UsbLifecycleEvent::kSofStall),
+                    std::memory_order_acq_rel);
+                if (usb_link_stall_sink_ != nullptr) {
+                    usb_link_stall_sink_();
+                }
+                return true;
+            }
+            hid_runtime::UsbLinkWatchdogSnapshot refreshed{};
+            if (runtime_->state_machine().usb_link_watchdog_snapshot(
+                    &refreshed)) {
+                usb_sof_watchdog_.identity = refreshed;
+                usb_sof_watchdog_.last_progress_ms = now_ms;
+                usb_sof_watchdog_.armed = true;
+                usb_sof_watchdog_.pending = false;
+                return false;
+            }
+        }
+        disarm_usb_sof_watchdog();
+        return false;
+    }
+
+    if (!usb_sof_watchdog_.armed ||
+        !same_usb_link_watchdog_identity(usb_sof_watchdog_.identity,
+                                         current)) {
+        usb_sof_watchdog_.identity = current;
+        usb_sof_watchdog_.last_progress_ms = now_ms;
+        usb_sof_watchdog_.armed = true;
+        usb_sof_watchdog_.pending = false;
+        return false;
+    }
+
+    if (usb_sof_watchdog_.identity.sof_heartbeat != current.sof_heartbeat) {
+        usb_sof_watchdog_.identity = current;
+        usb_sof_watchdog_.last_progress_ms = now_ms;
+        usb_sof_watchdog_.pending = false;
+        return false;
+    }
+
+    const std::uint32_t stalled_ms =
+        now_ms - usb_sof_watchdog_.last_progress_ms;
+    if (stalled_ms < kUsbSofStallTimeoutMs) {
+        return false;
+    }
+
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (sof_watchdog_before_fence_hook_ != nullptr) {
+        sof_watchdog_before_fence_hook_(*this);
+    }
+#endif
+    hid_route::ConditionalInvalidationToken conditional_token =
+        hid_route::kNoConditionalInvalidationToken;
+    const hid_runtime::UsbLinkStallResult result =
+        runtime_->state_machine().on_usb_link_stall(current,
+                                                    &conditional_token);
+    if (result == hid_runtime::UsbLinkStallResult::kPending) {
+        usb_sof_watchdog_.last_progress_ms = conditional_token;
+        usb_sof_watchdog_.pending = true;
+        return false;
+    }
+    if (result != hid_runtime::UsbLinkStallResult::kApplied) {
+        hid_runtime::UsbLinkWatchdogSnapshot refreshed{};
+        if (runtime_->state_machine().usb_link_watchdog_snapshot(&refreshed)) {
+            usb_sof_watchdog_.identity = refreshed;
+            usb_sof_watchdog_.last_progress_ms = now_ms;
+            usb_sof_watchdog_.armed = true;
+            usb_sof_watchdog_.pending = false;
+        } else {
+            disarm_usb_sof_watchdog();
+        }
+        return false;
+    }
+
+    disarm_usb_sof_watchdog();
+    usb_lifecycle_log_bits_.fetch_or(
+        static_cast<std::uint8_t>(UsbLifecycleEvent::kSofStall),
+        std::memory_order_acq_rel);
+    if (usb_link_stall_sink_ != nullptr) {
+        usb_link_stall_sink_();
+    }
+    return true;
+}
+
 void Controller::reconcile_usb_lifecycle_logs() {
     const std::uint8_t events =
         usb_lifecycle_log_bits_.exchange(0, std::memory_order_acq_rel);
@@ -1449,6 +1575,9 @@ void Controller::reconcile_usb_lifecycle_logs() {
     }
     if ((events & static_cast<std::uint8_t>(UsbLifecycleEvent::kResumed)) != 0) {
         ESP_LOGI(kLogTag, "USB HID resumed");
+    }
+    if ((events & static_cast<std::uint8_t>(UsbLifecycleEvent::kSofStall)) != 0) {
+        ESP_LOGW(kLogTag, "USB HID link activity lost (SOF stall)");
     }
 #else
     (void)events;
@@ -2897,6 +3026,19 @@ void Controller::set_usb_runtime_fault_occurrences_for_test(
     std::uint32_t value) {
     usb_runtime_fault_occurrences_.store(value, std::memory_order_release);
 }
+
+bool Controller::service_usb_sof_watchdog_for_test(std::uint32_t now_ms) {
+    return reconcile_usb_sof_watchdog(now_ms);
+}
+
+bool Controller::usb_sof_watchdog_armed_for_test() const {
+    return usb_sof_watchdog_.armed;
+}
+
+void Controller::set_sof_watchdog_before_fence_hook_for_test(
+    SofWatchdogBeforeFenceHook hook) {
+    sof_watchdog_before_fence_hook_ = hook;
+}
 #else
 void Controller::task_entry(void *context) {
     static_cast<Controller *>(context)->task_loop();
@@ -2909,7 +3051,11 @@ void Controller::task_loop() {
         // any accumulated notifications; the authoritative details remain in
         // the queue and fallback atomics. A notification given before this
         // wait remains pending, closing the check-then-sleep race.
-        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const TickType_t wait_ticks =
+            usb_sof_watchdog_.armed
+                ? pdMS_TO_TICKS(kUsbSofWatchdogSampleMs)
+                : portMAX_DELAY;
+        (void)ulTaskNotifyTake(pdTRUE, wait_ticks);
         (void)reconcile_usb_runtime_fault();
         Action action{};
         while (xQueueReceive(s_action_queue, &action, 0) == pdPASS) {
@@ -2919,6 +3065,10 @@ void Controller::task_loop() {
         // instead races after this check, its retained notification makes the
         // next wait return immediately.
         (void)reconcile_usb_runtime_fault();
+        const std::uint32_t now_ms = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(xTaskGetTickCount()) *
+            portTICK_PERIOD_MS);
+        (void)reconcile_usb_sof_watchdog(now_ms);
         reconcile_usb_lifecycle_logs();
         (void)reconcile_ble_fallbacks(nullptr);
         retire_ble_route_if_unready();

@@ -54,6 +54,54 @@ void ready(hid_runtime::StateMachine &state) {
            hid_runtime::RouteTransitionResult::kAccepted);
 }
 
+enum class RoutePublicationInterleave {
+    kSuspend,
+    kSuspendResume,
+    kUnmount,
+    kUnmountRemount,
+    kRuntimeFault,
+};
+
+hid_runtime::StateMachine *route_publication_runtime = nullptr;
+RoutePublicationInterleave route_publication_interleave =
+    RoutePublicationInterleave::kSuspend;
+
+void inject_route_publication_lifecycle(hid_route::StateMachine &) {
+    assert(route_publication_runtime != nullptr);
+    switch (route_publication_interleave) {
+        case RoutePublicationInterleave::kSuspend:
+            route_publication_runtime->on_suspend();
+            return;
+        case RoutePublicationInterleave::kSuspendResume:
+            route_publication_runtime->on_suspend();
+            route_publication_runtime->on_resume();
+            return;
+        case RoutePublicationInterleave::kUnmount:
+            route_publication_runtime->on_unmount();
+            return;
+        case RoutePublicationInterleave::kUnmountRemount:
+            route_publication_runtime->on_unmount();
+            route_publication_runtime->on_mount();
+            return;
+        case RoutePublicationInterleave::kRuntimeFault:
+            assert(route_publication_runtime->begin_usb_runtime_fault(91));
+            return;
+    }
+}
+
+void inject_suspend_resume_before_route_registration(
+    hid_runtime::StateMachine *state) {
+    state->on_suspend();
+    state->on_resume();
+}
+
+void prepare_route_publication(hid_runtime::StateMachine &state) {
+    expose(state);
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+}
+
 std::atomic_bool transition_hook_entered{false};
 std::atomic_bool transition_contender_started{false};
 std::atomic_bool transition_contender_finished{false};
@@ -479,6 +527,103 @@ void test_route_generation_is_independent_and_gates_stale_unsafe_work() {
     assert(!state.queue_mouse_report(0, 1, 0, 0, 0));
 }
 
+void verify_lifecycle_veto_during_incoherent_route_publication(
+    RoutePublicationInterleave interleave) {
+    hid_runtime::StateMachine state;
+    prepare_route_publication(state);
+    route_publication_runtime = &state;
+    route_publication_interleave = interleave;
+    state.set_route_generation_published_hook_for_test(
+        inject_route_publication_lifecycle);
+
+    const auto outcome = state.request_route_usb();
+    state.set_route_generation_published_hook_for_test(nullptr);
+    assert(outcome.action_result == hid_runtime::RouteTransitionResult::kNotReady);
+    const auto route = state.route_snapshot();
+    assert(route.coherent && !route.invalidation_pending);
+    assert(route.desired == hid_route::OutputRoute::kNone);
+    assert(route.active == hid_route::OutputRoute::kNone);
+    assert(route.transition == hid_route::Transition::kStable);
+    assert(route.generation == 1);
+
+    const auto status = state.status();
+    if (interleave == RoutePublicationInterleave::kSuspend) {
+        assert(status.mounted && status.suspended);
+    } else if (interleave == RoutePublicationInterleave::kUnmount) {
+        assert(!status.mounted && !status.suspended);
+    } else if (interleave == RoutePublicationInterleave::kRuntimeFault) {
+        assert(status.mounted && !status.suspended);
+        assert(!status.keyboard_ready && !status.mouse_ready);
+    } else {
+        assert(status.mounted && !status.suspended);
+        state.set_ready(hid_runtime::Interface::kKeyboard, true);
+        state.set_ready(hid_runtime::Interface::kMouse, true);
+        assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+        assert(state.request_route_usb().action_result ==
+               hid_runtime::RouteTransitionResult::kAccepted);
+        assert(state.route_snapshot().generation == 2);
+    }
+    route_publication_runtime = nullptr;
+}
+
+void test_lifecycle_vetoes_incoherent_usb_route_publication() {
+    for (const auto interleave :
+         {RoutePublicationInterleave::kSuspend,
+          RoutePublicationInterleave::kSuspendResume,
+          RoutePublicationInterleave::kUnmount,
+          RoutePublicationInterleave::kUnmountRemount,
+          RoutePublicationInterleave::kRuntimeFault}) {
+        verify_lifecycle_veto_during_incoherent_route_publication(interleave);
+    }
+}
+
+void test_lifecycle_cut_closes_pre_registration_window() {
+    hid_runtime::StateMachine state;
+    prepare_route_publication(state);
+    state.set_before_usb_route_commit_hook_for_test(
+        inject_suspend_resume_before_route_registration);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kNotReady);
+    const auto route = state.route_snapshot();
+    assert(route.coherent && !route.invalidation_pending);
+    assert(route.active == hid_route::OutputRoute::kNone);
+    assert(route.generation == 0);
+
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    assert(state.route_snapshot().generation == 1);
+}
+
+void verify_lifecycle_event_at_publication_release_boundary(bool before_release) {
+    hid_runtime::StateMachine state;
+    prepare_route_publication(state);
+    route_publication_runtime = &state;
+    route_publication_interleave = RoutePublicationInterleave::kSuspend;
+    if (before_release) {
+        state.set_route_usb_publication_before_release_hook_for_test(
+            inject_route_publication_lifecycle);
+    } else {
+        state.set_route_usb_publication_after_release_hook_for_test(
+            inject_route_publication_lifecycle);
+    }
+
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kNotReady);
+    const auto route = state.route_snapshot();
+    assert(route.coherent && !route.invalidation_pending);
+    assert(route.active == hid_route::OutputRoute::kNone);
+    assert(route.generation == 2);
+    assert(state.status().mounted && state.status().suspended);
+    route_publication_runtime = nullptr;
+}
+
+void test_lifecycle_event_cannot_cross_publication_release_boundary() {
+    verify_lifecycle_event_at_publication_release_boundary(true);
+    verify_lifecycle_event_at_publication_release_boundary(false);
+}
+
 void test_usb_transition_outcomes_freeze_stage_a_runtime() {
     hid_runtime::StateMachine state;
     ImmediateLifecycleExecutor executor;
@@ -881,6 +1026,181 @@ void test_suspend_preserves_safety_and_ignores_late_completion() {
     assert(state.queue_mouse_report(0, 10, 0, 0, 0));
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 3 && sink.instance == 1 && sink.report[1] == 10);
+}
+
+hid_runtime::UsbLinkStallResult apply_usb_link_stall(
+    hid_runtime::StateMachine &state,
+    hid_runtime::UsbLinkWatchdogSnapshot snapshot) {
+    hid_route::ConditionalInvalidationToken token =
+        hid_route::kNoConditionalInvalidationToken;
+    return state.on_usb_link_stall(snapshot, &token);
+}
+
+void test_sof_heartbeat_wraps_and_watchdog_snapshot_is_exact() {
+    hid_runtime::StateMachine state;
+    hid_runtime::UsbLinkWatchdogSnapshot snapshot{};
+    assert(!state.usb_link_watchdog_snapshot(&snapshot));
+    assert(!state.usb_link_watchdog_snapshot(nullptr));
+
+    state.set_sof_heartbeat_for_test(UINT32_MAX);
+    state.note_sof_activity();
+    assert(state.sof_heartbeat() == 0);
+    ready(state);
+    assert(state.usb_link_watchdog_snapshot(&snapshot));
+    assert(snapshot.attach_generation == state.attach_generation());
+    assert(snapshot.authority_epoch == state.authority_epoch());
+    assert(snapshot.route_generation == state.route_snapshot().generation);
+    assert(snapshot.sof_heartbeat == 0);
+
+    state.note_sof_activity();
+    assert(apply_usb_link_stall(state, snapshot) ==
+           hid_runtime::UsbLinkStallResult::kStale);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb);
+}
+
+void test_usb_link_stall_fences_tickets_sequence_and_preserves_lifecycle_truth() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    hid_runtime::ConfirmedHidState confirmed{};
+    hid_runtime::SequenceAuthority sequence{};
+    assert(state.begin_sequence(&confirmed, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+
+    hid_runtime::HidTicketId keyboard_ticket = 0;
+    hid_runtime::HidTicketId mouse_ticket = 0;
+    assert(state.begin_keyboard_report(
+               0, {4, 0, 0, 0, 0, 0}, sequence, &keyboard_ticket, 41) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(state.begin_mouse_report(1, 0, 0, 0, 0, sequence, &mouse_ticket,
+                                    41) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+
+    hid_runtime::UsbLinkWatchdogSnapshot snapshot{};
+    assert(state.usb_link_watchdog_snapshot(&snapshot));
+    const auto authority = state.authority_epoch();
+    assert(apply_usb_link_stall(state, snapshot) ==
+           hid_runtime::UsbLinkStallResult::kApplied);
+    assert(apply_usb_link_stall(state, snapshot) ==
+           hid_runtime::UsbLinkStallResult::kStale);
+
+    const auto runtime = state.status();
+    assert(runtime.mounted && !runtime.suspended);
+    assert(!runtime.keyboard_ready && !runtime.mouse_ready);
+    assert(state.usb_lifecycle_snapshot().observed ==
+           usb_lifecycle::ObservedState::kMounted);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+    assert(state.authority_epoch() == authority + 1U);
+    assert(!state.sequence_authority_current(sequence));
+    assert(state.sequence_active());
+
+    hid_runtime::KeyboardReportSnapshot keyboard{};
+    hid_runtime::MouseReportSnapshot mouse{};
+    assert(state.keyboard_report_snapshot(keyboard_ticket, &keyboard));
+    assert(keyboard.state == hid_runtime::KeyboardReportTicketState::kCanceled);
+    assert(keyboard.outcome ==
+           hid_runtime::KeyboardReportTicketOutcome::kAuthorityLost);
+    assert(state.mouse_report_snapshot(mouse_ticket, &mouse));
+    assert(mouse.state == hid_runtime::MouseReportTicketState::kCanceled);
+    assert(mouse.outcome == hid_runtime::MouseReportTicketOutcome::kAuthorityLost);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+
+    // Neither canceled ticket reached the host, so no release report is
+    // fabricated. Link activity can return, but the old route and sequence
+    // authority never resurrect.
+    state.note_sof_activity();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+    state.end_sequence(sequence);
+    assert(state.request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+}
+
+void test_usb_link_stall_cancels_public_release_ticket_without_delivery_claim() {
+    hid_runtime::StateMachine state;
+    ready(state);
+    state.begin_release_all();
+    const auto before = state.release_all_snapshot();
+    assert(before.active);
+    hid_runtime::UsbLinkWatchdogSnapshot snapshot{};
+    assert(state.usb_link_watchdog_snapshot(&snapshot));
+    assert(apply_usb_link_stall(state, snapshot) ==
+           hid_runtime::UsbLinkStallResult::kApplied);
+    const auto after = state.release_all_snapshot();
+    assert(!after.active && after.canceled);
+    assert(after.keyboard == hid_runtime::ReleaseAllInterfaceState::kCanceled);
+    assert(after.mouse == hid_runtime::ReleaseAllInterfaceState::kCanceled);
+    assert(!after.finalized);
+}
+
+void test_usb_link_stall_preserves_in_flight_uncertainty_and_rejects_late_owner() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    constexpr hid_runtime::ReportOriginOwnerId old_owner = 73;
+    assert(state.begin_keyboard_report(
+               0, {4, 0, 0, 0, 0, 0}, {}, nullptr, old_owner) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1);
+    const auto old_token =
+        state.in_flight_token(hid_runtime::Interface::kKeyboard);
+    hid_runtime::UsbLinkWatchdogSnapshot snapshot{};
+    assert(state.usb_link_watchdog_snapshot(&snapshot));
+    assert(apply_usb_link_stall(state, snapshot) ==
+           hid_runtime::UsbLinkStallResult::kApplied);
+    assert(state.safety_required(hid_runtime::Interface::kKeyboard));
+    assert(state.host_state_uncertain(hid_runtime::Interface::kKeyboard));
+    assert(!state.report_in_flight(hid_runtime::Interface::kKeyboard));
+
+    hid_runtime::ReportOriginOwnerId recovered = old_owner;
+    assert(!state.report_failed_for_token(
+        static_cast<std::uint8_t>(hid_runtime::Interface::kKeyboard),
+        old_token, nullptr, 0, &recovered));
+    assert(recovered == 0);
+    assert(state.safety_required(hid_runtime::Interface::kKeyboard));
+
+    state.note_sof_activity();
+    state.set_ready(hid_runtime::Interface::kKeyboard, true);
+    state.set_ready(hid_runtime::Interface::kMouse, true);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2 && sink.instance == 0 && sink.report[0] == 0 &&
+           sink.report[2] == 0);
+    assert(state.report_complete(0));
+    assert(!state.safety_required(hid_runtime::Interface::kKeyboard));
+}
+
+hid_runtime::UsbLinkWatchdogSnapshot writing_stall_snapshot{};
+
+void stall_while_ticket_is_writing(hid_runtime::StateMachine *state) {
+    assert(apply_usb_link_stall(*state, writing_stall_snapshot) ==
+           hid_runtime::UsbLinkStallResult::kApplied);
+}
+
+void test_usb_link_stall_wins_writing_ticket_without_slot_reuse() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    assert(state.usb_link_watchdog_snapshot(&writing_stall_snapshot));
+    state.set_before_ticket_publish_hook_for_test(stall_while_ticket_is_writing);
+    assert(state.begin_keyboard_report(
+               0, {4, 0, 0, 0, 0, 0}) ==
+           hid_runtime::KeyboardReportBeginResult::kAuthorityLost);
+    state.set_before_ticket_publish_hook_for_test(nullptr);
+    const hid_runtime::KeyboardReportSnapshot canceled =
+        state.keyboard_report_snapshot();
+    assert(canceled.ticket_id != 0);
+    assert(canceled.state == hid_runtime::KeyboardReportTicketState::kCanceled);
+    assert(canceled.outcome ==
+           hid_runtime::KeyboardReportTicketOutcome::kAuthorityLost);
+    assert(state.begin_keyboard_report(0, {5, 0, 0, 0, 0, 0}) ==
+           hid_runtime::KeyboardReportBeginResult::kNotReady);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
 }
 
 void test_unmount_preserves_uncertainty_for_fresh_generation_reconciliation() {
@@ -2257,6 +2577,9 @@ int main() {
     test_mailbox_sequence_exclusion_and_safety_priority();
     test_readiness_refresh_after_reattach();
     test_route_generation_is_independent_and_gates_stale_unsafe_work();
+    test_lifecycle_vetoes_incoherent_usb_route_publication();
+    test_lifecycle_cut_closes_pre_registration_window();
+    test_lifecycle_event_cannot_cross_publication_release_boundary();
     test_usb_transition_outcomes_freeze_stage_a_runtime();
     test_success_failure_and_release();
     test_partial_release_and_no_delayed_unsafe_replay();
@@ -2274,6 +2597,11 @@ int main() {
     test_executor_submission_bound();
     test_authority_epoch_suspend_resume_barrier();
     test_suspend_preserves_safety_and_ignores_late_completion();
+    test_sof_heartbeat_wraps_and_watchdog_snapshot_is_exact();
+    test_usb_link_stall_fences_tickets_sequence_and_preserves_lifecycle_truth();
+    test_usb_link_stall_cancels_public_release_ticket_without_delivery_claim();
+    test_usb_link_stall_preserves_in_flight_uncertainty_and_rejects_late_owner();
+    test_usb_link_stall_wins_writing_ticket_without_slot_reuse();
     test_unmount_preserves_uncertainty_for_fresh_generation_reconciliation();
     test_release_ticket_states_and_historical_submission();
     test_release_ticket_failure_and_lifecycle_cancellation();

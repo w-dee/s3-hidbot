@@ -10,6 +10,8 @@ RUNTIME_HEADER = ROOT / "firmware/components/hid_runtime/include/hid_runtime/hid
 ROUTE = ROOT / "firmware/components/hid_route/hid_route.cpp"
 ROUTE_HEADER = ROOT / "firmware/components/hid_route/include/hid_route/hid_route.hpp"
 MAIN = ROOT / "firmware/main/main.cpp"
+EXECUTOR = ROOT / "firmware/components/hid_control_executor/hid_control_executor.cpp"
+EXECUTOR_HEADER = ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp"
 PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
 TRANSPORT = ROOT / "firmware/components/uart_control_transport/uart_control_transport.cpp"
 SDKCONFIG = ROOT / "firmware/sdkconfig.defaults"
@@ -21,6 +23,8 @@ def main() -> int:
     route = ROUTE.read_text(encoding="utf-8")
     route_header = ROUTE_HEADER.read_text(encoding="utf-8")
     main_source = MAIN.read_text(encoding="utf-8")
+    executor = EXECUTOR.read_text(encoding="utf-8")
+    executor_header = EXECUTOR_HEADER.read_text(encoding="utf-8")
     protocol = PROTOCOL.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
     sdkconfig = SDKCONFIG.read_text(encoding="utf-8")
@@ -49,6 +53,16 @@ def main() -> int:
     assert "tud_hid_n_mouse_report" not in (main_source + protocol + transport)
     assert "extern \"C\" void tud_sof_cb" in main_source
     assert "service_sof()" in main_source
+    assert "state_machine_.note_sof_activity();" in runtime
+    service_start = runtime.index("void Runtime::service_sof()")
+    service_end = runtime.index("void Runtime::set_result", service_start)
+    service_body = runtime[service_start:service_end]
+    assert service_body.index("note_sof_activity()") < service_body.index(
+        "set_ready(Interface::kKeyboard"
+    )
+    assert "sof_heartbeat_.fetch_add(1, std::memory_order_relaxed);" in runtime
+    assert "std::atomic<SofHeartbeat> sof_heartbeat_{0};" in header
+    assert "std::atomic<SofHeartbeat>::is_always_lock_free" in header
     sof_start = runtime.index("void Runtime::enable_sof_after_mount()")
     sof_end = runtime.index("void Runtime::on_unmount()", sof_start)
     sof_body = runtime[sof_start:sof_end]
@@ -68,6 +82,45 @@ def main() -> int:
     assert "uart_control_transport::on_hid_safety_failure(" in main_source
     assert "s_published_local_owner" not in main_source
     assert "on_hid_lifecycle_invalidation()" in main_source
+    assert "kUsbSofStallTimeoutMs = 100" in executor_header
+    assert "kUsbSofWatchdogSampleMs = 10" in executor_header
+    assert executor.count("xTaskCreateStatic(") == 1
+    assert executor.count("xQueueCreateStatic(") == 1
+    assert "pdMS_TO_TICKS(kUsbSofWatchdogSampleMs)" in executor
+    stall_start = runtime.index("UsbLinkStallResult StateMachine::on_usb_link_stall(")
+    stall_end = runtime.index("void StateMachine::set_ready", stall_start)
+    stall_body = runtime[stall_start:stall_end]
+    assert "on_unmount()" not in stall_body
+    assert "on_suspend()" not in stall_body
+    assert "observe_unmount" not in stall_body
+    assert "observe_suspend" not in stall_body
+    assert "kMountedBit" not in stall_body
+    assert "kSuspendedBit" not in stall_body
+    assert "kKeyboardReadyBit | kMouseReadyBit" in stall_body
+    exact_claim = (
+        "route_.claim_invalidation_if_matches(route, conditional_token, &claim)"
+    )
+    assert exact_claim in stall_body
+    assert "claim.retire()" in stall_body
+    assert "InvalidationClaimResult::kPending" in stall_body
+    assert "UsbLinkStallResult::kStale" in stall_body
+    assert "sof_heartbeat() != expected.sof_heartbeat" in stall_body
+    assert stall_body.index("sof_heartbeat() != expected.sof_heartbeat") < stall_body.index(
+        exact_claim
+    )
+    assert stall_body.index("claim.retire()") < stall_body.index(
+        "cancel_keyboard_ticket"
+    )
+    assert "claim_invalidation_if_matches" in route
+    assert "InvalidationClaimResult::kClaimedExact" in route
+    assert "InvalidationClaimResult::kStale" in route
+    assert "InvalidationClaimResult::kPending" in route
+    assert "UsbLifecycleEvent::kSofStall" in executor
+    assert "USB HID link activity lost (SOF stall)" in executor
+    assert "notify_usb_link_stall" in main_source
+    assert "uart_control_transport::on_hid_lifecycle_invalidation();" in main_source
+    assert "usb_reg.h" not in (runtime + header + executor + executor_header + main_source)
+    assert "BVALID" not in (runtime + header + executor + executor_header + main_source)
     assert "authority_epoch_" in header
     assert "slot_authority_epoch" in header
     assert "in_flight_authority_epoch" in header
@@ -102,7 +155,32 @@ def main() -> int:
     assert "kBle" in route_header
     assert "std::uint32_t" in route_header
     assert "commit_none_locked" in route
-    assert "invalidation_pending_" in route
+    assert "conditional_token_" in route
+    assert "conditional_generation_" in route
+    assert "durable_generation_" in route
+    assert "durable_state_" in route
+    assert "std::atomic<UsbPublicationCut> usb_publication_state_{0};" in route_header
+    assert "publish_usb_lifecycle_veto" in route
+    assert "begin_usb_publication" in route
+    assert "finish_usb_publication" in route
+    unmount_start = runtime.index("void StateMachine::on_unmount()")
+    suspend_start = runtime.index("void StateMachine::on_suspend()", unmount_start)
+    resume_start = runtime.index("void StateMachine::on_resume()", suspend_start)
+    unmount_body = runtime[unmount_start:suspend_start]
+    suspend_body = runtime[suspend_start:resume_start]
+    assert unmount_body.index("publish_usb_lifecycle_veto()") < unmount_body.index(
+        "route_.snapshot()"
+    )
+    assert suspend_body.index("publish_usb_lifecycle_veto()") < suspend_body.index(
+        "route_.snapshot()"
+    )
+    fault_start = runtime.index("bool StateMachine::begin_usb_runtime_fault(")
+    fault_end = runtime.index(
+        "void StateMachine::commit_usb_runtime_fault_shutdown()", fault_start
+    )
+    assert "publish_usb_lifecycle_veto()" in runtime[fault_start:fault_end]
+    assert "cancel_conditional_invalidation" in route
+    assert "leave_writer_with_handoff" in route
     assert "request_release_all" in header
     assert "ReleaseAllTicket" in header
     assert "begin_release_all" in runtime

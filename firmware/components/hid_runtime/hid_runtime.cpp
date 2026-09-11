@@ -423,6 +423,10 @@ void StateMachine::on_unmount() {
         }
         return;
     }
+    // Record the lifecycle cut before attempting a coherent route snapshot.
+    // If a USB route publication owns the writer, this exact publication is
+    // vetoed even though snapshot() must return fail-closed/incoherent.
+    route_.publish_usb_lifecycle_veto();
     // Callback-side invalidation never waits for the shared control executor.
     // Its pending gate closes unsafe route work before later cleanup runs.
     const hid_route::Snapshot active_route = route_.snapshot();
@@ -470,6 +474,7 @@ void StateMachine::on_suspend() {
     if (!usb_lifecycle_.observe_suspend()) {
         return;
     }
+    route_.publish_usb_lifecycle_veto();
     const hid_route::Snapshot active_route = route_.snapshot();
     if (active_route.coherent &&
         active_route.active == hid_route::OutputRoute::kUsb) {
@@ -510,6 +515,156 @@ void StateMachine::on_resume() {
     // never silently restore it as HID-control authority.
     authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
     status_bits_.fetch_and(static_cast<std::uint8_t>(~kSuspendedBit), std::memory_order_acq_rel);
+}
+
+void StateMachine::note_sof_activity() {
+    // The wrapping counter is only evidence that the TinyUSB SOF path made
+    // progress. It does not publish any lifecycle, route, or readiness state.
+    sof_heartbeat_.fetch_add(1, std::memory_order_relaxed);
+}
+
+SofHeartbeat StateMachine::sof_heartbeat() const {
+    return sof_heartbeat_.load(std::memory_order_relaxed);
+}
+
+bool StateMachine::usb_link_watchdog_snapshot(
+    UsbLinkWatchdogSnapshot *snapshot) const {
+    if (snapshot == nullptr) {
+        return false;
+    }
+    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
+    const StatusSnapshot runtime = status();
+    const hid_route::Snapshot route = route_.snapshot();
+    const AuthorityEpoch authority = authority_epoch();
+    *snapshot = UsbLinkWatchdogSnapshot{
+        .attach_generation = lifecycle.generation,
+        .authority_epoch = authority,
+        .route_generation = route.generation,
+        .sof_heartbeat = sof_heartbeat(),
+    };
+    return lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed &&
+           lifecycle.observed == usb_lifecycle::ObservedState::kMounted &&
+           !lifecycle.recovery_required && runtime.mounted &&
+           !runtime.suspended && route.coherent &&
+           !route.invalidation_pending &&
+           route.desired == hid_route::OutputRoute::kUsb &&
+           route.active == hid_route::OutputRoute::kUsb &&
+           route.transition == hid_route::Transition::kStable;
+}
+
+UsbLinkStallResult StateMachine::on_usb_link_stall(
+    UsbLinkWatchdogSnapshot expected,
+    hid_route::ConditionalInvalidationToken *conditional_token) {
+    if (conditional_token == nullptr) {
+        return UsbLinkStallResult::kStale;
+    }
+    const auto withdraw_conditional = [&]() {
+        if (*conditional_token !=
+            hid_route::kNoConditionalInvalidationToken) {
+            (void)route_.cancel_conditional_invalidation(
+                expected.route_generation, *conditional_token);
+            *conditional_token =
+                hid_route::kNoConditionalInvalidationToken;
+        }
+        return UsbLinkStallResult::kStale;
+    };
+    const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
+    const StatusSnapshot runtime = status();
+    const hid_route::Snapshot route = route_.snapshot();
+    if (lifecycle.generation != expected.attach_generation ||
+        lifecycle.desired != usb_lifecycle::DesiredExposure::kExposed ||
+        lifecycle.observed != usb_lifecycle::ObservedState::kMounted ||
+        lifecycle.recovery_required || !runtime.mounted || runtime.suspended ||
+        authority_epoch() != expected.authority_epoch ||
+        sof_heartbeat() != expected.sof_heartbeat) {
+        return withdraw_conditional();
+    }
+    if (!route.coherent) {
+        return route.invalidation_pending &&
+                       *conditional_token !=
+                           hid_route::kNoConditionalInvalidationToken
+                   ? UsbLinkStallResult::kPending
+                   : withdraw_conditional();
+    }
+    if (route.desired != hid_route::OutputRoute::kUsb ||
+        route.active != hid_route::OutputRoute::kUsb ||
+        route.transition != hid_route::Transition::kStable ||
+        route.generation != expected.route_generation) {
+        return withdraw_conditional();
+    }
+
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (before_usb_stall_route_claim_hook_ != nullptr) {
+        const TestHook stall_hook = before_usb_stall_route_claim_hook_;
+        before_usb_stall_route_claim_hook_ = nullptr;
+        stall_hook(this);
+    }
+#endif
+
+    hid_route::ExactInvalidationClaim claim;
+    const hid_route::InvalidationClaimResult claim_result =
+        route_.claim_invalidation_if_matches(route, conditional_token, &claim);
+    if (claim_result == hid_route::InvalidationClaimResult::kPending) {
+        return UsbLinkStallResult::kPending;
+    }
+    if (claim_result != hid_route::InvalidationClaimResult::kClaimedExact) {
+        return withdraw_conditional();
+    }
+
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (after_usb_stall_route_claim_hook_ != nullptr) {
+        const TestHook stall_hook = after_usb_stall_route_claim_hook_;
+        after_usb_stall_route_claim_hook_ = nullptr;
+        stall_hook(this);
+    }
+#endif
+
+    // Route substitution is now blocked. Recheck external authority while the
+    // exact route writer/gate is held, before the retirement publication.
+    const usb_lifecycle::Snapshot claimed_lifecycle = usb_lifecycle_.snapshot();
+    const StatusSnapshot claimed_runtime = status();
+    const bool lifecycle_replaced =
+        claimed_lifecycle.generation != expected.attach_generation ||
+        claimed_lifecycle.desired != usb_lifecycle::DesiredExposure::kExposed ||
+        claimed_lifecycle.observed != usb_lifecycle::ObservedState::kMounted ||
+        claimed_lifecycle.recovery_required || !claimed_runtime.mounted ||
+        claimed_runtime.suspended;
+    if (lifecycle_replaced) {
+        // Releasing this conditional claim hands the writer directly to any
+        // durable lifecycle request for the same generation. Resume cannot
+        // erase that independent retirement obligation.
+        claim.release();
+        *conditional_token = hid_route::kNoConditionalInvalidationToken;
+        return UsbLinkStallResult::kStale;
+    }
+    if (authority_epoch() != expected.authority_epoch ||
+        sof_heartbeat() != expected.sof_heartbeat) {
+        claim.release();
+        *conditional_token = hid_route::kNoConditionalInvalidationToken;
+        return UsbLinkStallResult::kStale;
+    }
+
+    if (!claim.retire()) {
+        claim.release();
+        *conditional_token = hid_route::kNoConditionalInvalidationToken;
+        return UsbLinkStallResult::kStale;
+    }
+    *conditional_token = hid_route::kNoConditionalInvalidationToken;
+    cancel_release_ticket();
+    cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
+    cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
+    authority_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (!ble_route_authority_snapshot().releasing) {
+        release_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    preserve_suspend_safety(interfaces_[0]);
+    preserve_suspend_safety(interfaces_[1]);
+    // SOF loss is not proof of unmount or suspend. Keep those authoritative
+    // bits unchanged while making endpoint readiness explicitly unavailable.
+    status_bits_.fetch_and(
+        static_cast<std::uint8_t>(~(kKeyboardReadyBit | kMouseReadyBit)),
+        std::memory_order_acq_rel);
+    return UsbLinkStallResult::kApplied;
 }
 
 void StateMachine::set_ready(Interface interface, bool ready) {
@@ -744,6 +899,11 @@ void StateMachine::retire_unsafe_route_authority() {
 }
 
 RouteTransitionOutcome StateMachine::request_route_usb() {
+    // Capture before lifecycle/readiness validation. A suspend, unmount, or
+    // runtime-fault cut after this point either makes commit registration fail
+    // or vetoes the exact registered publication before its gate is released.
+    const hid_route::UsbPublicationCut publication_cut =
+        route_.usb_publication_cut();
     const RouteStatusSnapshot before = route_status_snapshot();
     const usb_lifecycle::Snapshot lifecycle = usb_lifecycle_.snapshot();
     if (before.route.desired == hid_route::OutputRoute::kUsb &&
@@ -780,7 +940,14 @@ RouteTransitionOutcome StateMachine::request_route_usb() {
                                       .snapshot = before};
     }
     retire_unsafe_route_authority();
-    if (!route_.commit_usb_if_none()) {
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (before_usb_route_commit_hook_ != nullptr) {
+        const TestHook hook = before_usb_route_commit_hook_;
+        before_usb_route_commit_hook_ = nullptr;
+        hook(this);
+    }
+#endif
+    if (!route_.commit_usb_if_none(publication_cut)) {
         return RouteTransitionOutcome{.action_result = RouteTransitionResult::kNotReady,
                                       .snapshot_valid = true,
                                       .snapshot = route_status_snapshot()};
@@ -1123,6 +1290,46 @@ void StateMachine::set_inside_ticket_finalize_hook_for_test(TestHook hook) {
 void StateMachine::set_before_terminal_ticket_publish_hook_for_test(TestHook hook) {
     before_terminal_ticket_publish_hook_ = hook;
 }
+
+void StateMachine::set_sof_heartbeat_for_test(SofHeartbeat heartbeat) {
+    sof_heartbeat_.store(heartbeat, std::memory_order_relaxed);
+}
+
+void StateMachine::set_before_usb_stall_route_claim_hook_for_test(
+    TestHook hook) {
+    before_usb_stall_route_claim_hook_ = hook;
+}
+
+void StateMachine::set_after_usb_stall_route_claim_hook_for_test(
+    TestHook hook) {
+    after_usb_stall_route_claim_hook_ = hook;
+}
+
+void StateMachine::set_before_usb_route_commit_hook_for_test(TestHook hook) {
+    before_usb_route_commit_hook_ = hook;
+}
+
+#ifdef HID_ROUTE_NATIVE_TEST
+void StateMachine::set_route_generation_published_hook_for_test(
+    hid_route::StateMachine::GenerationPublishedHook hook) {
+    route_.set_generation_published_hook_for_test(hook);
+}
+
+void StateMachine::set_route_writer_acquired_hook_for_test(
+    hid_route::StateMachine::WriterAcquiredHook hook) {
+    route_.set_writer_acquired_hook_for_test(hook);
+}
+
+void StateMachine::set_route_usb_publication_before_release_hook_for_test(
+    hid_route::StateMachine::WriterAcquiredHook hook) {
+    route_.set_usb_publication_before_release_hook_for_test(hook);
+}
+
+void StateMachine::set_route_usb_publication_after_release_hook_for_test(
+    hid_route::StateMachine::WriterAcquiredHook hook) {
+    route_.set_usb_publication_after_release_hook_for_test(hook);
+}
+#endif
 #endif
 
 bool StateMachine::mounted_and_active(Interface interface) const {
@@ -2464,6 +2671,11 @@ bool StateMachine::begin_usb_runtime_fault(std::int32_t error_code) {
     if (!usb_lifecycle_.begin_runtime_fault(error_code)) {
         return false;
     }
+
+    // A fault may arrive outside the serialized executor while a route request
+    // is publishing. Preserve that historical overlap before deferred exact
+    // route/ticket retirement runs in the executor.
+    route_.publish_usb_lifecycle_veto();
 
     // This is the callback/ISR-side gate: one atomic update immediately
     // closes normal endpoint readiness. Route and ticket retirement remain in
@@ -3883,6 +4095,7 @@ bool Runtime::submit_report(void *, std::uint8_t instance, const std::uint8_t *r
 }
 
 void Runtime::service_sof() {
+    state_machine_.note_sof_activity();
     state_machine_.set_ready(Interface::kKeyboard, tud_hid_n_ready(0));
     state_machine_.set_ready(Interface::kMouse, tud_hid_n_ready(1));
     state_machine_.execute(submit_report, nullptr);
