@@ -88,6 +88,7 @@ boards, operating systems, or future firmware.
 | Authenticated bond lifecycle | `HARDWARE VALIDATED` | FNK0085 lab evidence covers authenticated pairing, 16-byte keys, exact opaque-ID removal, crash-safe persistent absence, stale host-record behavior, and exact slot reuse. |
 | Three-bond capacity / no eviction | `HARDWARE VALIDATED` | One Linux/BlueZ peer plus named lab Xperia, Lenovo, and Moto Android fixtures were used across the accepted sequence: three verified bonds, `store_full` with the set preserved, exact removal, slot reuse, reconnect, and reboot persistence. No blanket Android/device qualification is claimed. |
 | Mouse left button in HID Sequence Executor v1 | `HARDWARE VALIDATED` | The USB-only sequence checkpoint observed exactly one `BTN_LEFT` down/up pair after the F24 pair, with no extra input events and a final all-up cleanup. This does not qualify the other mouse buttons or arbitrary sequences. |
+| Native USB Logical Link-Loss | `HARDWARE VALIDATED` | `PASS_NATIVE_USB_LINK_LOSS_PHYSICAL_CHECKPOINT` on firmware `c2dcfcb14d555da2c8d5b472f91dd5d2824af3a0` and artifact cache key `f711094a91eedc7cd3a38dc3d5285ad90d0046926cc1d68602c71758da2e8db3`: `PRIMARY_SUSPEND` fenced route generation 1 to stable none generation 2; signed host-remove-to-fence was -278.817 ms and the acceptance-transformed value was 0 ms against the frozen 250 ms limit. Reconnect did not resurrect the route, and fresh explicit selection recovered USB use. |
 | Other mouse buttons | `HARDWARE DEFERRED` | No accepted hardware evidence yet for right, middle, backward, or forward buttons. |
 | Wheel / pan | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
 | Physical `report_failed` injection | `HARDWARE DEFERRED` | No accepted hardware injection or recovery evidence yet. |
@@ -199,7 +200,7 @@ The corresponding native/CI coverage is authoritative in
 [`validation-entrypoints.md`](validation-entrypoints.md); protocol and safety
 semantics are authoritative in [`uart-control-plane.md`](uart-control-plane.md).
 
-## Native USB logical link-activity fence
+## Native USB Logical Link-Loss checkpoint
 
 The post-checkpoint product implementation adds a software-only SOF-stall
 safety fallback. TinyUSB suspend and unmount remain authoritative. Only while
@@ -228,13 +229,95 @@ discrimination is unavailable without hardware modification. The fallback
 publishes neither fake `mounted=false` nor fake `suspended=true`, and normal
 SOF/lifecycle recovery does not restore the old route.
 
-The implementation and deterministic boundary coverage are software evidence
-only. The following remains **HARDWARE DEFERRED**: continuous control-USB
-power, active native USB route, physical removal of only the native cable, and
-measurement of last SOF, first suspend/unmount/watchdog callback or fallback,
-route/authority fence latency, continuous boot identity, UART availability,
-and absence of reset/panic. Do not infer a physical latency acceptance bound
-from the 100 ms implementation constant.
+The native USB logical link-loss physical checkpoint is now **HARDWARE
+VALIDATED** on the documented Freenove fixture. It qualifies logical USB
+link-loss fencing, not electrical native-port VBUS-loss detection:
+
+```text
+classification = PASS_NATIVE_USB_LINK_LOSS_PHYSICAL_CHECKPOINT
+PER_PORT_VBUS_MONITORING = NOT_FEASIBLE_ON_CURRENT_BOARD
+firmware source authority = c2dcfcb14d555da2c8d5b472f91dd5d2824af3a0
+artifact cache key = f711094a91eedc7cd3a38dc3d5285ad90d0046926cc1d68602c71758da2e8db3
+artifact archive SHA-256 = 5b2bff1af17356c1a6f817f2b8ab3fb1b27a6576d9d3cd14041c1b9eb76586fb
+artifact application SHA-256 = fa8d972f26d4657d40553b78706a6c25c7da4c43b769f5a7e1302a83d952e192
+artifact ELF SHA-256 = ffc8e35fb7740e6e44820e43f2e8ebf572987ed24d657d327a9f68e4c4a2aca9
+artifact manifest SHA-256 = a2e4b1dc86d82ad1c21a579b7b37d2b536cccb8917d17e9b1ddd17681f9a12c5
+application = 668416 / 672784 bytes; headroom = 4368 bytes
+static RAM = 39520 / 39832 bytes; headroom = 312 bytes
+```
+
+The exact cached production artifact was flashed once, with no reflash. The
+programming/control USB remained connected throughout one native cable-removal
+attempt and one reconnect; there was no retry. Before removal, native USB was
+exposed and mounted, not suspended, both endpoints were ready, and the route
+was stable USB at generation 1. That state remained stable for the 250 ms
+quiet baseline.
+
+The host obtained `T0_HOST_REMOVE` from a passive kernel USB remove uevent
+matched only to the native connection. Existing production UART output was
+captured read-only at a 20 ms observation/ping cadence for the firmware cause
+and already-effective post-fence signal. All external timestamps used the
+host `CLOCK_MONOTONIC` clock; no firmware instrumentation was added. The
+acceptance limits were frozen before removal:
+
+```text
+MAX_HOST_REMOVE_TO_FENCE_MS = 250
+MAX_CAUSE_TO_FENCE_OBSERVATION_MS = 100
+SOF_STALL_TIMEOUT_MS = 100
+executor sampling period = 10 ms
+T1_LAST_SOF_DIRECTLY_OBSERVABLE = NO
+```
+
+`PRIMARY_SUSPEND`, rather than the SOF-stall fallback, was the first firmware
+cause. The observation-level timestamps and results were:
+
+```text
+T0_HOST_REMOVE = 210361049214770 ns
+T2_CAUSE = 210360770397677 ns
+T3_FENCE = 210360770397677 ns
+SIGNED_L_HOST_FENCE = -278.817 ms
+ACCEPTANCE_L_HOST_FENCE = max(0, SIGNED_L_HOST_FENCE) = 0 ms <= 250 ms; PASS
+L_INTERNAL_OBS = 0.000 ms <= 100 ms; PASS
+```
+
+The signed result is retained: the firmware suspend/fence observation preceded
+the host kernel remove uevent, which is a later external observation point and
+not an electrical-edge timestamp. Cause and fence used the same production
+post-fence signal, so `L_INTERNAL_OBS` is an observation-level delta, not zero
+MCU instruction latency.
+
+Suspend invalidated the old route authority and moved route generation 1 to
+generation 2, stable none and not ready. The production cause arrived before
+the next ping, so an explicit old-session `SESSION_MISMATCH` response was not
+directly observed. The generation change, stable-none state, and successful
+fresh session nevertheless established authority fencing and control-plane
+continuity without reboot. Boot identity remained continuous; reset, panic,
+and fatal runtime fault were not observed. Final runtime state retained
+`recovery_required=false` and `last_error=null`.
+
+After the single reconnect, mounted/unsuspended state and both endpoint-ready
+signals recovered while generation 2 remained stable none for at least 250
+ms. Thus readiness did not resurrect the old route. A fresh explicit
+`hid.route.set usb` selected stable, ready USB at generation 3. Final cleanup
+issued `hid.route.set none` once and reached stable none at generation 4, with
+the native cable connected.
+
+This narrow checkpoint issued no HID sequence, keyboard report, mouse report,
+`release_all`, or BLE operation. Its distinct physical evidence authority is:
+
+```text
+wrapper logical identity = native-usb-link-loss-physical-v1
+wrapper SHA-256 = 92edb31cda5de7a93885e1185d4be1e6f55132c9fd233ae305be08ae39221fcb
+remote capsule runner aggregate = 5bed0c419b14c945b887fd911d734ea1a3f86a73af9dcae644145f450d14deb5
+remote capsule lifecycle = PASS / SUCCESS -> RESOLVED -> ACKNOWLEDGED
+```
+
+Exact last SOF was not directly observable from the production artifact, the
+electrical per-port VBUS edge is not observable on the current FNK0085, and
+the old-session mismatch response was not directly observed in this run.
+These are evidence limits, not qualification failures. Machine-local device,
+session, lock, boot-identity, and filesystem identifiers and raw UART output
+remain private.
 
 ## U5.4 read-only event observer and F24 smoke
 
