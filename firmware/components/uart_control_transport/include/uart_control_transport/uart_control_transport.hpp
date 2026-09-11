@@ -27,10 +27,11 @@ esp_err_t start(const control_protocol::Config *protocol_config);
 void on_hid_lifecycle_invalidation();
 
 // Requests protocol-task authority revocation after an input HID report
-// failure. The TinyUSB callback only publishes an atomic notification; the
-// RX task performs the session mutation and invokes the configured safety
-// callback.
-void on_hid_safety_failure();
+// failure. The caller supplies the owner recovered from the exact failed HID
+// work token; the RX task later retires only that owner and invokes the
+// configured safety callback. Zero denotes internal work with no local owner.
+void on_hid_safety_failure(
+    control_session::LocalOwnerId originating_local_owner_id);
 
 // Writes a bounded machine-readable frame without routing it through ESP_LOG
 // or printf. Future protocol responses and events must use this sole path.

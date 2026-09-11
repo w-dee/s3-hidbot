@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL = ROOT / "firmware/components/control_protocol/control_protocol.cpp"
 PROTOCOL_HEADER = ROOT / "firmware/components/control_protocol/include/control_protocol/control_protocol.hpp"
 SESSION = ROOT / "firmware/components/control_session/control_session.cpp"
+SESSION_HEADER = ROOT / "firmware/components/control_session/include/control_session/control_session.hpp"
 TRANSPORT = ROOT / "firmware/components/uart_control_transport/uart_control_transport.cpp"
 MAIN = ROOT / "firmware/main/main.cpp"
 
@@ -16,6 +17,7 @@ def main() -> int:
     protocol = PROTOCOL.read_text(encoding="utf-8")
     protocol_header = PROTOCOL_HEADER.read_text(encoding="utf-8")
     session = SESSION.read_text(encoding="utf-8")
+    session_header = SESSION_HEADER.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
     main_source = MAIN.read_text(encoding="utf-8")
 
@@ -50,6 +52,10 @@ def main() -> int:
     assert "session_.inspect_request(session, id, payload, authority_epoch" in protocol
     assert "session_.inspect_hello(client_nonce, payload, authority_epoch" in protocol
     assert "session_authority_epoch_" in session
+    assert "using LocalOwnerId = std::uint64_t;" in session_header
+    assert "next_local_owner_id_ = 1" in session_header
+    assert "session_.local_owner_id()" in protocol
+    assert "sequence_owner_retired" in protocol_header
     assert "hello_cache_.authority_epoch != current_epoch" in session
     assert "request_cache_.authority_epoch != current_epoch" in session
     assert "session_authority_epoch_ != current_epoch" in session
@@ -73,6 +79,8 @@ def main() -> int:
     assert "firmware_identity::Identity" in protocol_header
     assert "keyboard_report_provider" in protocol_header
     assert "mouse_report_provider" in protocol_header
+    assert "session_.local_owner_id(),\n                                                       keyboard_request" in protocol
+    assert "session_.local_owner_id(),\n                                                    mouse_request" in protocol
     assert 'command == "hid.route.v2.status"' in protocol
     assert 'command == "hid.route.v2.set"' in protocol
     assert "hid.output-route-v1" in protocol

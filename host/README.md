@@ -3,7 +3,9 @@
 `s3-hidbot-host` is the pure-Python client and `hidbotctl` CLI for the
 s3-hidbot UART control plane. It provides bounded transport, framing, protocol,
 session, artifact-verification, identity-comparison, and explicit HID primitive
-APIs for an FNK0085 fixture.
+APIs for an FNK0085 fixture. It also provides an immutable low-level
+`SequenceBuilder` and typed sequence start/status methods; text, layout, and
+named-key translation remain outside the firmware protocol.
 
 Python 3.11 or newer is required.
 
@@ -125,6 +127,14 @@ explicit human authorization. They use raw HID values, not symbolic key names.
 state can remain active. Successful commands, timeouts, and client close do
 not automatically release it; use `hidbotctl release-all` for explicit safety
 recovery and do not outer-retry ambiguous unsafe requests.
+
+Library callers can construct one bounded MCU-paced plan with
+`SequenceBuilder`, then call `Client.sequence_start()` and observe it with
+`Client.sequence_status()`. The builder emits only raw HID usages and the five
+`MouseButton` values. Sequence status polling is observational; the MCU owns
+all waits after admission. A normally completed sequence may intentionally
+leave keys, modifiers, or buttons held, so callers retain responsibility for
+explicit `release_all()` recovery.
 
 ## Further documentation
 

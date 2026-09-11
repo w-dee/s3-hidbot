@@ -9,11 +9,13 @@ device proves that the HID USB path is attached, or vice versa.
 The current v1 implementation extends the bounded JSON control core with the mandatory session lease,
 HID runtime safety foundation, explicit native-USB exposure control, explicit
 HID output routing, the safety-only `hid.release_all` command, and the public absolute
-`hid.keyboard.report` and relative `hid.mouse.report` commands. It implements
+`hid.keyboard.report`, relative `hid.mouse.report`, and bounded low-level HID
+sequence commands. It implements
 `protocol.hello`, `system.ping`, `system.info`, `usb.status`,
 `usb.exposure.status`, `usb.attach`, `usb.detach`, `hid.route.status`,
 `hid.route.set`, `hid.route.v2.status`, `hid.route.v2.set`, `hid.release_all`,
-`hid.keyboard.report`, `hid.mouse.report`, `ble.exposure.status`, `ble.enable`,
+`hid.keyboard.report`, `hid.mouse.report`, `hid.sequence.start`,
+`hid.sequence.status`, `ble.exposure.status`, `ble.enable`,
 `ble.disable`, `ble.pairing.status`, `ble.pairing.respond`, `ble.bond.list`, and
 `ble.bond.remove`. There is still no keyboard
 helper, high-level keyboard/mouse automation, asynchronous event, GPIO action,
@@ -22,7 +24,8 @@ remain explicitly unsafe.
 
 U7.3 adds `ble.exposure.status`, `ble.enable`, and `ble.disable` under
 `ble.exposure-control-v1`; protocol remains 1. With the later pairing and route
-extensions, the full identity hello has 15 unique capabilities. BLE is
+extensions and the HID sequence executor, the full identity hello has 16
+unique capabilities. BLE is
 uninitialized/non-advertising at boot and lazy
 initialization occurs only after accepted enable. Normal disable retains the
 stack in hidden idle. BLE lifecycle generation is independent of USB route and
@@ -493,7 +496,7 @@ initial capability list:
 ```text
   protocol.hello-v1, system.ping-v1, system.info-v1, usb.status-v1,
   usb.exposure-control-v1, hid.lease-v1, hid.release-all-v1, hid.keyboard-report-v1,
-  hid.mouse-report-v1, firmware.identity-v1, hid.output-route-v1,
+  hid.mouse-report-v1, hid.sequence-v1, firmware.identity-v1, hid.output-route-v1,
   hid.output-route-v2,
   ble.exposure-control-v1, ble.pairing-transaction-v1,
   ble.bond-administration-v1
@@ -506,7 +509,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","firmware.identity-v1","hid.output-route-v1","hid.output-route-v2","ble.exposure-control-v1","ble.pairing-transaction-v1","ble.bond-administration-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","hid.sequence-v1","firmware.identity-v1","hid.output-route-v1","hid.output-route-v2","ble.exposure-control-v1","ble.pairing-transaction-v1","ble.bond-administration-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
@@ -970,11 +973,13 @@ Lifecycle or authority changes cancel published work and return
 `SESSION_MISMATCH`. Canceled work is never replayed on a later SOF.
 
 Submitted state is provisional until the matching generation/authority,
-interface, payload, and in-flight identity receives `report_complete`. A
-matching failure does not confirm the keys: it marks host state uncertain,
-requires the global all-up safety path, revokes control authority, and never
-retries the failed unsafe payload. `hid.release_all` remains the only public
-safety recovery command. Successful and operational-error responses are
+interface, payload, and in-flight identity receives `report_complete`. Report
+admission also binds the current 64-bit local-owner ID into that exact ticket
+and work token. A matching failure returns that immutable source owner, marks
+host state uncertain, requires the global all-up safety path, and never retries
+the failed unsafe payload. Owner-scoped protocol maintenance revokes control
+authority only when the returned source remains current. `hid.release_all`
+remains the only public safety recovery command. Successful and operational-error responses are
 cached for exact same-ID/bytes retries; retries never submit a second report,
 and an old authority epoch is rejected before cache replay. Lease refresh
 applies to successful and operational outcomes, but not invalid parameters,
@@ -1242,10 +1247,13 @@ Keyboard and Mouse logical state is separate from host-state uncertainty. A
 successful submission is provisional until `tud_hid_report_complete_cb`; a
 `tud_hid_report_failed_cb` marks that interface uncertain and requires an
 all-up safety report, including when the failed report was itself all-up. The
-input-report failure callback also publishes a non-blocking notification; the
-UART RX task revokes the control session authority before invoking the runtime
-safety callback. Host-to-device output reports are not treated as project HID
-state and do not trigger this path.
+input-report failure callback also publishes a non-blocking notification
+containing the owner recovered from the exact failed token. The UART RX task
+uses that stored source for owner-scoped retirement; it never infers report
+origin from the owner current when the callback or deferred pass runs. Internal
+all-up/safety work carries owner zero and therefore cannot be attributed to a
+current UART owner. Host-to-device output reports are not treated as project
+HID state and do not trigger this path.
 Keyboard and Mouse safety release is independent, so a successful Keyboard
 release never clears a pending Mouse release. Only safety all-up reports may
 be retried automatically. Unsafe reports that are not ready, are canceled by
@@ -1323,6 +1331,114 @@ The `hid.release-all-v1`, `hid.keyboard-report-v1`, and
 safety operation is also available as `hidbotctl release-all`. Host APIs are
 `Client.release_all()`, `Client.keyboard_report(modifiers, keys)`, and
 `Client.mouse_report(buttons, x, y, wheel, pan)`.
+
+## Bounded HID sequences
+
+The optional `hid.sequence-v1` capability advertises two low-level commands:
+
+```json
+{"v":1,"id":9,"session":"<token>","cmd":"hid.sequence.start","params":{"code":"d10;kp4;kr4;w200;mpL;mrL"}}
+{"v":1,"id":10,"session":"<token>","cmd":"hid.sequence.status","params":{"sequence_id":9}}
+```
+
+Sequence code is ASCII and case-sensitive, contains no whitespace, and uses
+`operation (";" operation)*`. The operations are `dN` for a new default delay,
+`wN` for an explicit wait, `kpN`/`krN` for keyboard usage press/release, and
+`mpX`/`mrX` for mouse-button press/release. Mouse buttons are `L`, `R`, `M`,
+`B`, and `F`. Decimal integers have no sign or leading zero except literal
+`0`. Keyboard usages are `4..164`, `176..221`, and modifier usages `224..231`.
+Modifiers occupy their eight modifier bits rather than ordinary key slots.
+
+The firmware accepts at most 320 code bytes and 64 tokens. Numeric fields are
+at most four decimal digits, default delays are `0..1000` ms, explicit waits
+are `0..2000` ms, and total declared scheduled duration is at most 2500 ms.
+Execution has a 4000 ms admission-to-completion deadline and one active plan.
+Parsing and state simulation finish before the first sequence HID report, so
+malformed syntax or a transition beyond six simultaneous ordinary keys has no
+sequence HID side effect. Repeated presses and absent releases are idempotent.
+
+Default delay starts at zero. A HID operation receives the current default
+delay only when another token follows. A `dN` token consumes no time, and a
+`wN` token receives only its explicit wait. The executor establishes every
+delay from the monotonic time observed after the preceding local HID report
+acceptance. It never advances one global timeline, so late report work or a
+late task wake cannot intentionally shorten the next requested delay. USB,
+BLE, FreeRTOS, radio, polling, and target-host latency may lengthen an
+interval.
+
+Admission takes a coherent snapshot of the existing runtime-confirmed
+keyboard modifiers/usages and mouse buttons, then temporarily excludes
+ordinary keyboard and mouse producers. The dedicated static executor task
+submits through the existing USB or BLE ticket owner and emits zero mouse
+motion, wheel, and pan deltas. Normal completion preserves held state. A
+second start and ordinary HID producers return `HID_BUSY` while the sequence
+owns production. `hid.release_all`, lease expiry, session takeover, lifecycle
+loss, and execution failure abort remaining work and use the existing safety
+release path.
+
+Every public report waiter retains the exact fixed-slot ticket identity it
+published. Terminal results may be consumed only by that identity; a delayed
+waiter whose slot has been retired or reused fails boundedly instead of
+observing or freeing the replacement ticket. Ticket identity is a shared,
+nonwrapping 64-bit allocation space; theoretical exhaustion fails closed.
+Identity and lifecycle transitions are protected by short per-interface
+metadata critical sections that never span transport submission or task waits.
+A writer canceled before publication retains its slot until it acknowledges
+the cancellation and publishes its complete terminal outcome. A canceled BLE
+ticket likewise remains unavailable while its already-queued owner action is
+pending, while its caller still returns at the existing bounded deadline.
+A ticket becomes too late to
+cancel when its transport owner enters the local submission adapter; the
+report linearizes when that adapter reports local acceptance. For USB this is
+a successful `tud_hid_n_report` submission, and for BLE it is local
+`ble_gatts_notify_custom` stack acceptance, never host, peer, or OS delivery.
+Release treats the claimed/submitting ticket as outstanding and keeps safety
+pending until an all-up report has serialized after it. A public release
+publishes its release-epoch barrier before taking even an already-up snapshot,
+so work admitted before that barrier either fails its final fence or appears
+in the release ordering predicate. Its active result ticket continues to gate
+ordinary report and sequence producers until the caller finalizes the bounded
+result, even if the transport executor has already consumed the epoch request.
+
+An accepted start result is exactly
+`{"sequence_id":N,"state":"accepted"}`, where `N` is the start request ID.
+An exact same-ID/byte retry replays that cached response and does not start the
+plan again. Status returns exactly `sequence_id`, `state`, `started`,
+`executed`, `failed_token`, and `code`; states are `accepted`, `running`,
+`completed`, `failed`, and `aborted`. `executed` counts each token only after
+the token and any default delay attached to its HID operation have completed
+within the execution deadline. `failed_token` is zero-based. The latest
+accepted status is retained until a replacement or session retirement;
+otherwise status returns `SEQUENCE_NOT_FOUND`.
+
+Sequence lifecycle fields are published and sampled as one coherent record.
+Completion, failure, timeout, and revocation compete for one generation-owned
+terminal transition; once one terminal state wins it cannot be overwritten.
+Every fresh accepted hello allocates one nonzero, nonwrapping 64-bit local
+control-owner ID. Exact hello replay retains the existing ID. This identity is
+separate from the HID runtime authority epoch: the local owner scopes sequence
+visibility and retirement, while the HID epoch continues to fence report
+execution. Every protocol path that retires a session captures its local owner
+ID before clearing session state and retires only sequence status owned by that
+ID. Delayed cleanup for an older local owner therefore cannot erase or abort a
+newer owner's status even when both sessions share one HID authority epoch or
+reuse the same numeric sequence ID. Direct and sequence-generated reports bind
+that owner at report admission and carry it through the ticket and asynchronous
+work token. Deferred local HID-failure handling stores the owner recovered from
+the exact failed report before the UART task performs retirement; it does not
+sample the later published current owner as the source.
+
+The sequence `code` JSON string is the only request string allowed to exceed
+the normal string bound. For this command the complete raw request must contain
+no backslash, which rejects all escaped and other noncanonical string forms.
+The framing layer also rejects an embedded NUL before JSON parsing. These
+narrow rules ensure that the parser consumes one unambiguous complete code
+string without changing unrelated JSON limits.
+
+The host library exposes immutable `Sequence` values through
+`SequenceBuilder`, the `MouseButton` enum, `Client.sequence_start()`, and
+`Client.sequence_status()`. Builder validation covers static grammar and
+duration bounds; runtime-dependent held-state validation remains in firmware.
 
 ## Relative mouse reports
 

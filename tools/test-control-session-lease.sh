@@ -6,6 +6,7 @@ temporary_directory=$(mktemp -d)
 trap 'rm -f "$temporary_directory/test_control_session_lease"; rmdir "$temporary_directory" 2>/dev/null || true' EXIT
 
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -pedantic \
+  -DCONTROL_SESSION_NATIVE_TEST \
   -I"$repository_root/firmware/components/control_session/include" \
   -I"$repository_root/firmware/components/secure_memory/include" \
   -I"$repository_root/firmware/components/sensitive_request/include" \

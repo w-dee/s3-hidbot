@@ -5,6 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifdef HID_RUNTIME_NATIVE_TEST
+#include <mutex>
+#else
+#include "freertos/FreeRTOS.h"
+#endif
+
 #include "hid_route/hid_route.hpp"
 #include "usb_lifecycle/usb_lifecycle.hpp"
 
@@ -114,6 +120,7 @@ enum class KeyboardReportState : std::uint8_t {
 enum class KeyboardReportTicketState : std::uint8_t {
     kFree,
     kWriting,
+    kWritingCanceled,
     kPublished,
     kClaimed,
     kSubmitted,
@@ -130,9 +137,41 @@ enum class KeyboardReportTicketOutcome : std::uint8_t {
     kAuthorityLost,
 };
 
+using HidTicketId = std::uint64_t;
+using ReportOriginOwnerId = std::uint64_t;
+
+// Ticket identity and lifecycle transitions use one short synchronization
+// domain. No transport call or task wait is performed while this lock is held.
+class TicketMetadataLock {
+  public:
+    void lock() const {
+#ifdef HID_RUNTIME_NATIVE_TEST
+        mutex_.lock();
+#else
+        portENTER_CRITICAL(&mux_);
+#endif
+    }
+
+    void unlock() const {
+#ifdef HID_RUNTIME_NATIVE_TEST
+        mutex_.unlock();
+#else
+        portEXIT_CRITICAL(&mux_);
+#endif
+    }
+
+  private:
+#ifdef HID_RUNTIME_NATIVE_TEST
+    mutable std::mutex mutex_{};
+#else
+    mutable portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
+#endif
+};
+
 struct KeyboardReportSnapshot {
     KeyboardReportTicketState state = KeyboardReportTicketState::kFree;
     KeyboardReportTicketOutcome outcome = KeyboardReportTicketOutcome::kNone;
+    HidTicketId ticket_id = 0;
 };
 
 struct KeyboardReportResult {
@@ -167,6 +206,7 @@ enum class MouseReportState : std::uint8_t {
 enum class MouseReportTicketState : std::uint8_t {
     kFree,
     kWriting,
+    kWritingCanceled,
     kPublished,
     kClaimed,
     kSubmitted,
@@ -186,6 +226,7 @@ enum class MouseReportTicketOutcome : std::uint8_t {
 struct MouseReportSnapshot {
     MouseReportTicketState state = MouseReportTicketState::kFree;
     MouseReportTicketOutcome outcome = MouseReportTicketOutcome::kNone;
+    HidTicketId ticket_id = 0;
 };
 
 struct MouseReportResult {
@@ -201,7 +242,24 @@ struct MouseReportResult {
 using AuthorityEpoch = std::uint32_t;
 using UsbGeneration = usb_lifecycle::Generation;
 using RouteGeneration = hid_route::Generation;
-using HidTicketId = std::uint32_t;
+
+struct ConfirmedHidState {
+    KeyboardState keyboard{};
+    MouseState mouse{};
+};
+
+struct SequenceAuthority {
+    std::uint32_t generation = 0;
+    AuthorityEpoch authority_epoch = 0;
+    std::uint32_t release_epoch = 0;
+};
+
+enum class SequenceAdmissionResult : std::uint8_t {
+    kAccepted,
+    kBusy,
+    kNotReady,
+    kSafetyPending,
+};
 
 inline constexpr std::uint16_t kNoBleConnection = 0xffff;
 
@@ -238,6 +296,8 @@ struct HidWorkToken {
     std::uint32_t transport_generation = 0;
     HidTicketId ticket_id = 0;
     std::uint32_t release_epoch = 0;
+    std::uint32_t sequence_generation = 0;
+    ReportOriginOwnerId originating_local_owner_id = 0;
     std::uint16_t connection_handle = kNoBleConnection;
     std::uint16_t characteristic_handle = 0;
     ReportKind report_kind = ReportKind::kUnsafeKeyboard;
@@ -379,10 +439,20 @@ class StateMachine {
     // USB SOF or BLE control executor claims and resolves it without ever
     // reading a partially-written report.
     KeyboardReportBeginResult begin_keyboard_report(
-        std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes);
+        std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes,
+        SequenceAuthority sequence = {}, HidTicketId *ticket_id = nullptr,
+        ReportOriginOwnerId originating_local_owner_id = 0);
     KeyboardReportSnapshot keyboard_report_snapshot() const;
-    bool cancel_keyboard_report();
-    void finalize_keyboard_report();
+    bool keyboard_report_snapshot(HidTicketId ticket_id,
+                                  KeyboardReportSnapshot *snapshot) const;
+    bool cancel_keyboard_report(HidTicketId ticket_id);
+    bool finalize_keyboard_report(HidTicketId ticket_id);
+#ifdef HID_RUNTIME_NATIVE_TEST
+    void finalize_keyboard_report() {
+        (void)finalize_keyboard_report(
+            keyboard_report_snapshot().ticket_id);
+    }
+#endif
 
     // Public mouse reports use a dedicated fixed-size ticket. Relative axes
     // are kept only in the ticket/in-flight identity; confirmed state stores
@@ -390,10 +460,20 @@ class StateMachine {
     MouseReportBeginResult begin_mouse_report(std::uint8_t buttons,
                                               std::int8_t x, std::int8_t y,
                                               std::int8_t vertical,
-                                              std::int8_t horizontal);
+                                              std::int8_t horizontal,
+                                              SequenceAuthority sequence = {},
+                                              HidTicketId *ticket_id = nullptr,
+                                              ReportOriginOwnerId originating_local_owner_id = 0);
     MouseReportSnapshot mouse_report_snapshot() const;
-    bool cancel_mouse_report();
-    void finalize_mouse_report();
+    bool mouse_report_snapshot(HidTicketId ticket_id,
+                               MouseReportSnapshot *snapshot) const;
+    bool cancel_mouse_report(HidTicketId ticket_id);
+    bool finalize_mouse_report(HidTicketId ticket_id);
+#ifdef HID_RUNTIME_NATIVE_TEST
+    void finalize_mouse_report() {
+        (void)finalize_mouse_report(mouse_report_snapshot().ticket_id);
+    }
+#endif
 
     HidWorkToken published_report_token(Interface interface) const;
     bool mark_ble_report_scheduled(Interface interface, HidWorkToken token);
@@ -417,29 +497,44 @@ class StateMachine {
                          std::uint16_t length = 0);
     bool report_failed(std::uint8_t instance,
                        const std::uint8_t *report = nullptr,
-                       std::uint16_t length = 0);
+                       std::uint16_t length = 0,
+                       ReportOriginOwnerId *originating_local_owner_id = nullptr);
     bool report_complete_for_token(std::uint8_t instance, HidWorkToken token,
                                    const std::uint8_t *report = nullptr,
                                    std::uint16_t length = 0);
     bool report_failed_for_token(std::uint8_t instance, HidWorkToken token,
                                  const std::uint8_t *report = nullptr,
-                                 std::uint16_t length = 0);
+                                 std::uint16_t length = 0,
+                                 ReportOriginOwnerId *originating_local_owner_id = nullptr);
 
     KeyboardState keyboard_state() const;
     MouseState mouse_state() const;
     bool safety_required(Interface interface) const;
     bool host_state_uncertain(Interface interface) const;
     bool report_in_flight(Interface interface) const;
+    SequenceAdmissionResult begin_sequence(ConfirmedHidState *state,
+                                           SequenceAuthority *authority);
+    bool sequence_authority_current(SequenceAuthority authority) const;
+    void end_sequence(SequenceAuthority authority);
+    void revoke_sequence();
+    bool sequence_active() const;
 
 #ifdef HID_RUNTIME_NATIVE_TEST
     using TestHook = void (*)(StateMachine *);
     void set_before_ticket_publish_hook_for_test(TestHook hook);
     void set_before_submit_hook_for_test(TestHook hook);
+    void set_after_submit_hook_for_test(TestHook hook);
+    void set_before_ble_terminal_publish_hook_for_test(TestHook hook);
     void set_before_release_reconciliation_hook_for_test(TestHook hook);
     void publish_release_request_only_for_test();
     bool release_requested_for_test() const;
     std::uint32_t release_request_epoch_for_test() const;
     void set_release_epoch_for_test(std::uint32_t release_epoch);
+    void set_next_sequence_generation_for_test(std::uint32_t generation);
+    void set_next_public_ticket_id_for_test(HidTicketId ticket_id);
+    void set_inside_ticket_cancel_hook_for_test(TestHook hook);
+    void set_inside_ticket_finalize_hook_for_test(TestHook hook);
+    void set_before_terminal_ticket_publish_hook_for_test(TestHook hook);
 #endif
 
   private:
@@ -451,6 +546,8 @@ class StateMachine {
         HidTransport slot_transport = HidTransport::kUsb;
         HidTicketId slot_ticket_id = 0;
         std::uint32_t slot_release_epoch = 0;
+        std::uint32_t slot_sequence_generation = 0;
+        ReportOriginOwnerId slot_originating_local_owner_id = 0;
         ReportKind slot_kind = ReportKind::kUnsafeKeyboard;
         std::uint8_t slot_length = 0;
         std::uint8_t slot_report[8]{};
@@ -462,6 +559,8 @@ class StateMachine {
         HidTransport in_flight_transport = HidTransport::kUsb;
         HidTicketId in_flight_ticket_id = 0;
         std::uint32_t in_flight_release_epoch = 0;
+        std::uint32_t in_flight_sequence_generation = 0;
+        ReportOriginOwnerId in_flight_originating_local_owner_id = 0;
         ReportKind in_flight_kind = ReportKind::kUnsafeKeyboard;
         std::uint8_t in_flight_length = 0;
         std::uint8_t in_flight_report[8]{};
@@ -540,6 +639,8 @@ class StateMachine {
     bool process_mouse_ticket(SubmitFn submit, void *context,
                               UsbGeneration current_generation,
                               AuthorityEpoch current_authority_epoch);
+    bool allocate_public_ticket_id(HidTicketId *ticket_id);
+    HidWorkToken current_report_token_locked(Interface interface) const;
 
     struct KeyboardReportTicket {
         std::atomic<KeyboardReportTicketState> state{KeyboardReportTicketState::kFree};
@@ -547,12 +648,14 @@ class StateMachine {
         std::atomic<AuthorityEpoch> authority_epoch{0};
         std::atomic<RouteGeneration> route_generation{0};
         std::atomic<HidTransport> transport{HidTransport::kUsb};
-        std::atomic<HidTicketId> ticket_id{0};
+        HidTicketId ticket_id = 0;
         std::atomic<std::uint32_t> release_epoch{0};
+        std::atomic<std::uint32_t> sequence_generation{0};
+        ReportOriginOwnerId originating_local_owner_id = 0;
         std::uint16_t connection_handle = kNoBleConnection;
         std::uint16_t characteristic_handle = 0;
-        std::atomic_bool ble_action_pending{false};
-        std::atomic<KeyboardReportTicketOutcome> outcome{KeyboardReportTicketOutcome::kNone};
+        bool ble_action_pending = false;
+        KeyboardReportTicketOutcome outcome = KeyboardReportTicketOutcome::kNone;
         std::uint8_t report[8]{};
     };
 
@@ -562,26 +665,30 @@ class StateMachine {
         std::atomic<AuthorityEpoch> authority_epoch{0};
         std::atomic<RouteGeneration> route_generation{0};
         std::atomic<HidTransport> transport{HidTransport::kUsb};
-        std::atomic<HidTicketId> ticket_id{0};
+        HidTicketId ticket_id = 0;
         std::atomic<std::uint32_t> release_epoch{0};
+        std::atomic<std::uint32_t> sequence_generation{0};
+        ReportOriginOwnerId originating_local_owner_id = 0;
         std::uint16_t connection_handle = kNoBleConnection;
         std::uint16_t characteristic_handle = 0;
-        std::atomic_bool ble_action_pending{false};
-        std::atomic<MouseReportTicketOutcome> outcome{MouseReportTicketOutcome::kNone};
+        bool ble_action_pending = false;
+        MouseReportTicketOutcome outcome = MouseReportTicketOutcome::kNone;
         std::uint8_t report[5]{};
     };
 
-    // ESP32-S3 has native lock-free 32-bit atomics. Keep this fixed-width
-    // publication token independent from attach generation so the lifecycle
-    // callback never needs to wait for the UART/control task.
+    // ESP32-S3 has native lock-free 32-bit atomics. Keep the internal mailbox
+    // token independent from attach generation. Public reusable-slot tickets
+    // use the separately locked 64-bit nonwrapping allocator below.
     static_assert(std::atomic<AuthorityEpoch>::is_always_lock_free);
     static_assert(std::atomic<UsbGeneration>::is_always_lock_free);
     static_assert(std::atomic<RouteGeneration>::is_always_lock_free);
-    static_assert(std::atomic<HidTicketId>::is_always_lock_free);
     static_assert(std::atomic<std::uint16_t>::is_always_lock_free);
     usb_lifecycle::StateMachine usb_lifecycle_{};
     hid_route::StateMachine route_{};
-    std::atomic<HidTicketId> next_ticket_id_{1};
+    std::atomic<std::uint32_t> next_ticket_id_{1};
+    // The allocator lock may be nested inside one ticket lock; no code takes
+    // these locks in the reverse order.
+    HidTicketId next_public_ticket_id_ = 1;
     std::atomic<AuthorityEpoch> authority_epoch_{0};
     std::atomic<std::uint32_t> release_epoch_{0};
     std::atomic<std::uint32_t> release_request_generation_{0};
@@ -589,6 +696,8 @@ class StateMachine {
     std::atomic<std::uint32_t> release_request_epoch_{0};
     std::atomic<std::uint8_t> status_bits_{0};  // mounted, suspended, kbd-ready, mouse-ready
     std::atomic_bool release_requested_{false};
+    std::atomic<std::uint32_t> sequence_generation_{0};
+    std::atomic<std::uint32_t> next_sequence_generation_{1};
     std::atomic_bool unavailable_release_reconciler_active_{false};
     std::atomic<std::uint32_t> ble_route_sequence_{0};
     std::atomic<AuthorityEpoch> ble_route_authority_epoch_{0};
@@ -602,12 +711,20 @@ class StateMachine {
     std::atomic<std::uint32_t> ble_route_release_epoch_{0};
     InterfaceState interfaces_[2]{};
     ReleaseAllTicket release_ticket_{};
+    mutable TicketMetadataLock ticket_id_lock_{};
+    mutable TicketMetadataLock keyboard_ticket_lock_{};
+    mutable TicketMetadataLock mouse_ticket_lock_{};
     KeyboardReportTicket keyboard_ticket_{};
     MouseReportTicket mouse_ticket_{};
 #ifdef HID_RUNTIME_NATIVE_TEST
     TestHook before_ticket_publish_hook_ = nullptr;
     TestHook before_submit_hook_ = nullptr;
+    TestHook after_submit_hook_ = nullptr;
+    TestHook before_ble_terminal_publish_hook_ = nullptr;
     TestHook before_release_reconciliation_hook_ = nullptr;
+    TestHook inside_ticket_cancel_hook_ = nullptr;
+    TestHook inside_ticket_finalize_hook_ = nullptr;
+    TestHook before_terminal_ticket_publish_hook_ = nullptr;
 #endif
 };
 
@@ -635,14 +752,25 @@ class Runtime {
     bool queue_mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
                             std::int8_t vertical, std::int8_t horizontal);
     KeyboardReportResult keyboard_report(
-        std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes);
+        std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes,
+        SequenceAuthority sequence = {},
+        ReportOriginOwnerId originating_local_owner_id = 0);
     MouseReportResult mouse_report(std::uint8_t buttons, std::int8_t x, std::int8_t y,
-                                   std::int8_t vertical, std::int8_t horizontal);
+                                   std::int8_t vertical, std::int8_t horizontal,
+                                   SequenceAuthority sequence = {},
+                                   ReportOriginOwnerId originating_local_owner_id = 0);
+    SequenceAdmissionResult begin_sequence(ConfirmedHidState *state,
+                                           SequenceAuthority *authority);
+    bool sequence_authority_current(SequenceAuthority authority) const;
+    void end_sequence(SequenceAuthority authority);
+    void revoke_sequence();
+    bool sequence_active() const;
     // Completes an already-published fixed ticket. The BLE control executor
     // uses this same bounded result bridge after scheduling the ticket token.
     KeyboardReportResult complete_keyboard_report(
-        KeyboardReportBeginResult begin);
-    MouseReportResult complete_mouse_report(MouseReportBeginResult begin);
+        KeyboardReportBeginResult begin, HidTicketId ticket_id);
+    MouseReportResult complete_mouse_report(MouseReportBeginResult begin,
+                                            HidTicketId ticket_id);
     void request_release_all();
     ReleaseAllResult release_all();
     LifecycleSafetyResult run_lifecycle_detach_safety();
@@ -654,7 +782,8 @@ class Runtime {
                             std::uint16_t length = 0);
     bool on_report_failed(std::uint8_t instance,
                           const std::uint8_t *report = nullptr,
-                          std::uint16_t length = 0);
+                          std::uint16_t length = 0,
+                          ReportOriginOwnerId *originating_local_owner_id = nullptr);
 
     // Results are consumed by the application task for bounded diagnostic
     // logging; the TinyUSB callback itself never logs or blocks.

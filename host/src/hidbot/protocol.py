@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 
 from .errors import CompatibilityError, ProtocolError
 from .framing import FRAME_PREFIX, MAX_MACHINE_FRAME_BYTES
+from .sequence import Sequence as HidSequence
 
 
 PROTOCOL_VERSION = 1
@@ -35,6 +36,7 @@ BLE_BOND_ADMINISTRATION_CAPABILITY = "ble.bond-administration-v1"
 MAX_BONDS = 3
 HID_OUTPUT_ROUTE_V1_CAPABILITY = "hid.output-route-v1"
 HID_OUTPUT_ROUTE_V2_CAPABILITY = "hid.output-route-v2"
+HID_SEQUENCE_CAPABILITY = "hid.sequence-v1"
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 SOURCE_REVISION_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_SOURCE_REVISION_BYTES}}}\Z")
 APP_ELF_SHA256_PATTERN = re.compile(rf"[0-9a-f]{{{MAX_APP_ELF_SHA256_BYTES}}}\Z")
@@ -58,6 +60,7 @@ OPTIONAL_CAPABILITIES = frozenset(
         "usb.exposure-control-v1",
         "hid.keyboard-report-v1",
         "hid.mouse-report-v1",
+        HID_SEQUENCE_CAPABILITY,
         "firmware.identity-v1",
         HID_OUTPUT_ROUTE_V1_CAPABILITY,
         HID_OUTPUT_ROUTE_V2_CAPABILITY,
@@ -158,6 +161,22 @@ class KeyboardReportResult:
 @dataclass(frozen=True)
 class MouseReportResult:
     state: Literal["already_set", "submitted"]
+
+
+@dataclass(frozen=True)
+class SequenceHandle:
+    sequence_id: int
+    state: Literal["accepted"]
+
+
+@dataclass(frozen=True)
+class SequenceStatus:
+    sequence_id: int
+    state: Literal["accepted", "running", "completed", "failed", "aborted"]
+    started: bool
+    executed: int
+    failed_token: int | None
+    code: str | None
 
 
 @dataclass(frozen=True)
@@ -505,6 +524,46 @@ def build_command_frame(request_id: int, session: str, command: str) -> bytes:
     )
 
 
+def build_sequence_start_frame(
+    request_id: int, session: str, sequence: HidSequence
+) -> bytes:
+    if type(request_id) is not int or not 0 <= request_id <= MAX_ID:
+        raise ProtocolError("request id is invalid")
+    if not isinstance(session, str) or TOKEN_PATTERN.fullmatch(session) is None:
+        raise ProtocolError("session is invalid")
+    if not isinstance(sequence, HidSequence):
+        raise ProtocolError("HID sequence is invalid")
+    return _serialize_request(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "session": session,
+            "cmd": "hid.sequence.start",
+            "params": {"code": sequence.encode()},
+        }
+    )
+
+
+def build_sequence_status_frame(
+    request_id: int, session: str, sequence_id: int
+) -> bytes:
+    if type(request_id) is not int or not 0 <= request_id <= MAX_ID:
+        raise ProtocolError("request id is invalid")
+    if not isinstance(session, str) or TOKEN_PATTERN.fullmatch(session) is None:
+        raise ProtocolError("session is invalid")
+    if type(sequence_id) is not int or not 0 <= sequence_id <= MAX_ID:
+        raise ProtocolError("sequence id is invalid")
+    return _serialize_request(
+        {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "session": session,
+            "cmd": "hid.sequence.status",
+            "params": {"sequence_id": sequence_id},
+        }
+    )
+
+
 def build_hid_route_set_frame(
     request_id: int, session: str, route: OutputRoute
 ) -> bytes:
@@ -767,6 +826,74 @@ def validate_mouse_report_result(value: Any) -> MouseReportResult:
     if state not in {"already_set", "submitted"}:
         raise ProtocolError("hid.mouse.report result state is invalid")
     return MouseReportResult(state=cast(Literal["already_set", "submitted"], state))
+
+
+def validate_sequence_handle(value: Any) -> SequenceHandle:
+    if not isinstance(value, dict) or set(value) != {"sequence_id", "state"}:
+        raise ProtocolError("hid.sequence.start result fields are invalid")
+    sequence_id = value["sequence_id"]
+    if type(sequence_id) is not int or not 0 <= sequence_id <= MAX_ID:
+        raise ProtocolError("hid.sequence.start result ID is invalid")
+    if value["state"] != "accepted":
+        raise ProtocolError("hid.sequence.start result state is invalid")
+    return SequenceHandle(sequence_id=sequence_id, state="accepted")
+
+
+def validate_sequence_status(value: Any) -> SequenceStatus:
+    fields = {"sequence_id", "state", "started", "executed", "failed_token", "code"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProtocolError("hid.sequence.status result fields are invalid")
+    sequence_id = value["sequence_id"]
+    state = value["state"]
+    started = value["started"]
+    executed = value["executed"]
+    failed_token = value["failed_token"]
+    code = value["code"]
+    states = {"accepted", "running", "completed", "failed", "aborted"}
+    failure_codes = {
+        "HID_BUSY", "HID_NOT_READY", "HID_SAFETY_PENDING",
+        "SEQUENCE_TIMEOUT",
+    }
+    abort_codes = {"SESSION_MISMATCH", "SEQUENCE_ABORTED"}
+    terminal_codes = failure_codes | abort_codes
+    if type(sequence_id) is not int or not 0 <= sequence_id <= MAX_ID:
+        raise ProtocolError("hid.sequence.status sequence ID is invalid")
+    if not isinstance(state, str) or state not in states or type(started) is not bool:
+        raise ProtocolError("hid.sequence.status state is invalid")
+    if type(executed) is not int or not 0 <= executed <= 64:
+        raise ProtocolError("hid.sequence.status executed count is invalid")
+    if failed_token is not None and (
+        type(failed_token) is not int or not 0 <= failed_token < 64
+    ):
+        raise ProtocolError("hid.sequence.status failed token is invalid")
+    if code is not None and (not isinstance(code, str) or code not in terminal_codes):
+        raise ProtocolError("hid.sequence.status terminal code is invalid")
+    if state == "accepted" and (started or executed != 0):
+        raise ProtocolError("hid.sequence.status accepted lifecycle is invalid")
+    if state in {"running", "completed", "failed", "aborted"} and not started:
+        raise ProtocolError("hid.sequence.status started lifecycle is invalid")
+    if state == "completed" and executed == 0:
+        raise ProtocolError("hid.sequence.status completed count is invalid")
+    if state in {"accepted", "running", "completed"} and (
+        failed_token is not None or code is not None
+    ):
+        raise ProtocolError("hid.sequence.status nonterminal failure is invalid")
+    if state in {"failed", "aborted"} and (failed_token is None or code is None):
+        raise ProtocolError("hid.sequence.status terminal failure is incomplete")
+    if state in {"failed", "aborted"} and failed_token != executed:
+        raise ProtocolError("hid.sequence.status terminal count is inconsistent")
+    if state == "failed" and code not in failure_codes:
+        raise ProtocolError("hid.sequence.status failure code is inconsistent")
+    if state == "aborted" and code not in abort_codes:
+        raise ProtocolError("hid.sequence.status abort code is inconsistent")
+    return SequenceStatus(
+        sequence_id=sequence_id,
+        state=cast(Literal["accepted", "running", "completed", "failed", "aborted"], state),
+        started=started,
+        executed=executed,
+        failed_token=failed_token,
+        code=code,
+    )
 
 
 def validate_usb_exposure_status(value: Any) -> UsbExposureStatus:

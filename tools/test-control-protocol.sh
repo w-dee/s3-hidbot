@@ -20,6 +20,7 @@ trap 'rm -f "$temporary_directory/cjson.o" "$temporary_directory/test_control_pr
   -I"$repository_root/firmware/components/control_protocol/include" \
   -I"$repository_root/firmware/components/firmware_identity/include" \
   -I"$repository_root/firmware/components/hid_runtime/include" \
+  -I"$repository_root/firmware/components/uart_control_transport/include" \
   -I"$repository_root/firmware/components/hid_route/include" \
   -I"$repository_root/firmware/components/usb_lifecycle/include" \
   -I"$repository_root/firmware/components/secure_memory/include" \

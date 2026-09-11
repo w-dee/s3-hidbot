@@ -48,6 +48,29 @@ esptool-free and that the optional `flash` extra installs a supported esptool
 for a version/help smoke without opening a serial port. It is a validation-only
 command; it never uploads or publishes an artifact.
 
+The bounded HID sequence feature adds `tools/test-hid-sequence.sh` to
+`test-native.sh`. Its deterministic fake monotonic clock covers the complete
+grammar and bounds, parse-before-execute behavior, held-state simulation,
+status and abort lifecycles, the 4000 ms deadline, and local minimum delays
+without global catch-up compression. It also covers stale admission wakes,
+revoked report authority, and deadline-edge wait arithmetic. The HID runtime
+suite covers coherent BLE confirmed-state publication, a release interleaving
+while a sequence ticket is still being written, ordinary mailbox producer
+exclusion, safety-release priority, claimed/submitting release serialization,
+writer-owned cancellation acknowledgement, exact cancel/finalize exclusion,
+terminal outcome visibility, 64-bit ticket boundary/exhaustion behavior, bounded
+canceled-BLE retirement, and exact ticket-result ownership across both keyboard
+and mouse slot-reuse waiter orders. The control-protocol suite covers
+capability and response shapes, exact retry without duplicate admission,
+local-owner-scoped status retirement across every session-retiring command,
+same-HID-epoch owner replacement and delayed-cleanup isolation,
+320-byte code handling, escaped-code
+rejection, embedded-NUL rejection, and missing status. Host unit and package
+suites cover the immutable builder, canonical encoding, strict response
+lifecycle validation, typed client methods, and artifact inclusion. These
+checks are software-only and perform no serial, USB, BLE, or other hardware
+access.
+
 ## Entrypoints
 
 `tools/test-rp-test-infra.sh` validates persistent rp-test bootstrap decisions,
@@ -183,6 +206,15 @@ return to direct runtime diagnostic output. Tier A always checks the
 project-owned callbacks and sink; `test-firmware.sh` reruns the same guard
 after dependency materialization to make the external queue-hook check
 mandatory without adding another firmware build.
+
+The HID runtime, control-executor, sequence, and protocol suites also cover
+64-bit local-owner metadata from direct or sequence report admission through
+USB/BLE ticket publication. The protocol regression accepts a late exact USB
+failure for owner A after owner B takes over under the same HID epoch, passes A
+through the production bounded deferred-event rule, and verifies that B's
+session and retained running sequence survive. Companion cases cover keyboard,
+mouse, owner-zero internal work, stale-token rejection, current-owner failure,
+and current-owner precedence when events coalesce.
 
 The bonded GATT-cache regression extends the executor and BLE HID static
 entrypoints with legacy missing-revision migration, stale-cache readiness

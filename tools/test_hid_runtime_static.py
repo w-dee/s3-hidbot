@@ -63,7 +63,10 @@ def main() -> int:
     )
     assert "on_report_complete" in main_source and "on_report_failed" in main_source
     assert "report_type == HID_REPORT_TYPE_INPUT" in main_source
-    assert "uart_control_transport::on_hid_safety_failure()" in main_source
+    assert "ReportOriginOwnerId originating_local_owner_id = 0" in main_source
+    assert "&originating_local_owner_id" in main_source
+    assert "uart_control_transport::on_hid_safety_failure(" in main_source
+    assert "s_published_local_owner" not in main_source
     assert "on_hid_lifecycle_invalidation()" in main_source
     assert "authority_epoch_" in header
     assert "slot_authority_epoch" in header
@@ -110,19 +113,51 @@ def main() -> int:
     assert "logical_state_held" in header
     assert "host_state_uncertain" in header
     assert "KeyboardReportTicket" in header
+    assert "kWritingCanceled" in header
     assert "kPublished" in header and "kClaimed" in header and "kCanceled" in header
     assert "begin_keyboard_report" in header
     assert "cancel_keyboard_report" in runtime
     assert "confirmed_sequence" in header
     assert "confirmed_keyboard_equals" in runtime
-    assert "keyboard_ticket_.state.compare_exchange_strong" in runtime
     assert "MouseReportTicket" in header
     assert "begin_mouse_report" in header
     assert "process_mouse_ticket" in runtime
-    assert "mouse_ticket_.state.compare_exchange_strong" in runtime
     assert "confirmed_mouse_buttons" in header
+    assert "using HidTicketId = std::uint64_t;" in header
+    assert "using ReportOriginOwnerId = std::uint64_t;" in header
+    assert "originating_local_owner_id" in header
+    assert "in_flight_originating_local_owner_id" in header
+    assert "std::atomic<HidTicketId>" not in header
+    assert "TicketMetadataLock" in header
+    assert "keyboard_ticket_lock_" in header and "mouse_ticket_lock_" in header
+    assert "cancel_keyboard_report(HidTicketId ticket_id);" in header
+    assert "cancel_mouse_report(HidTicketId ticket_id);" in header
+    keyboard_complete_start = runtime.index(
+        "KeyboardReportResult Runtime::complete_keyboard_report("
+    )
+    keyboard_complete_end = runtime.index(
+        "MouseReportResult Runtime::mouse_report(", keyboard_complete_start
+    )
+    keyboard_complete = runtime[keyboard_complete_start:keyboard_complete_end]
+    mouse_complete_start = runtime.index(
+        "MouseReportResult Runtime::complete_mouse_report("
+    )
+    mouse_complete_end = runtime.index(
+        "void Runtime::request_release_all()", mouse_complete_start
+    )
+    mouse_complete = runtime[mouse_complete_start:mouse_complete_end]
+    for complete, wait_name, poll_name in (
+        (keyboard_complete, "kKeyboardReportWaitTicks", "kKeyboardReportPollTicks"),
+        (mouse_complete, "kMouseReportWaitTicks", "kMouseReportPollTicks"),
+    ):
+        terminal_start = complete.index("kNotReady ||")
+        terminal_end = complete.index("kPublished)", terminal_start)
+        terminal_path = complete[terminal_start:terminal_end]
+        assert f"xTaskGetTickCount() - wait_start >= {wait_name}" in terminal_path
+        assert f"vTaskDelay({poll_name})" in terminal_path
     assert "static_cast<std::uint8_t>(Interface::kMouse)" in runtime
-    assert "mouse_ticket_.report, sizeof(mouse_ticket_.report)" in runtime
+    assert "std::memcpy(report.data(), keyboard_ticket_.report, report.size())" in runtime
+    assert "std::memcpy(report.data(), mouse_ticket_.report, report.size())" in runtime
     assert "tud_hid_n_report(instance, 0, report, length)" in runtime
     assert "GPIO_NUM_19" not in (runtime + header + main_source)
     assert "GPIO_NUM_20" not in (runtime + header + main_source)

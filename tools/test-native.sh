@@ -15,6 +15,7 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 "$repository_root/tools/test-ble-hid-control-point-gatt.sh"
 "$repository_root/tools/test-hid-control-executor.sh"
 "$repository_root/tools/test-hid-runtime.sh"
+"$repository_root/tools/test-hid-sequence.sh"
 "$repository_root/tools/test-firmware-identity.sh"
 
 echo "PASS: IDF-independent native validation suite"

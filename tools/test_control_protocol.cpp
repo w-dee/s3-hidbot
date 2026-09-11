@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "control_protocol/control_protocol.hpp"
 #include "firmware_identity/firmware_identity.hpp"
 #include "hid_runtime/hid_runtime.hpp"
+#include "uart_control_transport/deferred_hid_failure.hpp"
 
 namespace {
 
@@ -415,12 +417,15 @@ struct KeyboardSource {
         .failure = control_protocol::KeyboardReportFailure::kNone,
     };
     control_protocol::KeyboardReportRequest request{};
+    control_session::LocalOwnerId local_owner_id = 0;
     int calls = 0;
 
     static control_protocol::KeyboardReportResult get(
-        void *context, const control_protocol::KeyboardReportRequest &request) {
+        void *context, control_session::LocalOwnerId local_owner_id,
+        const control_protocol::KeyboardReportRequest &request) {
         auto *source = static_cast<KeyboardSource *>(context);
         source->request = request;
+        source->local_owner_id = local_owner_id;
         ++source->calls;
         return source->result;
     }
@@ -434,14 +439,67 @@ struct MouseSource {
         .failure = control_protocol::MouseReportFailure::kNone,
     };
     control_protocol::MouseReportRequest request{};
+    control_session::LocalOwnerId local_owner_id = 0;
     int calls = 0;
 
     static control_protocol::MouseReportResult get(
-        void *context, const control_protocol::MouseReportRequest &request) {
+        void *context, control_session::LocalOwnerId local_owner_id,
+        const control_protocol::MouseReportRequest &request) {
         auto *source = static_cast<MouseSource *>(context);
         source->request = request;
+        source->local_owner_id = local_owner_id;
         ++source->calls;
         return source->result;
+    }
+};
+
+struct SequenceSource {
+    control_protocol::SequenceStartResult start_result =
+        control_protocol::SequenceStartResult::kAccepted;
+    control_protocol::SequenceStatus status{
+        .sequence_id = 2,
+        .state = control_protocol::SequenceState::kCompleted,
+        .started = true,
+        .executed = 3,
+    };
+    std::string code;
+    int start_calls = 0;
+    int status_calls = 0;
+    control_session::LocalOwnerId owner_id = 0;
+    bool status_valid = false;
+
+    static control_protocol::SequenceStartResult start(
+        void *context, control_session::LocalOwnerId local_owner_id,
+        std::int32_t sequence_id, std::string_view code) {
+        auto *source = static_cast<SequenceSource *>(context);
+        ++source->start_calls;
+        source->code.assign(code);
+        source->status.sequence_id = sequence_id;
+        source->owner_id = local_owner_id;
+        source->status_valid = true;
+        return source->start_result;
+    }
+
+    static bool get_status(void *context,
+                           control_session::LocalOwnerId local_owner_id,
+                           std::int32_t sequence_id,
+                           control_protocol::SequenceStatus *status) {
+        auto *source = static_cast<SequenceSource *>(context);
+        ++source->status_calls;
+        if (!source->status_valid || source->owner_id != local_owner_id ||
+            sequence_id != source->status.sequence_id) {
+            return false;
+        }
+        *status = source->status;
+        return true;
+    }
+
+    static void retire(void *context,
+                       control_session::LocalOwnerId local_owner_id) {
+        auto *source = static_cast<SequenceSource *>(context);
+        if (source->status_valid && source->owner_id == local_owner_id) {
+            source->status_valid = false;
+        }
     }
 };
 
@@ -518,6 +576,7 @@ struct LeaseFixture {
     BondSource bonds;
     RouteSource route;
     ReleaseSource release;
+    SequenceSource sequence;
     int expired_callbacks = 0;
     int takeover_callbacks = 0;
     int hid_failure_callbacks = 0;
@@ -625,6 +684,12 @@ struct LeaseFixture {
             .keyboard_report_context = nullptr,
             .mouse_report_provider = nullptr,
             .mouse_report_context = nullptr,
+            .sequence_start_provider = SequenceSource::start,
+            .sequence_start_context = &sequence,
+            .sequence_status_provider = SequenceSource::get_status,
+            .sequence_status_context = &sequence,
+            .sequence_owner_retired = SequenceSource::retire,
+            .sequence_owner_retired_context = &sequence,
         };
         assert(protocol.initialize(config, RandomSource::fill, &random,
                                    RandomSource::secure_fill, &random,
@@ -636,6 +701,35 @@ struct LeaseFixture {
             control_framing::Event{control_framing::EventKind::kFrame, json});
     }
 };
+
+struct ImmediateUsbLifecycleExecutor final : usb_lifecycle::Executor {
+    bool schedule(usb_lifecycle::ExecutorAction,
+                  usb_lifecycle::Snapshot) override {
+        return true;
+    }
+};
+
+struct HidSubmitSink {
+    int calls = 0;
+
+    static bool submit(void *context, std::uint8_t, const std::uint8_t *,
+                       std::uint16_t) {
+        ++static_cast<HidSubmitSink *>(context)->calls;
+        return true;
+    }
+};
+
+void ready_runtime(hid_runtime::StateMachine *runtime) {
+    ImmediateUsbLifecycleExecutor executor;
+    assert(runtime->request_usb_attach(executor).action_result ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    runtime->complete_usb_install_success();
+    runtime->on_mount();
+    runtime->set_ready(hid_runtime::Interface::kKeyboard, true);
+    runtime->set_ready(hid_runtime::Interface::kMouse, true);
+    assert(runtime->request_route_usb().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+}
 
 struct Fixture {
     Sink sink;
@@ -650,6 +744,7 @@ struct Fixture {
     ReleaseSource release;
     KeyboardSource keyboard;
     MouseSource mouse;
+    SequenceSource sequence;
     firmware_identity::Identity identity{};
     bool identity_enabled = false;
     control_protocol::Protocol protocol;
@@ -719,6 +814,12 @@ struct Fixture {
             .keyboard_report_context = &keyboard,
             .mouse_report_provider = MouseSource::get,
             .mouse_report_context = &mouse,
+            .sequence_start_provider = SequenceSource::start,
+            .sequence_start_context = &sequence,
+            .sequence_status_provider = SequenceSource::get_status,
+            .sequence_status_context = &sequence,
+            .sequence_owner_retired = SequenceSource::retire,
+            .sequence_owner_retired_context = &sequence,
         };
     }
 
@@ -1422,7 +1523,7 @@ void test_hid_failure_revokes_authority() {
     fixture.payload(hello_request(1, kNonceA));
     const std::string session = extract_string(fixture.sink.last(), "session");
 
-    fixture.protocol.on_hid_safety_failure();
+    fixture.protocol.on_hid_safety_failure(fixture.protocol.local_owner_id());
     assert(fixture.hid_failure_callbacks == 1);
     fixture.payload(request(2, session, "system.ping"));
     require_contains(fixture.sink.last(), "\"code\":\"SESSION_MISMATCH\"");
@@ -1536,6 +1637,8 @@ void test_keyboard_report_schema_result_and_cache() {
     const std::string success = fixture.sink.last();
     require_contains(success, "\"state\":\"submitted\"");
     assert(fixture.keyboard.calls == 1);
+    assert(fixture.keyboard.local_owner_id == fixture.protocol.local_owner_id());
+    assert(fixture.keyboard.local_owner_id != 0);
     assert(fixture.keyboard.request.modifiers == 2);
     assert(fixture.keyboard.request.keycodes[0] == 4 && fixture.keyboard.request.keycodes[4] == 221);
     fixture.payload(valid);
@@ -1576,6 +1679,8 @@ void test_mouse_report_schema_result_and_cache() {
     const std::string success = fixture.sink.last();
     require_contains(success, "\"state\":\"submitted\"");
     assert(fixture.mouse.calls == 1);
+    assert(fixture.mouse.local_owner_id == fixture.protocol.local_owner_id());
+    assert(fixture.mouse.local_owner_id != 0);
     assert(fixture.mouse.request.buttons == 3 && fixture.mouse.request.x == 1 &&
            fixture.mouse.request.y == -2 && fixture.mouse.request.wheel == 0 &&
            fixture.mouse.request.pan == 4);
@@ -1632,7 +1737,7 @@ void test_hid_route_schema_frozen_retry_and_errors() {
     const std::string session = extract_string(hello, "session");
     assert(count_occurrences(hello, "\"hid.output-route-v1\"") == 1);
     assert(count_occurrences(hello, "\"hid.output-route-v2\"") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 14);
+    assert(count_occurrences(hello, "-v1\"") == 15);
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
 
     fixture.payload(request(2, session, "hid.route.status"));
@@ -1818,7 +1923,7 @@ void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
     const std::string session = extract_string(hello, "session");
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
     assert(count_occurrences(hello, "ble.exposure-control-v1") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 14);
+    assert(count_occurrences(hello, "-v1\"") == 15);
 
     fixture.payload(request(2, session, "ble.exposure.status"));
     const std::string cold = fixture.sink.last();
@@ -1886,7 +1991,7 @@ void test_ble_pairing_status_exact_schema() {
     assert(count_occurrences(hello, "ble.pairing-transaction-v1") == 1);
     assert(hello.find("ble.pairing-control-v1") == std::string::npos);
     assert(hello.find("ble.bond-store-v1") == std::string::npos);
-    assert(count_occurrences(hello, "-v1\"") == 14);
+    assert(count_occurrences(hello, "-v1\"") == 15);
 
     fixture.payload(request(2, session, "ble.pairing.status"));
     require_contains(
@@ -2207,6 +2312,378 @@ void test_cjson_secret_is_wiped_before_free() {
     assert(fixture.pairing.respond_calls == 1);
 }
 
+void test_hid_sequence_schema_status_and_exact_retry() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    require_contains(fixture.sink.last(), "hid.sequence-v1");
+    const std::string session = extract_string(fixture.sink.last(), "session");
+    const std::string start = request(
+        2, session, "hid.sequence.start",
+        "{\"code\":\"d10;kp4;kr4;w200;mpL;mrL\"}");
+    fixture.payload(start);
+    require_contains(fixture.sink.last(),
+                     "\"sequence_id\":2,\"state\":\"accepted\"");
+    assert(fixture.sequence.start_calls == 1);
+    assert(fixture.sequence.code == "d10;kp4;kr4;w200;mpL;mrL");
+    fixture.payload(start);
+    assert(fixture.sequence.start_calls == 1);
+
+    fixture.sequence.status.sequence_id = 2;
+    fixture.sequence.status.state = control_protocol::SequenceState::kCompleted;
+    fixture.sequence.status.started = true;
+    fixture.sequence.status.executed = 6;
+    fixture.payload(request(3, session, "hid.sequence.status",
+                            "{\"sequence_id\":2}"));
+    require_contains(fixture.sink.last(),
+                     "\"state\":\"completed\",\"started\":true,\"executed\":6,"
+                     "\"failed_token\":null,\"code\":null");
+    fixture.payload(request(4, session, "hid.sequence.status",
+                            "{\"sequence_id\":99}"));
+    require_contains(fixture.sink.last(), "\"code\":\"SEQUENCE_NOT_FOUND\"");
+
+    fixture.payload(request(5, session, "hid.sequence.start",
+                            "{\"code\":\"kp\\u0034\"}"));
+    require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    assert(fixture.sequence.start_calls == 1);
+
+    std::string long_code;
+    for (int index = 0; index < 43; ++index) {
+        if (!long_code.empty()) long_code += ';';
+        long_code += "kp231";
+    }
+    for (int index = 0; index < 21; ++index) long_code += ";d0";
+    assert(long_code.size() == 320);
+    fixture.payload(request(6, session, "hid.sequence.start",
+                            std::string("{\"code\":\"") + long_code + "\"}"));
+    assert(fixture.sequence.start_calls == 2);
+
+    std::string embedded = request(7, session, "hid.sequence.start",
+                                   "{\"code\":\"kp4\"}");
+    const std::size_t code_position = embedded.find("kp4");
+    embedded.insert(code_position + 2, 1, '\0');
+    fixture.payload(std::string_view(embedded.data(), embedded.size()));
+    require_contains(fixture.sink.last(), "embedded NUL");
+    assert(fixture.sequence.start_calls == 2);
+}
+
+void test_hid_sequence_status_retires_with_owning_session() {
+    Fixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string old_session = extract_string(fixture.sink.last(), "session");
+    const control_session::LocalOwnerId old_owner =
+        fixture.protocol.local_owner_id();
+    fixture.payload(request(2, old_session, "hid.sequence.start",
+                            "{\"code\":\"kp4\"}"));
+    require_contains(fixture.sink.last(), "\"state\":\"accepted\"");
+    assert(fixture.sequence.status_valid);
+    assert(fixture.sequence.owner_id == old_owner);
+
+    ++fixture.authority.epoch;
+    fixture.protocol.on_hid_lifecycle_invalidation();
+    assert(!fixture.sequence.status_valid);
+    fixture.payload(hello_request(3, kNonceB));
+    const std::string new_session = extract_string(fixture.sink.last(), "session");
+    fixture.payload(request(4, new_session, "hid.sequence.status",
+                            "{\"sequence_id\":2}"));
+    require_contains(fixture.sink.last(), "\"code\":\"SEQUENCE_NOT_FOUND\"");
+
+    fixture.payload(request(5, new_session, "hid.sequence.start",
+                            "{\"code\":\"mpL\"}"));
+    assert(fixture.sequence.status_valid);
+    assert(fixture.sequence.owner_id != old_owner);
+    SequenceSource::retire(&fixture.sequence, old_owner);
+    assert(fixture.sequence.status_valid);
+    fixture.payload(request(6, new_session, "hid.sequence.status",
+                            "{\"sequence_id\":5}"));
+    require_contains(fixture.sink.last(), "\"sequence_id\":5");
+
+    fixture.payload(hello_request(7, kNonceA));
+    const std::string takeover_session = extract_string(fixture.sink.last(), "session");
+    assert(!fixture.sequence.status_valid);
+    fixture.payload(request(8, takeover_session, "hid.sequence.status",
+                            "{\"sequence_id\":5}"));
+    require_contains(fixture.sink.last(), "\"code\":\"SEQUENCE_NOT_FOUND\"");
+
+    fixture.payload(request(9, takeover_session, "hid.sequence.start",
+                            "{\"code\":\"kp5\"}"));
+    assert(fixture.sequence.status_valid);
+    ++fixture.authority.epoch;
+    fixture.payload(hello_request(10, kNonceB));
+    const std::string early_hello_session =
+        extract_string(fixture.sink.last(), "session");
+    assert(!fixture.sequence.status_valid);
+    fixture.payload(request(11, early_hello_session, "hid.sequence.status",
+                            "{\"sequence_id\":9}"));
+    require_contains(fixture.sink.last(), "\"code\":\"SEQUENCE_NOT_FOUND\"");
+
+    fixture.payload(request(12, early_hello_session, "hid.sequence.start",
+                            "{\"code\":\"mpR\"}"));
+    assert(fixture.sequence.status_valid);
+    fixture.protocol.on_hid_lifecycle_invalidation();
+    assert(fixture.sequence.status_valid);
+    fixture.payload(request(13, early_hello_session, "hid.sequence.status",
+                            "{\"sequence_id\":12}"));
+    require_contains(fixture.sink.last(), "\"sequence_id\":12");
+}
+
+void test_sequence_status_retires_on_every_session_retirement_path() {
+    struct TransitionCase {
+        const char *command;
+        const char *params;
+    };
+    for (const TransitionCase transition : {
+             TransitionCase{"hid.route.set", "{\"route\":\"usb\"}"},
+             TransitionCase{"usb.detach", "{}"},
+             TransitionCase{"usb.attach", "{}"},
+         }) {
+        Fixture fixture;
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string old_session =
+            extract_string(fixture.sink.last(), "session");
+        const control_session::LocalOwnerId old_owner =
+            fixture.protocol.local_owner_id();
+        fixture.payload(request(2, old_session, "hid.sequence.start",
+                                "{\"code\":\"kp4\"}"));
+        assert(fixture.sequence.status_valid);
+        const std::string transition_request = request(
+            3, old_session, transition.command, transition.params);
+        fixture.payload(transition_request);
+        const std::string accepted = fixture.sink.last();
+        require_contains(accepted, "\"ok\":true");
+        assert(!fixture.sequence.status_valid);
+        fixture.payload(transition_request);
+        assert(fixture.sink.last() == accepted);
+        assert(fixture.protocol.local_owner_id() == 0);
+
+        fixture.payload(hello_request(4, kNonceB));
+        const std::string new_session =
+            extract_string(fixture.sink.last(), "session");
+        assert(fixture.protocol.local_owner_id() != 0);
+        assert(fixture.protocol.local_owner_id() != old_owner);
+        fixture.payload(request(5, new_session, "hid.sequence.status",
+                                "{\"sequence_id\":2}"));
+        require_contains(fixture.sink.last(),
+                         "\"code\":\"SEQUENCE_NOT_FOUND\"");
+    }
+
+    {
+        Fixture fixture;
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string session = extract_string(fixture.sink.last(), "session");
+        fixture.payload(request(2, session, "hid.sequence.start",
+                                "{\"code\":\"kp4\"}"));
+        assert(fixture.sequence.status_valid);
+        fixture.protocol.on_hid_safety_failure(
+            fixture.protocol.local_owner_id());
+        assert(!fixture.sequence.status_valid);
+    }
+
+    {
+        LeaseFixture fixture;
+        fixture.payload(hello_request(1, kNonceA));
+        const std::string session = extract_string(fixture.sink.last(), "session");
+        const control_session::AuthorityEpoch shared_hid_epoch =
+            fixture.authority.epoch;
+        const control_session::LocalOwnerId expired_owner =
+            fixture.protocol.local_owner_id();
+        fixture.payload(request(2, session, "hid.sequence.start",
+                                "{\"code\":\"kp4\"}"));
+        assert(fixture.sequence.status_valid);
+        fixture.clock.value = control_session::kLeaseMicroseconds;
+        fixture.protocol.service();
+        assert(!fixture.sequence.status_valid);
+        assert(fixture.expired_callbacks == 1);
+
+        fixture.payload(hello_request(3, kNonceB));
+        const std::string new_session =
+            extract_string(fixture.sink.last(), "session");
+        assert(fixture.authority.epoch == shared_hid_epoch);
+        assert(fixture.protocol.local_owner_id() != expired_owner);
+        fixture.payload(request(2, new_session, "hid.sequence.start",
+                                "{\"code\":\"mpL\"}"));
+        assert(fixture.sequence.status_valid);
+        SequenceSource::retire(&fixture.sequence, expired_owner);
+        assert(fixture.sequence.status_valid);
+        fixture.protocol.on_hid_safety_failure(expired_owner);
+        assert(fixture.hid_failure_callbacks == 0);
+        assert(fixture.protocol.local_owner_id() != expired_owner);
+        assert(fixture.sequence.status_valid);
+    }
+}
+
+void test_same_hid_epoch_owner_identity_survives_delayed_cleanup() {
+    Fixture fixture;
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session_a = extract_string(fixture.sink.last(), "session");
+    const control_session::AuthorityEpoch shared_hid_epoch = fixture.authority.epoch;
+    const control_session::LocalOwnerId owner_a = fixture.protocol.local_owner_id();
+    assert(owner_a != 0);
+
+    fixture.payload(hello_request(1, kNonceA));
+    assert(fixture.protocol.local_owner_id() == owner_a);
+
+    fixture.payload(request(7, session_a, "hid.sequence.start",
+                            "{\"code\":\"kp4\"}"));
+    assert(fixture.sequence.status_valid);
+    assert(fixture.sequence.owner_id == owner_a);
+
+    fixture.payload(hello_request(1, kNonceB));
+    const std::string session_b = extract_string(fixture.sink.last(), "session");
+    const control_session::LocalOwnerId owner_b = fixture.protocol.local_owner_id();
+    assert(owner_b != 0 && owner_b != owner_a);
+    assert(fixture.authority.epoch == shared_hid_epoch);
+    assert(!fixture.sequence.status_valid);
+
+    fixture.payload(request(7, session_b, "hid.sequence.start",
+                            "{\"code\":\"mpL\"}"));
+    assert(fixture.sequence.status_valid);
+    assert(fixture.sequence.owner_id == owner_b);
+
+    SequenceSource::retire(&fixture.sequence, owner_a);
+    assert(fixture.sequence.status_valid);
+    fixture.payload(request(8, session_b, "hid.sequence.status",
+                            "{\"sequence_id\":7}"));
+    require_contains(fixture.sink.last(), "\"sequence_id\":7");
+
+    fixture.protocol.on_hid_safety_failure(owner_a);
+    assert(fixture.protocol.local_owner_id() == owner_b);
+    assert(fixture.sequence.status_valid);
+    fixture.payload(request(9, session_b, "hid.sequence.status",
+                            "{\"sequence_id\":7}"));
+    require_contains(fixture.sink.last(), "\"sequence_id\":7");
+}
+
+void test_report_origin_crosses_runtime_deferred_event_and_protocol() {
+    LeaseFixture fixture;
+    ready_runtime(&fixture.runtime);
+    fixture.payload(hello_request(1, kNonceA));
+    const std::string session_a = extract_string(fixture.sink.last(), "session");
+    const control_session::LocalOwnerId owner_a =
+        fixture.protocol.local_owner_id();
+    const control_session::AuthorityEpoch shared_hid_epoch =
+        fixture.authority.epoch;
+
+    hid_runtime::ConfirmedHidState initial{};
+    hid_runtime::SequenceAuthority runtime_sequence{};
+    assert(fixture.runtime.begin_sequence(&initial, &runtime_sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    hid_runtime::HidTicketId ticket = 0;
+    assert(fixture.runtime.begin_keyboard_report(
+               0, {4, 0, 0, 0, 0, 0}, runtime_sequence, &ticket, owner_a) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    HidSubmitSink hid_sink;
+    fixture.runtime.execute(HidSubmitSink::submit, &hid_sink);
+    assert(hid_sink.calls == 1);
+    const hid_runtime::HidWorkToken old_a_report = fixture.runtime.in_flight_token(
+        hid_runtime::Interface::kKeyboard);
+    assert(old_a_report.ticket_id == ticket);
+    assert(old_a_report.sequence_generation == runtime_sequence.generation);
+    assert(old_a_report.originating_local_owner_id == owner_a);
+
+    fixture.payload(request(7, session_a, "hid.sequence.start",
+                            "{\"code\":\"kp4\"}"));
+    fixture.payload(hello_request(8, kNonceB));
+    const std::string session_b = extract_string(fixture.sink.last(), "session");
+    const control_session::LocalOwnerId owner_b =
+        fixture.protocol.local_owner_id();
+    assert(owner_b != 0 && owner_b != owner_a);
+    assert(fixture.authority.epoch == shared_hid_epoch);
+    assert(fixture.runtime.authority_epoch() ==
+           old_a_report.authority_epoch);
+    fixture.sequence.status.state = control_protocol::SequenceState::kRunning;
+    fixture.payload(request(7, session_b, "hid.sequence.start",
+                            "{\"code\":\"mpL\"}"));
+    assert(fixture.sequence.status_valid);
+    assert(fixture.sequence.owner_id == owner_b);
+
+    hid_runtime::ReportOriginOwnerId failed_owner = 0;
+    assert(fixture.runtime.report_failed_for_token(
+        static_cast<std::uint8_t>(hid_runtime::Interface::kKeyboard),
+        old_a_report, nullptr, 0, &failed_owner));
+    assert(failed_owner == owner_a);
+
+    uart_control_transport::DeferredHidFailure deferred;
+    deferred.publish(failed_owner, fixture.protocol.local_owner_id());
+    control_session::LocalOwnerId delivered_owner = 0;
+    assert(deferred.take(&delivered_owner));
+    assert(delivered_owner == owner_a);
+    fixture.protocol.on_hid_safety_failure(delivered_owner);
+    assert(fixture.protocol.local_owner_id() == owner_b);
+    assert(fixture.sequence.status_valid);
+    assert(fixture.sequence.owner_id == owner_b);
+    assert(fixture.sequence.status.state ==
+           control_protocol::SequenceState::kRunning);
+    assert(fixture.hid_failure_callbacks == 0);
+    fixture.payload(request(9, session_b, "hid.sequence.status",
+                            "{\"sequence_id\":7}"));
+    require_contains(fixture.sink.last(), "\"state\":\"running\"");
+
+    // A genuine current-B event is still delivered and performs the existing
+    // owner-scoped maintenance.
+    deferred.publish(owner_b, fixture.protocol.local_owner_id());
+    assert(deferred.take(&delivered_owner));
+    assert(delivered_owner == owner_b);
+    fixture.protocol.on_hid_safety_failure(delivered_owner);
+    assert(fixture.protocol.local_owner_id() == 0);
+    assert(!fixture.sequence.status_valid);
+    assert(fixture.hid_failure_callbacks == 1);
+}
+
+void test_current_owner_report_failure_and_deferred_coalescing() {
+    LeaseFixture fixture;
+    ready_runtime(&fixture.runtime);
+    fixture.payload(hello_request(1, kNonceB));
+    const control_session::LocalOwnerId owner_b =
+        fixture.protocol.local_owner_id();
+    hid_runtime::HidTicketId ticket = 0;
+    assert(fixture.runtime.begin_mouse_report(1, 1, 0, 0, 0, {}, &ticket,
+                                              owner_b) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    HidSubmitSink hid_sink;
+    fixture.runtime.execute(HidSubmitSink::submit, &hid_sink);
+    const auto report =
+        fixture.runtime.in_flight_token(hid_runtime::Interface::kMouse);
+    hid_runtime::ReportOriginOwnerId failed_owner = 0;
+    assert(fixture.runtime.report_failed_for_token(
+        static_cast<std::uint8_t>(hid_runtime::Interface::kMouse), report,
+        nullptr, 0, &failed_owner));
+    assert(failed_owner == owner_b);
+
+    uart_control_transport::DeferredHidFailure deferred;
+    constexpr control_session::LocalOwnerId high_owner =
+        static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) +
+        37U;
+    deferred.publish(high_owner, fixture.protocol.local_owner_id());
+    control_session::LocalOwnerId delivered_owner = 0;
+    assert(deferred.take(&delivered_owner) && delivered_owner == high_owner);
+    fixture.sequence.owner_id = high_owner;
+    fixture.sequence.status_valid = true;
+    fixture.protocol.on_hid_safety_failure(delivered_owner);
+    assert(fixture.protocol.local_owner_id() == owner_b);
+    assert(!fixture.sequence.status_valid);
+    assert(fixture.hid_failure_callbacks == 0);
+
+    deferred.publish(failed_owner, fixture.protocol.local_owner_id());
+    assert(deferred.take(&delivered_owner));
+    fixture.protocol.on_hid_safety_failure(delivered_owner);
+    assert(fixture.protocol.local_owner_id() == 0);
+    assert(fixture.hid_failure_callbacks == 1);
+
+    constexpr control_session::LocalOwnerId owner_a = 101;
+    constexpr control_session::LocalOwnerId current_b = 202;
+    deferred.publish(owner_a, owner_a);
+    deferred.publish(current_b, current_b);
+    assert(deferred.take(&delivered_owner) && delivered_owner == current_b);
+    deferred.publish(current_b, current_b);
+    deferred.publish(owner_a, current_b);
+    assert(deferred.take(&delivered_owner) && delivered_owner == current_b);
+    deferred.publish(current_b, current_b);
+    deferred.publish(0, current_b);
+    assert(deferred.take(&delivered_owner) && delivered_owner == current_b);
+    deferred.publish(0, current_b);
+    assert(deferred.take(&delivered_owner) && delivered_owner == 0);
+}
+
 bool fail_secure_random(void *, std::uint8_t *, std::size_t) { return false; }
 
 void test_pairing_rng_failure_is_startup_fail_closed() {
@@ -2245,6 +2722,12 @@ int main() {
     test_ble_pairing_respond_parser_retry_and_errors();
     test_ble_bond_administration_schema_errors_and_retry();
     test_cjson_secret_is_wiped_before_free();
+    test_hid_sequence_schema_status_and_exact_retry();
+    test_hid_sequence_status_retires_with_owning_session();
+    test_sequence_status_retires_on_every_session_retirement_path();
+    test_same_hid_epoch_owner_identity_survives_delayed_cleanup();
+    test_report_origin_crosses_runtime_deferred_event_and_protocol();
+    test_current_owner_report_failure_and_deferred_coalescing();
     test_pairing_rng_failure_is_startup_fail_closed();
     test_identity_hello_and_info_shapes();
     test_invalid_identity_rejected_at_protocol_initialization();

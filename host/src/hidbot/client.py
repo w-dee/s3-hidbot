@@ -24,6 +24,7 @@ from .protocol import (
     BLE_PAIRING_TRANSACTION_CAPABILITY,
     HID_OUTPUT_ROUTE_V1_CAPABILITY,
     HID_OUTPUT_ROUTE_V2_CAPABILITY,
+    HID_SEQUENCE_CAPABILITY,
     BleExposureStatus,
     BleBondList,
     BleBondRemoveResult,
@@ -34,6 +35,8 @@ from .protocol import (
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
+    SequenceHandle,
+    SequenceStatus,
     UsbExposureStatus,
     OutputRoute,
     OutputRouteV2,
@@ -44,6 +47,8 @@ from .protocol import (
     build_hid_route_set_frame,
     build_hid_route_v2_set_frame,
     build_mouse_report_frame,
+    build_sequence_start_frame,
+    build_sequence_status_frame,
     build_command_frame,
     build_hello_frame,
     parse_response,
@@ -61,9 +66,12 @@ from .protocol import (
     validate_mouse_report_inputs,
     validate_release_all_result,
     validate_mouse_report_result,
+    validate_sequence_handle,
+    validate_sequence_status,
     validate_usb_exposure_status,
     validate_hello_response,
 )
+from .sequence import Sequence as HidSequence
 
 
 class ByteTransport(Protocol):
@@ -618,6 +626,36 @@ class Client:
             return validate_mouse_report_result(
                 self._request_frame_locked(request_id, session, frame)
             )
+
+    def sequence_start(self, sequence: HidSequence) -> SequenceHandle:
+        """Submit one complete sequence for MCU-local execution."""
+
+        with self._lock:
+            if not isinstance(sequence, HidSequence):
+                raise ProtocolError("HID sequence is invalid")
+            self._require_capability_locked(HID_SEQUENCE_CAPABILITY)
+            request_id, session = self._allocate_request_id_locked()
+            frame = build_sequence_start_frame(request_id, session, sequence)
+            result = validate_sequence_handle(
+                self._request_frame_locked(request_id, session, frame)
+            )
+            if result.sequence_id != request_id:
+                raise ProtocolError("HID sequence response ID does not match request")
+            return result
+
+    def sequence_status(self, sequence_id: int) -> SequenceStatus:
+        """Observe retained MCU execution status without pacing it."""
+
+        with self._lock:
+            self._require_capability_locked(HID_SEQUENCE_CAPABILITY)
+            request_id, session = self._allocate_request_id_locked()
+            frame = build_sequence_status_frame(request_id, session, sequence_id)
+            result = validate_sequence_status(
+                self._request_frame_locked(request_id, session, frame)
+            )
+            if result.sequence_id != sequence_id:
+                raise ProtocolError("HID sequence status ID does not match request")
+            return result
 
     def close(self) -> None:
         with self._lock:

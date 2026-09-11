@@ -5,7 +5,7 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 temporary_directory=$(mktemp -d)
 trap 'rm -f "$temporary_directory/test_hid_runtime"; rmdir "$temporary_directory" 2>/dev/null || true' EXIT
 
-"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -pedantic \
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -pedantic -pthread \
   -DHID_RUNTIME_NATIVE_TEST \
   -DUSB_LIFECYCLE_NATIVE_TEST \
   -DHID_ROUTE_NATIVE_TEST \

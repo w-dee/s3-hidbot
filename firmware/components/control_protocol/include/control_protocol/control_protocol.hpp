@@ -285,7 +285,8 @@ struct KeyboardReportResult {
 };
 
 using KeyboardReportProvider = KeyboardReportResult (*)(
-    void *context, const KeyboardReportRequest &request);
+    void *context, control_session::LocalOwnerId local_owner_id,
+    const KeyboardReportRequest &request);
 
 enum class MouseReportState : std::uint8_t {
     kAlreadySet,
@@ -316,7 +317,43 @@ struct MouseReportResult {
 };
 
 using MouseReportProvider = MouseReportResult (*)(
-    void *context, const MouseReportRequest &request);
+    void *context, control_session::LocalOwnerId local_owner_id,
+    const MouseReportRequest &request);
+
+enum class SequenceStartResult : std::uint8_t {
+    kAccepted,
+    kInvalid,
+    kBusy,
+    kNotReady,
+    kSafetyPending,
+};
+
+enum class SequenceState : std::uint8_t {
+    kAccepted,
+    kRunning,
+    kCompleted,
+    kFailed,
+    kAborted,
+};
+
+struct SequenceStatus {
+    std::int32_t sequence_id = 0;
+    SequenceState state = SequenceState::kAccepted;
+    bool started = false;
+    std::uint8_t executed = 0;
+    bool failed_token_present = false;
+    std::uint8_t failed_token = 0;
+    const char *code = nullptr;
+};
+
+using SequenceStartProvider = SequenceStartResult (*)(
+    void *context, control_session::LocalOwnerId local_owner_id,
+    std::int32_t sequence_id, std::string_view code);
+using SequenceStatusProvider = bool (*)(
+    void *context, control_session::LocalOwnerId local_owner_id,
+    std::int32_t sequence_id, SequenceStatus *status);
+using SequenceOwnerRetired = void (*)(
+    void *context, control_session::LocalOwnerId local_owner_id);
 
 struct Config {
     Metadata metadata;
@@ -364,6 +401,12 @@ struct Config {
     void *keyboard_report_context;
     MouseReportProvider mouse_report_provider;
     void *mouse_report_context;
+    SequenceStartProvider sequence_start_provider;
+    void *sequence_start_context;
+    SequenceStatusProvider sequence_status_provider;
+    void *sequence_status_context;
+    SequenceOwnerRetired sequence_owner_retired;
+    void *sequence_owner_retired_context;
 };
 
 class Protocol {
@@ -378,8 +421,9 @@ class Protocol {
 
     void handle_framing_event(const control_framing::Event &event);
     void on_hid_lifecycle_invalidation();
-    void on_hid_safety_failure();
+    void on_hid_safety_failure(control_session::LocalOwnerId source_owner_id);
     void service();
+    control_session::LocalOwnerId local_owner_id() const;
 
 #ifdef CONTROL_PROTOCOL_NATIVE_TEST
     bool request_scratch_zero_for_test() const;
@@ -396,6 +440,7 @@ class Protocol {
     void cache_control_transition_retry(
         std::string_view session, std::int32_t id, std::string_view payload,
         const control_session::ResponseFrame &response);
+    void retire_sequence_owner(control_session::LocalOwnerId local_owner_id);
 
     Config config_{};
     control_session::State session_{};

@@ -1,6 +1,7 @@
 #include "control_session/control_session.hpp"
 
 #include <cstring>
+#include <limits>
 
 #include "secure_memory/secure_memory.hpp"
 
@@ -72,6 +73,8 @@ void State::initialize(RandomFill random_fill, void *random_context,
     active_session_ = false;
     current_session_[0] = '\0';
     session_authority_epoch_ = 0;
+    local_owner_id_ = 0;
+    next_local_owner_id_ = 1;
     lease_deadline_us_ = 0;
     clear_normal_cache();
     clear_hello_cache();
@@ -98,6 +101,10 @@ AuthorityEpoch State::session_authority_epoch() const {
     return session_authority_epoch_;
 }
 
+LocalOwnerId State::local_owner_id() const {
+    return local_owner_id_;
+}
+
 std::uint64_t State::now() const {
     return now_fn_ != nullptr ? now_fn_(now_context_) : 0;
 }
@@ -122,6 +129,7 @@ void State::clear_authority() {
     active_session_ = false;
     current_session_[0] = '\0';
     session_authority_epoch_ = 0;
+    local_owner_id_ = 0;
     lease_deadline_us_ = 0;
     clear_normal_cache();
     clear_hello_cache();
@@ -166,14 +174,22 @@ HelloCacheResult State::inspect_hello(std::string_view client_nonce,
     return HelloCacheResult::kExactRetry;
 }
 
-void State::activate_hello(std::string_view client_nonce,
+bool State::activate_hello(std::string_view client_nonce,
                            std::string_view request_bytes,
                            const char *new_session,
                            AuthorityEpoch authority_epoch,
                            const ResponseFrame &response) {
+    const LocalOwnerId owner_id = next_local_owner_id_;
+    if (owner_id == 0) {
+        return false;
+    }
+    next_local_owner_id_ = owner_id == std::numeric_limits<LocalOwnerId>::max()
+                               ? 0
+                               : owner_id + 1;
     copy_token(current_session_, std::string_view(new_session, kTokenHexLength));
     active_session_ = true;
     session_authority_epoch_ = authority_epoch;
+    local_owner_id_ = owner_id;
     lease_deadline_us_ = now() + kLeaseMicroseconds;
     clear_normal_cache();
     hello_cache_ = HelloCache{};
@@ -183,6 +199,7 @@ void State::activate_hello(std::string_view client_nonce,
     copy_token(hello_cache_.session, std::string_view(new_session, kTokenHexLength));
     hello_cache_.authority_epoch = authority_epoch;
     hello_cache_.response = response;
+    return true;
 }
 
 RequestCacheResult State::inspect_request(std::string_view session,
@@ -272,6 +289,10 @@ void State::cache_completed_sensitive_request(
 }
 
 #ifdef CONTROL_SESSION_NATIVE_TEST
+void State::set_next_local_owner_id_for_test(LocalOwnerId next_owner_id) {
+    next_local_owner_id_ = next_owner_id;
+}
+
 State::RequestCacheSnapshot State::request_cache_snapshot_for_test() const {
     bool raw_storage_zero = true;
     for (const char byte : request_cache_.request) {

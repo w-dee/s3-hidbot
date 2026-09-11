@@ -7,11 +7,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "firmware/components/uart_control_transport/uart_control_transport.cpp"
 HEADER = ROOT / "firmware/components/uart_control_transport/include/uart_control_transport/uart_control_transport.hpp"
+DEFERRED_FAILURE = ROOT / "firmware/components/uart_control_transport/include/uart_control_transport/deferred_hid_failure.hpp"
 
 
 def main() -> int:
     source = SOURCE.read_text(encoding="utf-8")
     header = HEADER.read_text(encoding="utf-8")
+    deferred_failure = DEFERRED_FAILURE.read_text(encoding="utf-8")
     assert "kMaxLogicalMachineFrameBytes = 1023" in header
     assert "kMaxWireMachineFrameBytes = 1024" in header
 
@@ -36,8 +38,13 @@ def main() -> int:
     assert "uart_driver_install(kConsoleUart" in source
     assert "uart_vfs_dev_use_driver(kConsoleUart)" in source
     assert "uart_read_bytes(kConsoleUart" in source
-    assert "s_hid_failure_pending.store(true, std::memory_order_release);" in source
-    assert "s_protocol.on_hid_safety_failure();" in source
+    assert "s_pending_hid_failure.publish(originating_local_owner_id," in source
+    assert "s_pending_hid_failure_owner = s_published_local_owner;" not in source
+    assert "DeferredHidFailure" in deferred_failure
+    assert "source_owner_id == current_owner_id" in deferred_failure
+    assert "owner_id_ = source_owner_id" in deferred_failure
+    assert "s_protocol.on_hid_safety_failure(failed_owner);" in source
+    assert "portENTER_CRITICAL(&s_local_owner_mux);" in source
     assert "s_lifecycle_invalidation_pending.store(true, std::memory_order_release);" in source
     assert "s_protocol.on_hid_lifecycle_invalidation();" in source
     assert "service_pending_notifications();" in source

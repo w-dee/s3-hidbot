@@ -712,68 +712,126 @@ bool Controller::enqueue_ble_hid_work(hid_runtime::Interface interface,
 
 hid_runtime::KeyboardReportBeginResult Controller::queue_ble_keyboard_report(
     std::uint8_t modifiers,
-    const std::array<std::uint8_t, 6> &keycodes) {
+    const std::array<std::uint8_t, 6> &keycodes,
+    hid_runtime::SequenceAuthority sequence,
+    hid_runtime::HidTicketId *ticket_id,
+    hid_runtime::ReportOriginOwnerId originating_local_owner_id) {
+    if (ticket_id != nullptr) *ticket_id = 0;
     if (!initialized_ || runtime_ == nullptr) {
         return hid_runtime::KeyboardReportBeginResult::kNotReady;
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
-    const auto begin = state.begin_keyboard_report(modifiers, keycodes);
+    hid_runtime::HidTicketId admitted_ticket = 0;
+    const auto begin = state.begin_keyboard_report(
+        modifiers, keycodes, sequence, &admitted_ticket,
+        originating_local_owner_id);
     if (begin != hid_runtime::KeyboardReportBeginResult::kPublished) {
         return begin;
     }
     const auto token =
         state.published_report_token(hid_runtime::Interface::kKeyboard);
-    if (token.transport != hid_runtime::HidTransport::kBle ||
+    if (token.ticket_id != admitted_ticket ||
+        token.transport != hid_runtime::HidTransport::kBle ||
         !enqueue_ble_hid_work(hid_runtime::Interface::kKeyboard, token)) {
-        (void)state.cancel_keyboard_report();
+        (void)state.cancel_keyboard_report(admitted_ticket);
         return hid_runtime::KeyboardReportBeginResult::kBusy;
     }
+    if (ticket_id != nullptr) *ticket_id = admitted_ticket;
     return begin;
 }
 
 hid_runtime::MouseReportBeginResult Controller::queue_ble_mouse_report(
     std::uint8_t buttons, std::int8_t x, std::int8_t y,
-    std::int8_t vertical, std::int8_t horizontal) {
+    std::int8_t vertical, std::int8_t horizontal,
+    hid_runtime::SequenceAuthority sequence,
+    hid_runtime::HidTicketId *ticket_id,
+    hid_runtime::ReportOriginOwnerId originating_local_owner_id) {
+    if (ticket_id != nullptr) *ticket_id = 0;
     if (!initialized_ || runtime_ == nullptr) {
         return hid_runtime::MouseReportBeginResult::kNotReady;
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
-    const auto begin = state.begin_mouse_report(buttons, x, y, vertical,
-                                                horizontal);
+    hid_runtime::HidTicketId admitted_ticket = 0;
+    const auto begin = state.begin_mouse_report(
+        buttons, x, y, vertical, horizontal, sequence, &admitted_ticket,
+        originating_local_owner_id);
     if (begin != hid_runtime::MouseReportBeginResult::kPublished) {
         return begin;
     }
     const auto token = state.published_report_token(
         hid_runtime::Interface::kMouse);
-    if (token.transport != hid_runtime::HidTransport::kBle ||
+    if (token.ticket_id != admitted_ticket ||
+        token.transport != hid_runtime::HidTransport::kBle ||
         !enqueue_ble_hid_work(hid_runtime::Interface::kMouse, token)) {
-        (void)state.cancel_mouse_report();
+        (void)state.cancel_mouse_report(admitted_ticket);
         return hid_runtime::MouseReportBeginResult::kBusy;
     }
+    if (ticket_id != nullptr) *ticket_id = admitted_ticket;
     return begin;
 }
 
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
 hid_runtime::KeyboardReportResult Controller::keyboard_report(
     std::uint8_t modifiers,
-    const std::array<std::uint8_t, 6> &keycodes) {
+    const std::array<std::uint8_t, 6> &keycodes,
+    hid_runtime::ReportOriginOwnerId originating_local_owner_id) {
     const auto route = runtime_->state_machine().route_snapshot();
     if (route.active != hid_route::OutputRoute::kBle) {
-        return runtime_->keyboard_report(modifiers, keycodes);
+        return runtime_->keyboard_report(modifiers, keycodes, {},
+                                         originating_local_owner_id);
     }
-    return runtime_->complete_keyboard_report(
-        queue_ble_keyboard_report(modifiers, keycodes));
+    hid_runtime::HidTicketId ticket_id = 0;
+    const auto begin = queue_ble_keyboard_report(
+        modifiers, keycodes, {}, &ticket_id, originating_local_owner_id);
+    return runtime_->complete_keyboard_report(begin, ticket_id);
 }
 
 hid_runtime::MouseReportResult Controller::mouse_report(
     std::uint8_t buttons, std::int8_t x, std::int8_t y,
-    std::int8_t vertical, std::int8_t horizontal) {
+    std::int8_t vertical, std::int8_t horizontal,
+    hid_runtime::ReportOriginOwnerId originating_local_owner_id) {
     const auto route = runtime_->state_machine().route_snapshot();
     if (route.active != hid_route::OutputRoute::kBle) {
-        return runtime_->mouse_report(buttons, x, y, vertical, horizontal);
+        return runtime_->mouse_report(buttons, x, y, vertical, horizontal, {},
+                                      originating_local_owner_id);
     }
-    return runtime_->complete_mouse_report(
-        queue_ble_mouse_report(buttons, x, y, vertical, horizontal));
+    hid_runtime::HidTicketId ticket_id = 0;
+    const auto begin = queue_ble_mouse_report(
+        buttons, x, y, vertical, horizontal, {}, &ticket_id,
+        originating_local_owner_id);
+    return runtime_->complete_mouse_report(begin, ticket_id);
+}
+
+hid_runtime::KeyboardReportResult Controller::sequence_keyboard_report(
+    hid_runtime::SequenceAuthority sequence,
+    std::uint8_t modifiers,
+    const std::array<std::uint8_t, 6> &keycodes,
+    hid_runtime::ReportOriginOwnerId originating_local_owner_id) {
+    const auto route = runtime_->state_machine().route_snapshot();
+    if (route.active != hid_route::OutputRoute::kBle) {
+        return runtime_->keyboard_report(modifiers, keycodes, sequence,
+                                         originating_local_owner_id);
+    }
+    hid_runtime::HidTicketId ticket_id = 0;
+    const auto begin = queue_ble_keyboard_report(
+        modifiers, keycodes, sequence, &ticket_id,
+        originating_local_owner_id);
+    return runtime_->complete_keyboard_report(begin, ticket_id);
+}
+
+hid_runtime::MouseReportResult Controller::sequence_mouse_report(
+    hid_runtime::SequenceAuthority sequence, std::uint8_t buttons,
+    hid_runtime::ReportOriginOwnerId originating_local_owner_id) {
+    const auto route = runtime_->state_machine().route_snapshot();
+    if (route.active != hid_route::OutputRoute::kBle) {
+        return runtime_->mouse_report(buttons, 0, 0, 0, 0, sequence,
+                                      originating_local_owner_id);
+    }
+    hid_runtime::HidTicketId ticket_id = 0;
+    const auto begin = queue_ble_mouse_report(
+        buttons, 0, 0, 0, 0, sequence, &ticket_id,
+        originating_local_owner_id);
+    return runtime_->complete_mouse_report(begin, ticket_id);
 }
 #endif
 

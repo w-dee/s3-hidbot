@@ -23,6 +23,7 @@ struct ResponseFrame {
 using RandomFill = void (*)(void *context, std::uint8_t *output, std::size_t length);
 using NowFn = std::uint64_t (*)(void *context);
 using AuthorityEpoch = std::uint32_t;
+using LocalOwnerId = std::uint64_t;
 
 enum class HelloCacheResult : std::uint8_t {
     kNewClient,
@@ -52,6 +53,7 @@ class State {
     bool has_active_session() const;
     bool authority_epoch_matches(AuthorityEpoch current_epoch) const;
     AuthorityEpoch session_authority_epoch() const;
+    LocalOwnerId local_owner_id() const;
     bool refresh_lease();
     bool service_lease();
     void revoke_for_takeover();
@@ -60,7 +62,7 @@ class State {
                                    std::string_view request_bytes,
                                    AuthorityEpoch current_epoch,
                                    const ResponseFrame **cached_response) const;
-    void activate_hello(std::string_view client_nonce,
+    bool activate_hello(std::string_view client_nonce,
                         std::string_view request_bytes,
                         const char *new_session,
                         AuthorityEpoch authority_epoch,
@@ -98,6 +100,7 @@ class State {
         sensitive_request::Digest digest{};
     };
     RequestCacheSnapshot request_cache_snapshot_for_test() const;
+    void set_next_local_owner_id_for_test(LocalOwnerId next_owner_id);
 #endif
 
   private:
@@ -140,6 +143,8 @@ class State {
     char current_session_[kTokenStorageBytes]{};
     bool active_session_ = false;
     AuthorityEpoch session_authority_epoch_ = 0;
+    LocalOwnerId local_owner_id_ = 0;
+    LocalOwnerId next_local_owner_id_ = 1;
     NowFn now_fn_ = nullptr;
     void *now_context_ = nullptr;
     std::uint64_t lease_deadline_us_ = 0;

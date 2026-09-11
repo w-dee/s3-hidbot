@@ -1,7 +1,10 @@
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <thread>
 
 #include "hid_runtime/hid_runtime.hpp"
 
@@ -49,6 +52,83 @@ void ready(hid_runtime::StateMachine &state) {
     state.set_ready(hid_runtime::Interface::kMouse, true);
     assert(state.request_route_usb().action_result ==
            hid_runtime::RouteTransitionResult::kAccepted);
+}
+
+std::atomic_bool transition_hook_entered{false};
+std::atomic_bool transition_contender_started{false};
+std::atomic_bool transition_contender_finished{false};
+
+void reset_transition_probe() {
+    transition_hook_entered.store(false, std::memory_order_relaxed);
+    transition_contender_started.store(false, std::memory_order_relaxed);
+    transition_contender_finished.store(false, std::memory_order_relaxed);
+}
+
+void hold_exact_ticket_transition(hid_runtime::StateMachine *) {
+    transition_hook_entered.store(true, std::memory_order_release);
+    while (!transition_contender_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    // The competing begin operation has reached the ticket metadata lock. It
+    // cannot reap or replace this ticket until the exact transition commits.
+    assert(!transition_contender_finished.load(std::memory_order_acquire));
+}
+
+std::atomic_bool terminal_hook_entered{false};
+std::atomic_bool terminal_observer_started{false};
+std::atomic_bool terminal_observer_finished{false};
+
+void reset_terminal_probe() {
+    terminal_hook_entered.store(false, std::memory_order_relaxed);
+    terminal_observer_started.store(false, std::memory_order_relaxed);
+    terminal_observer_finished.store(false, std::memory_order_relaxed);
+}
+
+void hold_before_terminal_publication(hid_runtime::StateMachine *) {
+    terminal_hook_entered.store(true, std::memory_order_release);
+    while (!terminal_observer_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    // Snapshot must remain blocked until outcome and terminal state are both
+    // published by the same metadata transaction.
+    assert(!terminal_observer_finished.load(std::memory_order_acquire));
+}
+
+enum class WritingProbeInterface { kKeyboard, kMouse };
+
+WritingProbeInterface writing_probe_interface = WritingProbeInterface::kKeyboard;
+hid_runtime::HidTicketId writing_probe_ticket = 0;
+hid_runtime::KeyboardReportBeginResult writing_probe_keyboard_result =
+    hid_runtime::KeyboardReportBeginResult::kNotReady;
+hid_runtime::MouseReportBeginResult writing_probe_mouse_result =
+    hid_runtime::MouseReportBeginResult::kNotReady;
+
+void cancel_writer_owned_ticket(hid_runtime::StateMachine *state) {
+    state->set_before_ticket_publish_hook_for_test(nullptr);
+    if (writing_probe_interface == WritingProbeInterface::kKeyboard) {
+        const auto writing = state->keyboard_report_snapshot();
+        assert(writing.state ==
+               hid_runtime::KeyboardReportTicketState::kWriting);
+        writing_probe_ticket = writing.ticket_id;
+        state->begin_release_all();
+        hid_runtime::KeyboardReportSnapshot canceled{};
+        assert(state->keyboard_report_snapshot(writing_probe_ticket, &canceled));
+        assert(canceled.state ==
+               hid_runtime::KeyboardReportTicketState::kWritingCanceled);
+        writing_probe_keyboard_result = state->begin_keyboard_report(
+            0, {5, 0, 0, 0, 0, 0});
+    } else {
+        const auto writing = state->mouse_report_snapshot();
+        assert(writing.state == hid_runtime::MouseReportTicketState::kWriting);
+        writing_probe_ticket = writing.ticket_id;
+        state->begin_release_all();
+        hid_runtime::MouseReportSnapshot canceled{};
+        assert(state->mouse_report_snapshot(writing_probe_ticket, &canceled));
+        assert(canceled.state ==
+               hid_runtime::MouseReportTicketState::kWritingCanceled);
+        writing_probe_mouse_result =
+            state->begin_mouse_report(0, 2, 0, 0, 0);
+    }
 }
 
 void test_lifecycle_and_generation_cancellation() {
@@ -107,6 +187,239 @@ void test_readiness_refresh_after_mount_without_hid_work() {
     snapshot = state.status();
     assert(snapshot.mounted && !snapshot.suspended);
     assert(snapshot.keyboard_ready && snapshot.mouse_ready);
+}
+
+void test_sequence_admission_snapshot_and_producer_exclusion() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    std::array<std::uint8_t, 6> held{4, 0, 0, 0, 0, 0};
+    assert(state.begin_keyboard_report(1, held) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 1);
+    assert(state.report_complete(0, sink.report.data(), 8));
+
+    hid_runtime::ConfirmedHidState snapshot{};
+    hid_runtime::SequenceAuthority sequence{};
+    assert(state.begin_sequence(&snapshot, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    assert(snapshot.keyboard.modifiers == 1);
+    assert(snapshot.keyboard.keycodes == held);
+    assert(snapshot.mouse.buttons == 0);
+    assert(sequence.authority_epoch == state.authority_epoch());
+    assert(state.sequence_active());
+    assert(state.begin_keyboard_report(0, {}) ==
+           hid_runtime::KeyboardReportBeginResult::kBusy);
+    assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kBusy);
+    assert(state.begin_keyboard_report(0, {}, sequence) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    state.end_sequence(sequence);
+    assert(!state.sequence_active());
+}
+
+void test_revoked_sequence_authority_cannot_create_or_submit_ticket() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    hid_runtime::ConfirmedHidState snapshot{};
+    hid_runtime::SequenceAuthority sequence{};
+    assert(state.begin_sequence(&snapshot, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    state.request_release_all();
+    assert(!state.sequence_authority_current(sequence));
+    assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, sequence) ==
+           hid_runtime::KeyboardReportBeginResult::kAuthorityLost);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+
+    // Lifecycle/session authority retirement rejects the same stale owner.
+    state.finalize_release_all();
+    hid_runtime::SequenceAuthority replacement{};
+    assert(state.begin_sequence(&snapshot, &replacement) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    state.on_suspend();
+    assert(state.begin_mouse_report(1, 0, 0, 0, 0, replacement) ==
+           hid_runtime::MouseReportBeginResult::kAuthorityLost);
+}
+
+void revoke_sequence_while_ticket_is_writing(hid_runtime::StateMachine *state) {
+    state->begin_release_all();
+}
+
+void test_sequence_ticket_paused_before_publication_cannot_survive_release() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    hid_runtime::ConfirmedHidState snapshot{};
+    hid_runtime::SequenceAuthority sequence{};
+    assert(state.begin_sequence(&snapshot, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    state.set_before_ticket_publish_hook_for_test(
+        revoke_sequence_while_ticket_is_writing);
+    assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, sequence) ==
+           hid_runtime::KeyboardReportBeginResult::kAuthorityLost);
+    state.set_before_ticket_publish_hook_for_test(nullptr);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 0);
+    assert(!state.sequence_authority_current(sequence));
+    assert((state.keyboard_state().keycodes ==
+            std::array<std::uint8_t, 6>{}));
+    const auto release = state.release_all_snapshot();
+    assert(release.keyboard ==
+           hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    assert(release.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    state.finalize_release_all();
+}
+
+void test_sequence_generation_does_not_wrap_to_stale_authority() {
+    hid_runtime::StateMachine state;
+    ready(state);
+    state.set_next_sequence_generation_for_test(
+        std::numeric_limits<std::uint32_t>::max());
+    hid_runtime::ConfirmedHidState snapshot{};
+    hid_runtime::SequenceAuthority final_authority{};
+    assert(state.begin_sequence(&snapshot, &final_authority) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    assert(final_authority.generation ==
+           std::numeric_limits<std::uint32_t>::max());
+    state.end_sequence(final_authority);
+    hid_runtime::SequenceAuthority exhausted{};
+    assert(state.begin_sequence(&snapshot, &exhausted) ==
+           hid_runtime::SequenceAdmissionResult::kNotReady);
+}
+
+hid_runtime::SequenceAdmissionResult ble_admission_during_commit;
+hid_runtime::SequenceAdmissionResult ble_admission_before_acceptance;
+
+void attempt_sequence_during_ble_commit(hid_runtime::StateMachine *state) {
+    hid_runtime::ConfirmedHidState snapshot{};
+    hid_runtime::SequenceAuthority sequence{};
+    ble_admission_during_commit = state->begin_sequence(&snapshot, &sequence);
+    if (ble_admission_during_commit ==
+        hid_runtime::SequenceAdmissionResult::kAccepted) {
+        state->end_sequence(sequence);
+    }
+}
+
+void attempt_sequence_before_ble_acceptance(hid_runtime::StateMachine *state) {
+    hid_runtime::ConfirmedHidState snapshot{};
+    hid_runtime::SequenceAuthority sequence{};
+    ble_admission_before_acceptance = state->begin_sequence(&snapshot, &sequence);
+    if (ble_admission_before_acceptance ==
+        hid_runtime::SequenceAdmissionResult::kAccepted) {
+        state->end_sequence(sequence);
+    }
+}
+
+hid_runtime::BleSubmitResult accept_ble_report(
+    void *, hid_runtime::Interface, hid_runtime::HidWorkToken,
+    const std::uint8_t *, std::uint16_t) {
+    return hid_runtime::BleSubmitResult::kStackAccepted;
+}
+
+void make_ble_ready(hid_runtime::StateMachine &state) {
+    const auto route = state.route_snapshot();
+    assert(state.request_route_ble({
+        .expected_authority_epoch = state.authority_epoch(),
+        .expected_route_generation = route.generation,
+        .ble_generation = 11,
+        .connection_handle = 12,
+        .keyboard_characteristic_handle = 13,
+        .mouse_characteristic_handle = 14,
+    }).action_result == hid_runtime::RouteTransitionResult::kAccepted);
+}
+
+void test_ble_terminal_visibility_follows_confirmed_state() {
+    for (const hid_runtime::Interface interface :
+         {hid_runtime::Interface::kKeyboard, hid_runtime::Interface::kMouse}) {
+        hid_runtime::StateMachine state;
+        make_ble_ready(state);
+        if (interface == hid_runtime::Interface::kKeyboard) {
+            assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+                   hid_runtime::KeyboardReportBeginResult::kPublished);
+        } else {
+            assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+                   hid_runtime::MouseReportBeginResult::kPublished);
+        }
+        const hid_runtime::HidWorkToken token =
+            state.published_report_token(interface);
+        assert(state.mark_ble_report_scheduled(interface, token));
+        state.set_before_submit_hook_for_test(
+            attempt_sequence_before_ble_acceptance);
+        state.set_before_ble_terminal_publish_hook_for_test(
+            attempt_sequence_during_ble_commit);
+        assert(state.process_ble_report(interface, token, accept_ble_report,
+                                        nullptr));
+        state.set_before_submit_hook_for_test(nullptr);
+        state.set_before_ble_terminal_publish_hook_for_test(nullptr);
+        assert(ble_admission_before_acceptance ==
+               hid_runtime::SequenceAdmissionResult::kBusy);
+        assert(ble_admission_during_commit ==
+               hid_runtime::SequenceAdmissionResult::kBusy);
+        if (interface == hid_runtime::Interface::kKeyboard) {
+            state.finalize_keyboard_report();
+        } else {
+            state.finalize_mouse_report();
+        }
+        hid_runtime::ConfirmedHidState snapshot{};
+        hid_runtime::SequenceAuthority sequence{};
+        assert(state.begin_sequence(&snapshot, &sequence) ==
+               hid_runtime::SequenceAdmissionResult::kAccepted);
+        assert(interface == hid_runtime::Interface::kKeyboard
+                   ? snapshot.keyboard.keycodes[0] == 4
+                   : snapshot.mouse.buttons == 1);
+        state.end_sequence(sequence);
+    }
+}
+
+hid_runtime::SequenceAdmissionResult mailbox_race_admission;
+
+void attempt_sequence_while_mailbox_claimed(hid_runtime::StateMachine *state) {
+    state->set_before_submit_hook_for_test(nullptr);
+    hid_runtime::ConfirmedHidState snapshot{};
+    hid_runtime::SequenceAuthority sequence{};
+    mailbox_race_admission = state->begin_sequence(&snapshot, &sequence);
+    if (mailbox_race_admission ==
+        hid_runtime::SequenceAdmissionResult::kAccepted) {
+        state->end_sequence(sequence);
+    }
+}
+
+void test_mailbox_sequence_exclusion_and_safety_priority() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    hid_runtime::ConfirmedHidState snapshot{};
+    hid_runtime::SequenceAuthority sequence{};
+    assert(state.begin_sequence(&snapshot, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    assert(!state.queue_mouse_report(0, 10, 0, 0, 0));
+    state.end_sequence(sequence);
+
+    assert(state.queue_mouse_report(0, 10, 0, 0, 0));
+    assert(state.begin_sequence(&snapshot, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kBusy);
+    state.set_before_submit_hook_for_test(attempt_sequence_while_mailbox_claimed);
+    state.execute(Sink::submit, &sink);
+    assert(mailbox_race_admission == hid_runtime::SequenceAdmissionResult::kBusy);
+    assert(sink.calls == 1);
+    assert(state.report_complete(1, sink.report.data(), 5));
+
+    assert(state.begin_sequence(&snapshot, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kAccepted);
+    assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, sequence) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 2);
+    assert(state.report_complete(0, sink.report.data(), 8));
+    state.finalize_keyboard_report();
+    state.request_release_all();
+    assert(!state.sequence_authority_current(sequence));
+    state.execute(Sink::submit, &sink);
+    assert(sink.calls == 3 && sink.instance == 0 && sink.report[0] == 0 &&
+           sink.report[2] == 0);
 }
 
 void test_readiness_refresh_after_reattach() {
@@ -268,6 +581,8 @@ void test_zero_work_release_terminalizes_lifecycle_pending() {
     assert(release.keyboard == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
     assert(release.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
     state.finalize_release_all();
+    assert(state.usb_lifecycle_snapshot().safety_pending);
+    state.execute(Sink::submit, &sink);
     assert(!state.usb_lifecycle_snapshot().safety_pending);
 }
 
@@ -606,6 +921,17 @@ void test_release_ticket_states_and_historical_submission() {
     auto snapshot = state.release_all_snapshot();
     assert(snapshot.keyboard == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
     assert(snapshot.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    // Even if the SOF owner consumes the epoch request before the public
+    // caller reads/finalizes its clean result, the active release ticket is a
+    // producer gate for that remaining window.
+    state.execute(Sink::submit, &sink);
+    assert(!state.release_requested_for_test());
+    assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+           hid_runtime::KeyboardReportBeginResult::kSafetyPending);
+    hid_runtime::ConfirmedHidState hid_state{};
+    hid_runtime::SequenceAuthority sequence{};
+    assert(state.begin_sequence(&hid_state, &sequence) ==
+           hid_runtime::SequenceAdmissionResult::kSafetyPending);
     state.finalize_release_all();
 
     const std::array<std::uint8_t, 6> keys = {4, 0, 0, 0, 0, 0};
@@ -745,7 +1071,8 @@ void test_keyboard_report_ticket_cancellation_and_barriers() {
     // keypress on any later executor pass.
     assert(state.begin_keyboard_report(0, keys) ==
            hid_runtime::KeyboardReportBeginResult::kPublished);
-    assert(state.cancel_keyboard_report());
+    assert(state.cancel_keyboard_report(
+        state.keyboard_report_snapshot().ticket_id));
     state.execute(Sink::submit, &sink);
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 0);
@@ -849,7 +1176,7 @@ void test_mouse_report_ticket_cancellation_and_failure() {
 
     assert(state.begin_mouse_report(0, 1, 0, 0, 0) ==
            hid_runtime::MouseReportBeginResult::kPublished);
-    assert(state.cancel_mouse_report());
+    assert(state.cancel_mouse_report(state.mouse_report_snapshot().ticket_id));
     state.execute(Sink::submit, &sink);
     state.execute(Sink::submit, &sink);
     assert(sink.calls == 0);
@@ -1264,11 +1591,670 @@ void test_route_release_callback_preemption_fails_closed() {
            hid_runtime::LifecycleSafetyResult::kUncertain);
 }
 
+struct ReleaseBoundarySink {
+    hid_runtime::StateMachine *state = nullptr;
+    bool release_at_adapter_entry = false;
+    bool mouse = false;
+    int calls = 0;
+    std::array<std::uint8_t, 8> first{};
+    std::array<std::uint8_t, 8> last{};
+    std::uint16_t last_length = 0;
+
+    static bool submit(void *context, std::uint8_t,
+                       const std::uint8_t *report, std::uint16_t length) {
+        auto *sink = static_cast<ReleaseBoundarySink *>(context);
+        if (sink->release_at_adapter_entry && sink->calls == 0) {
+            sink->state->begin_release_all();
+            const auto release = sink->state->release_all_snapshot();
+            assert((sink->mouse ? release.mouse : release.keyboard) !=
+                   hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+        }
+        ++sink->calls;
+        sink->last_length = length;
+        std::memcpy(sink->last.data(), report, length);
+        if (sink->calls == 1) sink->first = sink->last;
+        return true;
+    }
+};
+
+void release_from_runtime_hook(hid_runtime::StateMachine *state) {
+    state->begin_release_all();
+    assert(state->release_all_snapshot().keyboard !=
+           hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+}
+
+void finish_release_after_keyboard_boundary(hid_runtime::StateMachine &state,
+                                            ReleaseBoundarySink &sink) {
+    const auto ticket = state.keyboard_report_snapshot();
+    if (ticket.state == hid_runtime::KeyboardReportTicketState::kSubmitted) {
+        assert(state.report_complete(0, sink.last.data(), sink.last_length));
+    }
+    state.set_before_submit_hook_for_test(nullptr);
+    state.set_after_submit_hook_for_test(nullptr);
+    state.execute(ReleaseBoundarySink::submit, &sink);
+    assert(sink.calls >= 1);
+    assert(sink.last_length == 8 && sink.last[0] == 0 && sink.last[2] == 0);
+    assert(state.report_complete(0, sink.last.data(), sink.last_length));
+    assert(state.release_all_snapshot().keyboard ==
+           hid_runtime::ReleaseAllInterfaceState::kPending);
+    state.finalize_release_all();
+    state.execute(ReleaseBoundarySink::submit, &sink);
+    state.begin_release_all();
+    assert(state.release_all_snapshot().keyboard ==
+           hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    state.finalize_release_all();
+}
+
+void test_release_serializes_claimed_and_submitting_tickets() {
+    // Published but not claimed: the release epoch cancels the press before
+    // its claim, so the public release may complete AlreadyUp.
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        hid_runtime::HidTicketId ticket = 0;
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, {},
+                                           &ticket) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        state.begin_release_all();
+        ReleaseBoundarySink sink{.state = &state};
+        assert(state.release_all_snapshot().keyboard ==
+               hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+        state.finalize_release_all();
+        state.execute(ReleaseBoundarySink::submit, &sink);
+        assert(sink.calls == 0);
+        hid_runtime::KeyboardReportSnapshot canceled{};
+        assert(state.keyboard_report_snapshot(ticket, &canceled));
+        assert(canceled.state ==
+               hid_runtime::KeyboardReportTicketState::kCanceled);
+        assert(state.finalize_keyboard_report(ticket));
+    }
+
+    // Claimed before the final fence: revocation prevents the press.
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        state.set_before_submit_hook_for_test(release_from_runtime_hook);
+        ReleaseBoundarySink sink{.state = &state};
+        state.execute(ReleaseBoundarySink::submit, &sink);
+        finish_release_after_keyboard_boundary(state, sink);
+        assert(sink.first[2] == 0);
+    }
+
+    // Adapter entry is the USB submission linearization point. Release sees
+    // the claimed ticket, stays pending, and safety submits after the press.
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        ReleaseBoundarySink sink{.state = &state,
+                                 .release_at_adapter_entry = true};
+        state.execute(ReleaseBoundarySink::submit, &sink);
+        assert(sink.calls == 1 && sink.first[2] == 4);
+        finish_release_after_keyboard_boundary(state, sink);
+        assert(sink.calls == 2 && sink.last[2] == 0);
+    }
+
+    // Accepted by the adapter but not yet published in-flight is covered by
+    // the same claimed-ticket release barrier.
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        state.set_after_submit_hook_for_test(release_from_runtime_hook);
+        ReleaseBoundarySink sink{.state = &state};
+        state.execute(ReleaseBoundarySink::submit, &sink);
+        assert(sink.calls == 1 && sink.first[2] == 4);
+        finish_release_after_keyboard_boundary(state, sink);
+        assert(sink.calls == 2 && sink.last[2] == 0);
+    }
+
+    // Once in-flight is visible, release likewise serializes all-up after it.
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        ReleaseBoundarySink sink{.state = &state};
+        state.execute(ReleaseBoundarySink::submit, &sink);
+        state.begin_release_all();
+        assert(state.release_all_snapshot().keyboard !=
+               hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+        finish_release_after_keyboard_boundary(state, sink);
+        assert(sink.calls == 2 && sink.first[2] == 4 && sink.last[2] == 0);
+    }
+
+    // Mouse tickets share the claim/submission barrier.
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        ReleaseBoundarySink sink{.state = &state,
+                                 .release_at_adapter_entry = true,
+                                 .mouse = true};
+        state.execute(ReleaseBoundarySink::submit, &sink);
+        assert(sink.calls == 1 && sink.first[0] == 1);
+        assert(state.report_complete(1, sink.last.data(), sink.last_length));
+        state.execute(ReleaseBoundarySink::submit, &sink);
+        assert(sink.calls == 2 && sink.last_length == 5 && sink.last[0] == 0);
+        assert(state.report_complete(1, sink.last.data(), sink.last_length));
+        assert(state.release_all_snapshot().mouse ==
+               hid_runtime::ReleaseAllInterfaceState::kPending);
+        state.finalize_release_all();
+        state.execute(ReleaseBoundarySink::submit, &sink);
+        state.begin_release_all();
+        assert(state.release_all_snapshot().mouse ==
+               hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    }
+}
+
+void test_writing_cancellation_keeps_slot_writer_owned_until_acknowledged() {
+    {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        writing_probe_interface = WritingProbeInterface::kKeyboard;
+        writing_probe_ticket = 0;
+        state.set_before_ticket_publish_hook_for_test(
+            cancel_writer_owned_ticket);
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+               hid_runtime::KeyboardReportBeginResult::kSafetyPending);
+        assert(writing_probe_ticket != 0);
+        assert(writing_probe_keyboard_result ==
+               hid_runtime::KeyboardReportBeginResult::kBusy);
+        hid_runtime::KeyboardReportSnapshot old_snapshot{};
+        assert(state.keyboard_report_snapshot(writing_probe_ticket,
+                                              &old_snapshot));
+        assert(old_snapshot.state ==
+               hid_runtime::KeyboardReportTicketState::kCanceled);
+        assert(old_snapshot.outcome ==
+               hid_runtime::KeyboardReportTicketOutcome::kSafetyPending);
+        state.execute(Sink::submit, &sink);
+        assert(sink.calls == 0);
+        state.finalize_release_all();
+        assert(state.finalize_keyboard_report(writing_probe_ticket));
+
+        hid_runtime::HidTicketId replacement = 0;
+        assert(state.begin_keyboard_report(0, {5, 0, 0, 0, 0, 0}, {},
+                                           &replacement) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(replacement != writing_probe_ticket);
+        state.execute(Sink::submit, &sink);
+        assert(sink.calls == 1 && sink.report[2] == 5);
+        assert(state.report_complete(0, sink.report.data(), sink.length));
+        assert(state.finalize_keyboard_report(replacement));
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        writing_probe_interface = WritingProbeInterface::kMouse;
+        writing_probe_ticket = 0;
+        state.set_before_ticket_publish_hook_for_test(
+            cancel_writer_owned_ticket);
+        assert(state.begin_mouse_report(1, 1, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kSafetyPending);
+        assert(writing_probe_ticket != 0);
+        assert(writing_probe_mouse_result ==
+               hid_runtime::MouseReportBeginResult::kBusy);
+        hid_runtime::MouseReportSnapshot old_snapshot{};
+        assert(state.mouse_report_snapshot(writing_probe_ticket, &old_snapshot));
+        assert(old_snapshot.state ==
+               hid_runtime::MouseReportTicketState::kCanceled);
+        assert(old_snapshot.outcome ==
+               hid_runtime::MouseReportTicketOutcome::kSafetyPending);
+        state.execute(Sink::submit, &sink);
+        assert(sink.calls == 0);
+        state.finalize_release_all();
+        assert(state.finalize_mouse_report(writing_probe_ticket));
+
+        hid_runtime::HidTicketId replacement = 0;
+        assert(state.begin_mouse_report(2, 3, 0, 0, 0, {}, &replacement) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        assert(replacement != writing_probe_ticket);
+        state.execute(Sink::submit, &sink);
+        assert(sink.calls == 1 && sink.report[0] == 2 && sink.report[1] == 3);
+        assert(state.report_complete(1, sink.report.data(), sink.length));
+        assert(state.finalize_mouse_report(replacement));
+    }
+}
+
+void test_exact_cancel_transition_excludes_reuse() {
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        hid_runtime::HidTicketId old_ticket = 0;
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, {},
+                                           &old_ticket) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        reset_transition_probe();
+        state.set_inside_ticket_cancel_hook_for_test(
+            hold_exact_ticket_transition);
+        bool canceled = false;
+        std::thread old_caller(
+            [&] { canceled = state.cancel_keyboard_report(old_ticket); });
+        while (!transition_hook_entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        hid_runtime::HidTicketId replacement = 0;
+        hid_runtime::KeyboardReportBeginResult replacement_result{};
+        std::thread replacement_caller([&] {
+            transition_contender_started.store(true, std::memory_order_release);
+            replacement_result = state.begin_keyboard_report(
+                0, {5, 0, 0, 0, 0, 0}, {}, &replacement);
+            transition_contender_finished.store(true, std::memory_order_release);
+        });
+        old_caller.join();
+        replacement_caller.join();
+        state.set_inside_ticket_cancel_hook_for_test(nullptr);
+        assert(canceled);
+        assert(replacement_result ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(replacement != 0 && replacement != old_ticket);
+        assert(!state.cancel_keyboard_report(old_ticket));
+        assert(!state.finalize_keyboard_report(old_ticket));
+        hid_runtime::KeyboardReportSnapshot snapshot{};
+        assert(state.keyboard_report_snapshot(replacement, &snapshot));
+        assert(snapshot.state ==
+               hid_runtime::KeyboardReportTicketState::kPublished);
+        assert(state.cancel_keyboard_report(replacement));
+        assert(state.finalize_keyboard_report(replacement));
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        hid_runtime::HidTicketId old_ticket = 0;
+        assert(state.begin_mouse_report(1, 1, 0, 0, 0, {}, &old_ticket) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        reset_transition_probe();
+        state.set_inside_ticket_cancel_hook_for_test(
+            hold_exact_ticket_transition);
+        bool canceled = false;
+        std::thread old_caller(
+            [&] { canceled = state.cancel_mouse_report(old_ticket); });
+        while (!transition_hook_entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        hid_runtime::HidTicketId replacement = 0;
+        hid_runtime::MouseReportBeginResult replacement_result{};
+        std::thread replacement_caller([&] {
+            transition_contender_started.store(true, std::memory_order_release);
+            replacement_result =
+                state.begin_mouse_report(2, 2, 0, 0, 0, {}, &replacement);
+            transition_contender_finished.store(true, std::memory_order_release);
+        });
+        old_caller.join();
+        replacement_caller.join();
+        state.set_inside_ticket_cancel_hook_for_test(nullptr);
+        assert(canceled);
+        assert(replacement_result ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        assert(replacement != 0 && replacement != old_ticket);
+        assert(!state.cancel_mouse_report(old_ticket));
+        assert(!state.finalize_mouse_report(old_ticket));
+        hid_runtime::MouseReportSnapshot snapshot{};
+        assert(state.mouse_report_snapshot(replacement, &snapshot));
+        assert(snapshot.state == hid_runtime::MouseReportTicketState::kPublished);
+        assert(state.cancel_mouse_report(replacement));
+        assert(state.finalize_mouse_report(replacement));
+    }
+}
+
+void test_exact_finalize_transition_excludes_reuse() {
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        hid_runtime::HidTicketId old_ticket = 0;
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, {},
+                                           &old_ticket) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(state.cancel_keyboard_report(old_ticket));
+        reset_transition_probe();
+        state.set_inside_ticket_finalize_hook_for_test(
+            hold_exact_ticket_transition);
+        bool finalized = false;
+        std::thread old_caller(
+            [&] { finalized = state.finalize_keyboard_report(old_ticket); });
+        while (!transition_hook_entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        hid_runtime::HidTicketId replacement = 0;
+        hid_runtime::KeyboardReportBeginResult replacement_result{};
+        std::thread replacement_caller([&] {
+            transition_contender_started.store(true, std::memory_order_release);
+            replacement_result = state.begin_keyboard_report(
+                0, {5, 0, 0, 0, 0, 0}, {}, &replacement);
+            transition_contender_finished.store(true, std::memory_order_release);
+        });
+        old_caller.join();
+        replacement_caller.join();
+        state.set_inside_ticket_finalize_hook_for_test(nullptr);
+        assert(finalized);
+        assert(replacement_result ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(replacement != old_ticket);
+        assert(!state.finalize_keyboard_report(old_ticket));
+        assert(state.cancel_keyboard_report(replacement));
+        assert(state.finalize_keyboard_report(replacement));
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        hid_runtime::HidTicketId old_ticket = 0;
+        assert(state.begin_mouse_report(1, 1, 0, 0, 0, {}, &old_ticket) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        assert(state.cancel_mouse_report(old_ticket));
+        reset_transition_probe();
+        state.set_inside_ticket_finalize_hook_for_test(
+            hold_exact_ticket_transition);
+        bool finalized = false;
+        std::thread old_caller(
+            [&] { finalized = state.finalize_mouse_report(old_ticket); });
+        while (!transition_hook_entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        hid_runtime::HidTicketId replacement = 0;
+        hid_runtime::MouseReportBeginResult replacement_result{};
+        std::thread replacement_caller([&] {
+            transition_contender_started.store(true, std::memory_order_release);
+            replacement_result =
+                state.begin_mouse_report(2, 2, 0, 0, 0, {}, &replacement);
+            transition_contender_finished.store(true, std::memory_order_release);
+        });
+        old_caller.join();
+        replacement_caller.join();
+        state.set_inside_ticket_finalize_hook_for_test(nullptr);
+        assert(finalized);
+        assert(replacement_result ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        assert(replacement != old_ticket);
+        assert(!state.finalize_mouse_report(old_ticket));
+        assert(state.cancel_mouse_report(replacement));
+        assert(state.finalize_mouse_report(replacement));
+    }
+}
+
+void test_terminal_state_never_precedes_terminal_outcome() {
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        hid_runtime::HidTicketId ticket = 0;
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, {},
+                                           &ticket) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        reset_terminal_probe();
+        state.set_before_terminal_ticket_publish_hook_for_test(
+            hold_before_terminal_publication);
+        bool canceled = false;
+        std::thread producer(
+            [&] { canceled = state.cancel_keyboard_report(ticket); });
+        while (!terminal_hook_entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        bool found = false;
+        hid_runtime::KeyboardReportSnapshot observed{};
+        std::thread observer([&] {
+            terminal_observer_started.store(true, std::memory_order_release);
+            found = state.keyboard_report_snapshot(ticket, &observed);
+            terminal_observer_finished.store(true, std::memory_order_release);
+        });
+        producer.join();
+        observer.join();
+        state.set_before_terminal_ticket_publish_hook_for_test(nullptr);
+        assert(canceled && found);
+        assert(observed.state ==
+               hid_runtime::KeyboardReportTicketState::kCanceled);
+        assert(observed.outcome ==
+               hid_runtime::KeyboardReportTicketOutcome::kNotReady);
+        assert(state.finalize_keyboard_report(ticket));
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        ready(state);
+        hid_runtime::HidTicketId ticket = 0;
+        assert(state.begin_mouse_report(1, 1, 0, 0, 0, {}, &ticket) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        reset_terminal_probe();
+        state.set_before_terminal_ticket_publish_hook_for_test(
+            hold_before_terminal_publication);
+        bool canceled = false;
+        std::thread producer(
+            [&] { canceled = state.cancel_mouse_report(ticket); });
+        while (!terminal_hook_entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        bool found = false;
+        hid_runtime::MouseReportSnapshot observed{};
+        std::thread observer([&] {
+            terminal_observer_started.store(true, std::memory_order_release);
+            found = state.mouse_report_snapshot(ticket, &observed);
+            terminal_observer_finished.store(true, std::memory_order_release);
+        });
+        producer.join();
+        observer.join();
+        state.set_before_terminal_ticket_publish_hook_for_test(nullptr);
+        assert(canceled && found);
+        assert(observed.state == hid_runtime::MouseReportTicketState::kCanceled);
+        assert(observed.outcome ==
+               hid_runtime::MouseReportTicketOutcome::kNotReady);
+        assert(state.finalize_mouse_report(ticket));
+    }
+}
+
+void test_public_ticket_identity_width_boundary_and_exhaustion() {
+    static_assert(sizeof(hid_runtime::HidTicketId) >= 8);
+    hid_runtime::StateMachine state;
+    ready(state);
+
+    state.set_next_public_ticket_id_for_test(
+        std::numeric_limits<std::uint32_t>::max());
+    hid_runtime::HidTicketId low = 0;
+    assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, {}, &low) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(low == std::numeric_limits<std::uint32_t>::max());
+    assert(state.cancel_keyboard_report(low));
+    assert(state.finalize_keyboard_report(low));
+
+    hid_runtime::HidTicketId high = 0;
+    assert(state.begin_mouse_report(1, 1, 0, 0, 0, {}, &high) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    assert(high ==
+           static_cast<hid_runtime::HidTicketId>(
+               std::numeric_limits<std::uint32_t>::max()) +
+               1);
+    assert(high != low);
+    hid_runtime::MouseReportSnapshot high_snapshot{};
+    assert(state.mouse_report_snapshot(high, &high_snapshot));
+    assert(!state.mouse_report_snapshot(low, &high_snapshot));
+    assert(state.cancel_mouse_report(high));
+    assert(state.finalize_mouse_report(high));
+
+    state.set_next_public_ticket_id_for_test(
+        std::numeric_limits<hid_runtime::HidTicketId>::max());
+    hid_runtime::HidTicketId final_ticket = 0;
+    assert(state.begin_keyboard_report(0, {6, 0, 0, 0, 0, 0}, {},
+                                       &final_ticket) ==
+           hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(final_ticket ==
+           std::numeric_limits<hid_runtime::HidTicketId>::max());
+    assert(state.cancel_keyboard_report(final_ticket));
+    assert(state.finalize_keyboard_report(final_ticket));
+
+    hid_runtime::HidTicketId exhausted_ticket = 123;
+    assert(state.begin_mouse_report(1, 2, 0, 0, 0, {}, &exhausted_ticket) ==
+           hid_runtime::MouseReportBeginResult::kNotReady);
+    assert(exhausted_ticket == 0);
+    assert(state.mouse_report_snapshot().state ==
+           hid_runtime::MouseReportTicketState::kFree);
+}
+
+void test_ticket_identity_prevents_result_theft_and_wrong_free() {
+    for (const bool old_waiter_first : {false, true}) {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        hid_runtime::HidTicketId old_ticket = 0;
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}, {},
+                                           &old_ticket) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(state.cancel_keyboard_report(old_ticket));
+        hid_runtime::KeyboardReportSnapshot old_snapshot{};
+        assert(state.keyboard_report_snapshot(old_ticket, &old_snapshot));
+        assert(old_snapshot.state ==
+               hid_runtime::KeyboardReportTicketState::kCanceled);
+
+        if (old_waiter_first) {
+            assert(state.finalize_keyboard_report(old_ticket));
+        }
+        hid_runtime::HidTicketId new_ticket = 0;
+        assert(state.begin_keyboard_report(0, {5, 0, 0, 0, 0, 0}, {},
+                                           &new_ticket) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(new_ticket != old_ticket);
+        if (!old_waiter_first) {
+            assert(!state.keyboard_report_snapshot(old_ticket, &old_snapshot));
+            assert(!state.finalize_keyboard_report(old_ticket));
+        }
+        state.execute(Sink::submit, &sink);
+        hid_runtime::KeyboardReportSnapshot new_snapshot{};
+        assert(state.keyboard_report_snapshot(new_ticket, &new_snapshot));
+        assert(new_snapshot.state ==
+               hid_runtime::KeyboardReportTicketState::kSubmitted);
+        assert(state.finalize_keyboard_report(new_ticket));
+    }
+
+    for (const bool old_waiter_first : {false, true}) {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        hid_runtime::HidTicketId old_ticket = 0;
+        assert(state.begin_mouse_report(1, 0, 0, 0, 0, {}, &old_ticket) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        assert(state.cancel_mouse_report(old_ticket));
+        hid_runtime::MouseReportSnapshot old_snapshot{};
+        assert(state.mouse_report_snapshot(old_ticket, &old_snapshot));
+        assert(old_snapshot.state ==
+               hid_runtime::MouseReportTicketState::kCanceled);
+        if (old_waiter_first) {
+            assert(state.finalize_mouse_report(old_ticket));
+        }
+        hid_runtime::HidTicketId new_ticket = 0;
+        assert(state.begin_mouse_report(2, 0, 0, 0, 0, {}, &new_ticket) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        assert(new_ticket != old_ticket);
+        if (!old_waiter_first) {
+            assert(!state.mouse_report_snapshot(old_ticket, &old_snapshot));
+            assert(!state.finalize_mouse_report(old_ticket));
+        }
+        state.execute(Sink::submit, &sink);
+        hid_runtime::MouseReportSnapshot new_snapshot{};
+        assert(state.mouse_report_snapshot(new_ticket, &new_snapshot));
+        assert(new_snapshot.state ==
+               hid_runtime::MouseReportTicketState::kSubmitted);
+        assert(state.finalize_mouse_report(new_ticket));
+    }
+}
+
+void test_report_origin_owner_is_bound_to_exact_async_work() {
+    constexpr hid_runtime::ReportOriginOwnerId high_owner =
+        static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) +
+        17U;
+
+    {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        hid_runtime::HidTicketId ticket = 0;
+        assert(state.begin_keyboard_report(
+                   0, {4, 0, 0, 0, 0, 0}, {}, &ticket, high_owner) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        const auto published =
+            state.published_report_token(hid_runtime::Interface::kKeyboard);
+        assert(published.ticket_id == ticket);
+        assert(published.originating_local_owner_id == high_owner);
+        state.execute(Sink::submit, &sink);
+        const auto in_flight =
+            state.in_flight_token(hid_runtime::Interface::kKeyboard);
+        assert(in_flight.originating_local_owner_id == high_owner);
+
+        auto forged = in_flight;
+        forged.originating_local_owner_id = high_owner + 1U;
+        hid_runtime::ReportOriginOwnerId recovered = high_owner;
+        assert(!state.report_failed_for_token(
+            static_cast<std::uint8_t>(hid_runtime::Interface::kKeyboard),
+            forged, nullptr, 0, &recovered));
+        assert(recovered == 0);
+        assert(state.report_in_flight(hid_runtime::Interface::kKeyboard));
+
+        // The public operation remains attributable after an intervening
+        // release request, which models a local-owner takeover barrier.
+        state.request_release_all();
+        assert(state.report_failed_for_token(
+            static_cast<std::uint8_t>(hid_runtime::Interface::kKeyboard),
+            in_flight, nullptr, 0, &recovered));
+        assert(recovered == high_owner);
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        hid_runtime::HidTicketId ticket = 0;
+        assert(state.begin_mouse_report(1, 3, -2, 1, -1, {}, &ticket,
+                                        high_owner) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        const auto published =
+            state.published_report_token(hid_runtime::Interface::kMouse);
+        assert(published.ticket_id == ticket);
+        assert(published.originating_local_owner_id == high_owner);
+        state.execute(Sink::submit, &sink);
+        const auto in_flight =
+            state.in_flight_token(hid_runtime::Interface::kMouse);
+        assert(in_flight.originating_local_owner_id == high_owner);
+        hid_runtime::ReportOriginOwnerId recovered = 0;
+        state.request_release_all();
+        assert(state.report_failed_for_token(
+            static_cast<std::uint8_t>(hid_runtime::Interface::kMouse),
+            in_flight, nullptr, 0, &recovered));
+        assert(recovered == high_owner);
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        Sink sink;
+        ready(state);
+        assert(state.queue_keyboard_report(0, {4, 0, 0, 0, 0, 0}));
+        state.execute(Sink::submit, &sink);
+        const auto internal =
+            state.in_flight_token(hid_runtime::Interface::kKeyboard);
+        assert(internal.originating_local_owner_id == 0);
+        hid_runtime::ReportOriginOwnerId recovered = high_owner;
+        assert(state.report_failed_for_token(
+            static_cast<std::uint8_t>(hid_runtime::Interface::kKeyboard),
+            internal, nullptr, 0, &recovered));
+        assert(recovered == 0);
+    }
+}
+
 }  // namespace
 
 int main() {
     test_lifecycle_and_generation_cancellation();
     test_readiness_refresh_after_mount_without_hid_work();
+    test_sequence_admission_snapshot_and_producer_exclusion();
+    test_revoked_sequence_authority_cannot_create_or_submit_ticket();
+    test_sequence_ticket_paused_before_publication_cannot_survive_release();
+    test_sequence_generation_does_not_wrap_to_stale_authority();
+    test_ble_terminal_visibility_follows_confirmed_state();
+    test_mailbox_sequence_exclusion_and_safety_priority();
     test_readiness_refresh_after_reattach();
     test_route_generation_is_independent_and_gates_stale_unsafe_work();
     test_usb_transition_outcomes_freeze_stage_a_runtime();
@@ -1307,5 +2293,13 @@ int main() {
     test_route_zero_work_round_trip_is_coherent_and_keeps_usb_exposed();
     test_route_held_key_release_uses_old_route_before_none_commit();
     test_route_release_callback_preemption_fails_closed();
+    test_release_serializes_claimed_and_submitting_tickets();
+    test_writing_cancellation_keeps_slot_writer_owned_until_acknowledged();
+    test_exact_cancel_transition_excludes_reuse();
+    test_exact_finalize_transition_excludes_reuse();
+    test_terminal_state_never_precedes_terminal_outcome();
+    test_public_ticket_identity_width_boundary_and_exhaustion();
+    test_ticket_identity_prevents_result_theft_and_wrong_free();
+    test_report_origin_owner_is_bound_to_exact_async_work();
     return 0;
 }

@@ -1,6 +1,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <string_view>
 
 #include "control_session/control_session.hpp"
@@ -31,7 +32,8 @@ void test_lease_lifecycle() {
     control_session::State state;
     state.initialize(random_fill, nullptr, Clock::now, &clock);
     control_session::ResponseFrame response{};
-    state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response);
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
+    assert(state.local_owner_id() == 1);
     assert(state.has_active_session());
 
     clock.value = control_session::kLeaseMicroseconds - 1;
@@ -50,7 +52,7 @@ void test_takeover_clears_retry_authority() {
     control_session::State state;
     state.initialize(random_fill, nullptr);
     control_session::ResponseFrame response{};
-    state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response);
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
     state.cache_completed_request(1, "{\"ping\":true}", kEpochOne, response);
     state.revoke_for_takeover();
     assert(!state.has_active_session());
@@ -66,7 +68,7 @@ void test_authority_epoch_scopes_session_and_caches() {
     control_session::ResponseFrame response{};
     response.bytes[0] = 'o';
     response.length = 1;
-    state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response);
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
     state.cache_completed_request(1, "{\"ping\":true}", kEpochOne, response);
 
     const control_session::ResponseFrame *cached = nullptr;
@@ -81,7 +83,7 @@ void test_authority_epoch_scopes_session_and_caches() {
     assert(!state.has_active_session());
 
     state.initialize(random_fill, nullptr, Clock::now, &clock);
-    state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response);
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
     assert(state.inspect_hello(kNonce, kRequest, kEpochOne, &cached) ==
            control_session::HelloCacheResult::kExactRetry);
     assert(state.inspect_hello(kNonce, kRequest, kEpochTwo, &cached) ==
@@ -90,11 +92,53 @@ void test_authority_epoch_scopes_session_and_caches() {
     assert(!state.has_active_session());
 }
 
+void test_local_owner_allocator_is_unique_nonwrapping_and_retry_stable() {
+    control_session::State state;
+    state.initialize(random_fill, nullptr);
+    control_session::ResponseFrame response{};
+
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
+    const auto first = state.local_owner_id();
+    assert(first != 0);
+    const control_session::ResponseFrame *cached = nullptr;
+    assert(state.inspect_hello(kNonce, kRequest, kEpochOne, &cached) ==
+           control_session::HelloCacheResult::kExactRetry);
+    assert(state.local_owner_id() == first);
+
+    state.revoke_for_takeover();
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
+    assert(state.local_owner_id() == first + 1);
+
+    state.revoke_for_takeover();
+    state.set_next_local_owner_id_for_test(
+        static_cast<control_session::LocalOwnerId>(
+            std::numeric_limits<std::uint32_t>::max()));
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
+    assert(state.local_owner_id() == std::numeric_limits<std::uint32_t>::max());
+    state.revoke_for_takeover();
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
+    assert(state.local_owner_id() ==
+           static_cast<control_session::LocalOwnerId>(
+               std::numeric_limits<std::uint32_t>::max()) + 1U);
+
+    state.revoke_for_takeover();
+    state.set_next_local_owner_id_for_test(
+        std::numeric_limits<control_session::LocalOwnerId>::max());
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
+    assert(state.local_owner_id() ==
+           std::numeric_limits<control_session::LocalOwnerId>::max());
+    state.revoke_for_takeover();
+    assert(!state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
+    assert(!state.has_active_session());
+    assert(state.local_owner_id() == 0);
+}
+
 }  // namespace
 
 int main() {
     test_lease_lifecycle();
     test_takeover_clears_retry_authority();
     test_authority_epoch_scopes_session_and_caches();
+    test_local_owner_allocator_is_unique_nonwrapping_and_retry_stable();
     return 0;
 }

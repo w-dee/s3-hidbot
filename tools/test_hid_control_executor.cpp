@@ -479,6 +479,7 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
             std::memcpy(notify_history_payload[history_index].data(), payload,
                         payload_length);
         }
+        if (notify_hook != nullptr) notify_hook();
         return notify_result;
     }
     int register_calls = 0;
@@ -502,6 +503,7 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
     std::array<std::uint16_t, 64> notify_history_characteristic{};
     std::array<std::uint16_t, 64> notify_history_length{};
     std::array<std::array<std::uint8_t, 8>, 64> notify_history_payload{};
+    std::function<void()> notify_hook;
     hid_control_executor::BleNotifyBackendResult notify_result =
         hid_control_executor::BleNotifyBackendResult::kStackAccepted;
 };
@@ -3356,6 +3358,9 @@ struct ReadyBleRouteFixture {
 void observe_exact_route_disconnect(ReadyBleRouteFixture &fixture);
 
 void test_internal_ble_route_activation_and_exact_payloads() {
+    constexpr hid_runtime::ReportOriginOwnerId high_owner =
+        static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) +
+        23U;
     {
         hid_runtime::Runtime runtime;
         FakeBackend usb;
@@ -3398,8 +3403,12 @@ void test_internal_ble_route_activation_and_exact_payloads() {
     assert(noop.snapshot.route.generation == status.route.generation);
 
     const std::array<std::uint8_t, 6> keys{0x73, 0, 0, 0, 0, 0};
-    assert(fixture.controller.queue_ble_keyboard_report(0x02, keys) ==
+    assert(fixture.controller.queue_ble_keyboard_report(
+               0x02, keys, {}, nullptr, high_owner) ==
            hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(fixture.runtime.state_machine()
+               .published_report_token(hid_runtime::Interface::kKeyboard)
+               .originating_local_owner_id == high_owner);
     assert(fixture.controller.process_one_for_test());
     assert(fixture.database.notify_calls == 1);
     assert(fixture.database.last_connection == fixture.connection);
@@ -3414,8 +3423,11 @@ void test_internal_ble_route_activation_and_exact_payloads() {
     fixture.runtime.state_machine().finalize_keyboard_report();
 
     assert(fixture.controller.queue_ble_mouse_report(
-               0xff, -127, 127, -2, 1) ==
+               0xff, -127, 127, -2, 1, {}, nullptr, high_owner) ==
            hid_runtime::MouseReportBeginResult::kPublished);
+    assert(fixture.runtime.state_machine()
+               .published_report_token(hid_runtime::Interface::kMouse)
+               .originating_local_owner_id == high_owner);
     assert(fixture.controller.process_one_for_test());
     assert(fixture.database.notify_calls == 2);
     assert(fixture.database.last_characteristic ==
@@ -3427,6 +3439,72 @@ void test_internal_ble_route_activation_and_exact_payloads() {
     assert(fixture.database.last_payload[3] == 0xfe);
     assert(fixture.database.last_payload[4] == 0x01);
     fixture.runtime.state_machine().finalize_mouse_report();
+}
+
+void begin_release_after_ble_stack_acceptance(
+    hid_runtime::StateMachine *state) {
+    state->begin_release_all();
+    assert(state->release_all_snapshot().keyboard ==
+           hid_runtime::ReleaseAllInterfaceState::kPending);
+}
+
+void test_ble_release_serializes_stack_accepted_report() {
+    for (const bool release_at_adapter_entry : {true, false}) {
+        ReadyBleRouteFixture fixture(
+            static_cast<std::uint16_t>(release_at_adapter_entry ? 136 : 137));
+        auto &state = fixture.runtime.state_machine();
+        if (release_at_adapter_entry) {
+            fixture.database.notify_hook = [&]() {
+                if (fixture.database.notify_calls == 1) {
+                    state.begin_release_all();
+                    assert(state.release_all_snapshot().keyboard ==
+                           hid_runtime::ReleaseAllInterfaceState::kPending);
+                }
+            };
+        } else {
+            state.set_before_ble_terminal_publish_hook_for_test(
+                begin_release_after_ble_stack_acceptance);
+        }
+
+        const std::array<std::uint8_t, 6> keys{4, 0, 0, 0, 0, 0};
+        assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(fixture.controller.process_one_for_test());
+        state.set_before_ble_terminal_publish_hook_for_test(nullptr);
+        fixture.database.notify_hook = nullptr;
+
+        // The first notification is the old key press. Advancing the release
+        // epoch makes the BLE route unready, so the same serialized owner
+        // retires it and sends Keyboard and Mouse all-up after that press.
+        assert(fixture.database.notify_calls == 3);
+        assert(fixture.database.notify_history_length[0] == 8);
+        assert(fixture.database.notify_history_payload[0][2] == 4);
+        assert(fixture.database.notify_history_length[1] == 8);
+        assert((fixture.database.notify_history_payload[1] ==
+                std::array<std::uint8_t, 8>{}));
+        assert(fixture.database.notify_history_length[2] == 5);
+        assert((fixture.database.notify_history_payload[2] ==
+                std::array<std::uint8_t, 8>{}));
+        assert(state.route_snapshot().active == hid_route::OutputRoute::kBle);
+        assert(state.route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
+        state.finalize_keyboard_report();
+
+        assert(fixture.controller.expire_ble_route_release_grace_for_test());
+        assert(fixture.controller.process_one_for_test());
+        observe_exact_route_disconnect(fixture);
+        assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+
+        // After physical retirement has established the final boundary, no
+        // old work remains and a fresh public release is clean.
+        state.begin_release_all();
+        const auto clean = state.release_all_snapshot();
+        assert(clean.keyboard ==
+               hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+        assert(clean.mouse ==
+               hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+        state.finalize_release_all();
+    }
 }
 
 void test_ble_route_none_usb_and_no_dual_delivery() {
@@ -3495,10 +3573,12 @@ void test_ble_work_token_fences_every_authority_field() {
         assert(fixture.database.notify_calls == 0);
         assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
                hid_runtime::KeyboardReportTicketState::kPublished);
-        assert(fixture.runtime.state_machine().cancel_keyboard_report());
+        assert(fixture.runtime.state_machine().cancel_keyboard_report(
+            fixture.runtime.state_machine().keyboard_report_snapshot().ticket_id));
         fixture.runtime.state_machine().abandon_ble_report(
             hid_runtime::Interface::kKeyboard, original);
-        fixture.runtime.state_machine().finalize_keyboard_report();
+        assert(fixture.runtime.state_machine().finalize_keyboard_report(
+            fixture.runtime.state_machine().keyboard_report_snapshot().ticket_id));
         assert(fixture.runtime.state_machine().route_snapshot().active ==
                hid_route::OutputRoute::kBle);
     }
@@ -3524,8 +3604,9 @@ void test_canceled_ble_ticket_waits_for_exact_action_acknowledgment() {
            hid_runtime::KeyboardReportBeginResult::kPublished);
     hid_control_executor::Controller::Action old_action{};
     assert(fixture.controller.dequeue_one_for_test(old_action));
-    assert(fixture.runtime.state_machine().cancel_keyboard_report());
-    fixture.runtime.state_machine().finalize_keyboard_report();
+    const auto old_ticket = old_action.hid_work.ticket_id;
+    assert(fixture.runtime.state_machine().cancel_keyboard_report(old_ticket));
+    assert(!fixture.runtime.state_machine().finalize_keyboard_report(old_ticket));
     assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
            hid_runtime::KeyboardReportTicketState::kCanceled);
 
@@ -3536,12 +3617,36 @@ void test_canceled_ble_ticket_waits_for_exact_action_acknowledgment() {
     assert(fixture.database.notify_calls == 0);
     assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
            hid_runtime::KeyboardReportTicketState::kCanceled);
+    assert(fixture.runtime.state_machine().finalize_keyboard_report(old_ticket));
 
     assert(fixture.controller.queue_ble_keyboard_report(0, new_keys) ==
            hid_runtime::KeyboardReportBeginResult::kPublished);
     assert(fixture.controller.process_one_for_test());
     assert(fixture.database.notify_calls == 1);
     assert(fixture.database.last_payload[2] == 0x6b);
+
+    assert(fixture.controller.queue_ble_mouse_report(1, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    hid_control_executor::Controller::Action old_mouse_action{};
+    assert(fixture.controller.dequeue_one_for_test(old_mouse_action));
+    const auto old_mouse_ticket = old_mouse_action.hid_work.ticket_id;
+    assert(fixture.runtime.state_machine().cancel_mouse_report(old_mouse_ticket));
+    assert(!fixture.runtime.state_machine().finalize_mouse_report(
+        old_mouse_ticket));
+    assert(fixture.controller.queue_ble_mouse_report(2, 2, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kBusy);
+    fixture.controller.process_for_test(old_mouse_action);
+    assert(fixture.database.notify_calls == 1);
+    assert(fixture.runtime.state_machine().mouse_report_snapshot().state ==
+           hid_runtime::MouseReportTicketState::kCanceled);
+    assert(fixture.runtime.state_machine().finalize_mouse_report(
+        old_mouse_ticket));
+    assert(fixture.controller.queue_ble_mouse_report(2, 2, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.database.notify_calls == 2);
+    assert(fixture.database.last_payload[0] == 2);
+    assert(fixture.database.last_payload[1] == 2);
 }
 
 void test_usb_mount_retires_ble_authority_without_forgetting_held_state() {
@@ -5766,6 +5871,7 @@ int main() {
     test_store_full_retirement_does_not_poison_future_peer();
     test_internal_ble_notification_adapter_and_result_model();
     test_internal_ble_route_activation_and_exact_payloads();
+    test_ble_release_serializes_stack_accepted_report();
     test_ble_route_none_usb_and_no_dual_delivery();
     test_ble_work_token_fences_every_authority_field();
     test_canceled_ble_ticket_waits_for_exact_action_acknowledgment();

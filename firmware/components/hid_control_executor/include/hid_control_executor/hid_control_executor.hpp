@@ -439,17 +439,33 @@ class Controller final : public usb_lifecycle::Executor,
 #ifndef HID_CONTROL_EXECUTOR_NATIVE_TEST
     hid_runtime::KeyboardReportResult keyboard_report(
         std::uint8_t modifiers,
-        const std::array<std::uint8_t, 6> &keycodes);
+        const std::array<std::uint8_t, 6> &keycodes,
+        hid_runtime::ReportOriginOwnerId originating_local_owner_id);
     hid_runtime::MouseReportResult mouse_report(
         std::uint8_t buttons, std::int8_t x, std::int8_t y,
-        std::int8_t vertical, std::int8_t horizontal);
+        std::int8_t vertical, std::int8_t horizontal,
+        hid_runtime::ReportOriginOwnerId originating_local_owner_id);
+    hid_runtime::KeyboardReportResult sequence_keyboard_report(
+        hid_runtime::SequenceAuthority sequence,
+        std::uint8_t modifiers,
+        const std::array<std::uint8_t, 6> &keycodes,
+        hid_runtime::ReportOriginOwnerId originating_local_owner_id);
+    hid_runtime::MouseReportResult sequence_mouse_report(
+        hid_runtime::SequenceAuthority sequence, std::uint8_t buttons,
+        hid_runtime::ReportOriginOwnerId originating_local_owner_id);
 #endif
     hid_runtime::KeyboardReportBeginResult queue_ble_keyboard_report(
         std::uint8_t modifiers,
-        const std::array<std::uint8_t, 6> &keycodes);
+        const std::array<std::uint8_t, 6> &keycodes,
+        hid_runtime::SequenceAuthority sequence = {},
+        hid_runtime::HidTicketId *ticket_id = nullptr,
+        hid_runtime::ReportOriginOwnerId originating_local_owner_id = 0);
     hid_runtime::MouseReportBeginResult queue_ble_mouse_report(
         std::uint8_t buttons, std::int8_t x, std::int8_t y,
-        std::int8_t vertical, std::int8_t horizontal);
+        std::int8_t vertical, std::int8_t horizontal,
+        hid_runtime::SequenceAuthority sequence = {},
+        hid_runtime::HidTicketId *ticket_id = nullptr,
+        hid_runtime::ReportOriginOwnerId originating_local_owner_id = 0);
     ExposureSnapshot snapshot() const;
     hid_runtime::RouteStatusSnapshot route_snapshot();
     BleCommandOutcome request_ble_enable();

@@ -25,6 +25,7 @@ REQUIRED_MODULES = frozenset(
         "hidbot/protocol.py",
         "hidbot/provisioning.py",
         "hidbot/provisioning_workflow.py",
+        "hidbot/sequence.py",
         "hidbot/serial_transport.py",
     }
 )

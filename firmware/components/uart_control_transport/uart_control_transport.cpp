@@ -1,4 +1,5 @@
 #include "uart_control_transport/uart_control_transport.hpp"
+#include "uart_control_transport/deferred_hid_failure.hpp"
 
 #include <array>
 #include <atomic>
@@ -32,7 +33,9 @@ constexpr TickType_t kRxReadWaitTicks = pdMS_TO_TICKS(100);
 control_framing::Transport s_transport;
 control_protocol::Protocol s_protocol;
 std::atomic_bool s_lifecycle_invalidation_pending{false};
-std::atomic_bool s_hid_failure_pending{false};
+portMUX_TYPE s_local_owner_mux = portMUX_INITIALIZER_UNLOCKED;
+control_session::LocalOwnerId s_published_local_owner = 0;
+uart_control_transport::DeferredHidFailure s_pending_hid_failure;
 bool s_started = false;
 
 void fill_random(void *, std::uint8_t *output, std::size_t length) {
@@ -67,20 +70,37 @@ std::uint64_t monotonic_now(void *) {
     return static_cast<std::uint64_t>(esp_timer_get_time());
 }
 
+void publish_current_local_owner() {
+    const control_session::LocalOwnerId owner = s_protocol.local_owner_id();
+    portENTER_CRITICAL(&s_local_owner_mux);
+    s_published_local_owner = owner;
+    portEXIT_CRITICAL(&s_local_owner_mux);
+}
+
 void consume_framing_event(void *, const control_framing::Event &event) {
     s_protocol.handle_framing_event(event);
+    publish_current_local_owner();
 }
 
 void service_pending_notifications() {
     if (s_lifecycle_invalidation_pending.exchange(false, std::memory_order_acq_rel)) {
         s_protocol.on_hid_lifecycle_invalidation();
-        // A retired lifecycle epoch invalidates any delayed report-failure
-        // notification before it can revoke a current-epoch session.
-        s_hid_failure_pending.store(false, std::memory_order_release);
+        publish_current_local_owner();
+        // Discard only a failure captured for an owner that the lifecycle
+        // pass has retired. A concurrent failure for the still-current owner
+        // remains pending for the next serialized pass.
+        portENTER_CRITICAL(&s_local_owner_mux);
+        s_pending_hid_failure.discard_if_not_current(s_published_local_owner);
+        portEXIT_CRITICAL(&s_local_owner_mux);
         return;
     }
-    if (s_hid_failure_pending.exchange(false, std::memory_order_acq_rel)) {
-        s_protocol.on_hid_safety_failure();
+    control_session::LocalOwnerId failed_owner = 0;
+    portENTER_CRITICAL(&s_local_owner_mux);
+    const bool failure_pending = s_pending_hid_failure.take(&failed_owner);
+    portEXIT_CRITICAL(&s_local_owner_mux);
+    if (failure_pending) {
+        s_protocol.on_hid_safety_failure(failed_owner);
+        publish_current_local_owner();
     }
 }
 
@@ -95,6 +115,7 @@ void control_rx_task(void *) {
         // session mutation in this task avoids concurrent protocol-state access.
         service_pending_notifications();
         s_protocol.service();
+        publish_current_local_owner();
         if (bytes_read > 0) {
             s_transport.consume(buffer.data(),
                                 static_cast<std::size_t>(bytes_read),
@@ -146,6 +167,7 @@ esp_err_t start(const control_protocol::Config *protocol_config) {
                                nullptr)) {
         return ESP_ERR_INVALID_ARG;
     }
+    publish_current_local_owner();
 
     if (!uart_is_driver_installed(kConsoleUart)) {
         const esp_err_t install_result = uart_driver_install(kConsoleUart,
@@ -187,11 +209,18 @@ void on_hid_lifecycle_invalidation() {
     }
 }
 
-void on_hid_safety_failure() {
+void on_hid_safety_failure(
+    control_session::LocalOwnerId originating_local_owner_id) {
     if (s_started) {
-        // Keep the TinyUSB callback non-blocking; the RX task revokes protocol
-        // authority in its serialized state domain.
-        s_hid_failure_pending.store(true, std::memory_order_release);
+        // The exact report token already supplied its immutable source owner.
+        // Keep the 64-bit deferred event under one bounded critical section.
+        // A genuine failure for the current owner supersedes a stale-owner or
+        // internal pending event; a late stale event cannot displace current
+        // owner maintenance.
+        portENTER_CRITICAL(&s_local_owner_mux);
+        s_pending_hid_failure.publish(originating_local_owner_id,
+                                      s_published_local_owner);
+        portEXIT_CRITICAL(&s_local_owner_mux);
     }
 }
 

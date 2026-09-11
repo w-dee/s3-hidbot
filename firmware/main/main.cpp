@@ -1,6 +1,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <algorithm>
 #include <cstdlib>
 #include "freertos/FreeRTOS.h"
@@ -10,6 +11,7 @@
 #include "tinyusb_default_config.h"
 #include "hid_runtime/hid_runtime.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
+#include "hid_sequence/hid_sequence.hpp"
 #include "ble_transport/ble_transport.hpp"
 #include "ble_hid_service/ble_hid_service.hpp"
 #include "uart_control_transport/uart_control_transport.hpp"
@@ -41,9 +43,99 @@ constexpr uint8_t kMouseStringIndex = 5;
 
 hid_runtime::Runtime s_hid_runtime;
 hid_control_executor::Controller s_usb_exposure;
+hid_sequence::Controller s_hid_sequence;
 ble_transport::Backend s_ble_backend;
 ble_hid_service::Database s_ble_hid_database;
 firmware_identity::Identity s_firmware_identity;
+
+class SequenceBackend final : public hid_sequence::Backend {
+  public:
+    hid_sequence::AdmissionResult begin_sequence(
+        hid_sequence::HidState *initial_state,
+        hid_sequence::ExecutionAuthority *authority) override {
+        hid_runtime::ConfirmedHidState state{};
+        hid_runtime::SequenceAuthority runtime_authority{};
+        const auto result = s_hid_runtime.begin_sequence(&state, &runtime_authority);
+        if (result != hid_runtime::SequenceAdmissionResult::kAccepted) {
+            return result == hid_runtime::SequenceAdmissionResult::kBusy
+                       ? hid_sequence::AdmissionResult::kBusy
+                   : result == hid_runtime::SequenceAdmissionResult::kSafetyPending
+                       ? hid_sequence::AdmissionResult::kSafetyPending
+                       : hid_sequence::AdmissionResult::kNotReady;
+        }
+        initial_state->modifiers = state.keyboard.modifiers;
+        initial_state->keycodes = state.keyboard.keycodes;
+        initial_state->mouse_buttons = state.mouse.buttons;
+        *authority = hid_sequence::ExecutionAuthority{
+            .generation = runtime_authority.generation,
+            .authority_epoch = runtime_authority.authority_epoch,
+            .release_epoch = runtime_authority.release_epoch,
+        };
+        return hid_sequence::AdmissionResult::kAccepted;
+    }
+
+    static hid_runtime::SequenceAuthority convert(
+        hid_sequence::ExecutionAuthority authority) {
+        return hid_runtime::SequenceAuthority{
+            .generation = authority.generation,
+            .authority_epoch = authority.authority_epoch,
+            .release_epoch = authority.release_epoch,
+        };
+    }
+
+    bool authority_current(
+        hid_sequence::ExecutionAuthority authority) const override {
+        return s_hid_runtime.sequence_authority_current(convert(authority));
+    }
+    void end_sequence(hid_sequence::ExecutionAuthority authority) override {
+        s_hid_runtime.end_sequence(convert(authority));
+    }
+    void revoke_sequence() override {
+        s_hid_runtime.revoke_sequence();
+    }
+
+    hid_sequence::ReportResult keyboard_report(
+        hid_sequence::ExecutionAuthority authority,
+        std::uint64_t originating_local_owner_id,
+        std::uint8_t modifiers,
+        const std::array<std::uint8_t, 6> &keycodes) override {
+        const auto result = s_usb_exposure.sequence_keyboard_report(
+            convert(authority), modifiers, keycodes,
+            originating_local_owner_id);
+        if (result.success) return hid_sequence::ReportResult::kAccepted;
+        return result.failure == hid_runtime::KeyboardReportFailure::kBusy
+                   ? hid_sequence::ReportResult::kBusy
+               : result.failure == hid_runtime::KeyboardReportFailure::kSafetyPending
+                   ? hid_sequence::ReportResult::kSafetyPending
+               : result.failure == hid_runtime::KeyboardReportFailure::kAuthorityLost
+                   ? hid_sequence::ReportResult::kAuthorityLost
+                   : hid_sequence::ReportResult::kNotReady;
+    }
+
+    hid_sequence::ReportResult mouse_report(
+        hid_sequence::ExecutionAuthority authority,
+        std::uint64_t originating_local_owner_id,
+        std::uint8_t buttons) override {
+        const auto result = s_usb_exposure.sequence_mouse_report(
+            convert(authority), buttons, originating_local_owner_id);
+        if (result.success) return hid_sequence::ReportResult::kAccepted;
+        return result.failure == hid_runtime::MouseReportFailure::kBusy
+                   ? hid_sequence::ReportResult::kBusy
+               : result.failure == hid_runtime::MouseReportFailure::kSafetyPending
+                   ? hid_sequence::ReportResult::kSafetyPending
+               : result.failure == hid_runtime::MouseReportFailure::kAuthorityLost
+                   ? hid_sequence::ReportResult::kAuthorityLost
+                   : hid_sequence::ReportResult::kNotReady;
+    }
+
+    void request_safety_release() override { s_hid_runtime.request_release_all(); }
+};
+
+SequenceBackend s_sequence_backend;
+
+std::uint64_t sequence_now(void *) {
+    return static_cast<std::uint64_t>(esp_timer_get_time());
+}
 
 control_protocol::UsbStatus usb_status(void *) {
     const hid_runtime::StatusSnapshot status = s_hid_runtime.status_snapshot();
@@ -444,6 +536,7 @@ void request_hid_safety_release(void *) {
 }
 
 control_protocol::ReleaseAllResult release_all(void *) {
+    s_hid_sequence.abort();
     const hid_runtime::ReleaseAllResult result = s_hid_runtime.release_all();
     const auto convert = [](hid_runtime::ReleaseAllInterfaceState state) {
         return state == hid_runtime::ReleaseAllInterfaceState::kSubmitted
@@ -458,10 +551,69 @@ control_protocol::ReleaseAllResult release_all(void *) {
     };
 }
 
+control_protocol::SequenceStartResult sequence_start(
+    void *, control_session::LocalOwnerId local_owner_id,
+    std::int32_t sequence_id, std::string_view code) {
+    const auto result = s_hid_sequence.start(local_owner_id, sequence_id, code);
+    switch (result) {
+        case hid_sequence::AdmissionResult::kAccepted:
+            return control_protocol::SequenceStartResult::kAccepted;
+        case hid_sequence::AdmissionResult::kInvalid:
+            return control_protocol::SequenceStartResult::kInvalid;
+        case hid_sequence::AdmissionResult::kBusy:
+            return control_protocol::SequenceStartResult::kBusy;
+        case hid_sequence::AdmissionResult::kSafetyPending:
+            return control_protocol::SequenceStartResult::kSafetyPending;
+        case hid_sequence::AdmissionResult::kNotReady:
+        default:
+            return control_protocol::SequenceStartResult::kNotReady;
+    }
+}
+
+control_protocol::SequenceState sequence_state(hid_sequence::State state) {
+    switch (state) {
+        case hid_sequence::State::kAccepted:
+            return control_protocol::SequenceState::kAccepted;
+        case hid_sequence::State::kRunning:
+            return control_protocol::SequenceState::kRunning;
+        case hid_sequence::State::kCompleted:
+            return control_protocol::SequenceState::kCompleted;
+        case hid_sequence::State::kAborted:
+            return control_protocol::SequenceState::kAborted;
+        case hid_sequence::State::kFailed:
+        default:
+            return control_protocol::SequenceState::kFailed;
+    }
+}
+
+bool sequence_status(void *, control_session::LocalOwnerId local_owner_id,
+                     std::int32_t sequence_id,
+                     control_protocol::SequenceStatus *result) {
+    hid_sequence::Status status{};
+    if (result == nullptr ||
+        !s_hid_sequence.status(local_owner_id, sequence_id, &status)) return false;
+    *result = control_protocol::SequenceStatus{
+        .sequence_id = status.sequence_id,
+        .state = sequence_state(status.state),
+        .started = status.started,
+        .executed = status.executed,
+        .failed_token_present = status.failed_token_present,
+        .failed_token = status.failed_token,
+        .code = hid_sequence::terminal_code_name(status.code),
+    };
+    return true;
+}
+
+void sequence_owner_retired(void *, control_session::LocalOwnerId local_owner_id) {
+    s_hid_sequence.retire_owner(local_owner_id);
+}
+
 control_protocol::KeyboardReportResult keyboard_report(
-    void *, const control_protocol::KeyboardReportRequest &request) {
+    void *, control_session::LocalOwnerId local_owner_id,
+    const control_protocol::KeyboardReportRequest &request) {
     const hid_runtime::KeyboardReportResult result =
-        s_usb_exposure.keyboard_report(request.modifiers, request.keycodes);
+        s_usb_exposure.keyboard_report(request.modifiers, request.keycodes,
+                                       local_owner_id);
     const auto failure = [](hid_runtime::KeyboardReportFailure value) {
         switch (value) {
             case hid_runtime::KeyboardReportFailure::kBusy:
@@ -488,10 +640,11 @@ control_protocol::KeyboardReportResult keyboard_report(
 }
 
 control_protocol::MouseReportResult mouse_report(
-    void *, const control_protocol::MouseReportRequest &request) {
+    void *, control_session::LocalOwnerId local_owner_id,
+    const control_protocol::MouseReportRequest &request) {
     const hid_runtime::MouseReportResult result =
         s_usb_exposure.mouse_report(request.buttons, request.x, request.y,
-                                    request.wheel, request.pan);
+                                    request.wheel, request.pan, local_owner_id);
     const auto failure = [](hid_runtime::MouseReportFailure value) {
         switch (value) {
             case hid_runtime::MouseReportFailure::kBusy:
@@ -758,8 +911,11 @@ extern "C" void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t rep
     // Host-to-device HID output reports (for example keyboard LEDs) are not
     // project-owned input state and must not trigger the input safety path.
     if (report_type == HID_REPORT_TYPE_INPUT) {
-        if (s_hid_runtime.on_report_failed(instance, report, length)) {
-            uart_control_transport::on_hid_safety_failure();
+        hid_runtime::ReportOriginOwnerId originating_local_owner_id = 0;
+        if (s_hid_runtime.on_report_failed(
+                instance, report, length, &originating_local_owner_id)) {
+            uart_control_transport::on_hid_safety_failure(
+                originating_local_owner_id);
         }
     }
 }
@@ -805,6 +961,10 @@ extern "C" void app_main() {
     if (!s_usb_exposure.initialize(&s_hid_runtime, &s_usb_backend,
                                    &s_ble_backend, &s_ble_hid_database)) {
         ESP_LOGE(kLogTag, "USB lifecycle task initialization failed");
+        std::abort();
+    }
+    if (!s_hid_sequence.initialize(&s_sequence_backend, sequence_now, nullptr)) {
+        ESP_LOGE(kLogTag, "HID sequence task initialization failed");
         std::abort();
     }
     const gpio_config_t configuration = {
@@ -880,6 +1040,12 @@ extern "C" void app_main() {
         .keyboard_report_context = nullptr,
         .mouse_report_provider = mouse_report,
         .mouse_report_context = nullptr,
+        .sequence_start_provider = sequence_start,
+        .sequence_start_context = nullptr,
+        .sequence_status_provider = sequence_status,
+        .sequence_status_context = nullptr,
+        .sequence_owner_retired = sequence_owner_retired,
+        .sequence_owner_retired_context = nullptr,
     };
     ESP_ERROR_CHECK(uart_control_transport::start(&protocol_config));
     ESP_LOGI(kLogTag, "native USB HID hidden; use usb.attach over UART to expose it");

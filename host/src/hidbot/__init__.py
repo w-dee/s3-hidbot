@@ -21,6 +21,8 @@ from .protocol import (
     KeyboardReportResult,
     MouseReportResult,
     ReleaseAllResult,
+    SequenceHandle,
+    SequenceStatus,
     UsbExposureLastError,
     UsbExposureStatus,
     SystemInfo,
@@ -38,6 +40,7 @@ from .errors import (
     TransportError,
 )
 from .flashing import FlashExecutionResult
+from .sequence import MouseButton, Sequence, SequenceBuilder
 
 if TYPE_CHECKING:
     from .serial_transport import PySerialTransport
@@ -59,6 +62,11 @@ __all__ = [
     "ReleaseAllResult",
     "KeyboardReportResult",
     "MouseReportResult",
+    "MouseButton",
+    "Sequence",
+    "SequenceBuilder",
+    "SequenceHandle",
+    "SequenceStatus",
     "UsbExposureLastError",
     "UsbExposureStatus",
     "BleExposureDesired",

@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "uart_control_transport.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES control_framing control_protocol esp_driver_uart esp_hw_support esp_timer
+    REQUIRES control_framing control_protocol control_session esp_driver_uart esp_hw_support esp_timer
              bootloader_support mbedtls secure_memory sensitive_request
 )
 

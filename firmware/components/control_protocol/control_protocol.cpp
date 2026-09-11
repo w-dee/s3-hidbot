@@ -21,11 +21,12 @@ constexpr std::size_t kMaxJsonObjectMembers = 8;
 constexpr std::size_t kMaxJsonArrayMembers = 8;
 constexpr std::size_t kMaxJsonDepth = 4;
 constexpr std::size_t kMaxMetadataBytes = 32;
+constexpr std::size_t kMaxSequenceCodeBytes = 320;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -37,7 +38,7 @@ constexpr std::size_t kSessionFieldBytes = control_session::kTokenHexLength + 3;
 // Every formatter below writes to ResponseFrame::bytes. These conservative
 // bounds cover the largest identity-v1 protocol.hello and system.info responses
 // metadata, four 32-hex values (top-level session, result session, boot ID,
-// and client nonce), fifteen capabilities, maximum int32 id, framing, and LF.
+// and client nonce), sixteen capabilities, maximum int32 id, framing, and LF.
 // vsnprintf still fail-closes if a future format exceeds the buffer.
 constexpr std::size_t kMaximumHelloResponseBytes =
     kPrefixLength + 180 + kMaxMetadataBytes +
@@ -160,12 +161,16 @@ bool parse_id(const cJSON *root, std::int32_t *id) {
     return true;
 }
 
-bool is_json_tree_bounded(const cJSON *item, std::size_t depth) {
+bool is_json_tree_bounded(const cJSON *item, std::size_t depth,
+                          const cJSON *long_sequence_code = nullptr) {
     if (item == nullptr || depth > kMaxJsonDepth) {
         return false;
     }
     if (cJSON_IsString(item) &&
-        (item->valuestring == nullptr || std::strlen(item->valuestring) > kMaxJsonStringBytes)) {
+        (item->valuestring == nullptr ||
+         std::strlen(item->valuestring) >
+             (item == long_sequence_code ? kMaxSequenceCodeBytes
+                                         : kMaxJsonStringBytes))) {
         return false;
     }
 
@@ -176,7 +181,7 @@ bool is_json_tree_bounded(const cJSON *item, std::size_t depth) {
             if (++count > maximum ||
                 (cJSON_IsObject(item) &&
                  (child->string == nullptr || std::strlen(child->string) > kMaxJsonStringBytes)) ||
-                !is_json_tree_bounded(child, depth + 1)) {
+                !is_json_tree_bounded(child, depth + 1, long_sequence_code)) {
                 return false;
             }
         }
@@ -1027,6 +1032,81 @@ bool validate_mouse_report_params(const cJSON *params,
     return true;
 }
 
+bool validate_sequence_start_params(const cJSON *params,
+                                    std::string_view raw_payload,
+                                    std::string_view *code) {
+    static constexpr const char *kFields[] = {"code"};
+    if (code == nullptr || !cJSON_IsObject(params) ||
+        !object_has_only_fields(params, kFields, 1) ||
+        raw_payload.find('\\') != std::string_view::npos) {
+        return false;
+    }
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive(params, "code");
+    if (!cJSON_IsString(value) || value->valuestring == nullptr) return false;
+    const std::size_t length = std::strlen(value->valuestring);
+    if (length == 0 || length > kMaxSequenceCodeBytes) return false;
+    *code = std::string_view(value->valuestring, length);
+    return true;
+}
+
+bool validate_sequence_status_params(const cJSON *params,
+                                     std::int32_t *sequence_id) {
+    static constexpr const char *kFields[] = {"sequence_id"};
+    if (sequence_id == nullptr || !cJSON_IsObject(params) ||
+        !object_has_only_fields(params, kFields, 1)) return false;
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive(params, "sequence_id");
+    if (!is_integer_number(value) || value->valuedouble < 0 ||
+        value->valuedouble > std::numeric_limits<std::int32_t>::max()) return false;
+    *sequence_id = static_cast<std::int32_t>(value->valuedouble);
+    return true;
+}
+
+bool make_sequence_start(control_session::ResponseFrame *frame,
+                         ResponseSession session, std::int32_t id) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) return false;
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"sequence_id\":%ld,\"state\":\"accepted\"}}\n",
+                        static_cast<long>(id), session_field,
+                        static_cast<long>(id));
+}
+
+bool make_sequence_status(control_session::ResponseFrame *frame,
+                          ResponseSession session, std::int32_t id,
+                          const SequenceStatus &status) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) return false;
+    const char *state = status.state == SequenceState::kAccepted ? "accepted"
+        : status.state == SequenceState::kRunning ? "running"
+        : status.state == SequenceState::kCompleted ? "completed"
+        : status.state == SequenceState::kAborted ? "aborted" : "failed";
+    char failed_token[16]{};
+    char code[48]{};
+    if (status.failed_token_present) {
+        std::snprintf(failed_token, sizeof(failed_token), "%u",
+                      static_cast<unsigned>(status.failed_token));
+    } else {
+        std::snprintf(failed_token, sizeof(failed_token), "null");
+    }
+    if (status.code != nullptr) {
+        std::snprintf(code, sizeof(code), "\"%s\"", status.code);
+    } else {
+        std::snprintf(code, sizeof(code), "null");
+    }
+    return format_frame(frame,
+                        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+                        "\"session\":%s,\"ok\":true,\"result\":{"
+                        "\"sequence_id\":%ld,\"state\":\"%s\",\"started\":%s,"
+                        "\"executed\":%u,\"failed_token\":%s,\"code\":%s}}\n",
+                        static_cast<long>(id), session_field,
+                        static_cast<long>(status.sequence_id), state,
+                        status.started ? "true" : "false",
+                        static_cast<unsigned>(status.executed),
+                        failed_token, code);
+}
+
 bool make_keyboard_report(control_session::ResponseFrame *frame,
                           ResponseSession session,
                           std::int32_t id,
@@ -1134,6 +1214,8 @@ bool Protocol::initialize(const Config &config,
         config.ble_bond_list_provider == nullptr ||
         config.ble_bond_remove_provider == nullptr ||
         config.hid_route_set_provider == nullptr || config.authority_epoch_provider == nullptr ||
+        config.sequence_start_provider == nullptr ||
+        config.sequence_status_provider == nullptr ||
         random_fill == nullptr ||
         !is_safe_metadata_string(config.metadata.project) ||
         !is_safe_metadata_string(config.metadata.target) ||
@@ -1193,29 +1275,59 @@ void Protocol::cache_control_transition_retry(
     control_transition_retry_cache_.active = true;
 }
 
+void Protocol::retire_sequence_owner(
+    control_session::LocalOwnerId local_owner_id) {
+    if (local_owner_id != 0 && config_.sequence_owner_retired != nullptr) {
+        config_.sequence_owner_retired(
+            config_.sequence_owner_retired_context, local_owner_id);
+    }
+}
+
 void Protocol::on_hid_lifecycle_invalidation() {
     if (initialized_) {
         // Lifecycle publication is the primary correctness barrier. This
         // serialized cleanup only retires cached/session state from an older
         // epoch; it cannot revoke a hello that already captured the current
         // epoch before this coalesced notification was consumed.
-        session_.revoke_for_lifecycle_invalidation(
-            config_.authority_epoch_provider(config_.authority_epoch_context));
+        const control_session::AuthorityEpoch current_epoch =
+            config_.authority_epoch_provider(config_.authority_epoch_context);
+        const control_session::AuthorityEpoch retired_epoch =
+            session_.session_authority_epoch();
+        const control_session::LocalOwnerId retired_owner =
+            session_.local_owner_id();
+        const bool authority_retired = session_.has_active_session() &&
+                                       retired_epoch != current_epoch;
+        session_.revoke_for_lifecycle_invalidation(current_epoch);
+        if (authority_retired) retire_sequence_owner(retired_owner);
         lease_revoke_notified_ = false;
     }
 }
 
-void Protocol::on_hid_safety_failure() {
+void Protocol::on_hid_safety_failure(
+    control_session::LocalOwnerId source_owner_id) {
     if (!initialized_) {
         return;
     }
-    // HID report delivery is now uncertain. Revoke authority in the protocol
-    // task before asking the runtime to maintain its interface safety state.
-    session_.revoke_for_takeover();
+    // HID report delivery is now uncertain. Retire only the owner captured by
+    // the callback; a newer local owner remains active if the notification was
+    // delayed. Runtime safety maintenance is requested only while that source
+    // is still current, or while no replacement owner exists.
+    const bool has_current_owner = session_.has_active_session();
+    const bool source_is_current = has_current_owner &&
+                                   session_.local_owner_id() == source_owner_id;
+    if (source_is_current) {
+        session_.revoke_for_takeover();
+    }
+    retire_sequence_owner(source_owner_id);
     lease_revoke_notified_ = false;
-    if (config_.hid_safety_failure != nullptr) {
+    if ((!has_current_owner || source_is_current) &&
+        config_.hid_safety_failure != nullptr) {
         config_.hid_safety_failure(config_.hid_safety_failure_context);
     }
+}
+
+control_session::LocalOwnerId Protocol::local_owner_id() const {
+    return session_.has_active_session() ? session_.local_owner_id() : 0;
 }
 
 void Protocol::service() {
@@ -1223,9 +1335,12 @@ void Protocol::service() {
         return;
     }
     on_hid_lifecycle_invalidation();
+    const control_session::LocalOwnerId retired_owner =
+        session_.has_active_session() ? session_.local_owner_id() : 0;
     if (!session_.service_lease()) {
         return;
     }
+    retire_sequence_owner(retired_owner);
     if (!lease_revoke_notified_) {
         lease_revoke_notified_ = true;
         if (config_.lease_expired != nullptr) {
@@ -1259,6 +1374,15 @@ void Protocol::handle_frame(std::string_view payload) {
         return;
     }
 
+    if (std::memchr(payload.data(), '\0', payload.size()) != nullptr) {
+        auto &response = prepare_response_scratch();
+        if (make_error(&response, kUncorrelatableSession, false, 0,
+                       "MALFORMED_JSON", "request contains an embedded NUL")) {
+            write_frame(response);
+        }
+        return;
+    }
+
     std::memcpy(request_json_scratch_, payload.data(), payload.size());
     request_json_scratch_[payload.size()] = '\0';
     const char *parse_end = nullptr;
@@ -1280,7 +1404,21 @@ void Protocol::handle_frame(std::string_view payload) {
         secure_memory::zero(request_json_scratch_, payload.size() + 1);
         secure_memory::zero(sensitive_digest.data(), sensitive_digest.size());
     };
-    if (!cJSON_IsObject(root) || !is_json_tree_bounded(root, 0) ||
+    const cJSON *long_sequence_code = nullptr;
+    if (cJSON_IsObject(root)) {
+        const cJSON *early_command =
+            cJSON_GetObjectItemCaseSensitive(root, "cmd");
+        const cJSON *early_params =
+            cJSON_GetObjectItemCaseSensitive(root, "params");
+        if (cJSON_IsString(early_command) && early_command->valuestring != nullptr &&
+            std::strcmp(early_command->valuestring, "hid.sequence.start") == 0 &&
+            cJSON_IsObject(early_params)) {
+            long_sequence_code =
+                cJSON_GetObjectItemCaseSensitive(early_params, "code");
+        }
+    }
+    if (!cJSON_IsObject(root) ||
+        !is_json_tree_bounded(root, 0, long_sequence_code) ||
         !object_has_no_duplicate_keys(root)) {
         auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, false, 0, "INVALID_REQUEST", "request must be a bounded object")) {
@@ -1373,8 +1511,11 @@ void Protocol::handle_frame(std::string_view payload) {
         if (session_.has_active_session()) {
             // Revoke first so the old authority cannot issue another command
             // while the safety release is being started by the runtime.
+            const control_session::LocalOwnerId retired_owner =
+                session_.local_owner_id();
             const bool current_epoch_session = session_.authority_epoch_matches(authority_epoch);
             session_.revoke_for_takeover();
+            retire_sequence_owner(retired_owner);
             if (current_epoch_session && config_.session_takeover != nullptr) {
                 config_.session_takeover(config_.session_takeover_context);
             }
@@ -1394,7 +1535,14 @@ void Protocol::handle_frame(std::string_view payload) {
             finish();
             return;
         }
-        session_.activate_hello(client_nonce, payload, new_session, authority_epoch, response);
+        if (!session_.activate_hello(client_nonce, payload, new_session,
+                                     authority_epoch, response)) {
+            make_error(&response, kUncorrelatableSession, true, id,
+                       "INTERNAL_ERROR", "local owner identity exhausted");
+            write_frame(response);
+            finish();
+            return;
+        }
         // A successful fresh handshake supersedes any lifecycle retry proof
         // tied to the former session. Lifecycle invalidation itself must not
         // clear that proof: accepted attach/detach retries occur after it.
@@ -1573,8 +1721,11 @@ void Protocol::handle_frame(std::string_view payload) {
                     // one permitted same-ID retry remains byte-identical even
                     // after asynchronous install/uninstall progress.
                     cache_control_transition_retry(session, id, payload, response);
+                    const control_session::LocalOwnerId retired_owner =
+                        session_.local_owner_id();
                     session_.revoke_for_lifecycle_invalidation(
                         config_.authority_epoch_provider(config_.authority_epoch_context));
+                    retire_sequence_owner(retired_owner);
                     lease_revoke_notified_ = false;
                     write_frame(response);
                     finish();
@@ -1780,8 +1931,11 @@ void Protocol::handle_frame(std::string_view payload) {
                     if (completed &&
                         action.action_result == HidRouteActionResult::kAccepted) {
                         cache_control_transition_retry(session, id, payload, response);
+                        const control_session::LocalOwnerId retired_owner =
+                            session_.local_owner_id();
                         session_.revoke_for_lifecycle_invalidation(
                             config_.authority_epoch_provider(config_.authority_epoch_context));
+                        retire_sequence_owner(retired_owner);
                         lease_revoke_notified_ = false;
                         write_frame(response);
                         finish();
@@ -1811,6 +1965,53 @@ void Protocol::handle_frame(std::string_view payload) {
                 completed = make_release_all(&response, current_session, id, release_result);
             }
         }
+    } else if (command == "hid.sequence.start") {
+        std::string_view code;
+        if (!validate_sequence_start_params(params, payload, &code)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "sequence code is invalid");
+        } else {
+            const SequenceStartResult result = config_.sequence_start_provider(
+                config_.sequence_start_context, session_.local_owner_id(), id, code);
+            if (result == SequenceStartResult::kInvalid) {
+                make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                           "sequence code is invalid");
+            } else {
+                semantically_valid = true;
+                if (result == SequenceStartResult::kBusy) {
+                    completed = make_error(&response, current_session, true, id,
+                                           "HID_BUSY", "HID sequence executor is busy");
+                } else if (result == SequenceStartResult::kSafetyPending) {
+                    completed = make_error(&response, current_session, true, id,
+                                           "HID_SAFETY_PENDING",
+                                           "HID safety recovery is pending");
+                } else if (result == SequenceStartResult::kNotReady) {
+                    completed = make_error(&response, current_session, true, id,
+                                           "HID_NOT_READY", "HID route is not ready");
+                } else {
+                    completed = make_sequence_start(&response, current_session, id);
+                }
+            }
+        }
+    } else if (command == "hid.sequence.status") {
+        std::int32_t sequence_id = 0;
+        if (!validate_sequence_status_params(params, &sequence_id)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "sequence status params are invalid");
+        } else {
+            semantically_valid = true;
+            SequenceStatus status{};
+            if (!config_.sequence_status_provider(config_.sequence_status_context,
+                                                  session_.local_owner_id(),
+                                                  sequence_id, &status)) {
+                completed = make_error(&response, current_session, true, id,
+                                       "SEQUENCE_NOT_FOUND",
+                                       "sequence status is not retained");
+            } else {
+                completed = make_sequence_status(&response, current_session, id,
+                                                 status);
+            }
+        }
     } else if (command == "hid.keyboard.report") {
         KeyboardReportRequest keyboard_request{};
         if (!validate_keyboard_report_params(params, &keyboard_request)) {
@@ -1821,6 +2022,7 @@ void Protocol::handle_frame(std::string_view payload) {
             const KeyboardReportResult keyboard_result =
                 config_.keyboard_report_provider != nullptr
                     ? config_.keyboard_report_provider(config_.keyboard_report_context,
+                                                       session_.local_owner_id(),
                                                        keyboard_request)
                     : KeyboardReportResult{};
             if (keyboard_result.authority_lost ||
@@ -1848,6 +2050,7 @@ void Protocol::handle_frame(std::string_view payload) {
             const MouseReportResult mouse_result =
                 config_.mouse_report_provider != nullptr
                     ? config_.mouse_report_provider(config_.mouse_report_context,
+                                                    session_.local_owner_id(),
                                                     mouse_request)
                     : MouseReportResult{};
             if (mouse_result.authority_lost ||
