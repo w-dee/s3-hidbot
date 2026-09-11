@@ -94,8 +94,8 @@ BleCommandOutcome Controller::request_ble_enable() {
     }
     const ble_lifecycle::TransitionOutcome outcome = ble_state_.begin_enable();
     if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
-        const Action item{.kind = ActionKind::kBleEnable,
-                          .operation = operation};
+        const Action item =
+            Action::with_operation(ActionKind::kBleEnable, operation);
         if (!enqueue(item)) {
             ble_state_.complete_fault(outcome.snapshot.generation,
                                       ble_lifecycle::Operation::kEnable, -1);
@@ -130,8 +130,8 @@ BleCommandOutcome Controller::request_ble_disable() {
         return transition;
     }();
     if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
-        const Action item{.kind = ActionKind::kBleDisable,
-                          .operation = operation};
+        const Action item =
+            Action::with_operation(ActionKind::kBleDisable, operation);
         if (!enqueue(item)) {
             ble_state_.complete_fault(outcome.snapshot.generation,
                                       ble_lifecycle::Operation::kDisable, -1);
@@ -200,8 +200,9 @@ PairingStatusSnapshot Controller::request_pairing_status() {
         token = next_pairing_rpc_token_++;
     }
     pairing_rpc_pending_.store(token, std::memory_order_release);
-    const Action item{.kind = ActionKind::kPairingStatus,
-                      .mailbox_token = token};
+    const Action item =
+        Action::with_operation(ActionKind::kPairingStatus,
+                               ControlOperation::kNone, token);
     if (!enqueue(item)) {
         pairing_rpc_pending_.store(0, std::memory_order_release);
         return {};
@@ -236,8 +237,9 @@ ble_pairing::RespondResult Controller::request_pairing_response(
     pairing_mailbox_.occupied = true;
     pairing_rpc_result_ = ble_pairing::RespondResult::kNotPending;
     pairing_rpc_pending_.store(token, std::memory_order_release);
-    const Action item{.kind = ActionKind::kPairingRespond,
-                      .mailbox_token = token};
+    const Action item =
+        Action::with_operation(ActionKind::kPairingRespond,
+                               ControlOperation::kNone, token);
     if (!enqueue(item)) {
         wipe_pairing_mailbox();
         pairing_rpc_pending_.store(0, std::memory_order_release);
@@ -274,8 +276,8 @@ BleBondListResult Controller::request_bond_list() {
         return {};
     }
     bond_list_rpc_result_ = {};
-    if (!enqueue(Action{.kind = ActionKind::kBondList,
-                        .mailbox_token = token})) {
+    if (!enqueue(Action::with_operation(ActionKind::kBondList,
+                                        ControlOperation::kNone, token))) {
         pairing_rpc_pending_.store(0, std::memory_order_release);
         return {};
     }
@@ -309,9 +311,8 @@ BleBondRemoveResult Controller::request_bond_remove(const BondId &bond_id) {
     }
     bond_remove_mailbox_ = bond_id;
     bond_remove_rpc_result_ = unavailable;
-    if (!enqueue(Action{.kind = ActionKind::kBondRemove,
-                        .operation = operation,
-                        .mailbox_token = token})) {
+    if (!enqueue(Action::with_operation(ActionKind::kBondRemove,
+                                        operation, token))) {
         bond_remove_mailbox_ = {};
         pairing_rpc_pending_.store(0, std::memory_order_release);
         release_operation(operation);
@@ -381,7 +382,7 @@ bool Controller::claim_dle(BleEvent event) {
 bool Controller::signal_ble_event(BleEvent event) {
     observe_dle_event(event);
     mark_ble_route_loss(event);
-    const Action item{.kind = ActionKind::kBleEvent, .ble_event = event};
+    const Action item = Action::with_ble_event(event);
     if (enqueue(item)) {
         return true;
     }
@@ -443,7 +444,7 @@ bool Controller::signal_ble_route_release_grace(
         return false;
     }
     ble_route_grace_due_.store(true, std::memory_order_release);
-    const Action action{.kind = ActionKind::kBleRouteReleaseGrace};
+    const Action action = Action::empty(ActionKind::kBleRouteReleaseGrace);
     if (!enqueue(action)) {
         // The due bit is authoritative and the independent task notification
         // makes a full normal queue unable to strand retirement.
@@ -555,9 +556,8 @@ RouteCommandOutcome Controller::request_route(hid_route::OutputRoute desired) {
         }
         constexpr std::uint32_t token = 0xffffffffU;
         pairing_rpc_pending_.store(token, std::memory_order_release);
-        if (!enqueue(Action{.kind = ActionKind::kRouteBleActivate,
-                            .operation = operation,
-                            .mailbox_token = token})) {
+        if (!enqueue(Action::with_operation(ActionKind::kRouteBleActivate,
+                                            operation, token))) {
             pairing_rpc_pending_.store(0, std::memory_order_release);
             release_operation(operation);
             return {};
@@ -585,12 +585,10 @@ RouteCommandOutcome Controller::request_route(hid_route::OutputRoute desired) {
                                        .snapshot_valid = outcome.snapshot_valid,
                                        .snapshot = outcome.snapshot};
         }
-        const Action item{
-            .kind = ActionKind::kRouteRelease,
-            .lifecycle = runtime_->state_machine().usb_lifecycle_snapshot(),
-            .route = outcome.snapshot.route,
-            .operation = operation,
-        };
+        const Action item = Action::with_lifecycle(
+            ActionKind::kRouteRelease,
+            runtime_->state_machine().usb_lifecycle_snapshot(),
+            outcome.snapshot.route, operation);
         if (!enqueue(item)) {
             runtime_->state_machine().terminalize_route_release_schedule_failure(
                 outcome.snapshot.route);
@@ -701,9 +699,7 @@ bool Controller::enqueue_ble_hid_work(hid_runtime::Interface interface,
                                                               token)) {
         return false;
     }
-    if (enqueue(Action{.kind = ActionKind::kBleHidReport,
-                       .hid_interface = interface,
-                       .hid_work = token})) {
+    if (enqueue(Action::with_hid_report(interface, token))) {
         return true;
     }
     runtime_->state_machine().abandon_ble_report(interface, token);
@@ -1472,18 +1468,26 @@ bool Controller::schedule(usb_lifecycle::ExecutorAction action,
         active_operation_.load(std::memory_order_acquire) != operation) {
         return false;
     }
-    const Action item{.kind = action == usb_lifecycle::ExecutorAction::kInstall
-                                  ? ActionKind::kUsbInstall
-                                  : ActionKind::kUsbDetach,
-                      .lifecycle = snapshot,
-                      .route = runtime_->state_machine().route_snapshot(),
-                      .operation = operation};
+    const Action item = Action::with_lifecycle(
+        action == usb_lifecycle::ExecutorAction::kInstall
+            ? ActionKind::kUsbInstall
+            : ActionKind::kUsbDetach,
+        snapshot, runtime_->state_machine().route_snapshot(), operation);
     return enqueue(item);
 }
 
 void Controller::process(Action action) {
     if (runtime_ == nullptr || backend_ == nullptr) {
-        release_operation(action.operation);
+        if (action.kind == ActionKind::kUsbInstall ||
+            action.kind == ActionKind::kUsbDetach ||
+            action.kind == ActionKind::kRouteRelease) {
+            release_operation(action.payload.lifecycle.operation);
+        } else if (action.kind == ActionKind::kBleEnable ||
+                   action.kind == ActionKind::kBleDisable ||
+                   action.kind == ActionKind::kRouteBleActivate ||
+                   action.kind == ActionKind::kBondRemove) {
+            release_operation(action.payload.operation.operation);
+        }
         return;
     }
     (void)reconcile_usb_runtime_fault();
@@ -1501,8 +1505,10 @@ void Controller::process(Action action) {
     }
     hid_runtime::StateMachine &state = runtime_->state_machine();
     if (action.kind == ActionKind::kBleHidReport) {
-        (void)state.process_ble_report(action.hid_interface, action.hid_work,
-                                      submit_runtime_ble_report, this);
+        (void)state.process_ble_report(
+            action.payload.hid_report.interface,
+            action.payload.hid_report.work,
+            submit_runtime_ble_report, this);
         retire_ble_route_if_unready();
         return;
     }
@@ -1513,41 +1519,44 @@ void Controller::process(Action action) {
         return;
     }
     if (action.kind == ActionKind::kRouteBleActivate) {
+        const auto payload = action.payload.operation;
         if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
-            action.mailbox_token) {
-            release_operation(action.operation);
+            payload.mailbox_token) {
+            release_operation(payload.operation);
             return;
         }
         if (active_operation_.load(std::memory_order_acquire) ==
-            action.operation) {
+            payload.operation) {
             route_rpc_result_ = activate_ble_route();
         } else {
             route_rpc_result_ = {};
         }
-        if (ble_route_release_owner_ != action.operation) {
-            release_operation(action.operation);
+        if (ble_route_release_owner_ != payload.operation) {
+            release_operation(payload.operation);
         }
-        complete_pairing_rpc(action.mailbox_token);
+        complete_pairing_rpc(payload.mailbox_token);
         return;
     }
     if (action.kind == ActionKind::kPairingStatus) {
+        const auto payload = action.payload.operation;
         if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
-            action.mailbox_token) {
+            payload.mailbox_token) {
             return;
         }
         reconcile_pairing_deadline();
         pairing_rpc_status_ = current_pairing_status();
-        complete_pairing_rpc(action.mailbox_token);
+        complete_pairing_rpc(payload.mailbox_token);
         return;
     }
     if (action.kind == ActionKind::kPairingRespond) {
+        const auto payload = action.payload.operation;
         if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
-            action.mailbox_token) {
+            payload.mailbox_token) {
             return;
         }
         std::array<char, 6> secret{};
         const bool mailbox_current = pairing_mailbox_.occupied &&
-                                     pairing_mailbox_.token == action.mailbox_token;
+                                     pairing_mailbox_.token == payload.mailbox_token;
         const auto generation = pairing_mailbox_.generation;
         const auto connection = pairing_mailbox_.connection_handle;
         const auto pairing_id = pairing_mailbox_.pairing_id;
@@ -1560,12 +1569,13 @@ void Controller::process(Action action) {
             ? respond_to_pairing(generation, connection, pairing_id, secret)
             : ble_pairing::RespondResult::kNotPending;
         secure_memory::zero(secret.data(), secret.size());
-        complete_pairing_rpc(action.mailbox_token);
+        complete_pairing_rpc(payload.mailbox_token);
         return;
     }
     if (action.kind == ActionKind::kBondList) {
+        const auto payload = action.payload.operation;
         if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
-            action.mailbox_token) {
+            payload.mailbox_token) {
             return;
         }
         const auto lifecycle = ble_state_.snapshot();
@@ -1577,13 +1587,14 @@ void Controller::process(Action action) {
         } else {
             bond_list_rpc_result_ = ble_backend_->list_bonds();
         }
-        complete_pairing_rpc(action.mailbox_token);
+        complete_pairing_rpc(payload.mailbox_token);
         return;
     }
     if (action.kind == ActionKind::kBondRemove) {
+        const auto payload = action.payload.operation;
         if (pairing_rpc_pending_.load(std::memory_order_acquire) !=
-            action.mailbox_token) {
-            release_operation(action.operation);
+            payload.mailbox_token) {
+            release_operation(payload.operation);
             return;
         }
         const BondId bond_id = bond_remove_mailbox_;
@@ -1604,25 +1615,27 @@ void Controller::process(Action action) {
         } else {
             bond_remove_rpc_result_ = ble_backend_->remove_bond(bond_id);
         }
-        release_operation(action.operation);
-        complete_pairing_rpc(action.mailbox_token);
+        release_operation(payload.operation);
+        complete_pairing_rpc(payload.mailbox_token);
         return;
     }
     if (action.kind == ActionKind::kBleEvent) {
-        complete_ble_route_release_on_disconnect(action.ble_event);
-        process_ble_event(action.ble_event);
-        if (event_immediately_loses_ble_hid_readiness(action.ble_event)) {
-            clear_ble_route_loss(action.ble_event.generation);
+        const BleEvent event = action.payload.ble_event.event;
+        complete_ble_route_release_on_disconnect(event);
+        process_ble_event(event);
+        if (event_immediately_loses_ble_hid_readiness(event)) {
+            clear_ble_route_loss(event.generation);
         }
         retire_ble_route_if_unready();
         return;
     }
     if (action.kind == ActionKind::kBleEnable) {
+        const ControlOperation operation = action.payload.operation.operation;
         const auto current = ble_state_.snapshot();
-        if (active_operation_.load(std::memory_order_acquire) != action.operation ||
+        if (active_operation_.load(std::memory_order_acquire) != operation ||
             current.desired != ble_lifecycle::DesiredExposure::kExposed ||
             current.observed != ble_lifecycle::ObservedState::kEnabling) {
-            release_operation(action.operation);
+            release_operation(operation);
             return;
         }
         ble_backend_->set_generation(current.generation);
@@ -1633,7 +1646,7 @@ void Controller::process(Action action) {
                 this, ble_database_, current.generation);
             if (result != 0) {
                 fail_ble(current.generation, ble_lifecycle::Operation::kEnable,
-                         result, action.operation);
+                         result, operation);
             }
             return;
         }
@@ -1645,19 +1658,20 @@ void Controller::process(Action action) {
             ble_state_.complete_advertising(current.generation);
             ble_backend_->record_heap_checkpoint(
                 BleBackend::HeapCheckpoint::kAdvertising);
-            release_operation(action.operation);
+            release_operation(operation);
         } else {
             fail_ble(current.generation, ble_lifecycle::Operation::kEnable, result,
-                     action.operation);
+                     operation);
         }
         return;
     }
     if (action.kind == ActionKind::kBleDisable) {
+        const ControlOperation operation = action.payload.operation.operation;
         const auto current = ble_state_.snapshot();
-        if (active_operation_.load(std::memory_order_acquire) != action.operation ||
+        if (active_operation_.load(std::memory_order_acquire) != operation ||
             current.desired != ble_lifecycle::DesiredExposure::kHidden ||
             current.observed != ble_lifecycle::ObservedState::kDisabling) {
-            release_operation(action.operation);
+            release_operation(operation);
             return;
         }
         // Stage A already made public readiness fail closed. Everything below,
@@ -1679,7 +1693,7 @@ void Controller::process(Action action) {
             const std::int32_t result = ble_backend_->stop_advertising();
             if (result != 0) {
                 fail_ble(current.generation, ble_lifecycle::Operation::kDisable,
-                         result, action.operation);
+                         result, operation);
                 return;
             }
         }
@@ -1688,49 +1702,51 @@ void Controller::process(Action action) {
                 ble_backend_->disconnect(ble_state_.connection_handle());
             if (result != 0) {
                 fail_ble(current.generation, ble_lifecycle::Operation::kDisable,
-                         result, action.operation);
+                         result, operation);
             }
             return;
         }
         ble_state_.complete_disable(current.generation);
         ble_backend_->record_heap_checkpoint(
             BleBackend::HeapCheckpoint::kHiddenIdle);
-        release_operation(action.operation);
+        release_operation(operation);
         return;
     }
     if (action.kind == ActionKind::kRouteRelease) {
+        const auto payload = action.payload.lifecycle;
         const hid_route::Snapshot route = state.route_snapshot();
         const usb_lifecycle::Snapshot lifecycle = state.usb_lifecycle_snapshot();
         const bool expected_route = route.coherent && !route.invalidation_pending &&
                                     route.desired == hid_route::OutputRoute::kNone &&
                                     route.active == hid_route::OutputRoute::kUsb &&
                                     route.transition == hid_route::Transition::kReleasing &&
-                                    route.generation == action.route.generation;
+                                    route.generation == payload.route.generation;
         const bool expected_transport =
-            lifecycle.generation == action.lifecycle.generation &&
+            lifecycle.generation == payload.lifecycle.generation &&
             lifecycle.desired == usb_lifecycle::DesiredExposure::kExposed &&
             lifecycle.observed == usb_lifecycle::ObservedState::kMounted;
-        if (active_operation_.load(std::memory_order_acquire) != action.operation ||
+        if (active_operation_.load(std::memory_order_acquire) != payload.operation ||
             !expected_route || !expected_transport) {
             if (expected_route) {
-                state.terminalize_route_release_schedule_failure(action.route);
+                state.terminalize_route_release_schedule_failure(payload.route);
             }
-            release_operation(action.operation);
+            release_operation(payload.operation);
             return;
         }
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
         const hid_runtime::LifecycleSafetyResult safety =
-            state.begin_route_release_safety(action.route);
+            state.begin_route_release_safety(payload.route);
         if (safety != hid_runtime::LifecycleSafetyResult::kClean) {
-            state.mark_lifecycle_detach_uncertain(action.lifecycle.generation);
+            state.mark_lifecycle_detach_uncertain(payload.lifecycle.generation);
         }
 #else
-        (void)runtime_->run_route_release_safety(action.route);
+        (void)runtime_->run_route_release_safety(payload.route);
 #endif
-        state.complete_route_release(action.route);
-        release_operation(action.operation);
+        state.complete_route_release(payload.route);
+        release_operation(payload.operation);
         return;
     }
+    const auto payload = action.payload.lifecycle;
     const usb_lifecycle::Snapshot current = state.usb_lifecycle_snapshot();
     const bool expected_lifecycle_state =
         action.kind == ActionKind::kUsbInstall
@@ -1738,12 +1754,12 @@ void Controller::process(Action action) {
                   current.observed == usb_lifecycle::ObservedState::kAttaching
             : current.desired == usb_lifecycle::DesiredExposure::kHidden &&
                   current.observed == usb_lifecycle::ObservedState::kDetaching;
-    if (active_operation_.load(std::memory_order_acquire) != action.operation ||
+    if (active_operation_.load(std::memory_order_acquire) != payload.operation ||
         !expected_lifecycle_state ||
-        current.desired != action.lifecycle.desired ||
-        current.observed != action.lifecycle.observed ||
-        current.generation != action.lifecycle.generation) {
-        release_operation(action.operation);
+        current.desired != payload.lifecycle.desired ||
+        current.observed != payload.lifecycle.observed ||
+        current.generation != payload.lifecycle.generation) {
+        release_operation(payload.operation);
         return;
     }
     if (action.kind == ActionKind::kUsbInstall) {
@@ -1764,19 +1780,19 @@ void Controller::process(Action action) {
                 state.complete_usb_install_ambiguous_failure(result.error_code);
                 break;
         }
-        release_operation(action.operation);
+        release_operation(payload.operation);
         return;
     }
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
     const hid_runtime::LifecycleSafetyResult safety = state.begin_lifecycle_detach_safety();
     if (safety != hid_runtime::LifecycleSafetyResult::kClean) {
-        state.mark_lifecycle_detach_uncertain(action.lifecycle.generation);
+        state.mark_lifecycle_detach_uncertain(payload.lifecycle.generation);
     }
 #else
     (void)runtime_->run_lifecycle_detach_safety();
 #endif
-    state.complete_usb_detach_route_invalidation(action.route);
+    state.complete_usb_detach_route_invalidation(payload.route);
     state.begin_usb_uninstall();
     const BackendResult result = backend_->uninstall();
     if (result.kind == BackendResultKind::kSuccess) {
@@ -1785,7 +1801,7 @@ void Controller::process(Action action) {
     } else {
         state.complete_usb_uninstall_failure(result.error_code);
     }
-    release_operation(action.operation);
+    release_operation(payload.operation);
 }
 
 bool Controller::reconcile_ble_fallbacks(const Action *action) {
@@ -1797,9 +1813,9 @@ bool Controller::reconcile_ble_fallbacks(const Action *action) {
         ble_backend_->persistent_store_failure_observed()) {
         const bool detailed =
             action != nullptr && action->kind == ActionKind::kBleEvent &&
-            action->ble_event.kind == BleEventKind::kStorageFailure;
+            action->payload.ble_event.event.kind == BleEventKind::kStorageFailure;
         const auto reported_kind =
-            detailed ? action->ble_event.store_failure_kind
+            detailed ? action->payload.ble_event.event.store_failure_kind
                      : ble_security::StoreFailureKind::kNone;
         const auto kind =
             reported_kind == ble_security::StoreFailureKind::kRead ||
@@ -1807,7 +1823,7 @@ bool Controller::reconcile_ble_fallbacks(const Action *action) {
                 ? reported_kind
                 : ble_security::StoreFailureKind::kWrite;
         commit_persistent_store_failure(
-            kind, detailed ? action->ble_event.status : -3);
+            kind, detailed ? action->payload.ble_event.event.status : -3);
     }
     const bool lifecycle_handoff_failed =
         reconcile_ble_lifecycle_handoff_failure();

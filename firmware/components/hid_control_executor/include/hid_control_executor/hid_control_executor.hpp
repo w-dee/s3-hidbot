@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "ble_pairing/ble_pairing.hpp"
 #include "ble_security/ble_security.hpp"
@@ -416,15 +417,90 @@ class Controller final : public usb_lifecycle::Executor,
     };
 
     struct Action {
+        struct LifecyclePayload {
+            usb_lifecycle::Snapshot lifecycle{};
+            hid_route::Snapshot route{};
+            ControlOperation operation = ControlOperation::kNone;
+        };
+
+        struct OperationPayload {
+            ControlOperation operation = ControlOperation::kNone;
+            std::uint32_t mailbox_token = 0;
+        };
+
+        struct BleEventPayload {
+            BleEvent event{};
+        };
+
+        struct HidReportPayload {
+            hid_runtime::Interface interface = hid_runtime::Interface::kKeyboard;
+            hid_runtime::HidWorkToken work{};
+        };
+
+        union Payload {
+            LifecyclePayload lifecycle;
+            OperationPayload operation;
+            BleEventPayload ble_event;
+            HidReportPayload hid_report;
+
+            constexpr Payload() : operation{} {}
+            constexpr explicit Payload(LifecyclePayload value)
+                : lifecycle(value) {}
+            constexpr explicit Payload(OperationPayload value)
+                : operation(value) {}
+            constexpr explicit Payload(BleEventPayload value)
+                : ble_event(value) {}
+            constexpr explicit Payload(HidReportPayload value)
+                : hid_report(value) {}
+        };
+
         ActionKind kind = ActionKind::kUsbInstall;
-        usb_lifecycle::Snapshot lifecycle{};
-        hid_route::Snapshot route{};
-        ControlOperation operation = ControlOperation::kNone;
-        BleEvent ble_event{};
-        hid_runtime::Interface hid_interface = hid_runtime::Interface::kKeyboard;
-        hid_runtime::HidWorkToken hid_work{};
-        std::uint32_t mailbox_token = 0;
+        Payload payload{};
+
+        static Action empty(ActionKind kind) {
+            Action result{};
+            result.kind = kind;
+            return result;
+        }
+
+        static Action with_operation(ActionKind kind,
+                                     ControlOperation operation,
+                                     std::uint32_t mailbox_token = 0) {
+            return Action{
+                .kind = kind,
+                .payload = Payload(OperationPayload{operation, mailbox_token}),
+            };
+        }
+
+        static Action with_lifecycle(ActionKind kind,
+                                     usb_lifecycle::Snapshot lifecycle,
+                                     hid_route::Snapshot route,
+                                     ControlOperation operation) {
+            return Action{
+                .kind = kind,
+                .payload = Payload(LifecyclePayload{lifecycle, route, operation}),
+            };
+        }
+
+        static Action with_ble_event(BleEvent event) {
+            return Action{
+                .kind = ActionKind::kBleEvent,
+                .payload = Payload(BleEventPayload{event}),
+            };
+        }
+
+        static Action with_hid_report(hid_runtime::Interface interface,
+                                      hid_runtime::HidWorkToken work) {
+            return Action{
+                .kind = ActionKind::kBleHidReport,
+                .payload = Payload(HidReportPayload{interface, work}),
+            };
+        }
     };
+
+    static_assert(std::is_trivially_copyable_v<Action>);
+    static_assert(sizeof(Action) >= 56 && sizeof(Action) <= 64);
+    static_assert(alignof(Action) <= alignof(std::uint64_t));
 
     bool initialize(hid_runtime::Runtime *runtime, Backend *backend,
                     BleBackend *ble_backend = nullptr,

@@ -450,16 +450,8 @@ class Protocol {
     // Protocol is consumed only by the UART RX task. Keeping these reusable
     // workspaces on the Protocol instance avoids placing multi-kilobyte JSON
     // and response buffers on that task's stack.
-    char request_json_scratch_[control_session::kMaxRequestBytes + 1]{};
-    control_session::ResponseFrame response_scratch_{};
-    struct ControlTransitionRetryCache {
-        bool active = false;
-        std::int32_t id = 0;
-        std::array<char, control_session::kTokenStorageBytes> session{};
-        std::array<char, control_session::kMaxRequestBytes + 1> payload{};
-        std::size_t payload_length = 0;
-        control_session::ResponseFrame response{};
-    } control_transition_retry_cache_{};
+    alignas(control_session::ResponseFrame)
+        std::uint8_t scratch_storage_[sizeof(control_session::ResponseFrame)]{};
 };
 
 }  // namespace control_protocol

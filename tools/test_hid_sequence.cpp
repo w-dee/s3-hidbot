@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <limits>
@@ -179,6 +180,60 @@ void local_delay_does_not_catch_up() {
     assert(status.executed == 4);
     assert(backend.safety_releases == 0);
     assert(!backend.owned);
+}
+
+void fixed_key_canonicalizer_matches_six_key_sort_semantics() {
+    std::array<std::uint8_t, 6> permutation{4, 50, 100, 164, 176, 221};
+    const std::array<std::uint8_t, 6> canonical = permutation;
+    do {
+        std::string code;
+        for (const std::uint8_t usage : permutation) {
+            if (!code.empty()) code += ';';
+            code += "kp" + std::to_string(usage);
+        }
+        Clock clock{};
+        Backend backend{};
+        backend.clock = &clock;
+        hid_sequence::Controller controller;
+        assert(controller.initialize(&backend, Clock::now, &clock));
+        assert(controller.start(90, code) ==
+               hid_sequence::AdmissionResult::kAccepted);
+        controller.run_for_test();
+        assert(backend.keyboard_keys.size() == 6);
+        assert(backend.keyboard_keys.back() == canonical);
+    } while (std::next_permutation(permutation.begin(), permutation.end()));
+
+    Clock clock{};
+    Backend backend{};
+    backend.clock = &clock;
+    hid_sequence::Controller controller;
+    assert(controller.initialize(&backend, Clock::now, &clock));
+    assert(controller.start(
+               91,
+               "kr4;kp221;kp176;kp164;kp4;kp100;kp50;kp100;kp224;"
+               "kr100;kr4;kr221") == hid_sequence::AdmissionResult::kAccepted);
+    controller.run_for_test();
+    assert(backend.keyboard_keys.front() ==
+           (std::array<std::uint8_t, 6>{}));
+    assert(backend.keyboard_keys[6] == canonical);
+    assert(backend.keyboard_keys[7] == canonical);  // duplicate press
+    assert(backend.keyboard_keys[8] == canonical);  // modifier is independent
+    assert(backend.keyboard_modifiers[8] == 1);
+    assert(backend.keyboard_keys[9] ==
+           (std::array<std::uint8_t, 6>{4, 50, 164, 176, 221, 0}));
+    assert(backend.keyboard_keys[10] ==
+           (std::array<std::uint8_t, 6>{50, 164, 176, 221, 0, 0}));
+    assert(backend.keyboard_keys[11] ==
+           (std::array<std::uint8_t, 6>{50, 164, 176, 0, 0, 0}));
+
+    hid_sequence::Plan plan{};
+    const hid_sequence::HidState empty{};
+    assert(!hid_sequence::parse("kp4;kp50;kp100;kp164;kp176;kp221;kp5",
+                                empty, &plan));
+    for (const char *boundary : {"kp4", "kp164", "kp176", "kp221",
+                                 "kp224", "kp231"}) {
+        assert(hid_sequence::parse(boundary, empty, &plan));
+    }
 }
 
 void state_and_failure_contract() {
@@ -576,6 +631,7 @@ void retired_owner_late_wake_cannot_republish_for_new_owner() {
 
 int main() {
     parser_contract();
+    fixed_key_canonicalizer_matches_six_key_sort_semantics();
     local_delay_does_not_catch_up();
     state_and_failure_contract();
     admission_abort_and_authority_contract();

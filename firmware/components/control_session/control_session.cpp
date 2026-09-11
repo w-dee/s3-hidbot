@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <limits>
+#include <new>
 
 #include "secure_memory/secure_memory.hpp"
 
@@ -51,9 +52,21 @@ bool State::same_request(const char *cached,
 }
 
 void State::clear_normal_cache() {
-    secure_memory::zero(request_cache_.request, sizeof(request_cache_.request));
-    secure_memory::zero(request_cache_.digest.data(), request_cache_.digest.size());
-    request_cache_ = RequestCache{};
+    if (retry_cache_kind_ != RetryCacheKind::kNormal) {
+        return;
+    }
+    secure_memory::zero(&retry_cache_.normal, sizeof(retry_cache_.normal));
+    new (&retry_cache_.normal) RequestCache{};
+}
+
+State::RequestCache &State::activate_normal_cache() {
+    if (retry_cache_kind_ == RetryCacheKind::kTransition) {
+        secure_memory::zero(&retry_cache_.transition,
+                            sizeof(retry_cache_.transition));
+        new (&retry_cache_.normal) RequestCache{};
+        retry_cache_kind_ = RetryCacheKind::kNormal;
+    }
+    return retry_cache_.normal;
 }
 
 void State::clear_hello_cache() {
@@ -76,6 +89,7 @@ void State::initialize(RandomFill random_fill, void *random_context,
     local_owner_id_ = 0;
     next_local_owner_id_ = 1;
     lease_deadline_us_ = 0;
+    clear_transition_retry();
     clear_normal_cache();
     clear_hello_cache();
     generate_token(boot_id_);
@@ -196,7 +210,6 @@ bool State::activate_hello(std::string_view client_nonce,
     hello_cache_.valid = true;
     copy_token(hello_cache_.client_nonce, client_nonce);
     copy_request(hello_cache_.request, &hello_cache_.request_length, request_bytes);
-    copy_token(hello_cache_.session, std::string_view(new_session, kTokenHexLength));
     hello_cache_.authority_epoch = authority_epoch;
     hello_cache_.response = response;
     return true;
@@ -216,19 +229,23 @@ RequestCacheResult State::inspect_request(std::string_view session,
         !same_token(current_session_, session)) {
         return RequestCacheResult::kSessionMismatch;
     }
-    if (!request_cache_.valid || request_cache_.authority_epoch != current_epoch ||
-        id > request_cache_.id) {
+    if (retry_cache_kind_ != RetryCacheKind::kNormal) {
         return RequestCacheResult::kAcceptNew;
     }
-    if (id < request_cache_.id) {
+    const RequestCache &request_cache = retry_cache_.normal;
+    if (!request_cache.valid || request_cache.authority_epoch != current_epoch ||
+        id > request_cache.id) {
+        return RequestCacheResult::kAcceptNew;
+    }
+    if (id < request_cache.id) {
         return RequestCacheResult::kIdStale;
     }
-    if (request_cache_.sensitive ||
-        !same_request(request_cache_.request, request_cache_.request_length, request_bytes)) {
+    if (request_cache.sensitive ||
+        !same_request(request_cache.request, request_cache.request_length, request_bytes)) {
         return RequestCacheResult::kIdConflict;
     }
     if (cached_response != nullptr) {
-        *cached_response = &request_cache_.response;
+        *cached_response = &request_cache.response;
     }
     return RequestCacheResult::kExactRetry;
 }
@@ -244,19 +261,23 @@ RequestCacheResult State::inspect_sensitive_request(
         !same_token(current_session_, session)) {
         return RequestCacheResult::kSessionMismatch;
     }
-    if (!request_cache_.valid || request_cache_.authority_epoch != current_epoch ||
-        id > request_cache_.id) {
+    if (retry_cache_kind_ != RetryCacheKind::kNormal) {
         return RequestCacheResult::kAcceptNew;
     }
-    if (id < request_cache_.id) {
+    const RequestCache &request_cache = retry_cache_.normal;
+    if (!request_cache.valid || request_cache.authority_epoch != current_epoch ||
+        id > request_cache.id) {
+        return RequestCacheResult::kAcceptNew;
+    }
+    if (id < request_cache.id) {
         return RequestCacheResult::kIdStale;
     }
-    if (!request_cache_.sensitive || request_cache_.request_length != payload_length ||
-        !sensitive_request::constant_time_equal(request_cache_.digest, digest)) {
+    if (!request_cache.sensitive || request_cache.request_length != payload_length ||
+        !sensitive_request::constant_time_equal(request_cache.digest, digest)) {
         return RequestCacheResult::kIdConflict;
     }
     if (cached_response != nullptr) {
-        *cached_response = &request_cache_.response;
+        *cached_response = &request_cache.response;
     }
     return RequestCacheResult::kExactRetry;
 }
@@ -265,13 +286,14 @@ void State::cache_completed_request(std::int32_t id,
                                     std::string_view request_bytes,
                                     AuthorityEpoch authority_epoch,
                                     const ResponseFrame &response) {
-    request_cache_ = RequestCache{};
-    request_cache_.valid = true;
-    request_cache_.sensitive = false;
-    request_cache_.id = id;
-    request_cache_.authority_epoch = authority_epoch;
-    copy_request(request_cache_.request, &request_cache_.request_length, request_bytes);
-    request_cache_.response = response;
+    RequestCache &request_cache = activate_normal_cache();
+    request_cache = RequestCache{};
+    request_cache.valid = true;
+    request_cache.sensitive = false;
+    request_cache.id = id;
+    request_cache.authority_epoch = authority_epoch;
+    copy_request(request_cache.request, &request_cache.request_length, request_bytes);
+    request_cache.response = response;
 }
 
 void State::cache_completed_sensitive_request(
@@ -279,13 +301,62 @@ void State::cache_completed_sensitive_request(
     const sensitive_request::Digest &digest, AuthorityEpoch authority_epoch,
     const ResponseFrame &response) {
     clear_normal_cache();
-    request_cache_.valid = true;
-    request_cache_.sensitive = true;
-    request_cache_.id = id;
-    request_cache_.request_length = payload_length;
-    request_cache_.digest = digest;
-    request_cache_.authority_epoch = authority_epoch;
-    request_cache_.response = response;
+    RequestCache &request_cache = activate_normal_cache();
+    request_cache.valid = true;
+    request_cache.sensitive = true;
+    request_cache.id = id;
+    request_cache.request_length = payload_length;
+    request_cache.digest = digest;
+    request_cache.authority_epoch = authority_epoch;
+    request_cache.response = response;
+}
+
+const ResponseFrame *State::inspect_transition_retry(
+    std::string_view session, std::int32_t id,
+    std::string_view request_bytes) const {
+    if (retry_cache_kind_ != RetryCacheKind::kTransition) {
+        return nullptr;
+    }
+    const TransitionRetryCache &cache = retry_cache_.transition;
+    if (!cache.active || cache.id != id ||
+        !same_token(cache.session, session) ||
+        !same_request(cache.request, cache.request_length, request_bytes)) {
+        return nullptr;
+    }
+    return &cache.response;
+}
+
+void State::cache_transition_retry(std::string_view session, std::int32_t id,
+                                   std::string_view request_bytes,
+                                   const ResponseFrame &response) {
+    if (session.size() != kTokenHexLength ||
+        request_bytes.size() > kMaxRequestBytes || response.length == 0) {
+        return;
+    }
+    if (retry_cache_kind_ == RetryCacheKind::kNormal) {
+        secure_memory::zero(&retry_cache_.normal, sizeof(retry_cache_.normal));
+    } else {
+        secure_memory::zero(&retry_cache_.transition,
+                            sizeof(retry_cache_.transition));
+    }
+    new (&retry_cache_.transition) TransitionRetryCache{};
+    retry_cache_kind_ = RetryCacheKind::kTransition;
+    TransitionRetryCache &cache = retry_cache_.transition;
+    cache.id = id;
+    copy_token(cache.session, session);
+    copy_request(cache.request, &cache.request_length, request_bytes);
+    cache.response = response;
+    cache.active = true;
+}
+
+void State::clear_transition_retry() {
+    if (retry_cache_kind_ != RetryCacheKind::kTransition) {
+        return;
+    }
+    secure_memory::zero(&retry_cache_.transition,
+                        sizeof(retry_cache_.transition));
+    new (&retry_cache_.normal) RequestCache{};
+    retry_cache_kind_ = RetryCacheKind::kNormal;
 }
 
 #ifdef CONTROL_SESSION_NATIVE_TEST
@@ -294,23 +365,47 @@ void State::set_next_local_owner_id_for_test(LocalOwnerId next_owner_id) {
 }
 
 State::RequestCacheSnapshot State::request_cache_snapshot_for_test() const {
+    if (retry_cache_kind_ != RetryCacheKind::kNormal) {
+        return {.raw_storage_zero = true};
+    }
+    const RequestCache &request_cache = retry_cache_.normal;
     bool raw_storage_zero = true;
-    for (const char byte : request_cache_.request) {
+    for (const char byte : request_cache.request) {
         raw_storage_zero = raw_storage_zero && byte == 0;
     }
-    return {.valid = request_cache_.valid,
-            .sensitive = request_cache_.sensitive,
-            .id = request_cache_.id,
-            .payload_length = request_cache_.request_length,
+    return {.valid = request_cache.valid,
+            .sensitive = request_cache.sensitive,
+            .id = request_cache.id,
+            .payload_length = request_cache.request_length,
             .raw_storage_zero = raw_storage_zero,
-            .digest = request_cache_.digest};
+            .digest = request_cache.digest};
+}
+
+bool State::transition_cache_active_for_test() const {
+    return retry_cache_kind_ == RetryCacheKind::kTransition;
+}
+
+bool State::retry_cache_contains_for_test(std::string_view bytes) const {
+    if (bytes.empty() || bytes.size() > sizeof(retry_cache_)) {
+        return false;
+    }
+    const auto *storage = reinterpret_cast<const std::uint8_t *>(&retry_cache_);
+    for (std::size_t offset = 0; offset + bytes.size() <= sizeof(retry_cache_);
+         ++offset) {
+        if (std::memcmp(storage + offset, bytes.data(), bytes.size()) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 #endif
 
 void State::revoke_for_lifecycle_invalidation(AuthorityEpoch current_epoch) {
     if ((active_session_ && session_authority_epoch_ != current_epoch) ||
         (hello_cache_.valid && hello_cache_.authority_epoch != current_epoch) ||
-        (request_cache_.valid && request_cache_.authority_epoch != current_epoch)) {
+        (retry_cache_kind_ == RetryCacheKind::kNormal &&
+         retry_cache_.normal.valid &&
+         retry_cache_.normal.authority_epoch != current_epoch)) {
         clear_authority();
     }
 }

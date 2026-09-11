@@ -3557,15 +3557,15 @@ void test_ble_work_token_fences_every_authority_field() {
                hid_runtime::KeyboardReportBeginResult::kPublished);
         hid_control_executor::Controller::Action work{};
         assert(fixture.controller.dequeue_one_for_test(work));
-        const auto original = work.hid_work;
+        const auto original = work.payload.hid_report.work;
         switch (mutation) {
-            case 0: ++work.hid_work.route_generation; break;
-            case 1: ++work.hid_work.authority_epoch; break;
-            case 2: ++work.hid_work.transport_generation; break;
-            case 3: ++work.hid_work.connection_handle; break;
-            case 4: ++work.hid_work.characteristic_handle; break;
+            case 0: ++work.payload.hid_report.work.route_generation; break;
+            case 1: ++work.payload.hid_report.work.authority_epoch; break;
+            case 2: ++work.payload.hid_report.work.transport_generation; break;
+            case 3: ++work.payload.hid_report.work.connection_handle; break;
+            case 4: ++work.payload.hid_report.work.characteristic_handle; break;
             case 5:
-                work.hid_work.report_kind =
+                work.payload.hid_report.work.report_kind =
                     hid_runtime::ReportKind::kUnsafeMouse;
                 break;
         }
@@ -3604,7 +3604,7 @@ void test_canceled_ble_ticket_waits_for_exact_action_acknowledgment() {
            hid_runtime::KeyboardReportBeginResult::kPublished);
     hid_control_executor::Controller::Action old_action{};
     assert(fixture.controller.dequeue_one_for_test(old_action));
-    const auto old_ticket = old_action.hid_work.ticket_id;
+    const auto old_ticket = old_action.payload.hid_report.work.ticket_id;
     assert(fixture.runtime.state_machine().cancel_keyboard_report(old_ticket));
     assert(!fixture.runtime.state_machine().finalize_keyboard_report(old_ticket));
     assert(fixture.runtime.state_machine().keyboard_report_snapshot().state ==
@@ -3629,7 +3629,8 @@ void test_canceled_ble_ticket_waits_for_exact_action_acknowledgment() {
            hid_runtime::MouseReportBeginResult::kPublished);
     hid_control_executor::Controller::Action old_mouse_action{};
     assert(fixture.controller.dequeue_one_for_test(old_mouse_action));
-    const auto old_mouse_ticket = old_mouse_action.hid_work.ticket_id;
+    const auto old_mouse_ticket =
+        old_mouse_action.payload.hid_report.work.ticket_id;
     assert(fixture.runtime.state_machine().cancel_mouse_report(old_mouse_ticket));
     assert(!fixture.runtime.state_machine().finalize_mouse_report(
         old_mouse_ticket));
@@ -3889,7 +3890,8 @@ void test_ble_not_ready_and_stale_results_terminalize_runtime_ticket() {
         assert(fixture.controller.dequeue_one_for_test(action));
         BleSubmitSink sink{.result = result};
         assert(!fixture.runtime.state_machine().process_ble_report(
-            action.hid_interface, action.hid_work, BleSubmitSink::submit,
+            action.payload.hid_report.interface,
+            action.payload.hid_report.work, BleSubmitSink::submit,
             &sink));
         assert(sink.calls == 1);
         assert(fixture.database.notify_calls == 0);
@@ -5804,7 +5806,71 @@ void test_dle_last_order_admission_and_retirement() {
     assert(ble.dle_calls == 0);
 }
 
+void test_action_tagged_union_constructs_each_payload_without_identity_loss() {
+    using Controller = hid_control_executor::Controller;
+    using Action = Controller::Action;
+    using Kind = Controller::ActionKind;
+    static_assert(sizeof(Action) >= 56 && sizeof(Action) <= 64);
+
+    usb_lifecycle::Snapshot lifecycle{};
+    lifecycle.generation = UINT32_MAX - 7U;
+    hid_route::Snapshot route{};
+    route.generation = UINT32_MAX - 11U;
+    for (const Kind kind : {Kind::kUsbInstall, Kind::kUsbDetach,
+                            Kind::kRouteRelease}) {
+        const Action action = Action::with_lifecycle(
+            kind, lifecycle, route,
+            hid_control_executor::ControlOperation::kUsbDetach);
+        assert(action.kind == kind);
+        assert(action.payload.lifecycle.lifecycle.generation ==
+               lifecycle.generation);
+        assert(action.payload.lifecycle.route.generation == route.generation);
+        assert(action.payload.lifecycle.operation ==
+               hid_control_executor::ControlOperation::kUsbDetach);
+    }
+
+    for (const Kind kind : {Kind::kBleEnable, Kind::kBleDisable,
+                            Kind::kRouteBleActivate, Kind::kPairingStatus,
+                            Kind::kPairingRespond, Kind::kBondList,
+                            Kind::kBondRemove}) {
+        const Action action = Action::with_operation(
+            kind, hid_control_executor::ControlOperation::kBondAdministration,
+            UINT32_MAX - 3U);
+        assert(action.kind == kind);
+        assert(action.payload.operation.operation ==
+               hid_control_executor::ControlOperation::kBondAdministration);
+        assert(action.payload.operation.mailbox_token == UINT32_MAX - 3U);
+    }
+
+    hid_control_executor::BleEvent event{};
+    event.kind = hid_control_executor::BleEventKind::kStorageFailure;
+    event.generation = UINT32_MAX - 5U;
+    event.connection_handle = 0xface;
+    const Action ble_event = Action::with_ble_event(event);
+    assert(ble_event.kind == Kind::kBleEvent);
+    assert(ble_event.payload.ble_event.event.kind == event.kind);
+    assert(ble_event.payload.ble_event.event.generation == event.generation);
+    assert(ble_event.payload.ble_event.event.connection_handle ==
+           event.connection_handle);
+
+    hid_runtime::HidWorkToken work{};
+    work.ticket_id = UINT64_C(0xfedcba9876543210);
+    work.originating_local_owner_id = UINT64_C(0x8123456789abcdef);
+    const Action hid_report =
+        Action::with_hid_report(hid_runtime::Interface::kMouse, work);
+    assert(hid_report.kind == Kind::kBleHidReport);
+    assert(hid_report.payload.hid_report.interface ==
+           hid_runtime::Interface::kMouse);
+    assert(hid_report.payload.hid_report.work.ticket_id == work.ticket_id);
+    assert(hid_report.payload.hid_report.work.originating_local_owner_id ==
+           work.originating_local_owner_id);
+
+    const Action grace = Action::empty(Kind::kBleRouteReleaseGrace);
+    assert(grace.kind == Kind::kBleRouteReleaseGrace);
+}
+
 int main() {
+    test_action_tagged_union_constructs_each_payload_without_identity_loss();
     test_dle_last_order_admission_and_retirement();
     test_install_and_uninstall_are_task_owned_and_serialized();
     test_route_owner_blocks_attach_before_lifecycle_stage_a();

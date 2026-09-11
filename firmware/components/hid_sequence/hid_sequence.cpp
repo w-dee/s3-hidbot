@@ -79,30 +79,37 @@ bool apply_transition(const Operation &operation, HidState *state) {
         }
         return true;
     }
-    auto found = std::find(state->keycodes.begin(), state->keycodes.end(), usage);
+    std::size_t found = state->keycodes.size();
+    for (std::size_t index = 0; index < state->keycodes.size(); ++index) {
+        if (state->keycodes[index] == usage) {
+            found = index;
+            break;
+        }
+    }
     if (operation.kind == OperationKind::kKeyPress) {
-        if (found != state->keycodes.end()) {
+        if (found != state->keycodes.size()) {
             return true;
         }
-        auto empty = std::find(state->keycodes.begin(), state->keycodes.end(), 0);
-        if (empty == state->keycodes.end()) {
+        std::size_t empty = state->keycodes.size();
+        for (std::size_t index = 0; index < state->keycodes.size(); ++index) {
+            if (state->keycodes[index] == 0) {
+                empty = index;
+                break;
+            }
+        }
+        if (empty == state->keycodes.size()) {
             return false;
         }
-        *empty = static_cast<std::uint8_t>(usage);
-        std::sort(state->keycodes.begin(), state->keycodes.end(),
-                  [](std::uint8_t left, std::uint8_t right) {
-                      if (left == 0) return false;
-                      if (right == 0) return true;
-                      return left < right;
-                  });
-    } else if (found != state->keycodes.end()) {
-        *found = 0;
-        std::sort(state->keycodes.begin(), state->keycodes.end(),
-                  [](std::uint8_t left, std::uint8_t right) {
-                      if (left == 0) return false;
-                      if (right == 0) return true;
-                      return left < right;
-                  });
+        while (empty > 0 && state->keycodes[empty - 1] > usage) {
+            state->keycodes[empty] = state->keycodes[empty - 1];
+            --empty;
+        }
+        state->keycodes[empty] = static_cast<std::uint8_t>(usage);
+    } else if (found != state->keycodes.size()) {
+        for (std::size_t index = found; index + 1 < state->keycodes.size(); ++index) {
+            state->keycodes[index] = state->keycodes[index + 1];
+        }
+        state->keycodes.back() = 0;
     }
     return true;
 }

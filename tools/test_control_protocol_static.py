@@ -22,8 +22,10 @@ def main() -> int:
     main_source = MAIN.read_text(encoding="utf-8")
 
     assert "config_.output(config_.output_context" in protocol
-    assert "request_json_scratch_" in protocol_header
-    assert "response_scratch_" in protocol_header
+    assert "scratch_storage_[sizeof(control_session::ResponseFrame)]" in protocol_header
+    assert "alignas(control_session::ResponseFrame)" in protocol_header
+    assert "request_json_scratch_" not in protocol_header
+    assert "response_scratch_" not in protocol_header
     assert "prepare_response_scratch()" in protocol
     assert "control_session::ResponseFrame response{}" not in protocol
     assert "char json[control_session::kMaxRequestBytes + 1]" not in protocol
@@ -53,11 +55,14 @@ def main() -> int:
     assert "session_.inspect_hello(client_nonce, payload, authority_epoch" in protocol
     assert "session_authority_epoch_" in session
     assert "using LocalOwnerId = std::uint64_t;" in session_header
-    assert "next_local_owner_id_ = 1" in session_header
+    assert "next_local_owner_id_ = 0" in session_header
+    assert "next_local_owner_id_ = 1;" in session
     assert "session_.local_owner_id()" in protocol
     assert "sequence_owner_retired" in protocol_header
     assert "hello_cache_.authority_epoch != current_epoch" in session
-    assert "request_cache_.authority_epoch != current_epoch" in session
+    assert "retry_cache_.normal.authority_epoch != current_epoch" in session
+    assert "union RetryCacheStorage" in session_header
+    assert "RetryCacheKind retry_cache_kind_" in session_header
     assert "session_authority_epoch_ != current_epoch" in session
     assert "status_snapshot()" in main_source
     assert "service_sof()" in main_source

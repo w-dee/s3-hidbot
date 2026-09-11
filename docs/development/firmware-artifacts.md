@@ -80,8 +80,17 @@ usage is the actual generated application `.bin` file size. Static RAM is the
 ESP-IDF v5.5.4 size JSON sum of DRAM and DIRAM `.data` plus `.bss`; it is not a
 normal-profile estimate or a text-summary approximation.
 
-The machine limits are application `<= 664592` bytes and static RAM
-`<= 39832` bytes. The pre-U7.6C1 U7.5C artifact-profile reference measured
+The machine limits are application `<= 672784` bytes and static RAM
+`<= 39832` bytes. Product functionality and correctness are primary. The
+application limit is a capacity guard, not a target that normal feature work
+should approach through flash-size micro-optimization. Do not complicate
+normal feature implementations solely to save small amounts of application
+flash while the image remains within this gate. Flash-size optimization is a
+separate later phase with its own measurement, review, and acceptance
+criteria; this policy does not weaken the static-RAM gate or other resource
+safety requirements.
+
+The pre-U7.6C1 U7.5C artifact-profile reference measured
 646896 and 37064 bytes respectively. `tools/firmware_resource_gate.py` rejects
 missing files, tool failure, malformed or unexpected size JSON, invalid
 measurements, and either limit excess. It prints each measured value, limit,

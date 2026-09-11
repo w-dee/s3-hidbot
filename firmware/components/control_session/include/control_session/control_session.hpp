@@ -88,6 +88,14 @@ class State {
         const sensitive_request::Digest &digest,
         AuthorityEpoch authority_epoch, const ResponseFrame &response);
 
+    const ResponseFrame *inspect_transition_retry(
+        std::string_view session, std::int32_t id,
+        std::string_view request_bytes) const;
+    void cache_transition_retry(std::string_view session, std::int32_t id,
+                                std::string_view request_bytes,
+                                const ResponseFrame &response);
+    void clear_transition_retry();
+
     void revoke_for_lifecycle_invalidation(AuthorityEpoch current_epoch);
 
 #ifdef CONTROL_SESSION_NATIVE_TEST
@@ -100,6 +108,8 @@ class State {
         sensitive_request::Digest digest{};
     };
     RequestCacheSnapshot request_cache_snapshot_for_test() const;
+    bool transition_cache_active_for_test() const;
+    bool retry_cache_contains_for_test(std::string_view bytes) const;
     void set_next_local_owner_id_for_test(LocalOwnerId next_owner_id);
 #endif
 
@@ -109,7 +119,6 @@ class State {
         char client_nonce[kTokenStorageBytes]{};
         char request[kMaxRequestBytes + 1]{};
         std::size_t request_length = 0;
-        char session[kTokenStorageBytes]{};
         AuthorityEpoch authority_epoch = 0;
         ResponseFrame response{};
     };
@@ -125,6 +134,27 @@ class State {
         ResponseFrame response{};
     };
 
+    struct TransitionRetryCache {
+        bool active = false;
+        std::int32_t id = 0;
+        char session[kTokenStorageBytes]{};
+        char request[kMaxRequestBytes + 1]{};
+        std::size_t request_length = 0;
+        ResponseFrame response{};
+    };
+
+    union RetryCacheStorage {
+        RequestCache normal;
+        TransitionRetryCache transition;
+
+        constexpr RetryCacheStorage() : normal{} {}
+    };
+
+    enum class RetryCacheKind : std::uint8_t {
+        kNormal,
+        kTransition,
+    };
+
     static void copy_token(char destination[kTokenStorageBytes], std::string_view token);
     static void copy_request(char destination[kMaxRequestBytes + 1],
                              std::size_t *destination_length,
@@ -132,6 +162,7 @@ class State {
     static bool same_request(const char *cached,
                              std::size_t cached_length,
                              std::string_view request);
+    RequestCache &activate_normal_cache();
     void clear_normal_cache();
     void clear_hello_cache();
     std::uint64_t now() const;
@@ -142,14 +173,17 @@ class State {
     char boot_id_[kTokenStorageBytes]{};
     char current_session_[kTokenStorageBytes]{};
     bool active_session_ = false;
+    RetryCacheKind retry_cache_kind_ = RetryCacheKind::kNormal;
     AuthorityEpoch session_authority_epoch_ = 0;
     LocalOwnerId local_owner_id_ = 0;
-    LocalOwnerId next_local_owner_id_ = 1;
+    // initialize() establishes the first valid owner. Keeping static storage
+    // zero-initialized avoids making the containing Protocol image-backed.
+    LocalOwnerId next_local_owner_id_ = 0;
     NowFn now_fn_ = nullptr;
     void *now_context_ = nullptr;
     std::uint64_t lease_deadline_us_ = 0;
     HelloCache hello_cache_{};
-    RequestCache request_cache_{};
+    RetryCacheStorage retry_cache_{};
 };
 
 bool is_lower_hex_token(std::string_view value);

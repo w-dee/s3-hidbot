@@ -133,6 +133,51 @@ void test_local_owner_allocator_is_unique_nonwrapping_and_retry_stable() {
     assert(state.local_owner_id() == 0);
 }
 
+void test_retry_cache_members_are_exclusive_and_retired_storage_is_wiped() {
+    constexpr std::string_view kNormalRequest =
+        R"({"normal-retired-marker":"0123456789"})";
+    constexpr std::string_view kTransitionRequest =
+        R"({"transition-retired-marker":"9876543210"})";
+    constexpr std::string_view kNextNormalRequest =
+        R"({"next-normal-marker":true})";
+
+    control_session::State state;
+    state.initialize(random_fill, nullptr);
+    control_session::ResponseFrame response{};
+    response.bytes[0] = 'o';
+    response.length = 1;
+    assert(state.activate_hello(kNonce, kRequest, kSession, kEpochOne, response));
+
+    state.cache_completed_request(1, kNormalRequest, kEpochOne, response);
+    assert(!state.transition_cache_active_for_test());
+    assert(state.retry_cache_contains_for_test("normal-retired-marker"));
+
+    state.cache_transition_retry(kSession, 2, kTransitionRequest, response);
+    assert(state.transition_cache_active_for_test());
+    assert(state.inspect_transition_retry(kSession, 2, kTransitionRequest) !=
+           nullptr);
+    assert(!state.retry_cache_contains_for_test("normal-retired-marker"));
+    const control_session::ResponseFrame *cached = nullptr;
+    assert(state.inspect_request(kSession, 1, kNormalRequest, kEpochOne,
+                                 &cached) ==
+           control_session::RequestCacheResult::kAcceptNew);
+
+    state.cache_completed_request(3, kNextNormalRequest, kEpochOne, response);
+    assert(!state.transition_cache_active_for_test());
+    assert(state.inspect_transition_retry(kSession, 2, kTransitionRequest) ==
+           nullptr);
+    assert(!state.retry_cache_contains_for_test("transition-retired-marker"));
+    assert(state.inspect_request(kSession, 3, kNextNormalRequest, kEpochOne,
+                                 &cached) ==
+           control_session::RequestCacheResult::kExactRetry);
+
+    state.cache_transition_retry(kSession, 4, kTransitionRequest, response);
+    state.clear_transition_retry();
+    assert(!state.transition_cache_active_for_test());
+    assert(!state.retry_cache_contains_for_test("transition-retired-marker"));
+    assert(state.request_cache_snapshot_for_test().raw_storage_zero);
+}
+
 }  // namespace
 
 int main() {
@@ -140,5 +185,6 @@ int main() {
     test_takeover_clears_retry_authority();
     test_authority_epoch_scopes_session_and_caches();
     test_local_owner_allocator_is_unique_nonwrapping_and_retry_stable();
+    test_retry_cache_members_are_exclusive_and_retired_storage_is_wiped();
     return 0;
 }

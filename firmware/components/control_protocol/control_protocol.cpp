@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <string_view>
 
 #include "cJSON.h"
@@ -1231,7 +1232,7 @@ bool Protocol::initialize(const Config &config,
         return false;
     }
     session_.initialize(random_fill, random_context, config.now, config.now_context);
-    control_transition_retry_cache_ = {};
+    session_.clear_transition_retry();
     initialized_ = true;
     lease_revoke_notified_ = false;
     return true;
@@ -1243,36 +1244,21 @@ bool Protocol::write_frame(const control_session::ResponseFrame &frame) const {
 }
 
 control_session::ResponseFrame &Protocol::prepare_response_scratch() {
-    response_scratch_ = {};
-    return response_scratch_;
+    secure_memory::zero(scratch_storage_, sizeof(scratch_storage_));
+    return *new (scratch_storage_) control_session::ResponseFrame{};
 }
 
 bool Protocol::replay_control_transition_retry(std::string_view session, std::int32_t id,
                                                std::string_view payload) {
-    const ControlTransitionRetryCache &cached = control_transition_retry_cache_;
-    if (!cached.active || cached.id != id || cached.payload_length != payload.size() ||
-        session.size() != control_session::kTokenHexLength ||
-        std::memcmp(cached.session.data(), session.data(), session.size()) != 0 ||
-        std::memcmp(cached.payload.data(), payload.data(), payload.size()) != 0) {
-        return false;
-    }
-    return write_frame(cached.response);
+    const control_session::ResponseFrame *cached =
+        session_.inspect_transition_retry(session, id, payload);
+    return cached != nullptr && write_frame(*cached);
 }
 
 void Protocol::cache_control_transition_retry(
     std::string_view session, std::int32_t id, std::string_view payload,
     const control_session::ResponseFrame &response) {
-    if (session.size() != control_session::kTokenHexLength ||
-        payload.size() > control_session::kMaxRequestBytes || response.length == 0) {
-        return;
-    }
-    control_transition_retry_cache_ = {};
-    control_transition_retry_cache_.id = id;
-    std::memcpy(control_transition_retry_cache_.session.data(), session.data(), session.size());
-    std::memcpy(control_transition_retry_cache_.payload.data(), payload.data(), payload.size());
-    control_transition_retry_cache_.payload_length = payload.size();
-    control_transition_retry_cache_.response = response;
-    control_transition_retry_cache_.active = true;
+    session_.cache_transition_retry(session, id, payload, response);
 }
 
 void Protocol::retire_sequence_owner(
@@ -1383,16 +1369,22 @@ void Protocol::handle_frame(std::string_view payload) {
         return;
     }
 
-    std::memcpy(request_json_scratch_, payload.data(), payload.size());
-    request_json_scratch_[payload.size()] = '\0';
+    char *const request_json_scratch =
+        reinterpret_cast<char *>(scratch_storage_);
+    secure_memory::zero(scratch_storage_, sizeof(scratch_storage_));
+    std::memcpy(request_json_scratch, payload.data(), payload.size());
+    request_json_scratch[payload.size()] = '\0';
     const char *parse_end = nullptr;
-    cJSON *root = cJSON_ParseWithLengthOpts(request_json_scratch_, payload.size() + 1, &parse_end, true);
+    cJSON *root = cJSON_ParseWithLengthOpts(request_json_scratch,
+                                           payload.size() + 1,
+                                           &parse_end, true);
     if (root == nullptr) {
         auto &response = prepare_response_scratch();
         if (make_error(&response, kUncorrelatableSession, false, 0, "MALFORMED_JSON", "request is not valid JSON")) {
             write_frame(response);
         }
-        secure_memory::zero(request_json_scratch_, payload.size() + 1);
+        secure_memory::zero(request_json_scratch,
+                            control_session::kMaxRequestBytes + 1);
         return;
     }
 
@@ -1401,7 +1393,8 @@ void Protocol::handle_frame(std::string_view payload) {
         wipe_json_strings(root);
         cJSON_Delete(root);
         root = nullptr;
-        secure_memory::zero(request_json_scratch_, payload.size() + 1);
+        secure_memory::zero(request_json_scratch,
+                            control_session::kMaxRequestBytes + 1);
         secure_memory::zero(sensitive_digest.data(), sensitive_digest.size());
     };
     const cJSON *long_sequence_code = nullptr;
@@ -1546,7 +1539,7 @@ void Protocol::handle_frame(std::string_view payload) {
         // A successful fresh handshake supersedes any lifecycle retry proof
         // tied to the former session. Lifecycle invalidation itself must not
         // clear that proof: accepted attach/detach retries occur after it.
-        control_transition_retry_cache_ = {};
+        session_.clear_transition_retry();
         lease_revoke_notified_ = false;
         write_frame(response);
         finish();
@@ -2106,8 +2099,9 @@ void Protocol::handle_frame(std::string_view payload) {
 
 #ifdef CONTROL_PROTOCOL_NATIVE_TEST
 bool Protocol::request_scratch_zero_for_test() const {
-    for (const char byte : request_json_scratch_) {
-        if (byte != 0) {
+    for (std::size_t index = 0;
+         index < control_session::kMaxRequestBytes + 1; ++index) {
+        if (scratch_storage_[index] != 0) {
             return false;
         }
     }

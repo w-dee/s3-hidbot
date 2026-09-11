@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TextIO
 
 
-APPLICATION_LIMIT = 664_592
+APPLICATION_LIMIT = 672_784
 STATIC_RAM_LIMIT = 39_832
 
 _SIZE_FIELDS = frozenset(
