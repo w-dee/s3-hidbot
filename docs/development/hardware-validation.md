@@ -88,6 +88,7 @@ boards, operating systems, or future firmware.
 | Authenticated bond lifecycle | `HARDWARE VALIDATED` | FNK0085 lab evidence covers authenticated pairing, 16-byte keys, exact opaque-ID removal, crash-safe persistent absence, stale host-record behavior, and exact slot reuse. |
 | Three-bond capacity / no eviction | `HARDWARE VALIDATED` | One Linux/BlueZ peer plus named lab Xperia, Lenovo, and Moto Android fixtures were used across the accepted sequence: three verified bonds, `store_full` with the set preserved, exact removal, slot reuse, reconnect, and reboot persistence. No blanket Android/device qualification is claimed. |
 | Mouse left button in HID Sequence Executor v1 | `HARDWARE VALIDATED` | The USB-only sequence checkpoint observed exactly one `BTN_LEFT` down/up pair after the F24 pair, with no extra input events and a final all-up cleanup. This does not qualify the other mouse buttons or arbitrary sequences. |
+| BLE HID Sequence Executor v1 | `HARDWARE VALIDATED` | `PASS_BLE_SEQUENCE_EXECUTOR_PHYSICAL_QUALIFICATION` on firmware `c2dcfcb14d555da2c8d5b472f91dd5d2824af3a0` and artifact cache key `f711094a91eedc7cd3a38dc3d5285ad90d0046926cc1d68602c71758da2e8db3`: one accepted execution of the exact seven-token F24/left-button workload produced the four expected BLE evdev transitions in order and no unexpected event. This closes BLE delivery only for the scoped Sequence Executor v1 workload on the documented fixture; it does not replace the USB-only checkpoint or qualify arbitrary sequences. |
 | Native USB Logical Link-Loss | `HARDWARE VALIDATED` | `PASS_NATIVE_USB_LINK_LOSS_PHYSICAL_CHECKPOINT` on firmware `c2dcfcb14d555da2c8d5b472f91dd5d2824af3a0` and artifact cache key `f711094a91eedc7cd3a38dc3d5285ad90d0046926cc1d68602c71758da2e8db3`: `PRIMARY_SUSPEND` fenced route generation 1 to stable none generation 2; signed host-remove-to-fence was -278.817 ms and the acceptance-transformed value was 0 ms against the frozen 250 ms limit. Reconnect did not resurrect the route, and fresh explicit selection recovered USB use. |
 | Other mouse buttons | `HARDWARE DEFERRED` | No accepted hardware evidence yet for right, middle, backward, or forward buttons. |
 | Wheel / pan | `HARDWARE DEFERRED` | No accepted hardware evidence yet. |
@@ -199,6 +200,102 @@ BLE_REQUALIFICATION_PERFORMED = NO
 The corresponding native/CI coverage is authoritative in
 [`validation-entrypoints.md`](validation-entrypoints.md); protocol and safety
 semantics are authoritative in [`uart-control-plane.md`](uart-control-plane.md).
+
+## BLE HID Sequence Executor v1 checkpoint
+
+The bounded BLE HID Sequence Executor v1 passed its scoped physical checkpoint
+on the documented Freenove fixture. This closes the previously deferred BLE
+delivery qualification for this exact Sequence Executor workload. It does not
+repeat or replace the earlier USB-only Sequence Executor checkpoint:
+
+```text
+classification = PASS_BLE_SEQUENCE_EXECUTOR_PHYSICAL_QUALIFICATION
+firmware source authority = c2dcfcb14d555da2c8d5b472f91dd5d2824af3a0
+artifact cache key = f711094a91eedc7cd3a38dc3d5285ad90d0046926cc1d68602c71758da2e8db3
+artifact ELF SHA-256 = ffc8e35fb7740e6e44820e43f2e8ebf572987ed24d657d327a9f68e4c4a2aca9
+```
+
+The firmware source and cached artifact are the executable authorities. The
+documentation commit recording this checkpoint is evidence-record authority
+only and is not firmware source authority. No firmware or diagnostic build,
+flash, source edit, or artifact mutation occurred during the qualification.
+
+The qualification reused the existing bond. Before the attempt the target was
+connected, encrypted, authenticated, bonded with Secure Connections and a
+16-byte key, and had both Keyboard and Mouse CCCDs ready. The bond store was
+healthy, all three existing records were verified, and no runtime fault was
+present. Pairing, bond deletion, `RemoveDevice`, and NVS or other destructive
+bond mutation were each zero.
+
+The initial stable route was none at generation 4. Explicit selection reached
+desired and active BLE, stable and ready, at generation 5. Independent
+read-only BLE HID Keyboard and Mouse observers were selected without retaining
+their device paths or Bluetooth address. Their 250 ms quiet baseline passed
+with no relevant input event.
+
+The exact workload was
+`w500;d150;kp115;kr115;w700;mpL;mrL`: seven tokens with a declared
+schedule of 1650 ms, covering F24 press/release followed by left-button
+press/release. Exactly one physical Sequence attempt and one
+`hid.sequence.start` were consumed, with no retry. Sequence ID 6 was accepted.
+
+The host then made zero control-plane Client calls during 2400.687 ms of
+sender silence. The independent observers recorded exactly this order and
+timing:
+
+```text
+KEY_F24 down -> KEY_F24 up -> BTN_LEFT down -> BTN_LEFT up
+acceptance -> KEY_F24 down = 473.631 ms
+KEY_F24 down -> KEY_F24 up = 146.143 ms
+KEY_F24 up -> BTN_LEFT down = 828.687 ms
+BTN_LEFT down -> BTN_LEFT up = 146.237 ms
+```
+
+All intervals passed the frozen qualification windows. There were zero
+unexpected events, repeats, mouse motion, wheel, pan, or `SYN_DROPPED` events.
+After the final button-up, approximately 805.989 ms of the sender-silence
+interval remained quiet. This establishes MCU-timed execution without host
+polling or pacing for the qualified workload.
+
+The sole post-silence status observation returned sequence ID 6,
+`state=completed`, `started=true`, `executed=7`, `failed_token=null`, and
+`code=null`. Boot continuity passed; no reset, panic, fatal runtime fault, or
+recovery fault was observed.
+
+Cleanup confirmed `release_all` results of Keyboard `already_up` and Mouse
+`already_up`, then completed the generation-5 BLE to generation-6 none route
+transition. The final route was desired none, active none, and stable; the
+final HID state was `ALL_UP`. The bond and store remained unchanged, the host
+Bluetooth adapter was restored from OFF to OFF, the physical lock was
+released, and the post-run host doctor returned `HOST_DOCTOR_READY`.
+
+Reversible environment repair reacquired fresh UART sessions after long BlueZ
+and cleanup operations, corrected host-side sysfs capability-bitmap
+interpretation, and handled an observer fd removed by BLE disconnection. The
+single product attempt was not rerun, and the frozen acceptance contract was
+unchanged.
+
+Qualification accounting was:
+
+```text
+firmware build = 0
+diagnostic build = 0
+flash = 0
+physical Sequence attempts = 1
+hid.sequence.start = 1
+pairing = 0
+bond deletion = 0
+ordinary keyboard reports outside the Sequence = 0
+ordinary mouse reports outside the Sequence = 0
+source edits during qualification = 0
+artifact mutation = 0
+```
+
+This checkpoint qualifies BLE delivery, MCU-local timing, terminal status,
+and final all-up cleanup for this exact Sequence Executor v1 workload on the
+documented fixture. It does not newly qualify pairing, bond administration,
+arbitrary Sequence programs, other mouse buttons, held-state cases,
+mid-sequence interruption, invalid input, another host, or another board.
 
 ## Native USB Logical Link-Loss checkpoint
 
