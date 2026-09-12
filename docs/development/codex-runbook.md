@@ -41,7 +41,9 @@ full-product physical gate. No diagnostic counters are part of production.
 ## Scope
 
 `AGENTS.md` defines stable repository invariants. This runbook explains the
-development procedure. Physical s3-hidbot work also requires
+development procedure. [`codex-mission-policy.md`](codex-mission-policy.md)
+defines the roles, autonomy envelope, hard boundaries, and anti-drift rule for
+mission-oriented Codex work. Physical s3-hidbot work also requires
 [`hardware-validation.md`](hardware-validation.md), which is a separate review
 gate from implementation and static validation.
 
@@ -116,6 +118,8 @@ Push only when a human explicitly requests it.
 
 ## Related documents
 
+- [`codex-mission-policy.md`](codex-mission-policy.md) — mission roles,
+  autonomous reversible work, hard budgets, and owner-return boundaries.
 - [`validation-entrypoints.md`](validation-entrypoints.md) — canonical local
   and CI validation commands.
 - [`hardware-validation.md`](hardware-validation.md) — physical safety and
