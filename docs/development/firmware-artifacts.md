@@ -247,9 +247,12 @@ metadata, installed CLI behavior, the flash extra, and `verify-artifact` on
 Python 3.11 and 3.12. The host package is checked semantically; no claim of
 cross-workflow byte-identical host archives is made.
 
-The candidate firmware becomes physical-release evidence only after a separate
-authorized hardware gate. A later tag build must compare its firmware archive
-with the physically validated candidate and require exact bytes before release
+The candidate firmware ordinarily becomes physical-release evidence only
+after a separate authorized hardware gate. For v0.3.0 only, the narrowly
+bounded release-only evidence rebind described below may substitute for that
+gate. The release candidate must still pass the current resource gates and
+official artifact verification. A later tag build must compare its firmware
+archive with the reviewed candidate and require exact bytes before release
 publication can begin. Release tags are annotated and unsigned; lightweight
 tags are rejected.
 
@@ -300,6 +303,27 @@ to succeed; prove candidate/tag firmware equality and both asset sets; obtain
 human authorization to create and populate one draft; perform draft read-back
 and fresh-download verification; obtain separate publication authorization;
 publish only that draft; then read back and freshly verify the public assets.
+
+For v0.3.0, the executable feature line and its USB Sequence, BLE Sequence,
+Native USB Logical Link-Loss, and general BLE physical checkpoints were sealed
+before the release-only version change. Release preparation must prove that
+the final source differs from that sealed line only in reviewed release
+version, tests, and documentation, then perform a production diagnostic build
+and resource check. The exact `release-build.yml` candidate regenerates the
+version-bearing firmware and host assets. Independent review may rebind the
+sealed behavioral evidence to that candidate without repeating physical work;
+any runtime-semantic, descriptor, persistent-format, dependency, profile, or
+resource-policy change invalidates that path and requires a new decision.
+
+The v0.3.0 publication sequence otherwise retains the bounded v0.2.1 model:
+seal one exact release-source commit, push it and require exact main CI
+success, dispatch and verify the exact candidate Release build, complete the
+documented evidence rebind, create and push annotated unsigned tag `v0.3.0` at
+the same commit, verify the tag Release build and exact candidate/tag firmware
+equality, then use separately authorized CLI/API operations to create, verify,
+publish, and finally reverify one stable Release and its ten exact assets.
+Neither `release-build.yml` nor the historical v0.1.0 draft workflow publishes
+that Release automatically.
 
 The local artifact contract remains valid when `build.container_image` is
 `null`; only the dedicated CI workflow supplies immutable container

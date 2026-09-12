@@ -433,7 +433,15 @@ of duplicating their test logic.
   publish only that draft. Public metadata and downloads are verified again.
   Unknown mutation outcomes are resolved by read-only queries before any newly
   authorized recovery action. The existing `release-draft.yml` remains
-  historical v0.1.0 recovery machinery and is not the v0.2.1 path.
+  historical v0.1.0 recovery machinery and is not the v0.2.1 or v0.3.0 path.
+  For v0.3.0, independently reviewed release-only source and diagnostic
+  resource evidence may rebind the sealed USB Sequence, BLE Sequence, Native
+  USB Logical Link-Loss, and general BLE physical checkpoints to the exact
+  candidate. Any product-semantic, descriptor, persistent-format, dependency,
+  hardware-profile, or resource-policy change prevents that rebind. The
+  version-bearing candidate and later annotated-tag build must still each be
+  independently verified, and their firmware archives must be byte-for-byte
+  identical, before separately authorized draft creation or publication.
 
 The workflows run on pushes to every branch and on pull requests. The artifact
 workflow also supports manual `workflow_dispatch` runs. They cancel
