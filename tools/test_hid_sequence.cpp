@@ -398,7 +398,8 @@ void explicit_release_owns_only_its_sequence_abort_cleanup() {
 
     assert(controller.start(33, "w200;kp4") ==
            hid_sequence::AdmissionResult::kAccepted);
-    controller.abort_for_release();
+    assert(controller.abort_for_release());
+    assert(controller.abort_for_release());
     controller.run_for_test();
     hid_sequence::Status status{};
     assert(controller.status(33, &status));
@@ -417,6 +418,44 @@ void explicit_release_owns_only_its_sequence_abort_cleanup() {
     assert(status.state == hid_sequence::State::kFailed);
     assert(status.code == hid_sequence::TerminalCode::kHidNotReady);
     assert(backend.safety_releases == 1);
+}
+
+bool release_adopted_failed_sequence = true;
+
+void try_release_after_sequence_failure(hid_sequence::Controller *controller) {
+    release_adopted_failed_sequence = controller->abort_for_release();
+}
+
+void sequence_failure_cleanup_ownership_is_terminal() {
+    for (const bool after_decision : {false, true}) {
+        Clock clock{};
+        Backend backend{};
+        backend.clock = &clock;
+        hid_sequence::Controller controller;
+        assert(controller.initialize(&backend, Clock::now, &clock));
+        assert(controller.start(after_decision ? 36 : 35, "w0") ==
+               hid_sequence::AdmissionResult::kAccepted);
+        clock.value =
+            static_cast<std::uint64_t>(hid_sequence::kExecutionDeadlineMs) *
+            1000U;
+        release_adopted_failed_sequence = true;
+        if (after_decision) {
+            controller.set_before_safety_cleanup_hook_for_test(
+                try_release_after_sequence_failure);
+        } else {
+            controller.set_before_cleanup_decision_hook_for_test(
+                try_release_after_sequence_failure);
+        }
+        controller.run_for_test();
+        controller.set_before_cleanup_decision_hook_for_test(nullptr);
+        controller.set_before_safety_cleanup_hook_for_test(nullptr);
+        assert(!release_adopted_failed_sequence);
+        assert(backend.safety_releases == 1);
+        hid_sequence::Status status{};
+        assert(controller.status(after_decision ? 36 : 35, &status));
+        assert(status.state == hid_sequence::State::kFailed);
+        assert(status.code == hid_sequence::TerminalCode::kSequenceTimeout);
+    }
 }
 
 void execution_deadline_contract() {
@@ -749,6 +788,7 @@ int main() {
     state_and_failure_contract();
     admission_abort_and_authority_contract();
     explicit_release_owns_only_its_sequence_abort_cleanup();
+    sequence_failure_cleanup_ownership_is_terminal();
     execution_deadline_contract();
     revoked_report_cannot_complete();
     abort_and_release_before_ticket_creation_rejects_stale_work();

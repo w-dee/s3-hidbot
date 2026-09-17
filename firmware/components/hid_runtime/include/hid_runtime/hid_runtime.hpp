@@ -370,6 +370,23 @@ enum class BleReleaseAllAction : std::uint8_t {
     kSubmitNeutral,
 };
 
+// One authoritative lifecycle for a public release transaction.  The BLE
+// owner may act only in kOpen.  Success, a safety/loss veto, cancellation, and
+// timeout compete through this single word, so contradictory terminal states
+// cannot be assembled from independently published flags.
+enum class ReleaseAllTransactionState : std::uint8_t {
+    kInactive,
+    kAdmitting,
+    kOpen,
+    kSuccessCommitting,
+    kSucceeded,
+    kFailed,
+    kCanceled,
+    kTimedOut,
+    kFinalizedSuccess,
+    kFinalizedFailure,
+};
+
 // Fixed-size, heap-free outcome bridge between the UART/control task and the
 // selected transport owner. Interface outcomes are historical: kSubmitted
 // means the local USB or BLE stack accepted the all-up report, not that the
@@ -388,12 +405,10 @@ struct ReleaseAllTicket {
                hid_capability::kReportRoleCount> report_handles{};
     std::atomic<ReleaseAllInterfaceState> keyboard{ReleaseAllInterfaceState::kUnresolved};
     std::atomic<ReleaseAllInterfaceState> mouse{ReleaseAllInterfaceState::kUnresolved};
+    std::atomic<ReleaseAllTransactionState> state{
+        ReleaseAllTransactionState::kInactive};
     std::atomic_bool active{false};
-    std::atomic_bool finalized{false};
-    std::atomic_bool failed_before_finalization{false};
-    std::atomic_bool canceled{false};
     std::atomic_bool ble_continuity_lost{false};
-    std::atomic_bool success_committed{false};
 };
 
 struct ReleaseAllSnapshot {
@@ -409,6 +424,7 @@ struct ReleaseAllSnapshot {
     ReportHandles report_handles{};
     ReleaseAllInterfaceState keyboard = ReleaseAllInterfaceState::kUnresolved;
     ReleaseAllInterfaceState mouse = ReleaseAllInterfaceState::kUnresolved;
+    ReleaseAllTransactionState state = ReleaseAllTransactionState::kInactive;
     bool active = false;
     bool finalized = false;
     bool failed_before_finalization = false;
@@ -604,6 +620,9 @@ class StateMachine {
     void set_after_submit_hook_for_test(TestHook hook);
     void set_before_ble_terminal_publish_hook_for_test(TestHook hook);
     void set_before_release_reconciliation_hook_for_test(TestHook hook);
+    void set_after_release_barrier_hook_for_test(TestHook hook);
+    void set_before_release_scan_write_hook_for_test(TestHook hook);
+    void set_before_release_success_claim_hook_for_test(TestHook hook);
     void publish_release_request_only_for_test();
     bool release_requested_for_test() const;
     std::uint32_t release_request_epoch_for_test() const;
@@ -725,6 +744,7 @@ class StateMachine {
     bool known_all_up(Interface interface) const;
     bool release_interface_work_pending(Interface interface) const;
     bool release_ticket_matches(ReleaseAllSnapshot expected) const;
+    bool fail_open_ble_release(bool continuity_lost);
     void set_release_outcome(Interface interface, ReleaseAllInterfaceState outcome);
     void write_confirmed_keyboard(const std::uint8_t *report);
     std::array<std::uint8_t, 8> read_confirmed_keyboard() const;
@@ -830,6 +850,9 @@ class StateMachine {
     TestHook after_submit_hook_ = nullptr;
     TestHook before_ble_terminal_publish_hook_ = nullptr;
     TestHook before_release_reconciliation_hook_ = nullptr;
+    TestHook after_release_barrier_hook_ = nullptr;
+    TestHook before_release_scan_write_hook_ = nullptr;
+    TestHook before_release_success_claim_hook_ = nullptr;
     TestHook inside_ticket_cancel_hook_ = nullptr;
     TestHook inside_ticket_finalize_hook_ = nullptr;
     TestHook before_terminal_ticket_publish_hook_ = nullptr;

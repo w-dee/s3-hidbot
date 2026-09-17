@@ -143,11 +143,14 @@ class Controller {
                 std::int32_t sequence_id,
                 Status *status);
     void abort();
-    void abort_for_release();
+    // True means there was no unsafe independent terminal outcome, or this
+    // call atomically won the exact abort/cleanup ownership transition.
+    bool abort_for_release();
     void retire_owner(std::uint64_t local_owner_id);
     bool active() const;
 
 #ifdef HID_SEQUENCE_NATIVE_TEST
+    using TestHook = void (*)(Controller *);
     AdmissionResult start(std::int32_t sequence_id, std::string_view code) {
         return start(1, sequence_id, code);
     }
@@ -156,6 +159,8 @@ class Controller {
     }
     void run_for_test();
     void set_next_generation_for_test(std::uint32_t generation);
+    void set_before_cleanup_decision_hook_for_test(TestHook hook);
+    void set_before_safety_cleanup_hook_for_test(TestHook hook);
 #endif
 
   private:
@@ -184,7 +189,6 @@ class Controller {
     std::atomic<std::uint32_t> reserved_generation_{0};
     std::atomic<std::uint32_t> runnable_generation_{0};
     std::atomic<std::uint32_t> canceled_generation_{0};
-    std::atomic<std::uint32_t> release_owned_generation_{0};
     std::atomic<std::uint32_t> status_owner_low_{0};
     std::atomic<std::uint32_t> status_owner_high_{0};
     std::atomic<std::uint32_t> status_generation_{0};
@@ -192,6 +196,10 @@ class Controller {
     std::atomic_bool initialized_{false};
     std::atomic_bool cancel_requested_{false};
     std::atomic<std::int32_t> sequence_id_{0};
+#ifdef HID_SEQUENCE_NATIVE_TEST
+    TestHook before_cleanup_decision_hook_ = nullptr;
+    TestHook before_safety_cleanup_hook_ = nullptr;
+#endif
 };
 
 const char *state_name(State state);

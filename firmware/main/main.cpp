@@ -553,7 +553,12 @@ void request_hid_safety_release(void *) {
 }
 
 control_protocol::ReleaseAllResult release_all(void *) {
-    s_hid_sequence.abort_for_release();
+    if (!s_hid_sequence.abort_for_release()) {
+        // An independent Sequence terminal failure already owns generic
+        // cleanup.  Publish that safety cause before public release admission
+        // so the BLE transaction cannot preserve ahead of it.
+        s_hid_runtime.request_release_all();
+    }
     const hid_runtime::ReleaseAllResult result = s_hid_runtime.release_all();
     const auto convert = [](hid_runtime::ReleaseAllInterfaceState state) {
         return state == hid_runtime::ReleaseAllInterfaceState::kSubmitted

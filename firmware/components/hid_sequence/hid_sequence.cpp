@@ -147,11 +147,13 @@ constexpr std::uint32_t kStatusFailedTokenShift = 11U;
 constexpr std::uint32_t kStatusFailedTokenMask = 0x3fU;
 constexpr std::uint32_t kStatusCodeShift = 17U;
 constexpr std::uint32_t kStatusCodeMask = 0xfU;
+constexpr std::uint32_t kStatusReleaseOwned = 1U << 21U;
 
 constexpr std::uint32_t encode_status(State state, std::uint8_t executed,
                                       bool failed_token_present,
                                       std::uint8_t failed_token,
-                                      TerminalCode code) {
+                                      TerminalCode code,
+                                      bool release_owned = false) {
     return static_cast<std::uint32_t>(state) |
            ((static_cast<std::uint32_t>(executed) & kStatusExecutedMask)
             << kStatusExecutedShift) |
@@ -159,7 +161,8 @@ constexpr std::uint32_t encode_status(State state, std::uint8_t executed,
            ((static_cast<std::uint32_t>(failed_token) & kStatusFailedTokenMask)
             << kStatusFailedTokenShift) |
            ((static_cast<std::uint32_t>(code) & kStatusCodeMask)
-            << kStatusCodeShift);
+            << kStatusCodeShift) |
+           (release_owned ? kStatusReleaseOwned : 0U);
 }
 
 constexpr State decode_state(std::uint32_t status) {
@@ -183,6 +186,10 @@ constexpr std::uint8_t decode_failed_token(std::uint32_t status) {
 constexpr TerminalCode decode_terminal_code(std::uint32_t status) {
     return static_cast<TerminalCode>(
         (status >> kStatusCodeShift) & kStatusCodeMask);
+}
+
+constexpr bool decode_release_owned(std::uint32_t status) {
+    return (status & kStatusReleaseOwned) != 0;
 }
 
 constexpr bool terminal_state(State state) {
@@ -467,15 +474,38 @@ void Controller::abort() {
     abort_generation(generation);
 }
 
-void Controller::abort_for_release() {
+bool Controller::abort_for_release() {
     const std::uint32_t generation =
         reserved_generation_.load(std::memory_order_acquire);
     if (generation == 0) {
         cancel_requested_.store(true, std::memory_order_release);
-        return;
+        return true;
     }
-    release_owned_generation_.store(generation, std::memory_order_release);
-    abort_generation(generation);
+    if (status_generation_.load(std::memory_order_acquire) != generation) {
+        return false;
+    }
+    std::uint32_t current = status_word_.load(std::memory_order_acquire);
+    while (decode_state(current) == State::kAccepted ||
+           decode_state(current) == State::kRunning) {
+        const std::uint8_t executed = decode_executed(current);
+        const std::uint32_t aborted = encode_status(
+            State::kAborted, executed, true, executed,
+            TerminalCode::kSequenceAborted, true);
+        if (status_word_.compare_exchange_weak(
+                current, aborted, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            canceled_generation_.store(generation, std::memory_order_release);
+            backend_->revoke_sequence();
+            cancel_requested_.store(true, std::memory_order_release);
+#ifndef HID_SEQUENCE_NATIVE_TEST
+            if (s_task != nullptr) xTaskNotifyGive(s_task);
+#endif
+            return true;
+        }
+    }
+    const State terminal = decode_state(current);
+    return terminal == State::kCompleted ||
+           (terminal == State::kAborted && decode_release_owned(current));
 }
 
 void Controller::retire_owner(std::uint64_t local_owner_id) {
@@ -608,10 +638,6 @@ void Controller::run(std::uint32_t generation) {
         (void)reserved_generation_.compare_exchange_strong(
             expected_generation, 0, std::memory_order_acq_rel,
             std::memory_order_acquire);
-        std::uint32_t expected_release_owner = generation;
-        (void)release_owned_generation_.compare_exchange_strong(
-            expected_release_owner, 0, std::memory_order_acq_rel,
-            std::memory_order_acquire);
         return;
     }
     std::uint32_t accepted = encode_status(
@@ -623,18 +649,13 @@ void Controller::run(std::uint32_t generation) {
             std::memory_order_acquire)) {
         if (status_generation_.load(std::memory_order_acquire) == generation &&
             decode_state(accepted) == State::kAborted &&
-            release_owned_generation_.load(std::memory_order_acquire) !=
-                generation) {
+            !decode_release_owned(accepted)) {
             backend_->request_safety_release();
         }
         backend_->end_sequence(authority_);
         std::uint32_t expected_generation = generation;
         (void)reserved_generation_.compare_exchange_strong(
             expected_generation, 0, std::memory_order_acq_rel,
-            std::memory_order_acquire);
-        std::uint32_t expected_release_owner = generation;
-        (void)release_owned_generation_.compare_exchange_strong(
-            expected_release_owner, 0, std::memory_order_acq_rel,
             std::memory_order_acquire);
         return;
     }
@@ -719,21 +740,27 @@ void Controller::run(std::uint32_t generation) {
         (void)claim_terminal(
             generation, final_state, executed, failed_token, final_code);
     }
-    const State published_state =
-        decode_state(status_word_.load(std::memory_order_acquire));
+    const std::uint32_t published =
+        status_word_.load(std::memory_order_acquire);
+    const State published_state = decode_state(published);
+#ifdef HID_SEQUENCE_NATIVE_TEST
+    if (before_cleanup_decision_hook_ != nullptr) {
+        before_cleanup_decision_hook_(this);
+    }
+#endif
     if (published_state != State::kCompleted &&
-        release_owned_generation_.load(std::memory_order_acquire) !=
-            generation) {
+        !decode_release_owned(published)) {
+#ifdef HID_SEQUENCE_NATIVE_TEST
+        if (before_safety_cleanup_hook_ != nullptr) {
+            before_safety_cleanup_hook_(this);
+        }
+#endif
         backend_->request_safety_release();
     }
     backend_->end_sequence(authority_);
     std::uint32_t expected_generation = generation;
     (void)reserved_generation_.compare_exchange_strong(
         expected_generation, 0, std::memory_order_acq_rel,
-        std::memory_order_acquire);
-    std::uint32_t expected_release_owner = generation;
-    (void)release_owned_generation_.compare_exchange_strong(
-        expected_release_owner, 0, std::memory_order_acq_rel,
         std::memory_order_acquire);
 }
 
@@ -757,6 +784,14 @@ void Controller::run_for_test() {
 
 void Controller::set_next_generation_for_test(std::uint32_t generation) {
     next_generation_.store(generation, std::memory_order_release);
+}
+
+void Controller::set_before_cleanup_decision_hook_for_test(TestHook hook) {
+    before_cleanup_decision_hook_ = hook;
+}
+
+void Controller::set_before_safety_cleanup_hook_for_test(TestHook hook) {
+    before_safety_cleanup_hook_ = hook;
 }
 #endif
 

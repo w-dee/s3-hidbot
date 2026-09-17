@@ -4270,6 +4270,139 @@ void submit_held_ble_mouse(ReadyBleRouteFixture &fixture,
     fixture.runtime.state_machine().finalize_mouse_report();
 }
 
+enum class ReleaseRaceHook : std::uint8_t {
+    kNone,
+    kAdmissionBarrier,
+    kAdmissionScan,
+    kCommitCccdLoss,
+    kCommitGenericSafety,
+    kCommitTimeout,
+};
+
+ReleaseRaceHook release_race_hook = ReleaseRaceHook::kNone;
+ReadyBleRouteFixture *release_race_fixture = nullptr;
+
+void run_release_race_hook(hid_runtime::StateMachine *state) {
+    assert(release_race_fixture != nullptr);
+    ReadyBleRouteFixture &fixture = *release_race_fixture;
+    const ReleaseRaceHook hook = release_race_hook;
+    release_race_hook = ReleaseRaceHook::kNone;
+    if (hook == ReleaseRaceHook::kAdmissionBarrier ||
+        hook == ReleaseRaceHook::kAdmissionScan) {
+        fixture.controller.signal_hid_authority_change();
+        assert(fixture.controller.process_wake_cycle_for_test());
+        const auto release = state->release_all_snapshot();
+        assert(state->route_snapshot().active ==
+               hid_route::OutputRoute::kBle);
+        assert(state->route_snapshot().transition ==
+               hid_route::Transition::kStable);
+        assert(release.state ==
+               hid_runtime::ReleaseAllTransactionState::kAdmitting);
+        assert(!release.success_committed);
+        return;
+    }
+    if (hook == ReleaseRaceHook::kCommitCccdLoss) {
+        assert(queue_subscription(
+            fixture.controller, fixture.generation, fixture.connection,
+            hid_control_executor::BleHidInterface::kKeyboard,
+            fixture.database.handles.keyboard_value, false));
+    } else if (hook == ReleaseRaceHook::kCommitGenericSafety) {
+        state->request_release_all();
+    } else if (hook == ReleaseRaceHook::kCommitTimeout) {
+        state->finalize_release_all();
+    }
+}
+
+void test_explicit_ble_release_transaction_race_closure() {
+    {
+        ReadyBleRouteFixture fixture(192);
+        auto &state = fixture.runtime.state_machine();
+        release_race_fixture = &fixture;
+        release_race_hook = ReleaseRaceHook::kAdmissionBarrier;
+        state.set_after_release_barrier_hook_for_test(run_release_race_hook);
+        state.begin_release_all();
+        state.set_after_release_barrier_hook_for_test(nullptr);
+        fixture.controller.signal_hid_authority_change();
+        assert(fixture.controller.process_wake_cycle_for_test());
+        assert(state.release_all_snapshot().success_committed);
+        state.finalize_release_all();
+        assert(fixture.controller.route_snapshot().ready);
+    }
+    {
+        // The same release-epoch mismatch has no preservation privilege in
+        // the absence of an exact admitting transaction.
+        ReadyBleRouteFixture fixture(193);
+        auto &state = fixture.runtime.state_machine();
+        const auto before = state.ble_route_authority_snapshot();
+        state.set_release_epoch_for_test(before.release_epoch + 1U);
+        fixture.controller.signal_hid_authority_change();
+        assert(fixture.controller.process_wake_cycle_for_test());
+        assert(state.route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
+    }
+    for (const int held : {0, 1, 2, 3}) {
+        ReadyBleRouteFixture fixture(static_cast<std::uint16_t>(193 + held));
+        if ((held & 1) != 0) submit_held_ble_keyboard(fixture);
+        if ((held & 2) != 0) submit_held_ble_mouse(fixture);
+        auto &state = fixture.runtime.state_machine();
+        release_race_fixture = &fixture;
+        release_race_hook = ReleaseRaceHook::kAdmissionScan;
+        state.set_before_release_scan_write_hook_for_test(
+            run_release_race_hook);
+        state.begin_release_all();
+        state.set_before_release_scan_write_hook_for_test(nullptr);
+        fixture.controller.signal_hid_authority_change();
+        assert(fixture.controller.process_wake_cycle_for_test());
+        assert(state.release_all_snapshot().success_committed);
+        state.finalize_release_all();
+        assert(fixture.controller.route_snapshot().ready);
+        const std::array<std::uint8_t, 6> keys{6, 0, 0, 0, 0, 0};
+        assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(fixture.controller.process_one_for_test());
+        state.finalize_keyboard_report();
+        assert(fixture.controller.queue_ble_mouse_report(
+                   0, 1, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        assert(fixture.controller.process_one_for_test());
+        state.finalize_mouse_report();
+    }
+    for (const auto race : {ReleaseRaceHook::kCommitCccdLoss,
+                            ReleaseRaceHook::kCommitGenericSafety,
+                            ReleaseRaceHook::kCommitTimeout}) {
+        ReadyBleRouteFixture fixture(
+            static_cast<std::uint16_t>(200 + static_cast<unsigned>(race)));
+        auto &state = fixture.runtime.state_machine();
+        state.begin_release_all();
+        release_race_fixture = &fixture;
+        release_race_hook = race;
+        state.set_before_release_success_claim_hook_for_test(
+            run_release_race_hook);
+        fixture.controller.signal_hid_authority_change();
+        assert(fixture.controller.process_wake_cycle_for_test());
+        state.set_before_release_success_claim_hook_for_test(nullptr);
+        const auto release = state.release_all_snapshot();
+        assert(!release.success_committed);
+        assert(release.state == hid_runtime::ReleaseAllTransactionState::kFailed ||
+               release.state ==
+                   hid_runtime::ReleaseAllTransactionState::kTimedOut);
+        assert(!fixture.controller.route_snapshot().ready);
+    }
+    {
+        ReadyBleRouteFixture fixture(210);
+        auto &state = fixture.runtime.state_machine();
+        drive_healthy_ble_release(fixture);
+        assert(queue_subscription(
+            fixture.controller, fixture.generation, fixture.connection,
+            hid_control_executor::BleHidInterface::kKeyboard,
+            fixture.database.handles.keyboard_value, false));
+        assert(fixture.controller.process_wake_cycle_for_test());
+        assert(state.route_snapshot().transition ==
+               hid_route::Transition::kReleasing);
+    }
+    release_race_fixture = nullptr;
+}
+
 void test_explicit_ble_release_preserves_clean_and_held_routes() {
     {
         ReadyBleRouteFixture fixture(180);
@@ -7155,6 +7288,7 @@ int main(int argc, char **argv) {
     test_internal_ble_notification_adapter_and_result_model();
     test_internal_ble_route_activation_and_exact_payloads();
     test_ble_release_serializes_stack_accepted_report();
+    test_explicit_ble_release_transaction_race_closure();
     test_explicit_ble_release_preserves_clean_and_held_routes();
     test_explicit_ble_release_loss_and_retirement_win();
     test_explicit_ble_release_incarnation_and_stale_work();
