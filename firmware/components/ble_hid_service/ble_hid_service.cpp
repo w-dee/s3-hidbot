@@ -123,9 +123,9 @@ ble_gatt_chr_def s_characteristics[] = {
     {},
 };
 
-// Fixed storage for one reviewed mouse-only template. No public descriptor
+// Fixed storage for reviewed single-input templates. No public descriptor
 // input is accepted, and this storage is rewritten only after a proven stop.
-ble_gatt_chr_def s_mouse_characteristics[5]{};
+ble_gatt_chr_def s_single_input_characteristics[5]{};
 
 ble_gatt_svc_def s_services[] = {
     {.type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -176,20 +176,24 @@ int Database::register_database() {
     s_database = this;
     registered_ = true; // Even a partial registration requires proven teardown.
     s_services[1].characteristics = s_characteristics;
-    if (profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly) {
-        s_mouse_characteristics[0] = s_characteristics[0];
-        s_mouse_characteristics[1] = s_characteristics[1];
-        s_mouse_characteristics[2] = s_characteristics[2];
-        s_mouse_characteristics[2].flags =
-            BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC;
-        s_mouse_characteristics[3] = s_characteristics[4];
-        s_mouse_characteristics[3].flags =
-            BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC |
-            BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC |
-            BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR;
-        s_mouse_characteristics[2].min_key_size = profile_->attributes.key_size;
-        s_mouse_characteristics[3].min_key_size = profile_->attributes.key_size;
-        s_services[1].characteristics = s_mouse_characteristics;
+    if (profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly ||
+        profile_->gatt_template == ble_fixture_profile::GattTemplateId::kKeyboardOnly) {
+        const bool mouse_only = profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly;
+        s_single_input_characteristics[0] = s_characteristics[0];
+        s_single_input_characteristics[1] = s_characteristics[1];
+        s_single_input_characteristics[2] = s_characteristics[2];
+        s_single_input_characteristics[3] = s_characteristics[mouse_only ? 4 : 3];
+        if (mouse_only) {
+            s_single_input_characteristics[2].flags =
+                BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC;
+            s_single_input_characteristics[3].flags =
+                BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC |
+                BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC |
+                BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR;
+        }
+        s_single_input_characteristics[2].min_key_size = profile_->attributes.key_size;
+        s_single_input_characteristics[3].min_key_size = profile_->attributes.key_size;
+        s_services[1].characteristics = s_single_input_characteristics;
     }
     int result = ble_gatts_count_cfg(s_services);
     if (result == 0) {
@@ -350,13 +354,20 @@ int Database::access(std::uint16_t connection_handle,
             return result;
         }
         case AccessTarget::kKeyboardReport:
-            return s_keyboard_value_handle != 0
-                ? append(context->om, kNeutralKeyboard) : BLE_ATT_ERR_UNLIKELY;
-        case AccessTarget::kMouseReport:
-            return append(context->om, kNeutralMouse);
-        case AccessTarget::kKeyboardReference:
-            return s_keyboard_value_handle != 0
-                ? append(context->om, kKeyboardReportReference) : BLE_ATT_ERR_UNLIKELY;
+        case AccessTarget::kMouseReport: {
+            const auto role = target_from(argument) == AccessTarget::kKeyboardReport
+                ? ble_fixture_profile::ReportRole::kKeyboardInput
+                : ble_fixture_profile::ReportRole::kMouseInput;
+            const auto *report = ble_fixture_profile::find_report(*s_database->profile_, role);
+            return report != nullptr ? append(context->om, report->neutral_value)
+                                     : BLE_ATT_ERR_UNLIKELY;
+        }
+        case AccessTarget::kKeyboardReference: {
+            const auto *report = ble_fixture_profile::find_report(
+                *s_database->profile_, ble_fixture_profile::ReportRole::kKeyboardInput);
+            return report != nullptr ? append(context->om, report->report_reference)
+                                     : BLE_ATT_ERR_UNLIKELY;
+        }
         case AccessTarget::kMouseReference: {
             const auto *report = ble_fixture_profile::find_report(
                 *s_database->profile_, ble_fixture_profile::ReportRole::kMouseInput);

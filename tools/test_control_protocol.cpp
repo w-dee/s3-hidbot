@@ -2768,6 +2768,9 @@ void test_finite_profile_api_and_retry() {
     require_contains(fixture.sink.last(), "\"id\":\"standalone_mouse_just_works\",\"rev\":1,\"schema\":2");
     require_contains(fixture.sink.last(), "c2fb165ffe3f84fc4160b013e15914dffbdecbc330c3c315051dc6922262e924");
     require_contains(fixture.sink.last(), "\"bond\":1,\"identity\":0");
+    require_contains(fixture.sink.last(), "\"id\":\"standalone_keyboard\",\"rev\":1,\"schema\":3");
+    require_contains(fixture.sink.last(), "d56a8aa0efc3f4126a0aea1df4c6f6f1b5bc1d624a710159c34b1cdb02bc45ae");
+    require_contains(fixture.sink.last(), "\"bond\":2,\"identity\":0");
     assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
     fixture.payload(request(3, session, "ble.profile.status"));
     require_contains(fixture.sink.last(), "\"selected\":\"strict_composite\",\"active\":null,\"transition\":\"stable\"");
@@ -2786,8 +2789,12 @@ void test_finite_profile_api_and_retry() {
     fixture.payload(request(6, session, "ble.profile.select", "{\"profile\":\"standalone_mouse_just_works\"}"));
     assert(fixture.profile.requested == ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks);
     require_contains(fixture.sink.last(), "\"selected\":\"standalone_mouse_just_works\",\"active\":null,\"transition\":\"initializing\"");
+    fixture.profile.snapshot.selected = ble_fixture_profile::ProfileId::kStandaloneKeyboard;
+    fixture.payload(request(7, session, "ble.profile.select", "{\"profile\":\"standalone_keyboard\"}"));
+    assert(fixture.profile.requested == ble_fixture_profile::ProfileId::kStandaloneKeyboard);
+    require_contains(fixture.sink.last(), "\"selected\":\"standalone_keyboard\"");
     const int calls = fixture.profile.selections;
-    int id = 7;
+    int id = 8;
     for (const auto *params : {"{}", "{\"profile\":3}", "{\"profile\":\"unknown\"}",
                               "{\"profile\":\"strict_composite\",\"upload\":true}",
                               "{\"profile\":\"strict_composite\\u0000x\"}"}) {

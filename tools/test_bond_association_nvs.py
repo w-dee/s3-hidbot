@@ -118,7 +118,7 @@ void reset(){ble_hs_cfg={Backend::store_read,Backend::store_write,Backend::store
 ble_store_value key_value(bool authenticated=false){ble_store_value result{};
  result.sec.peer_addr=connected;result.sec.ltk_present=1;result.sec.authenticated=authenticated;
  result.sec.sc=1;result.sec.key_size=16;result.sec.synthetic_ltk[0]=42;return result;}
-void both(Backend&b){Backend::instance_=&b;auto value=key_value();
+void both(Backend&b,bool authenticated=false,bool sc=true){Backend::instance_=&b;auto value=key_value(authenticated);value.sec.sc=sc;
  assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==0);
  assert(read_association(connected).record.state==detail::AssociationState::kPending);
  assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==0);
@@ -222,6 +222,23 @@ int main(){
  AssociationStore synchronized{read_inventory_security};
  assert(synchronized.prove_security_absent(association_peer(connected))==1);
  assert(!host_locked);
+ // Keyboard uses authenticated policy but its own association, including
+ // authenticated Legacy fallback; authentication bits alone never reuse strict.
+ for(bool sc:{false,true}){
+  reset();Backend keyboard;keyboard.profile_=&ble_fixture_profile::kStandaloneKeyboard;
+  both(keyboard,true,sc);assert(validate_complete_associations()==0);
+  assert(read_association(connected).record.bond_class==detail::BondClass::kStandaloneKeyboard);
+  before=disk;keyboard.profile_=&ble_fixture_profile::kStrictComposite;
+  assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL && disk==before);
+  assert(keyboard.read_security_raw(true,key.sec,raw)==0 && raw.authenticated);
+ }
+ reset();Backend unauthenticated;Backend::instance_=&unauthenticated;
+ unauthenticated.profile_=&ble_fixture_profile::kStandaloneKeyboard;value=key_value(false);
+ assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==BLE_HS_ESTORE_FAIL && disk.empty());
+ reset();Backend retained;Backend::instance_=&retained;retained.profile_=&ble_fixture_profile::kStrictComposite;
+ value=key_value(true);assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==0);
+ before=disk;retained.profile_=&ble_fixture_profile::kStandaloneKeyboard;
+ assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL && disk==before);
  // No new record may exceed the three-record namespace bound.
  reset();AssociationStore store{raw_read};
  for(unsigned i=1;i<=3;++i){auto address=connected;address.val[0]=i;

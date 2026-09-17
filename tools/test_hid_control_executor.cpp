@@ -486,9 +486,10 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
     bool configure_profile(ble_fixture_profile::ProfileId id) override {
         if (id != profile_id || reset_pending) {
             handles = {.report_map_value = 5,
-                       .keyboard_value = id == ble_fixture_profile::ProfileId::kStrictComposite
+                       .keyboard_value = id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks
                            ? std::uint16_t{10} : std::uint16_t{0},
-                       .mouse_value = 20, .control_point_value = 30};
+                       .mouse_value = id == ble_fixture_profile::ProfileId::kStandaloneKeyboard
+                           ? std::uint16_t{0} : std::uint16_t{20}, .control_point_value = 30};
         }
         profile_id = id;
         reset_pending = false;
@@ -7634,7 +7635,78 @@ void test_cold_mouse_profile_capability_consumption() {
     finite_release_controller = nullptr;
 }
 
-void test_mouse_cache_requires_map_and_fresh_write_without_migration() {
+void test_cold_keyboard_profile_capability_consumption(bool secure_connections) {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_profile_select(ProfileId::kStandaloneKeyboard).result == SelectionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.initialize_calls == 0 && ble.begin_stop_calls == 0);
+    assert(controller.profile_snapshot().transition == SelectionTransition::kStable);
+    assert(!controller.profile_snapshot().active_present);
+    assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(ble.event(Event::kConnect, 4)); assert(controller.process_one_for_test());
+    make_security_ready(ble);
+    ble.security_link.authenticated = true;
+    ble.security_link.secure_connections = secure_connections;
+    ble.security_persisted.our.secure_connections = ble.security_persisted.peer.secure_connections = secure_connections;
+    ble.security_persisted.our.authenticated = ble.security_persisted.peer.authenticated = true;
+    assert(ble.event(Event::kEncryptionChange, 4)); assert(controller.process_one_for_test());
+    assert(controller.signal_ble_event({.kind = Event::kSubscription,
+        .generation = controller.ble_snapshot().generation, .connection_handle = 4,
+        .attribute_handle = database.handles.keyboard_value,
+        .hid_interface = hid_control_executor::BleHidInterface::kKeyboard,
+        .subscription_reason = hid_control_executor::BleSubscriptionReason::kWrite,
+        .notify_enabled = true, .stack_incarnation = 1}));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+    assert(controller.activate_ble_route_internal().action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    assert(controller.route_snapshot().ready);
+    const auto authority = runtime.state_machine().ble_route_authority_snapshot();
+    assert(authority.present_roles == hid_capability::kKeyboardInput);
+    const std::array<std::uint8_t, 6> keys{4};
+    assert(controller.queue_ble_mouse_report(1, 0, 0, 0, 0) == hid_runtime::MouseReportBeginResult::kUnsupportedOperation);
+    assert(database.notify_calls == 0);
+    assert(controller.route_snapshot().ready);
+    assert(controller.queue_ble_keyboard_report(0, keys) == hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(controller.process_one_for_test());
+    assert(database.notify_calls == 1 && database.last_characteristic == database.handles.keyboard_value);
+    // The public Runtime wait/finalization must preserve a keyboard-only route;
+    // no nonexistent mouse subscription can be a final commit predicate.
+    finite_release_controller = &controller;
+    runtime.set_release_poll_hook_for_test(+[](hid_runtime::StateMachine *) {
+        assert(finite_release_controller->process_wake_cycle_for_test());
+    });
+    const auto generation = runtime.state_machine().route_snapshot().generation;
+    const auto epoch = runtime.state_machine().authority_epoch();
+    const auto released = runtime.release_all();
+    assert(released.success && !released.authority_lost);
+    assert(released.keyboard == hid_runtime::ReleaseAllInterfaceState::kSubmitted);
+    assert(released.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    assert(database.notify_calls == 2 && database.last_characteristic == database.handles.keyboard_value);
+    assert(controller.route_snapshot().ready && runtime.state_machine().route_snapshot().generation == generation);
+    assert(runtime.state_machine().authority_epoch() == epoch && ble.disconnect_calls == 0);
+    const auto all_up = runtime.release_all();
+    assert(all_up.success && !all_up.authority_lost && database.notify_calls == 2);
+    assert(controller.route_snapshot().ready);
+    // Producer gate is released; a later report still uses this explicit route.
+    assert(controller.queue_ble_keyboard_report(0, keys) == hid_runtime::KeyboardReportBeginResult::kPublished);
+    assert(controller.process_one_for_test());
+    database.notify_result = hid_control_executor::BleNotifyBackendResult::kStackRejected;
+    const auto failed = runtime.release_all();
+    assert(!failed.success && !controller.route_snapshot().ready);
+    runtime.set_release_poll_hook_for_test(nullptr);
+    finite_release_controller = nullptr;
+}
+
+void test_single_role_cache_requires_map_and_fresh_write_without_migration(bool keyboard_only) {
     using namespace ble_fixture_profile;
     using Event = hid_control_executor::BleEventKind;
     using Reason = hid_control_executor::BleSubscriptionReason;
@@ -7648,20 +7720,20 @@ void test_mouse_cache_requires_map_and_fresh_write_without_migration() {
         if (scenario == 2) ble.gatt_schema_status_result.kind =
             hid_control_executor::GattSchemaStoreResultKind::kIncompatible;
         assert(controller.initialize(&runtime, &usb, &ble, &database));
-        assert(controller.request_profile_select(ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kAccepted);
+        assert(controller.request_profile_select(keyboard_only ? ProfileId::kStandaloneKeyboard : ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kAccepted);
         assert(controller.process_one_for_test());
         assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
         assert(controller.process_one_for_test());
         assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
         assert(ble.event(Event::kConnect, 5)); assert(controller.process_one_for_test());
         make_security_ready(ble);
-        ble.security_link.authenticated = false;
-        ble.security_persisted.our.authenticated = ble.security_persisted.peer.authenticated = false;
+        ble.security_link.authenticated = keyboard_only;
+        ble.security_persisted.our.authenticated = ble.security_persisted.peer.authenticated = keyboard_only;
         assert(ble.event(Event::kEncryptionChange, 5)); assert(controller.process_one_for_test());
         const auto send = [&](Event kind, std::uint16_t handle, Reason reason) {
             assert(controller.signal_ble_event({.kind = kind,
                 .generation = controller.ble_snapshot().generation, .connection_handle = 5,
-                .attribute_handle = handle, .hid_interface = hid_control_executor::BleHidInterface::kMouse,
+                .attribute_handle = handle, .hid_interface = keyboard_only ? hid_control_executor::BleHidInterface::kKeyboard : hid_control_executor::BleHidInterface::kMouse,
                 .subscription_reason = reason, .notify_enabled = true, .indicate_enabled = true,
                 .stack_incarnation = 1}));
             assert(controller.process_one_for_test());
@@ -7677,11 +7749,11 @@ void test_mouse_cache_requires_map_and_fresh_write_without_migration() {
         assert(ble.gatt_cache_refresh_calls == 0);
         if (scenario == 0) {
             send(Event::kReportMapRead, database.handles.report_map_value, Reason::kUnknown);
-            send(Event::kSubscription, database.handles.mouse_value, Reason::kRestore);
+            send(Event::kSubscription, (keyboard_only ? database.handles.keyboard_value : database.handles.mouse_value), Reason::kRestore);
             assert(ble.persist_gatt_schema_calls == 0 && !controller.ble_link_ready());
-            send(Event::kSubscription, database.handles.mouse_value, Reason::kWrite);
+            send(Event::kSubscription, (keyboard_only ? database.handles.keyboard_value : database.handles.mouse_value), Reason::kWrite);
         } else {
-            send(Event::kSubscription, database.handles.mouse_value, Reason::kWrite);
+            send(Event::kSubscription, (keyboard_only ? database.handles.keyboard_value : database.handles.mouse_value), Reason::kWrite);
             assert(ble.persist_gatt_schema_calls == 0 && !controller.ble_link_ready());
             send(Event::kReportMapRead, database.handles.report_map_value, Reason::kUnknown);
         }
@@ -7732,7 +7804,10 @@ int main(int argc, char **argv) {
     test_hidden_reset_sync_and_new_stack_reset_budget();
     test_stale_reset_cannot_clear_current_peer();
     test_cold_mouse_profile_capability_consumption();
-    test_mouse_cache_requires_map_and_fresh_write_without_migration();
+    test_cold_keyboard_profile_capability_consumption(true);
+    test_cold_keyboard_profile_capability_consumption(false);
+    test_single_role_cache_requires_map_and_fresh_write_without_migration(false);
+    test_single_role_cache_requires_map_and_fresh_write_without_migration(true);
     if (argc == 2 &&
         std::string_view(argv[1]) == "--controller-grace-authority-only") {
         test_controller_grace_authority_closes_both_replacement_windows();

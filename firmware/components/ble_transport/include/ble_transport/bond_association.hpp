@@ -24,6 +24,7 @@ constexpr const ble_fixture_profile::ProfileDefinition *association_profile(Bond
     // imply bond provenance. Extend this reviewed mapping with each profile.
     switch (value) {
         case BondClass::kStrictComposite: return &ble_fixture_profile::kStrictComposite;
+        case BondClass::kStandaloneKeyboard: return &ble_fixture_profile::kStandaloneKeyboard;
         case BondClass::kStandaloneMouseJustWorks:
             return &ble_fixture_profile::kStandaloneMouseJustWorks;
     }

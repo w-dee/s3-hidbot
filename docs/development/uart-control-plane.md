@@ -1600,7 +1600,7 @@ not a schematic, direct-rail, backfeed, or general electrical-safety claim.
 `ble.fixture-profile-v1` adds `ble.profile.list`, `ble.profile.status`, and
 `ble.profile.select`. The catalog is finite; it accepts no descriptor, packet,
 GATT or arbitrary configuration upload. The public development catalog contains
-`strict_composite` and `standalone_mouse_just_works`. Public availability does
+`strict_composite`, `standalone_mouse_just_works` and `standalone_keyboard`. Public availability does
 not imply physical qualification or completion of the remaining P0 profiles.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
 
@@ -1681,3 +1681,11 @@ unchanged. Keyboard input and keyboard-bearing Sequences are rejected before
 admission on its ready BLE route. USB remains composite. Moving the same host
 between these incompatible profiles requires explicit bond preparation on both
 ends; profile selection never performs that preparation.
+
+`standalone_keyboard` is revision 1, schema 3, bond class 2 and shared identity
+class 0. Its static 47-byte Report Map contains only the eight-byte 6KRO keyboard
+Input Report ID 1. It retains KeyboardOnly/authenticated/16-byte strict-style
+security, SC support and authenticated Legacy fallback. Only keyboard CCCD is
+required; mouse commands and mouse-bearing Sequences fail before admission.
+There is no LED Output Report. Its bond class is distinct from strict even when
+authentication bits match. Switching requires the same explicit bond preparation.

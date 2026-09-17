@@ -47,6 +47,7 @@ constexpr std::array<std::uint8_t, 116> kExpectedStrictReportMap{
     0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,
     0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,0x05,0x0c,0x0a,0x38,
     0x02,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x01,0x81,0x06,0xc0,0xc0};
+constexpr std::array<std::uint8_t, 47> kExpectedKeyboardReportMap{0x05,0x01,0x09,0x06,0xa1,0x01,0x85,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,0x81,0x01,0x95,0x06,0x75,0x08,0x15,0x00,0x26,0xff,0x00,0x19,0x00,0x2a,0xff,0x00,0x81,0x00,0xc0};
 constexpr std::array<std::uint8_t, 69> kExpectedMouseReportMap{
     0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x02,0x09,0x01,0xa1,0x00,0x05,0x09,
     0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,0x75,0x01,0x81,0x02,
@@ -600,6 +601,28 @@ int main() {
     require(database.notify_custom(1, 0, kExpectedNeutralKeyboard.data(), 8) ==
                 hid_control_executor::BleNotifyBackendResult::kStackRejected,
             "mouse", "absent keyboard handle accepted");
+    database.reset_after_stop();
+    require(database.configure_profile(ProfileId::kStandaloneKeyboard), "keyboard", "selection failed");
+    require(database.register_database() == 0 && database.validate_registered_database() == 0,
+            "keyboard", "registered topology rejected");
+    require(database.hid_handles().keyboard_value == 0x19 && database.hid_handles().mouse_value == 0,
+            "keyboard", "wrong finite role handles");
+    require(find_characteristic(kHidServiceUuid, kReportUuid, 1) == nullptr,
+            "keyboard", "unexpected second input/CCCD");
+    const auto *keyboard_input = find_characteristic(kHidServiceUuid, kReportUuid);
+    require(keyboard_input->flags == (BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_AUTHEN |
+            BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN |
+            BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR) && keyboard_input->min_key_size == 16,
+            "keyboard", "authentication/key-size policy changed");
+    require_served_value(keyboard_input, kExpectedNeutralKeyboard, "keyboard neutral");
+    require_served_value(find_descriptor(keyboard_input, kReportReferenceUuid), kExpectedKeyboardReference, "keyboard reference");
+    require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid), kExpectedKeyboardReportMap, "keyboard map");
+    require_served_value(g_registered_services[0].characteristics, std::array<std::uint8_t, 1>{3}, "keyboard epoch");
+    const auto *keyboard_control = find_characteristic(kHidServiceUuid, kControlPointUuid);
+    require(keyboard_control->flags == (BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_AUTHEN) && keyboard_control->min_key_size == 16,
+            "keyboard", "control point authentication changed");
+    require(database.notify_custom(1, 0, kExpectedNeutralMouse.data(), 5) == hid_control_executor::BleNotifyBackendResult::kStackRejected,
+            "keyboard", "absent mouse accepted");
     database.reset_after_stop();
     require(database.configure_profile(ProfileId::kStrictComposite),
             "strict restore", "strict selection failed");

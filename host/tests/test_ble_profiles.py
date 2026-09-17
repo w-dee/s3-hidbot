@@ -19,6 +19,7 @@ PROFILE = {"id": "strict_composite", "rev": 1, "schema": 1,
 MOUSE = {"id": "standalone_mouse_just_works", "rev": 1, "schema": 2,
          "map": "c2fb165ffe3f84fc4160b013e15914dffbdecbc330c3c315051dc6922262e924",
          "bond": 1, "identity": 0}
+KEYBOARD = {"id": "standalone_keyboard", "rev": 1, "schema": 3, "map": "d56a8aa0efc3f4126a0aea1df4c6f6f1b5bc1d624a710159c34b1cdb02bc45ae", "bond": 2, "identity": 0}
 STATUS = {"selected": "strict_composite", "active": None, "transition": "stable"}
 
 
@@ -33,6 +34,10 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(catalog[1].bond_class, 1)
         mouse_status = {"selected": MOUSE["id"], "active": MOUSE["id"], "transition": "stable"}
         self.assertEqual(validate_ble_profile_status(mouse_status).active, BleProfileId.STANDALONE_MOUSE_JUST_WORKS)
+        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE, KEYBOARD]})
+        self.assertEqual(catalog[2].profile_id, BleProfileId.STANDALONE_KEYBOARD)
+        self.assertEqual(catalog[2].bond_class, 2)
+        self.assertIn(b'standalone_keyboard', build_ble_profile_select_frame(9, TOKEN, KEYBOARD["id"]))
         for item in ({**STATUS, "active": "strict_composite"},
                      {**STATUS, "transition": "initializing"},
                      {**STATUS, "transition": "fault"}):
@@ -40,7 +45,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_exact_finite_validation_rejects_unreviewed_values(self):
         for key, value in [("id", "custom"), ("rev", True), ("schema", 0),
-                           ("map", "a" * 63), ("bond", 2), ("identity", True),
+                           ("map", "a" * 63), ("bond", 3), ("identity", True),
                            ("upload", "bytes")]:
             with self.subTest(key=key), self.assertRaises(ProtocolError):
                 validate_ble_profile_list({"profiles": [{**PROFILE, key: value}]})
@@ -120,7 +125,8 @@ class ProfileTests(unittest.TestCase):
         from hidbot.cli import main
         for args in (["ble-profile-list"], ["ble-profile-status"],
                      ["ble-profile-select", "strict_composite"],
-                     ["ble-profile-select", MOUSE["id"]]):
+                     ["ble-profile-select", MOUSE["id"]],
+                     ["ble-profile-select", KEYBOARD["id"]]):
             commands = []
             def on_write(transport, data):
                 if data == TRANSPORT_SYNC: return

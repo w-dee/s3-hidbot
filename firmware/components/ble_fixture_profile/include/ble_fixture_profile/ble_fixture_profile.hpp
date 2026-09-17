@@ -12,11 +12,12 @@ namespace ble_fixture_profile {
 enum class ProfileId : std::uint8_t {
     kStrictComposite = 0,
     kStandaloneMouseJustWorks = 1,
+    kStandaloneKeyboard = 2,
 };
 
 // Profile identity and bond/cache interpretation are separate namespaces.
 enum class BondAssociationClass : std::uint8_t {
-    kStrictComposite = 0, kStandaloneMouseJustWorks = 1
+    kStrictComposite = 0, kStandaloneMouseJustWorks = 1, kStandaloneKeyboard = 2
 };
 enum class LogicalIdentityClass : std::uint8_t { kSharedFixture = 0 };
 enum class SelectionTransition : std::uint8_t { kStable, kInitializing, kFault };
@@ -35,16 +36,19 @@ struct SelectionOutcome {
 enum class TopologyId : std::uint8_t {
     kStrictComposite = 0,
     kMouseOnly = 1,
+    kKeyboardOnly = 2,
 };
 
 enum class GattTemplateId : std::uint8_t {
     kStrictComposite = 0,
     kMouseOnly = 1,
+    kKeyboardOnly = 2,
 };
 
 enum class GattLayoutId : std::uint8_t {
     kStrictRevision1 = 0,
     kMouseRevision2 = 1,
+    kKeyboardRevision3 = 2,
 };
 
 enum class SmpPolicyId : std::uint8_t {
@@ -65,6 +69,7 @@ enum class AttributePolicyId : std::uint8_t {
 enum class CachePolicyId : std::uint8_t {
     kStrictRevision1 = 0,
     kMouseRevision2 = 1,
+    kKeyboardRevision3 = 2,
 };
 
 using ReportRole = hid_capability::ReportRole;
@@ -300,8 +305,7 @@ inline constexpr ProfileDefinition kStrictComposite{
     },
 };
 
-// Finite next-profile definition. It is not selectable until lifecycle and
-// durable association consumers are installed; the public catalog stays strict.
+// Reviewed finite mouse-only definition; strict bytes and policy stay frozen.
 inline constexpr std::array<std::uint8_t, 69> kMouseReportMap{
     0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x02,0x09,0x01,0xa1,0x00,0x05,0x09,
     0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,0x75,0x01,0x81,0x02,
@@ -350,14 +354,45 @@ inline constexpr ProfileDefinition kStandaloneMouseJustWorks = [] {
     return profile;
 }();
 
-inline constexpr std::array<const ProfileDefinition *, 2> kCatalog{
-    &kStrictComposite, &kStandaloneMouseJustWorks};
+// Keyboard-only collection, independently bounded and hash-pinned. No Output
+// Report or mouse collection is part of this first keyboard profile.
+inline constexpr std::array<std::uint8_t, 47> kKeyboardReportMap{0x05,0x01,0x09,0x06,0xa1,0x01,0x85,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,0x81,0x01,0x95,0x06,0x75,0x08,0x15,0x00,0x26,0xff,0x00,0x19,0x00,0x2a,0xff,0x00,0x81,0x00,0xc0};
+inline constexpr std::array<std::uint8_t, 32> kKeyboardReportMapSha256{0xd5,0x6a,0x8a,0xa0,0xef,0xc3,0xf4,0x12,0x6a,0x0a,0xea,0x1d,0xf4,0xc6,0xf6,0xf1,0xb5,0xbc,0x1d,0x62,0x4a,0x71,0x01,0x59,0xc3,0x4b,0x1c,0xdb,0x02,0xbc,0x45,0xae};
+inline constexpr std::array<ReportDefinition, 1> kKeyboardReports{{
+    {.role = ReportRole::kKeyboardInput, .type = ReportType::kInput,
+     .report_id = 1, .value_size = 8, .report_reference = {1, 1},
+     .neutral_value = {kStrictNeutralKeyboard.data(), kStrictNeutralKeyboard.size()}},
+}};
+inline constexpr ProfileDefinition kStandaloneKeyboard = [] {
+    auto profile = kStrictComposite;
+    profile.id = ProfileId::kStandaloneKeyboard;
+    profile.name = "standalone_keyboard";
+    profile.bond_class = BondAssociationClass::kStandaloneKeyboard;
+    profile.topology = TopologyId::kKeyboardOnly;
+    profile.gatt_template = GattTemplateId::kKeyboardOnly;
+    profile.layout.id = GattLayoutId::kKeyboardRevision3;
+    profile.layout.mouse_value = 0;
+    profile.layout.hid_last_attribute = 0x001b;
+    profile.reports = {kKeyboardReports.data(), kKeyboardReports.size()};
+    profile.supported_reports = report_bit(ReportRole::kKeyboardInput);
+    profile.required_input_subscriptions = report_bit(ReportRole::kKeyboardInput);
+    profile.report_map = {kKeyboardReportMap.data(), kKeyboardReportMap.size()};
+    profile.report_map_sha256 = kKeyboardReportMapSha256;
+    profile.cache.id = CachePolicyId::kKeyboardRevision3;
+    profile.cache.schema_revision = 3;
+    profile.cache.schema_epoch_value = {3};
+    return profile;
+}();
+
+inline constexpr std::array<const ProfileDefinition *, 3> kCatalog{
+    &kStrictComposite, &kStandaloneMouseJustWorks, &kStandaloneKeyboard};
 
 // Internal reviewed definitions can precede public lifecycle enablement.
 constexpr const ProfileDefinition *find_definition(ProfileId id) {
     switch (id) {
         case ProfileId::kStrictComposite: return &kStrictComposite;
         case ProfileId::kStandaloneMouseJustWorks: return &kStandaloneMouseJustWorks;
+        case ProfileId::kStandaloneKeyboard: return &kStandaloneKeyboard;
     }
     return nullptr;
 }
@@ -402,7 +437,7 @@ constexpr bool subscriptions_ready(const ProfileDefinition &profile,
 }
 
 static_assert(kStrictComposite.report_map.size() == 116);
-static_assert(kCatalog.size() == 2 &&
+static_assert(kCatalog.size() == 3 &&
               kCatalog[0]->id == ProfileId::kStrictComposite);
 static_assert(kStrictReports[0].report_id == 1 &&
               kStrictReports[0].value_size == 8);

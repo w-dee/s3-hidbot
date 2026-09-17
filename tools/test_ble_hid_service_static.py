@@ -137,6 +137,10 @@ def main() -> int:
     assert len(mouse_map) == 69
     assert hashlib.sha256(mouse_map).digest() == byte_array(profile, "kMouseReportMapSha256")
     assert mouse_map == byte_array(profile, "kStrictReportMap")[47:]
+    keyboard_map = byte_array(profile, "kKeyboardReportMap")
+    assert len(keyboard_map) == 47
+    assert hashlib.sha256(keyboard_map).digest() == byte_array(profile, "kKeyboardReportMapSha256")
+    assert keyboard_map == byte_array(profile, "kStrictReportMap")[:47]
     service = SERVICE.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
     grace_ownership = GRACE_OWNERSHIP.read_text(encoding="utf-8")

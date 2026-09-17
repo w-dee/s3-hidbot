@@ -29,7 +29,21 @@ int main() {
     assert(subscriptions_ready(mouse_definition, report_bit(ReportRole::kMouseInput)));
     assert(!subscriptions_ready(mouse_definition, report_bit(ReportRole::kKeyboardInput)));
 
-    assert(kCatalog.size() == 2);
+    assert(kCatalog.size() == 3);
+    const auto &keyboard_definition = kStandaloneKeyboard;
+    assert(find_profile("standalone_keyboard") == &keyboard_definition);
+    assert(keyboard_definition.report_map.size() == 47 && keyboard_definition.reports.size() == 1);
+    assert(keyboard_definition.layout.keyboard_value == 0x19 && keyboard_definition.layout.mouse_value == 0);
+    assert(keyboard_definition.layout.hid_last_attribute == 0x1b);
+    assert(keyboard_definition.smp.io_capability == IoCapability::kKeyboardOnly);
+    assert(keyboard_definition.smp.mitm && keyboard_definition.smp.bonding && keyboard_definition.smp.security_level == 3);
+    assert(keyboard_definition.security.authenticated && keyboard_definition.attributes.authenticated && keyboard_definition.attributes.key_size == 16);
+    assert(keyboard_definition.reports.values[0].report_id == 1 && keyboard_definition.reports.values[0].value_size == 8);
+    assert(keyboard_definition.smp.secure_connections && !keyboard_definition.smp.secure_connections_only);
+    assert(!keyboard_definition.security.secure_connections_required && keyboard_definition.security.key_size == 16);
+    assert(keyboard_definition.cache.schema_revision == 3 && keyboard_definition.bond_class == BondAssociationClass::kStandaloneKeyboard);
+    assert(subscriptions_ready(keyboard_definition, report_bit(ReportRole::kKeyboardInput)));
+    assert(!subscriptions_ready(keyboard_definition, report_bit(ReportRole::kMouseInput)));
     assert(kCatalog[0] == &profile);
     assert(profile.id == ProfileId::kStrictComposite);
     assert(profile.revision == 1);
