@@ -507,3 +507,8 @@ restoration. Store-adapter tests reject plain-mouse/metadata-mouse bond reuse
 in both directions despite identical maps and security. Runtime/cache tests
 exercise its mouse-only readiness and explicit release; the maximum-ID catalog
 response must still fit the unchanged wire frame limit.
+
+Retained reconnect coverage distinguishes the initial non-strict schema fence
+from an already current matching association: an exact restored subscription
+makes the latter link ready without a map reread, cache rewrite or automatic
+route selection. Every finite single-input profile exercises both cases.

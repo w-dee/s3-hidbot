@@ -1675,7 +1675,10 @@ are durably absent, so interrupted deletion cannot import a bond as legacy stric
 Non-strict CCCD restore is filtered before NimBLE consumes it and requires both
 matching association and schema. A fresh non-strict schema requires a Report Map
 read and fresh WRITE subscriptions for every required input. RESTORE alone does
-not satisfy that fence. A different retained non-strict schema is incompatible
+not satisfy that fence. A matching retained association and current schema can
+reuse restored input subscriptions on reconnect without repeating the initial
+Report Map/read-and-write fence; this never restores the HID route automatically.
+A different retained non-strict schema is incompatible
 and is not migrated through Service Changed. Strict's existing schema-1 behavior
 is preserved. The mouse profile uses revision 1, schema 2, bond class 1 and shared identity
 class 0. It is NoInputNoOutput, bonded/encrypted with 16-byte keys and

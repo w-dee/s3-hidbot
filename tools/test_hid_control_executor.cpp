@@ -7741,13 +7741,13 @@ void test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_f
     using namespace ble_fixture_profile;
     using Event = hid_control_executor::BleEventKind;
     using Reason = hid_control_executor::BleSubscriptionReason;
-    for (unsigned scenario = 0; scenario < 3; ++scenario) {
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
         hid_runtime::Runtime runtime;
         FakeBackend usb;
         FakeBleBackend ble;
         FakeBleDatabase database;
         hid_control_executor::Controller controller;
-        ble.stored_gatt_schema_current = false;
+        ble.stored_gatt_schema_current = scenario == 3;
         if (scenario == 2) ble.gatt_schema_status_result.kind =
             hid_control_executor::GattSchemaStoreResultKind::kIncompatible;
         assert(controller.initialize(&runtime, &usb, &ble, &database));
@@ -7774,6 +7774,16 @@ void test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_f
             assert(!controller.ble_snapshot().recovery_required);
             assert(!ble.persistent_store_failure_observed());
             assert(ble.persist_gatt_schema_calls == 0 && ble.gatt_cache_refresh_calls == 0);
+            continue;
+        }
+        if (scenario == 3) {
+            // A matching retained association/schema accepts the exact restored
+            // input subscription without a fresh map read or persistence write.
+            assert(!controller.ble_link_ready());
+            send(Event::kSubscription, (keyboard_only ? database.handles.keyboard_value : database.handles.mouse_value), Reason::kRestore);
+            assert(controller.ble_link_ready());
+            assert(ble.persist_gatt_schema_calls == 0 && ble.gatt_cache_refresh_calls == 0);
+            assert(controller.route_snapshot().route.active == hid_route::OutputRoute::kNone);
             continue;
         }
         send(Event::kServiceChangedSubscription, ble.service_changed_handle, Reason::kWrite);
