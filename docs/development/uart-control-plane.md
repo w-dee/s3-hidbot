@@ -1601,7 +1601,8 @@ not a schematic, direct-rail, backfeed, or general electrical-safety claim.
 `ble.profile.select`. The catalog is finite; it accepts no descriptor, packet,
 GATT or arbitrary configuration upload. The public development catalog contains
 `strict_composite`, `standalone_mouse_just_works`, `standalone_keyboard` and
-`standalone_mouse_just_works_id7` and `standalone_keyboard_leds`. Public
+`standalone_mouse_just_works_id7`, `standalone_keyboard_leds` and
+`mouse_metadata`. Public
 availability does not imply physical
 qualification.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
@@ -1740,5 +1741,32 @@ original response under the usual protocol rules. The typed host method is
 Peers without the capability fail locally before sending the command.
 
 The hello capability-array bound is 18; unrelated JSON arrays retain their
-existing bound of 16. The complete five-profile catalog remains within the
+existing bound of 16. The complete six-profile catalog remains within the
 1023-byte logical machine-frame limit, including a maximum request ID.
+
+
+### Synthetic mouse metadata profile
+
+`mouse_metadata` is revision 1, schema 6, bond class 5 and shared identity 0.
+It retains the ordinary Just Works mouse's Report ID 2, exact 69-byte map,
+5-byte input, encrypted 16-byte-key policy and mouse-only readiness. The
+additional services make its GATT/cache identity distinct even though the
+Report Map digest is identical. Plain mouse bonds are incompatible in both
+directions; selecting a profile does not delete or migrate them.
+
+The immutable fixture exposes read-only Battery Service (`0x180f`) and Device
+Information Service (`0x180a`) after HID. Battery Level is **73**, Manufacturer
+Name is `s3-hidbot synthetic fixture`, Model Number is `Finite mouse metadata`,
+and PnP ID is the seven bytes `01 ff ff 01 00 00 01`. The PnP fields encode
+source 1, synthetic vendor sentinel `0xffff`, product `0x0001`, and version
+`0x0100`; this is neither a vendor allocation nor a compliance claim.
+These values do not describe the physical FNK0099 board, a measured battery,
+or a commercial device. No unique serial number is exposed.
+
+Battery Level supports Read only: no notification, CCCD, writable state, or
+battery-control API is implemented. All four metadata values allow open reads
+and reject writes. The additional service/value handles are BAS `0x1c` / `0x1e`
+and DIS `0x1f` / `0x21`, `0x23`, `0x25` (manufacturer, model, PnP).
+Metadata adds no HID producer role or subscription prerequisite. The existing
+quiescent, boot-scoped selection policy applies. Strict's services and map
+remain unchanged, and metadata disappears when another profile is selected.

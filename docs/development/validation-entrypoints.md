@@ -497,5 +497,13 @@ isolation and late-write retirement. Executor tests keep Output state separate
 from input route readiness/release and invalidate observation across retirement.
 The actual NVS/store adapter rejects plain-keyboard/LED-keyboard bond reuse.
 Host and control-protocol tests cover `ble.led-observation-v1`, exact typed
-status, capability gating, CLI observation, cached retry and the five-profile
+status, capability gating, CLI observation, cached retry and the six-profile
 catalog at the maximum request ID. None of these tests touches physical LEDs.
+
+The synthetic metadata profile extends the actual GATT registration/access
+oracle with independent multi-service handles and exact fixed values, read-only
+flags, wrong-handle/write rejection, missing-attribute failure and strict
+restoration. Store-adapter tests reject plain-mouse/metadata-mouse bond reuse
+in both directions despite identical maps and security. Runtime/cache tests
+exercise its mouse-only readiness and explicit release; the maximum-ID catalog
+response must still fit the unchanged wire frame limit.

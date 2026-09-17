@@ -15,12 +15,13 @@ enum class ProfileId : std::uint8_t {
     kStandaloneKeyboard = 2,
     kStandaloneMouseJustWorksId7 = 3,
     kStandaloneKeyboardLeds = 4,
+    kMouseMetadata = 5,
 };
 
 // Profile identity and bond/cache interpretation are separate namespaces.
 enum class BondAssociationClass : std::uint8_t {
     kStrictComposite = 0, kStandaloneMouseJustWorks = 1, kStandaloneKeyboard = 2,
-    kStandaloneMouseJustWorksId7 = 3, kStandaloneKeyboardLeds = 4
+    kStandaloneMouseJustWorksId7 = 3, kStandaloneKeyboardLeds = 4, kMouseMetadata = 5
 };
 enum class LogicalIdentityClass : std::uint8_t { kSharedFixture = 0 };
 enum class SelectionTransition : std::uint8_t { kStable, kInitializing, kFault };
@@ -41,6 +42,7 @@ enum class TopologyId : std::uint8_t {
     kMouseOnly = 1,
     kKeyboardOnly = 2,
     kKeyboardWithLeds = 3,
+    kMouseWithMetadata = 4,
 };
 
 enum class GattTemplateId : std::uint8_t {
@@ -48,6 +50,7 @@ enum class GattTemplateId : std::uint8_t {
     kMouseOnly = 1,
     kKeyboardOnly = 2,
     kKeyboardWithLeds = 3,
+    kMouseWithMetadata = 4,
 };
 
 enum class GattLayoutId : std::uint8_t {
@@ -56,6 +59,7 @@ enum class GattLayoutId : std::uint8_t {
     kKeyboardRevision3 = 2,
     kMouseId7Revision4 = 3,
     kKeyboardLedsRevision5 = 4,
+    kMouseMetadataRevision6 = 5,
 };
 
 enum class SmpPolicyId : std::uint8_t {
@@ -79,6 +83,7 @@ enum class CachePolicyId : std::uint8_t {
     kKeyboardRevision3 = 2,
     kMouseId7Revision4 = 3,
     kKeyboardLedsRevision5 = 4,
+    kMouseMetadataRevision6 = 5,
 };
 
 using ReportRole = hid_capability::ReportRole;
@@ -188,6 +193,12 @@ struct GattLayout {
     std::uint16_t mouse_value;
     std::uint16_t hid_last_attribute;
     std::uint16_t led_output_value = 0;
+    std::uint16_t battery_service_start = 0;
+    std::uint16_t battery_value = 0;
+    std::uint16_t information_service_start = 0;
+    std::uint16_t manufacturer_value = 0;
+    std::uint16_t model_value = 0;
+    std::uint16_t pnp_value = 0;
 };
 
 inline constexpr std::array<std::uint8_t, 4> kStrictHidInformation{
@@ -228,6 +239,13 @@ inline constexpr std::array<ReportDefinition, 2> kStrictReports{{
      .neutral_value = {kStrictNeutralMouse.data(), kStrictNeutralMouse.size()}},
 }};
 
+struct SyntheticMetadata {
+    std::uint8_t battery_level;
+    std::string_view manufacturer;
+    std::string_view model;
+    std::array<std::uint8_t, 7> pnp;
+};
+
 struct ProfileDefinition {
     ProfileId id;
     const char *name;
@@ -248,6 +266,7 @@ struct ProfileDefinition {
     SecurityOutcomePolicy security;
     AttributePolicy attributes;
     CachePolicy cache;
+    const SyntheticMetadata *metadata = nullptr;
 };
 
 inline constexpr ProfileDefinition kStrictComposite{
@@ -448,12 +467,40 @@ inline constexpr ProfileDefinition kStandaloneKeyboardLeds = [] {
     return profile;
 }();
 
+// Deliberately synthetic fixture data: neither measured power nor vendor identity.
+inline constexpr SyntheticMetadata kSyntheticMouseMetadata{
+    .battery_level = 73,
+    .manufacturer = "s3-hidbot synthetic fixture",
+    .model = "Finite mouse metadata",
+    .pnp = {1, 0xff, 0xff, 1, 0, 0, 1}, // Synthetic FFFF/0001, BCD version1.0.0.
+};
+inline constexpr ProfileDefinition kMouseMetadata = [] {
+    auto profile = kStandaloneMouseJustWorks;
+    profile.id = ProfileId::kMouseMetadata;
+    profile.name = "mouse_metadata";
+    profile.bond_class = BondAssociationClass::kMouseMetadata;
+    profile.topology = TopologyId::kMouseWithMetadata;
+    profile.gatt_template = GattTemplateId::kMouseWithMetadata;
+    profile.layout.id = GattLayoutId::kMouseMetadataRevision6;
+    profile.layout.battery_service_start = 0x001c;
+    profile.layout.battery_value = 0x001e;
+    profile.layout.information_service_start = 0x001f;
+    profile.layout.manufacturer_value = 0x0021;
+    profile.layout.model_value = 0x0023;
+    profile.layout.pnp_value = 0x0025;
+    profile.cache.id = CachePolicyId::kMouseMetadataRevision6;
+    profile.cache.schema_revision = 6;
+    profile.cache.schema_epoch_value = {6};
+    profile.metadata = &kSyntheticMouseMetadata;
+    return profile;
+}();
+
 struct LedValue { bool valid = false; std::uint8_t leds = 0; };
 struct LedStatus { bool supported = false; bool valid = false; std::uint8_t leds = 0; };
 
-inline constexpr std::array<const ProfileDefinition *, 5> kCatalog{
+inline constexpr std::array<const ProfileDefinition *, 6> kCatalog{
     &kStrictComposite, &kStandaloneMouseJustWorks, &kStandaloneKeyboard,
-    &kStandaloneMouseJustWorksId7, &kStandaloneKeyboardLeds};
+    &kStandaloneMouseJustWorksId7, &kStandaloneKeyboardLeds, &kMouseMetadata};
 
 // Internal reviewed definitions can precede public lifecycle enablement.
 constexpr const ProfileDefinition *find_definition(ProfileId id) {
@@ -462,6 +509,7 @@ constexpr const ProfileDefinition *find_definition(ProfileId id) {
         case ProfileId::kStandaloneMouseJustWorks: return &kStandaloneMouseJustWorks;
         case ProfileId::kStandaloneKeyboard: return &kStandaloneKeyboard;
         case ProfileId::kStandaloneKeyboardLeds: return &kStandaloneKeyboardLeds;
+        case ProfileId::kMouseMetadata: return &kMouseMetadata;
         case ProfileId::kStandaloneMouseJustWorksId7: return &kStandaloneMouseJustWorksId7;
     }
     return nullptr;
@@ -507,7 +555,7 @@ constexpr bool subscriptions_ready(const ProfileDefinition &profile,
 }
 
 static_assert(kStrictComposite.report_map.size() == 116);
-static_assert(kCatalog.size() == 5 &&
+static_assert(kCatalog.size() == 6 &&
               kCatalog[0]->id == ProfileId::kStrictComposite);
 static_assert(kStrictReports[0].report_id == 1 &&
               kStrictReports[0].value_size == 8);

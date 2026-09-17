@@ -601,7 +601,7 @@ bool make_profile_list(control_session::ResponseFrame *frame,
                        ResponseSession session, std::int32_t id) {
     char session_field[kSessionFieldBytes]{};
     if (!format_session_field(session_field, session)) return false;
-    char entries[800]{};
+    char entries[900]{};
     std::size_t used = 0;
     for (const auto *profile : ble_fixture_profile::kCatalog) {
         char digest[65]{};

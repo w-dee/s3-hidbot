@@ -74,7 +74,7 @@ def main() -> int:
     # Keyboard Input, Mouse Input and LED Output Report Reference descriptors
     # and the public, read-only schema epoch
     # characteristic intentionally have no encryption-key-size requirement.
-    assert service.count(".min_key_size = 0") == 4
+    assert service.count(".min_key_size = 0") == 8
     for exposed in ("ble.pairing.status", "ble.pairing.respond",
                     "ble.pairing-transaction-v1"):
         assert exposed in protocol

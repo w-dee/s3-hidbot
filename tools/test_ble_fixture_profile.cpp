@@ -29,7 +29,15 @@ int main() {
     assert(subscriptions_ready(mouse_definition, report_bit(ReportRole::kMouseInput)));
     assert(!subscriptions_ready(mouse_definition, report_bit(ReportRole::kKeyboardInput)));
 
-    assert(kCatalog.size() == 5);
+    assert(kCatalog.size() == 6);
+    const auto &metadata = kMouseMetadata;
+    assert(metadata.cache.schema_revision == 6 && metadata.cache.schema_epoch_value[0] == 6);
+    assert(metadata.bond_class == BondAssociationClass::kMouseMetadata);
+    assert(metadata.report_map_sha256 == kStandaloneMouseJustWorks.report_map_sha256);
+    assert(metadata.metadata && metadata.metadata->battery_level == 73);
+    assert(metadata.layout.battery_value == 0x1e && metadata.layout.pnp_value == 0x25);
+    assert(!metadata.security.authenticated && metadata.security.key_size == 16);
+    for (const auto *entry : kCatalog) assert((entry->metadata != nullptr) == (entry->id == ProfileId::kMouseMetadata));
     const auto &leds = kStandaloneKeyboardLeds;
     assert(leds.reports.size() == 2 && leds.report_map.size() == 69);
     assert(leds.cache.schema_revision == 5 && leds.cache.schema_epoch_value[0] == 5);

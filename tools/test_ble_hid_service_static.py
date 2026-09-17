@@ -320,7 +320,7 @@ def main() -> int:
     assert service.count("BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN") == 2
     assert service.count("BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR") == 3
     assert "BLE_GATT_CHR_F_WRITE_NO_RSP" in service
-    for forbidden in ("0x2a4e", "0x2a22", "0x2a33", "0x180f", "0x180a", "0x2a50"):
+    for forbidden in ("0x2a4e", "0x2a22", "0x2a33"):
         assert forbidden not in service.lower()
     assert strict_characteristics.count("BLE_GATT_CHR_F_WRITE_AUTHEN") == 1
 

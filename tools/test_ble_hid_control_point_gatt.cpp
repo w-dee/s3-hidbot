@@ -62,6 +62,7 @@ constexpr std::array<std::uint8_t, 8> kExpectedNeutralKeyboard{};
 constexpr std::array<std::uint8_t, 5> kExpectedNeutralMouse{};
 
 const ble_gatt_svc_def *g_registered_services = nullptr;
+std::vector<std::pair<const ble_uuid_t *, std::uint16_t>> g_service_handles;
 int g_count_calls = 0;
 int g_add_calls = 0;
 bool g_topology_mode = false;
@@ -315,6 +316,7 @@ extern "C" int ble_gatts_count_cfg(const ble_gatt_svc_def *services) {
 extern "C" int ble_gatts_add_svcs(const ble_gatt_svc_def *services) {
     ++g_add_calls;
     g_registered_services = services;
+    g_service_handles.clear();
     std::uint16_t next_handle = 0x7001;
     if (g_topology_mode) {
         // Independent sequential ATT allocator: service, declaration, value,
@@ -322,7 +324,7 @@ extern "C" int ble_gatts_add_svcs(const ble_gatt_svc_def *services) {
         next_handle = 0x000e;
         for (const auto *service = services; service->type != BLE_GATT_SVC_TYPE_END;
              ++service) {
-            ++next_handle;
+            g_service_handles.emplace_back(service->uuid, next_handle++);
             for (const auto *chr = service->characteristics; chr->uuid != nullptr; ++chr) {
                 ++next_handle;
                 *chr->val_handle = next_handle++;
@@ -354,9 +356,16 @@ extern "C" int ble_gatts_add_svcs(const ble_gatt_svc_def *services) {
 extern "C" int ble_gatts_find_svc(const ble_uuid_t *uuid, std::uint16_t *handle) {
     if (!g_topology_mode) return BLE_HS_ENOENT;
     if (uuid16_equals(uuid, 0x1801)) *handle = 6;
-    else if (uuid16_equals(uuid, kHidServiceUuid)) *handle = 0x0011;
-    else if (uuid->type == BLE_UUID_TYPE_128) *handle = 0x000e;
-    else return BLE_HS_ENOENT;
+    else {
+        for (const auto &[registered, assigned] : g_service_handles) {
+            if (uuid->type == registered->type &&
+                ((uuid->type == BLE_UUID_TYPE_16 && uuid16_equals(registered, reinterpret_cast<const ble_uuid16_t *>(uuid)->value)) ||
+                 (uuid->type == BLE_UUID_TYPE_128 && std::memcmp(registered, uuid, sizeof(ble_uuid128_t)) == 0))) {
+                *handle = assigned; return 0;
+            }
+        }
+        return BLE_HS_ENOENT;
+    }
     return 0;
 }
 
@@ -368,9 +377,9 @@ extern "C" int ble_gatts_find_chr(const ble_uuid_t *service_uuid,
         *handle = *g_registered_services[0].characteristics[0].val_handle;
         return 0;
     }
-    if (!uuid16_equals(service_uuid, kHidServiceUuid) || uuid->type != BLE_UUID_TYPE_16)
+    if (service_uuid->type != BLE_UUID_TYPE_16 || uuid->type != BLE_UUID_TYPE_16)
         return BLE_HS_ENOENT;
-    const auto *chr = find_characteristic(kHidServiceUuid,
+    const auto *chr = find_characteristic(reinterpret_cast<const ble_uuid16_t *>(service_uuid)->value,
         reinterpret_cast<const ble_uuid16_t *>(uuid)->value);
     if (chr == nullptr) return BLE_HS_ENOENT;
     *handle = *chr->val_handle;
@@ -701,9 +710,43 @@ int main() {
     require(database.validate_registered_database() != 0, "LED", "missing output handle accepted");
     database.reset_after_stop();
     require(!database.led_value(kDistinctiveGeneration + 1, kDistinctiveConnectionHandle).valid, "LED", "teardown retained value");
+    require(database.configure_profile(ProfileId::kMouseMetadata), "metadata", "selection failed");
+    require(database.register_database() == 0 && database.validate_registered_database() == 0, "metadata", "topology rejected");
+    require(g_service_handles.size() == 4 && g_service_handles[2].second == 0x1c && g_service_handles[3].second == 0x1f, "metadata", "service topology wrong");
+    require(database.hid_handles().keyboard_value == 0 && database.hid_handles().mouse_value == 0x19, "metadata", "input topology changed");
+    require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid), kExpectedMouseReportMap, "metadata mouse map");
+    require_served_value(find_descriptor(find_characteristic(kHidServiceUuid, kReportUuid), kReportReferenceUuid), kExpectedMouseReference, "metadata mouse reference");
+    require_served_value(g_registered_services[0].characteristics, std::array<std::uint8_t, 1>{6}, "metadata epoch");
+    const auto *battery = find_characteristic(0x180f, 0x2a19);
+    const auto *manufacturer = find_characteristic(0x180a, 0x2a29);
+    const auto *model = find_characteristic(0x180a, 0x2a24);
+    const auto *pnp = find_characteristic(0x180a, 0x2a50);
+    require_served_value(battery, std::array<std::uint8_t, 1>{73}, "synthetic battery");
+    require_served_value(pnp, std::array<std::uint8_t, 7>{1,255,255,1,0,0,1}, "synthetic PnP");
+    const auto text_bytes = []<std::size_t N>(const char (&text)[N]) {
+        std::array<std::uint8_t, N-1> bytes{};
+        std::copy_n(text, N-1, bytes.begin()); return bytes;
+    };
+    require_served_value(manufacturer, text_bytes("s3-hidbot synthetic fixture"), "synthetic manufacturer");
+    require_served_value(model, text_bytes("Finite mouse metadata"), "synthetic model");
+    const std::array<const ble_gatt_chr_def *, 4> metadata{battery, manufacturer, model, pnp};
+    const std::array<std::uint16_t, 4> expected_handles{0x1e,0x21,0x23,0x25};
+    for (std::size_t i=0; i<metadata.size(); ++i) {
+        const auto *chr=metadata[i];
+        require(chr->flags == BLE_GATT_CHR_F_READ && chr->min_key_size == 0 && chr->descriptors == nullptr && *chr->val_handle == expected_handles[i], "metadata", "access or handle mismatch");
+        os_mbuf out{}; ble_gatt_access_ctxt ctx{}; ctx.om=&out; ctx.chr=chr;
+        g_appended_bytes.clear(); ctx.op=BLE_GATT_ACCESS_OP_WRITE_CHR;
+        require(chr->access_cb(1,*chr->val_handle,&ctx,chr->arg)!=0 && g_appended_bytes.empty(), "metadata", "write accepted");
+        ctx.op=BLE_GATT_ACCESS_OP_READ_CHR;
+        require(chr->access_cb(1,*chr->val_handle+1,&ctx,chr->arg)!=0 && g_appended_bytes.empty(), "metadata", "wrong handle accepted");
+        const auto saved=*chr->val_handle; *chr->val_handle=0;
+        require(database.validate_registered_database()!=0, "metadata", "missing attribute accepted"); *chr->val_handle=saved;
+    }
+    database.reset_after_stop();
     require(database.configure_profile(ProfileId::kStrictComposite),
             "strict restore", "strict selection failed");
-    require(database.register_database() == 0, "strict restore", "registration failed");
+    require(database.register_database() == 0 && database.validate_registered_database() == 0, "strict restore", "registration failed");
+    require(g_service_handles.size() == 2 && find_characteristic(0x180f,0x2a19)==nullptr && find_characteristic(0x180a,0x2a50)==nullptr, "strict restore", "metadata leaked");
     require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid),
                          kExpectedStrictReportMap, "strict restored map");
     require(find_characteristic(kHidServiceUuid, kReportUuid, 1) != nullptr,

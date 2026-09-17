@@ -21,6 +21,10 @@ enum class AccessTarget : std::uint8_t {
     kMouseReference,
     kLedReport,
     kLedReference,
+    kBattery,
+    kManufacturer,
+    kModel,
+    kPnp,
 };
 
 // Project-owned internal UUIDs.  Canonical service UUID:
@@ -40,10 +44,20 @@ ble_uuid16_t s_report_map = BLE_UUID16_INIT(0x2a4b);
 ble_uuid16_t s_control_point = BLE_UUID16_INIT(0x2a4c);
 ble_uuid16_t s_report = BLE_UUID16_INIT(0x2a4d);
 ble_uuid16_t s_report_reference = BLE_UUID16_INIT(0x2908);
+ble_uuid16_t s_battery_service = BLE_UUID16_INIT(0x180f);
+ble_uuid16_t s_battery = BLE_UUID16_INIT(0x2a19);
+ble_uuid16_t s_information_service = BLE_UUID16_INIT(0x180a);
+ble_uuid16_t s_manufacturer = BLE_UUID16_INIT(0x2a29);
+ble_uuid16_t s_model = BLE_UUID16_INIT(0x2a24);
+ble_uuid16_t s_pnp = BLE_UUID16_INIT(0x2a50);
 
 std::uint16_t s_keyboard_value_handle = 0;
 std::uint16_t s_mouse_value_handle = 0;
 std::uint16_t s_led_value_handle = 0;
+std::uint16_t s_battery_value_handle = 0;
+std::uint16_t s_manufacturer_value_handle = 0;
+std::uint16_t s_model_value_handle = 0;
+std::uint16_t s_pnp_value_handle = 0;
 std::uint16_t s_schema_epoch_value_handle = 0;
 std::uint16_t s_information_value_handle = 0;
 std::uint16_t s_report_map_value_handle = 0;
@@ -160,6 +174,33 @@ ble_gatt_svc_def s_services[] = {
     {},
 };
 
+ble_gatt_chr_def s_battery_characteristics[] = {
+    {.uuid = &s_battery.u, .access_cb = Database::access, .arg = target(AccessTarget::kBattery),
+     .flags = BLE_GATT_CHR_F_READ, .min_key_size = 0, .val_handle = &s_battery_value_handle},
+    {},
+};
+ble_gatt_chr_def s_information_characteristics[] = {
+    {.uuid = &s_manufacturer.u, .access_cb = Database::access, .arg = target(AccessTarget::kManufacturer),
+     .flags = BLE_GATT_CHR_F_READ, .min_key_size = 0, .val_handle = &s_manufacturer_value_handle},
+    {.uuid = &s_model.u, .access_cb = Database::access, .arg = target(AccessTarget::kModel),
+     .flags = BLE_GATT_CHR_F_READ, .min_key_size = 0, .val_handle = &s_model_value_handle},
+    {.uuid = &s_pnp.u, .access_cb = Database::access, .arg = target(AccessTarget::kPnp),
+     .flags = BLE_GATT_CHR_F_READ, .min_key_size = 0, .val_handle = &s_pnp_value_handle},
+    {},
+};
+// Separate bounded service list: metadata is never appended to the strict list.
+ble_gatt_svc_def s_metadata_services[] = {
+    {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &s_schema_epoch_service.u,
+     .characteristics = s_schema_epoch_characteristics},
+    {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &s_hid_service.u,
+     .characteristics = s_single_input_characteristics},
+    {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &s_battery_service.u,
+     .characteristics = s_battery_characteristics},
+    {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &s_information_service.u,
+     .characteristics = s_information_characteristics},
+    {},
+};
+
 template <typename ByteRange>
 int append(struct os_mbuf *buffer, const ByteRange &value) {
     return os_mbuf_append(buffer, value.data(), value.size()) == 0
@@ -186,6 +227,8 @@ void Database::reset_after_stop() {
     registered_ = false;
     led_word_.store(0, std::memory_order_release);
     s_led_value_handle = 0;
+    s_battery_value_handle = s_manufacturer_value_handle = 0;
+    s_model_value_handle = s_pnp_value_handle = 0;
     s_keyboard_value_handle = s_mouse_value_handle = 0;
     s_schema_epoch_value_handle = s_information_value_handle = 0;
     s_report_map_value_handle = s_control_point_value_handle = 0;
@@ -202,8 +245,10 @@ int Database::register_database() {
     s_services[1].characteristics = s_characteristics;
     if (profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly ||
         profile_->gatt_template == ble_fixture_profile::GattTemplateId::kKeyboardOnly ||
-        profile_->gatt_template == ble_fixture_profile::GattTemplateId::kKeyboardWithLeds) {
-        const bool mouse_only = profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly;
+        profile_->gatt_template == ble_fixture_profile::GattTemplateId::kKeyboardWithLeds ||
+        profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseWithMetadata) {
+        const bool mouse_only = profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly ||
+                                profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseWithMetadata;
         s_single_input_characteristics[0] = s_characteristics[0];
         s_single_input_characteristics[1] = s_characteristics[1];
         s_single_input_characteristics[2] = s_characteristics[2];
@@ -223,9 +268,10 @@ int Database::register_database() {
         s_single_input_characteristics[5] = {};
         s_services[1].characteristics = s_single_input_characteristics;
     }
-    int result = ble_gatts_count_cfg(s_services);
+    const auto *services = profile_->metadata != nullptr ? s_metadata_services : s_services;
+    int result = ble_gatts_count_cfg(services);
     if (result == 0) {
-        result = ble_gatts_add_svcs(s_services);
+        result = ble_gatts_add_svcs(services);
     }
     return result;
 }
@@ -292,6 +338,30 @@ int Database::validate_registered_database() {
         s_mouse_value_handle != layout.mouse_value ||
         s_led_value_handle != layout.led_output_value) {
         return BLE_HS_ENOENT;
+    }
+    std::uint16_t battery_service = 0, information_service = 0;
+    const int battery_result = ble_gatts_find_svc(&s_battery_service.u, &battery_service);
+    const int information_result = ble_gatts_find_svc(&s_information_service.u, &information_service);
+    if (profile_->metadata == nullptr) {
+        if (battery_result != BLE_HS_ENOENT || information_result != BLE_HS_ENOENT ||
+            s_battery_value_handle || s_manufacturer_value_handle || s_model_value_handle || s_pnp_value_handle)
+            return BLE_HS_ENOENT;
+    } else {
+        if (battery_result || information_result || battery_service != layout.battery_service_start ||
+            information_service != layout.information_service_start) return BLE_HS_ENOENT;
+        struct MetadataCharacteristic { const ble_uuid_t *service; const ble_uuid_t *uuid; std::uint16_t assigned; std::uint16_t expected; };
+        const MetadataCharacteristic metadata[] = {
+            {&s_battery_service.u, &s_battery.u, s_battery_value_handle, layout.battery_value},
+            {&s_information_service.u, &s_manufacturer.u, s_manufacturer_value_handle, layout.manufacturer_value},
+            {&s_information_service.u, &s_model.u, s_model_value_handle, layout.model_value},
+            {&s_information_service.u, &s_pnp.u, s_pnp_value_handle, layout.pnp_value},
+        };
+        for (const auto &item : metadata) {
+            std::uint16_t handle = 0;
+            if (item.assigned == 0 || item.assigned != item.expected ||
+                ble_gatts_find_chr(item.service, item.uuid, nullptr, &handle) != 0 || handle != item.assigned)
+                return BLE_HS_ENOENT;
+        }
     }
     return 0;
 }
@@ -412,6 +482,26 @@ int Database::access(std::uint16_t connection_handle,
                 *s_database->profile_, ble_fixture_profile::ReportRole::kMouseInput);
             return report != nullptr ? append(context->om, report->report_reference)
                                      : BLE_ATT_ERR_UNLIKELY;
+        }
+        case AccessTarget::kBattery:
+        case AccessTarget::kManufacturer:
+        case AccessTarget::kModel:
+        case AccessTarget::kPnp: {
+            const auto *metadata = s_database->profile_->metadata;
+            if (metadata == nullptr || context->op != BLE_GATT_ACCESS_OP_READ_CHR)
+                return BLE_ATT_ERR_READ_NOT_PERMITTED;
+            switch (target_from(argument)) {
+                case AccessTarget::kBattery:
+                    return attribute_handle == s_battery_value_handle
+                        ? append(context->om, std::array<std::uint8_t, 1>{metadata->battery_level}) : BLE_ATT_ERR_UNLIKELY;
+                case AccessTarget::kManufacturer:
+                    return attribute_handle == s_manufacturer_value_handle ? append(context->om, metadata->manufacturer) : BLE_ATT_ERR_UNLIKELY;
+                case AccessTarget::kModel:
+                    return attribute_handle == s_model_value_handle ? append(context->om, metadata->model) : BLE_ATT_ERR_UNLIKELY;
+                case AccessTarget::kPnp:
+                    return attribute_handle == s_pnp_value_handle ? append(context->om, metadata->pnp) : BLE_ATT_ERR_UNLIKELY;
+                default: return BLE_ATT_ERR_UNLIKELY;
+            }
         }
         case AccessTarget::kLedReference: {
             const auto *report = ble_fixture_profile::find_report(

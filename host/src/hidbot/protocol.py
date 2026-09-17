@@ -1481,6 +1481,7 @@ class BleProfileId(str, Enum):
     STANDALONE_MOUSE_JUST_WORKS = "standalone_mouse_just_works"
     STANDALONE_KEYBOARD = "standalone_keyboard"
     STANDALONE_KEYBOARD_LEDS = "standalone_keyboard_leds"
+    MOUSE_METADATA = "mouse_metadata"
     STANDALONE_MOUSE_JUST_WORKS_ID7 = "standalone_mouse_just_works_id7"
 
 
@@ -1527,7 +1528,7 @@ def validate_ble_profile_list(value: Any) -> tuple[BleFixtureProfile, ...]:
             raise ProtocolError("BLE profile schema is invalid")
         if not isinstance(item["map"], str) or APP_ELF_SHA256_PATTERN.fullmatch(item["map"]) is None:
             raise ProtocolError("BLE Report Map digest is invalid")
-        if type(item["bond"]) is not int or item["bond"] not in {0, 1, 2, 3, 4}:
+        if type(item["bond"]) is not int or item["bond"] not in {0, 1, 2, 3, 4, 5}:
             raise ProtocolError("BLE bond association class is invalid")
         if type(item["identity"]) is not int or item["identity"] != 0:
             raise ProtocolError("BLE logical identity class is invalid")

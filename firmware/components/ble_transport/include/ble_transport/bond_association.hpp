@@ -25,6 +25,7 @@ constexpr const ble_fixture_profile::ProfileDefinition *association_profile(Bond
     switch (value) {
         case BondClass::kStandaloneMouseJustWorksId7: return &ble_fixture_profile::kStandaloneMouseJustWorksId7;
         case BondClass::kStrictComposite: return &ble_fixture_profile::kStrictComposite;
+        case BondClass::kMouseMetadata: return &ble_fixture_profile::kMouseMetadata;
         case BondClass::kStandaloneKeyboardLeds: return &ble_fixture_profile::kStandaloneKeyboardLeds;
         case BondClass::kStandaloneKeyboard: return &ble_fixture_profile::kStandaloneKeyboard;
         case BondClass::kStandaloneMouseJustWorks:

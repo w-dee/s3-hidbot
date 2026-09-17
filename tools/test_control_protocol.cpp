@@ -2842,7 +2842,8 @@ void test_led_observation_exact_api() {
     fixture.payload(request(5, session, "ble.led.status", "{\"leds\":3}"));
     require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
     fixture.payload(request(INT32_MAX, session, "ble.profile.list"));
-    require_contains(fixture.sink.last(), "standalone_keyboard_leds");
+    require_contains(fixture.sink.last(), "mouse_metadata");
+    require_contains(fixture.sink.last(), "\"bond\":5,\"identity\":0");
     assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
 }
 

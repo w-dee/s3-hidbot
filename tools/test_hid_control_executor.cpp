@@ -487,7 +487,8 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
         if (id != profile_id || reset_pending) {
             handles = {.report_map_value = 5,
                        .keyboard_value = id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks &&
-                                         id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7
+                                         id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7 &&
+                                         id != ble_fixture_profile::ProfileId::kMouseMetadata
                            ? std::uint16_t{10} : std::uint16_t{0},
                        .mouse_value = (id == ble_fixture_profile::ProfileId::kStandaloneKeyboard ||
                                        id == ble_fixture_profile::ProfileId::kStandaloneKeyboardLeds)
@@ -7835,12 +7836,14 @@ int main(int argc, char **argv) {
     test_stale_reset_cannot_clear_current_peer();
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks);
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
+    test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseMetadata);
     test_cold_keyboard_profile_capability_consumption(true);
     test_cold_keyboard_profile_capability_consumption(false);
     test_cold_keyboard_profile_capability_consumption(true, true);
     test_cold_keyboard_profile_capability_consumption(false, true);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
+    test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kMouseMetadata);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneKeyboard);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneKeyboardLeds);
     if (argc == 2 &&

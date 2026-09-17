@@ -259,6 +259,15 @@ int main(){
   assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL && disk==before);
   assert(validate_complete_associations()==0 && store_failures==0);
  }
+ // Same Report Map and security do not make extra-service schemas reusable.
+ for(bool metadata:{false,true}){
+  reset();Backend mouse;mouse.profile_=metadata?&ble_fixture_profile::kMouseMetadata:&ble_fixture_profile::kStandaloneMouseJustWorks;
+  both(mouse);assert(validate_complete_associations()==0);before=disk;
+  mouse.profile_=metadata?&ble_fixture_profile::kStandaloneMouseJustWorks:&ble_fixture_profile::kMouseMetadata;
+  out={};assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL && out.sec.synthetic_ltk[0]==0 && disk==before);
+  value=key_value();assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL && disk==before);
+  assert(validate_complete_associations()==0 && store_failures==0);
+ }
  // No new record may exceed the three-record namespace bound.
  reset();AssociationStore store{raw_read};
  for(unsigned i=1;i<=3;++i){auto address=connected;address.val[0]=i;
