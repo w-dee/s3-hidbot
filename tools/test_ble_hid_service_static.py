@@ -13,6 +13,7 @@ HEADER = ROOT / "firmware/components/ble_hid_service/include/ble_hid_service/ble
 PROFILE = ROOT / "firmware/components/ble_fixture_profile/include/ble_fixture_profile/ble_fixture_profile.hpp"
 SERVICE = ROOT / "firmware/components/ble_hid_service/ble_hid_service.cpp"
 TRANSPORT = ROOT / "firmware/components/ble_transport/ble_transport.cpp"
+GRACE_OWNERSHIP = ROOT / "firmware/components/ble_transport/include/ble_transport/route_release_grace_ownership.hpp"
 EXECUTOR_HEADER = ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp"
 SDKCONFIG_DEFAULTS = ROOT / "firmware/sdkconfig.defaults"
 PROJECT_COMPONENTS = ROOT / "firmware/components"
@@ -134,6 +135,7 @@ def main() -> int:
     profile = PROFILE.read_text(encoding="utf-8")
     service = SERVICE.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
+    grace_ownership = GRACE_OWNERSHIP.read_text(encoding="utf-8")
     executor_header = EXECUTOR_HEADER.read_text(encoding="utf-8")
     sdkconfig_defaults = SDKCONFIG_DEFAULTS.read_text(encoding="utf-8")
     main = MAIN.read_text(encoding="utf-8")
@@ -495,9 +497,13 @@ def main() -> int:
     assert "arm_ble_route_release_grace(identity)" in executor
     assert "ble_route_grace_due_.store(true" in executor
     assert "request_executor_wake();" in executor
-    assert "route_release_timer_" in transport
-    assert 'name = "ble_route_release"' in transport
-    assert "&route_release_timer_" in transport
+    assert "route_release_timers_" in transport
+    assert '"ble_route_release_0", "ble_route_release_1"' in transport
+    assert "&route_release_timers_[index]" in transport
+    assert "static constexpr std::size_t kSlotCount = 2" in grace_ownership
+    assert "kCanceledAwaitingCallback" in grace_ownership
+    assert "kCanceledCallbackObserved" in grace_ownership
+    assert "begin_callback" in grace_ownership
     assert "&timeout_timer_" in transport
     assert (
         "hid_control_executor::kBleRouteReleaseGraceMs) * 1000U" in transport

@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 #include "ble_security/ble_security.hpp"
 #include "ble_transport/lifecycle_watchdog.hpp"
+#include "ble_transport/route_release_grace_ownership.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
 #include "esp_timer.h"
 #include "host/ble_store.h"
@@ -135,21 +137,18 @@ class Backend final : public hid_control_executor::BleBackend {
     std::atomic<std::uint16_t> pairing_timer_connection_{
         ble_lifecycle::kNoConnection};
     std::atomic<std::uint32_t> pairing_timer_id_{0};
-    esp_timer_handle_t route_release_timer_ = nullptr;
-    std::atomic<hid_runtime::AuthorityEpoch> route_release_authority_epoch_{0};
-    std::atomic<hid_runtime::RouteGeneration> route_release_route_generation_{0};
-    std::atomic<hid_runtime::ProfileActivationEpoch>
-        route_release_profile_activation_epoch_{0};
-    std::atomic<ble_lifecycle::Generation> route_release_ble_generation_{0};
-    std::atomic<std::uint16_t> route_release_connection_{
-        ble_lifecycle::kNoConnection};
-    std::atomic<hid_runtime::ReportMask> route_release_present_roles_{0};
-    std::atomic<hid_runtime::ReportMask>
-        route_release_required_subscriptions_{0};
-    std::array<std::atomic<std::uint16_t>,
-               hid_capability::kReportRoleCount> route_release_handles_{};
-    std::atomic<std::uint32_t> route_release_epoch_{0};
-    std::atomic_bool route_release_timer_active_{false};
+    struct RouteReleaseTimerContext {
+        Backend *backend = nullptr;
+        std::size_t slot =
+            detail::RouteReleaseGraceOwnership::kSlotCount;
+    };
+    std::array<esp_timer_handle_t,
+               detail::RouteReleaseGraceOwnership::kSlotCount>
+        route_release_timers_{};
+    std::array<RouteReleaseTimerContext,
+               detail::RouteReleaseGraceOwnership::kSlotCount>
+        route_release_timer_contexts_{};
+    detail::RouteReleaseGraceOwnership route_release_grace_ownership_{};
 };
 
 }  // namespace ble_transport

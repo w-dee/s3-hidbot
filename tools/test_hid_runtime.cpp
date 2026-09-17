@@ -525,6 +525,56 @@ void test_stale_profile_activation_epoch_and_release_snapshot() {
                                      stale_work, accept_ble_report, nullptr));
 }
 
+void test_activation_epoch_consumer_checks_are_independent() {
+    {
+        hid_runtime::StateMachine state;
+        make_ble_ready(state, hid_capability::kMouseInput);
+        assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        const auto original =
+            state.published_report_token(hid_runtime::Interface::kMouse);
+        auto forged = original;
+        ++forged.profile_activation_epoch;
+
+        // Keep the stored ticket identical to the supplied token so exact
+        // ticket matching cannot hide a missing unsafe_work_current epoch
+        // comparison. The active BLE route remains on the original epoch.
+        state.set_report_profile_activation_epoch_for_test(
+            hid_runtime::Interface::kMouse,
+            forged.profile_activation_epoch);
+        const auto stored =
+            state.published_report_token(hid_runtime::Interface::kMouse);
+        assert(stored.ticket_id == original.ticket_id);
+        assert(stored.route_generation == original.route_generation);
+        assert(stored.transport_generation == original.transport_generation);
+        assert(stored.connection_handle == original.connection_handle);
+        assert(stored.characteristic_handle == original.characteristic_handle);
+        assert(stored.profile_activation_epoch ==
+               forged.profile_activation_epoch);
+        assert(!state.ble_work_token_current(
+            hid_runtime::Interface::kMouse, forged));
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        make_ble_ready(state, hid_capability::kInputRoles);
+        hid_runtime::ConfirmedHidState hid_state{};
+        hid_runtime::SequenceAuthority sequence{};
+        assert(state.begin_sequence(&hid_state, &sequence) ==
+               hid_runtime::SequenceAdmissionResult::kAccepted);
+        assert(state.sequence_authority_current(sequence));
+        auto forged = sequence;
+        ++forged.profile_activation_epoch;
+        assert(forged.generation == sequence.generation);
+        assert(forged.authority_epoch == sequence.authority_epoch);
+        assert(forged.route_generation == sequence.route_generation);
+        assert(forged.release_epoch == sequence.release_epoch);
+        assert(forged.active_roles == sequence.active_roles);
+        assert(!state.sequence_authority_current(forged));
+        state.end_sequence(sequence);
+    }
+}
+
 void test_profile_activation_epoch_exhaustion_never_wraps() {
     hid_runtime::StateMachine state;
     state.set_next_profile_activation_epoch_for_test(
@@ -2780,6 +2830,7 @@ int main() {
     test_sequence_generation_does_not_wrap_to_stale_authority();
     test_capability_aware_ble_routes_and_activation_epoch();
     test_stale_profile_activation_epoch_and_release_snapshot();
+    test_activation_epoch_consumer_checks_are_independent();
     test_profile_activation_epoch_exhaustion_never_wraps();
     test_absent_role_release_is_clean_only_when_proven_clean();
     test_ble_terminal_visibility_follows_confirmed_state();

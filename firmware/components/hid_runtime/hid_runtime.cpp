@@ -1318,6 +1318,18 @@ void StateMachine::set_next_profile_activation_epoch_for_test(
     next_profile_activation_epoch_.store(epoch, std::memory_order_release);
 }
 
+void StateMachine::set_report_profile_activation_epoch_for_test(
+    Interface interface, ProfileActivationEpoch epoch) {
+    const ScopedTicketMetadataLock lock(
+        interface == Interface::kKeyboard ? keyboard_ticket_lock_
+                                          : mouse_ticket_lock_);
+    if (interface == Interface::kKeyboard) {
+        keyboard_ticket_.profile_activation_epoch = epoch;
+    } else {
+        mouse_ticket_.profile_activation_epoch = epoch;
+    }
+}
+
 void StateMachine::set_next_public_ticket_id_for_test(HidTicketId ticket_id) {
     const ScopedTicketMetadataLock lock(ticket_id_lock_);
     next_public_ticket_id_ = ticket_id;

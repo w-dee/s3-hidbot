@@ -46,6 +46,9 @@ constexpr std::uint16_t kConnectionIntervalMin = 12;  // 15 ms.
 constexpr std::uint16_t kConnectionIntervalMax = 24;  // 30 ms.
 constexpr std::uint16_t kSupervisionTimeout = 400;    // 4 s.
 constexpr char kLogTag[] = "ble_transport";
+constexpr std::array<const char *,
+                     detail::RouteReleaseGraceOwnership::kSlotCount>
+    kRouteReleaseTimerNames{"ble_route_release_0", "ble_route_release_1"};
 ble_uuid16_t s_hid_service_uuid = BLE_UUID16_INIT(0x1812);
 ble_uuid16_t s_gatt_service_uuid = BLE_UUID16_INIT(0x1801);
 ble_uuid16_t s_service_changed_uuid = BLE_UUID16_INIT(0x2a05);
@@ -676,17 +679,23 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     if (result != ESP_OK) {
         return result;
     }
-    const esp_timer_create_args_t route_release_timer_args{
-        .callback = route_release_grace_callback,
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "ble_route_release",
-        .skip_unhandled_events = true,
-    };
-    result = esp_timer_create(&route_release_timer_args,
-                              &route_release_timer_);
-    if (result != ESP_OK) {
-        return result;
+    for (std::size_t index = 0; index < route_release_timers_.size(); ++index) {
+        route_release_timer_contexts_[index] = {
+            .backend = this,
+            .slot = index,
+        };
+        const esp_timer_create_args_t route_release_timer_args{
+            .callback = route_release_grace_callback,
+            .arg = &route_release_timer_contexts_[index],
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = kRouteReleaseTimerNames[index],
+            .skip_unhandled_events = true,
+        };
+        result = esp_timer_create(&route_release_timer_args,
+                                  &route_release_timers_[index]);
+        if (result != ESP_OK) {
+            return result;
+        }
     }
     if (database != nullptr) {
         const int database_result = database->register_database();
@@ -1062,116 +1071,47 @@ bool Backend::security_teardown_already_disconnected(
 
 std::int32_t Backend::arm_ble_route_release_grace(
     hid_control_executor::BleRouteReleaseIdentity identity) {
-    if (route_release_timer_ == nullptr ||
-        route_release_timer_active_.load(std::memory_order_acquire) ||
-        esp_timer_is_active(route_release_timer_)) {
+    const auto claim = route_release_grace_ownership_.begin_arm(identity);
+    if (!claim.valid() || route_release_timers_[claim.slot] == nullptr) {
+        route_release_grace_ownership_.abort_arm(claim);
         return ESP_ERR_INVALID_STATE;
     }
-    route_release_authority_epoch_.store(identity.authority_epoch,
-                                         std::memory_order_relaxed);
-    route_release_route_generation_.store(identity.route_generation,
-                                          std::memory_order_relaxed);
-    route_release_profile_activation_epoch_.store(
-        identity.profile_activation_epoch, std::memory_order_relaxed);
-    route_release_ble_generation_.store(identity.ble_generation,
-                                        std::memory_order_relaxed);
-    route_release_connection_.store(identity.connection_handle,
-                                    std::memory_order_relaxed);
-    route_release_present_roles_.store(identity.present_roles,
-                                       std::memory_order_relaxed);
-    route_release_required_subscriptions_.store(
-        identity.required_input_subscriptions, std::memory_order_relaxed);
-    for (std::size_t index = 0;
-         index < hid_capability::kReportRoleCount; ++index) {
-        route_release_handles_[index].store(
-            identity.report_handles.values[index],
-            std::memory_order_relaxed);
-    }
-    route_release_epoch_.store(identity.release_epoch,
-                               std::memory_order_relaxed);
-    route_release_timer_active_.store(true, std::memory_order_release);
     const esp_err_t result = esp_timer_start_once(
-        route_release_timer_,
+        route_release_timers_[claim.slot],
         static_cast<std::uint64_t>(
             hid_control_executor::kBleRouteReleaseGraceMs) * 1000U);
     if (result != ESP_OK) {
-        route_release_timer_active_.store(false, std::memory_order_release);
+        route_release_grace_ownership_.abort_arm(claim);
     }
     return result;
 }
 
 void Backend::cancel_ble_route_release_grace(
     hid_control_executor::BleRouteReleaseIdentity identity) {
-    const bool exact =
-        route_release_authority_epoch_.load(std::memory_order_acquire) ==
-            identity.authority_epoch &&
-        route_release_route_generation_.load(std::memory_order_acquire) ==
-            identity.route_generation &&
-        route_release_profile_activation_epoch_.load(
-            std::memory_order_acquire) == identity.profile_activation_epoch &&
-        route_release_ble_generation_.load(std::memory_order_acquire) ==
-            identity.ble_generation &&
-        route_release_connection_.load(std::memory_order_acquire) ==
-            identity.connection_handle &&
-        route_release_present_roles_.load(std::memory_order_acquire) ==
-            identity.present_roles &&
-        route_release_required_subscriptions_.load(
-            std::memory_order_acquire) ==
-            identity.required_input_subscriptions &&
-        route_release_handles_[0].load(std::memory_order_acquire) ==
-            identity.report_handles.values[0] &&
-        route_release_handles_[1].load(std::memory_order_acquire) ==
-            identity.report_handles.values[1] &&
-        route_release_handles_[2].load(std::memory_order_acquire) ==
-            identity.report_handles.values[2] &&
-        route_release_epoch_.load(std::memory_order_acquire) ==
-            identity.release_epoch;
-    if (!exact ||
-        !route_release_timer_active_.exchange(false,
-                                              std::memory_order_acq_rel)) {
+    const auto claim = route_release_grace_ownership_.begin_cancel(identity);
+    if (!claim.valid()) {
         return;
     }
-    if (esp_timer_is_active(route_release_timer_)) {
-        (void)esp_timer_stop(route_release_timer_);
-    }
+    const bool stopped_before_dispatch =
+        esp_timer_stop(route_release_timers_[claim.slot]) == ESP_OK;
+    route_release_grace_ownership_.finish_cancel(
+        claim, stopped_before_dispatch);
 }
 
 void Backend::route_release_grace_callback(void *context) {
-    auto *backend = static_cast<Backend *>(context);
-    if (backend == nullptr ||
-        !backend->route_release_timer_active_.exchange(
-            false, std::memory_order_acq_rel) ||
+    auto *timer_context = static_cast<RouteReleaseTimerContext *>(context);
+    if (timer_context == nullptr || timer_context->backend == nullptr) {
+        return;
+    }
+    Backend *backend = timer_context->backend;
+    const auto claim = backend->route_release_grace_ownership_.begin_callback(
+        timer_context->slot);
+    if (claim.disposition !=
+            detail::RouteReleaseGraceOwnership::CallbackDisposition::kSignal ||
         backend->sink_ == nullptr) {
         return;
     }
-    (void)backend->sink_->signal_ble_route_release_grace({
-        .authority_epoch = backend->route_release_authority_epoch_.load(
-            std::memory_order_acquire),
-        .route_generation = backend->route_release_route_generation_.load(
-            std::memory_order_acquire),
-        .profile_activation_epoch =
-            backend->route_release_profile_activation_epoch_.load(
-                std::memory_order_acquire),
-        .ble_generation = backend->route_release_ble_generation_.load(
-            std::memory_order_acquire),
-        .connection_handle = backend->route_release_connection_.load(
-            std::memory_order_acquire),
-        .present_roles = backend->route_release_present_roles_.load(
-            std::memory_order_acquire),
-        .required_input_subscriptions =
-            backend->route_release_required_subscriptions_.load(
-                std::memory_order_acquire),
-        .report_handles = {.values = {
-            backend->route_release_handles_[0].load(
-                std::memory_order_acquire),
-            backend->route_release_handles_[1].load(
-                std::memory_order_acquire),
-            backend->route_release_handles_[2].load(
-                std::memory_order_acquire),
-        }},
-        .release_epoch = backend->route_release_epoch_.load(
-            std::memory_order_acquire),
-    });
+    (void)backend->sink_->signal_ble_route_release_grace(claim.identity);
 }
 
 std::int32_t Backend::terminate_orphan_connection(

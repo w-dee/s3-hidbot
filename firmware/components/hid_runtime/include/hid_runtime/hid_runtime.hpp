@@ -575,6 +575,8 @@ class StateMachine {
     void set_next_sequence_generation_for_test(std::uint32_t generation);
     void set_next_profile_activation_epoch_for_test(
         ProfileActivationEpoch epoch);
+    void set_report_profile_activation_epoch_for_test(
+        Interface interface, ProfileActivationEpoch epoch);
     void set_next_public_ticket_id_for_test(HidTicketId ticket_id);
     void set_inside_ticket_cancel_hook_for_test(TestHook hook);
     void set_inside_ticket_finalize_hook_for_test(TestHook hook);
