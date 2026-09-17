@@ -11,4 +11,4 @@ trap 'rm -f "$temporary_directory/test_ble_fixture_profile"; rmdir "$temporary_d
   "$repository_root/tools/test_ble_fixture_profile.cpp" \
   -o "$temporary_directory/test_ble_fixture_profile"
 "$temporary_directory/test_ble_fixture_profile"
-echo "PASS: strict-only BLE fixture profile contract"
+echo "PASS: finite BLE fixture profile contract"

@@ -1599,9 +1599,9 @@ not a schematic, direct-rail, backfeed, or general electrical-safety claim.
 
 `ble.fixture-profile-v1` adds `ble.profile.list`, `ble.profile.status`, and
 `ble.profile.select`. The catalog is finite; it accepts no descriptor, packet,
-GATT or arbitrary configuration upload. The initial public catalog contains
-only `strict_composite`. Standalone public selection remains pending the final
-integration/rehearsal gate; this checkpoint does not claim P0 completion.
+GATT or arbitrary configuration upload. The public development catalog contains
+`strict_composite` and `standalone_mouse_just_works`. Public availability does
+not imply physical qualification or completion of the remaining P0 profiles.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
 
 `ble.profile.list` and `ble.profile.status` accept no params (omitted or `{}`).
@@ -1624,8 +1624,8 @@ or `fault`. Advertising and connections do not by themselves change the profile
 transition. Exposure/readiness remain in their existing status APIs. Profile
 revision/schema/bond class do not replace internal runtime activation fencing.
 
-`ble.profile.select` requires exactly `{"profile":"strict_composite"}` at this
-checkpoint. Unknown IDs, additional fields, and embedded NUL are invalid.
+`ble.profile.select` requires exactly `{"profile":"PROFILE_ID"}`, with one
+catalog ID. Unknown IDs, additional fields, and embedded NUL are invalid.
 Selection requires stable route-none, known ALL_UP, no Sequence or pending HID
 work, hidden/nonadvertising/disconnected BLE, no pairing or conflicting control
 transition, and no lifecycle recovery fault. Nonquiescent selection returns
@@ -1633,10 +1633,7 @@ transition, and no lifecycle recovery fault. Nonquiescent selection returns
 bond write/deletion, session retirement, advertising or route restoration.
 Exact request retries replay the existing cache without another selection.
 
-The reviewed internal mouse definition is deliberately absent from this public
-catalog until controlled restart and durable bond association pass their final
-integration/rehearsal gate.
-The internal controller can switch reviewed definitions through proven stop,
+The controller switches the reviewed definitions through proven stop,
 hidden initialization and exact stack-incarnation fencing. Stop completion has
 a 5-second owner deadline, followed by a 10-second synchronization deadline.
 There is no automatic rollback; a failed/ambiguous transition stays hidden in
@@ -1645,11 +1642,11 @@ Cold selection changes only RAM and defers initialization until enable.
 The GATT consumer and per-connection security policy are native-tested: one
 5-byte mouse input, Report ID 2, no keyboard characteristic, encrypted 16-byte
 key access, and an unauthenticated bonded outcome. This foundation does not
-make the standalone profile selectable or constitute a hardware qualification.
+constitute a hardware qualification.
 
 The Python APIs are `Client.ble_profile_list()`, `ble_profile_status()` and
-`ble_profile_select(BleProfileId.STRICT_COMPOSITE)`. CLI counterparts are
-`ble-profile-list`, `ble-profile-status` and `ble-profile-select strict_composite`.
+`ble_profile_select(BleProfileId.STANDALONE_MOUSE_JUST_WORKS)`. CLI counterparts
+are `ble-profile-list`, `ble-profile-status`, and `ble-profile-select PROFILE_ID`.
 They require the advertised capability. The host permits up to 17 capabilities
 only in the hello capability array; other generic arrays retain their 16-item
 bound and the machine response frame remains 1024 bytes. Older host versions
@@ -1677,4 +1674,10 @@ matching association and schema. A fresh non-strict schema requires a Report Map
 read and fresh WRITE subscriptions for every required input. RESTORE alone does
 not satisfy that fence. A different retained non-strict schema is incompatible
 and is not migrated through Service Changed. Strict's existing schema-1 behavior
-is preserved. These internal mechanisms do not expand the public catalog.
+is preserved. The mouse profile uses revision 1, schema 2, bond class 1 and shared identity
+class 0. It is NoInputNoOutput, bonded/encrypted with 16-byte keys and
+`authenticated=false`; SC is preferred and authenticated strict behavior is
+unchanged. Keyboard input and keyboard-bearing Sequences are rejected before
+admission on its ready BLE route. USB remains composite. Moving the same host
+between these incompatible profiles requires explicit bond preparation on both
+ends; profile selection never performs that preparation.

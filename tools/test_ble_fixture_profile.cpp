@@ -9,7 +9,7 @@ int main() {
 
     const auto &mouse_definition = kStandaloneMouseJustWorks;
     assert(find_definition(ProfileId::kStandaloneMouseJustWorks) == &mouse_definition);
-    assert(find_profile(ProfileId::kStandaloneMouseJustWorks) == nullptr);
+    assert(find_profile(ProfileId::kStandaloneMouseJustWorks) == &mouse_definition);
     assert(mouse_definition.report_map.size() == 69);
     assert(mouse_definition.reports.size() == 1);
     assert(mouse_definition.smp.io_capability == IoCapability::kNoInputNoOutput);
@@ -29,7 +29,7 @@ int main() {
     assert(subscriptions_ready(mouse_definition, report_bit(ReportRole::kMouseInput)));
     assert(!subscriptions_ready(mouse_definition, report_bit(ReportRole::kKeyboardInput)));
 
-    assert(kCatalog.size() == 1);
+    assert(kCatalog.size() == 2);
     assert(kCatalog[0] == &profile);
     assert(profile.id == ProfileId::kStrictComposite);
     assert(profile.revision == 1);

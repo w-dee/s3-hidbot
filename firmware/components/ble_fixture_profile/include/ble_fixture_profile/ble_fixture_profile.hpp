@@ -350,8 +350,8 @@ inline constexpr ProfileDefinition kStandaloneMouseJustWorks = [] {
     return profile;
 }();
 
-inline constexpr std::array<const ProfileDefinition *, 1> kCatalog{
-    &kStrictComposite};
+inline constexpr std::array<const ProfileDefinition *, 2> kCatalog{
+    &kStrictComposite, &kStandaloneMouseJustWorks};
 
 // Internal reviewed definitions can precede public lifecycle enablement.
 constexpr const ProfileDefinition *find_definition(ProfileId id) {
@@ -402,7 +402,7 @@ constexpr bool subscriptions_ready(const ProfileDefinition &profile,
 }
 
 static_assert(kStrictComposite.report_map.size() == 116);
-static_assert(kCatalog.size() == 1 &&
+static_assert(kCatalog.size() == 2 &&
               kCatalog[0]->id == ProfileId::kStrictComposite);
 static_assert(kStrictReports[0].report_id == 1 &&
               kStrictReports[0].value_size == 8);

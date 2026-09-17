@@ -16,6 +16,9 @@ from test_client import FakeClock, FakeTransport, NONCE, TOKEN, hello_response, 
 PROFILE = {"id": "strict_composite", "rev": 1, "schema": 1,
            "map": "ef1be45d8fe7d0637568c8954b64bab971d5b5f57bf3d44f1cc040e8fe5c3d32",
            "bond": 0, "identity": 0}
+MOUSE = {"id": "standalone_mouse_just_works", "rev": 1, "schema": 2,
+         "map": "c2fb165ffe3f84fc4160b013e15914dffbdecbc330c3c315051dc6922262e924",
+         "bond": 1, "identity": 0}
 STATUS = {"selected": "strict_composite", "active": None, "transition": "stable"}
 
 
@@ -25,6 +28,11 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(catalog[0].profile_id, BleProfileId.STRICT_COMPOSITE)
         self.assertEqual(catalog[0].report_map_sha256, PROFILE["map"])
         self.assertIsNone(validate_ble_profile_status(STATUS).active)
+        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE]})
+        self.assertEqual(catalog[1].profile_id, BleProfileId.STANDALONE_MOUSE_JUST_WORKS)
+        self.assertEqual(catalog[1].bond_class, 1)
+        mouse_status = {"selected": MOUSE["id"], "active": MOUSE["id"], "transition": "stable"}
+        self.assertEqual(validate_ble_profile_status(mouse_status).active, BleProfileId.STANDALONE_MOUSE_JUST_WORKS)
         for item in ({**STATUS, "active": "strict_composite"},
                      {**STATUS, "transition": "initializing"},
                      {**STATUS, "transition": "fault"}):
@@ -32,7 +40,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_exact_finite_validation_rejects_unreviewed_values(self):
         for key, value in [("id", "custom"), ("rev", True), ("schema", 0),
-                           ("map", "a" * 63), ("bond", 1), ("identity", True),
+                           ("map", "a" * 63), ("bond", 2), ("identity", True),
                            ("upload", "bytes")]:
             with self.subTest(key=key), self.assertRaises(ProtocolError):
                 validate_ble_profile_list({"profiles": [{**PROFILE, key: value}]})
@@ -51,6 +59,8 @@ class ProfileTests(unittest.TestCase):
         frame = build_ble_profile_select_frame(7, TOKEN, BleProfileId.STRICT_COMPOSITE)
         self.assertEqual(request_object(frame), {"v": 1, "id": 7, "session": TOKEN,
             "cmd": "ble.profile.select", "params": {"profile": "strict_composite"}})
+        mouse = build_ble_profile_select_frame(8, TOKEN, BleProfileId.STANDALONE_MOUSE_JUST_WORKS)
+        self.assertEqual(request_object(mouse)["params"], {"profile": MOUSE["id"]})
         for bad in ("unknown", "strict_composite\x00suffix", 0, None):
             with self.assertRaises(ProtocolError):
                 build_ble_profile_select_frame(7, TOKEN, bad)
@@ -109,7 +119,8 @@ class ProfileTests(unittest.TestCase):
         import json
         from hidbot.cli import main
         for args in (["ble-profile-list"], ["ble-profile-status"],
-                     ["ble-profile-select", "strict_composite"]):
+                     ["ble-profile-select", "strict_composite"],
+                     ["ble-profile-select", MOUSE["id"]]):
             commands = []
             def on_write(transport, data):
                 if data == TRANSPORT_SYNC: return

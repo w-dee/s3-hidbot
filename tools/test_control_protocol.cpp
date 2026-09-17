@@ -285,12 +285,14 @@ struct ProfileSource {
     ble_fixture_profile::SelectionSnapshot snapshot{};
     ble_fixture_profile::SelectionResult result = ble_fixture_profile::SelectionResult::kNoOp;
     int selections = 0;
+    ble_fixture_profile::ProfileId requested = ble_fixture_profile::ProfileId::kStrictComposite;
     static ble_fixture_profile::SelectionSnapshot get(void *context) {
         return static_cast<ProfileSource *>(context)->snapshot;
     }
-    static ble_fixture_profile::SelectionOutcome select(void *context, ble_fixture_profile::ProfileId) {
+    static ble_fixture_profile::SelectionOutcome select(void *context, ble_fixture_profile::ProfileId id) {
         auto &source = *static_cast<ProfileSource *>(context);
         ++source.selections;
+        source.requested = id;
         return {.result = source.result, .snapshot = source.snapshot};
     }
 };
@@ -2763,6 +2765,10 @@ void test_finite_profile_api_and_retry() {
     require_contains(fixture.sink.last(), "\"id\":\"strict_composite\",\"rev\":1,\"schema\":1");
     require_contains(fixture.sink.last(), "ef1be45d8fe7d0637568c8954b64bab971d5b5f57bf3d44f1cc040e8fe5c3d32");
     require_contains(fixture.sink.last(), "\"bond\":0,\"identity\":0");
+    require_contains(fixture.sink.last(), "\"id\":\"standalone_mouse_just_works\",\"rev\":1,\"schema\":2");
+    require_contains(fixture.sink.last(), "c2fb165ffe3f84fc4160b013e15914dffbdecbc330c3c315051dc6922262e924");
+    require_contains(fixture.sink.last(), "\"bond\":1,\"identity\":0");
+    assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
     fixture.payload(request(3, session, "ble.profile.status"));
     require_contains(fixture.sink.last(), "\"selected\":\"strict_composite\",\"active\":null,\"transition\":\"stable\"");
     const auto select = request(4, session, "ble.profile.select", "{\"profile\":\"strict_composite\"}");
@@ -2773,8 +2779,15 @@ void test_finite_profile_api_and_retry() {
     assert(response == fixture.sink.last() && fixture.profile.selections == 1);
     fixture.payload(request(5, session, "ble.profile.select", "{\"profile\":\"strict_composite\"}"));
     require_contains(fixture.sink.last(), "\"code\":\"HID_BUSY\"");
+    fixture.profile.result = ble_fixture_profile::SelectionResult::kAccepted;
+    fixture.profile.snapshot = {.selected = ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks,
+        .active = ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks,
+        .active_present = false, .transition = ble_fixture_profile::SelectionTransition::kInitializing};
+    fixture.payload(request(6, session, "ble.profile.select", "{\"profile\":\"standalone_mouse_just_works\"}"));
+    assert(fixture.profile.requested == ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks);
+    require_contains(fixture.sink.last(), "\"selected\":\"standalone_mouse_just_works\",\"active\":null,\"transition\":\"initializing\"");
     const int calls = fixture.profile.selections;
-    int id = 6;
+    int id = 7;
     for (const auto *params : {"{}", "{\"profile\":3}", "{\"profile\":\"unknown\"}",
                               "{\"profile\":\"strict_composite\",\"upload\":true}",
                               "{\"profile\":\"strict_composite\\u0000x\"}"}) {
