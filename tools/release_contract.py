@@ -25,6 +25,10 @@ _RELEASE_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]
 _SOURCE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _BUILD_PROFILE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 _RAW_STRING_LITERAL = re.compile(r'(?:u8|u|U|L)?R"')
+_PHYSICAL_SPLICE = re.compile(r"\\[ \t\v\f]*\r?\n")
+_AUTHORITY_DIRECTIVE = re.compile(
+    r"(?:pragma[ \t]+once|include[ \t]*<[ \t]*(?:array|cstddef|cstdint|span|string_view)[ \t]*>)[ \t]*"
+)
 
 
 class ReleaseContractError(ValueError):
@@ -38,13 +42,17 @@ class _CppToken:
 
 
 def _cpp_tokens(text: str) -> tuple[_CppToken, ...]:
-    """Tokenize the deliberately narrow C++ subset used by the identity header."""
+    """Tokenize the bounded header grammar, rejecting unmodeled preprocessing.
+
+    Only the current/frozen standard includes and pragma once are permitted;
+    directives are checked as whole lines, never mined for declarations.
+    """
 
     if _RAW_STRING_LITERAL.search(text) is not None:
         raise ReleaseContractError(
             "firmware build profile authority uses an unsupported raw string literal"
         )
-    if "\\\n" in text or "\\\r\n" in text:
+    if _PHYSICAL_SPLICE.search(text) is not None:
         raise ReleaseContractError(
             "firmware build profile authority uses unsupported physical line splicing"
         )
@@ -70,21 +78,20 @@ def _cpp_tokens(text: str) -> tuple[_CppToken, ...]:
             line_start = line_start or "\n" in text[cursor : end + 2]
             cursor = end + 2
             continue
-        if character == "#" and line_start:
-            cursor += 1
-            while cursor < len(text) and text[cursor] in " \t":
-                cursor += 1
-            start = cursor
-            while cursor < len(text) and (text[cursor].isalnum() or text[cursor] == "_"):
-                cursor += 1
-            directive = text[start:cursor]
-            if directive not in {"include", "pragma"}:
+        if character == "#":
+            end = text.find("\n", cursor)
+            end = len(text) if end < 0 else end
+            directive = text[cursor + 1 : end].strip()
+            if not line_start or _AUTHORITY_DIRECTIVE.fullmatch(directive) is None:
                 raise ReleaseContractError(
-                    "firmware build profile authority uses unsupported conditional or macro syntax"
+                    "firmware build profile authority uses unsupported preprocessing syntax"
                 )
             tokens.append(_CppToken("directive", directive))
+            cursor = end
             line_start = False
             continue
+        if not character.isascii() or character in {"%", "\\"}:
+            raise ReleaseContractError("firmware build profile authority uses unsupported token syntax")
         line_start = False
         if character.isalpha() or character == "_":
             start = cursor
@@ -121,6 +128,47 @@ def _cpp_tokens(text: str) -> tuple[_CppToken, ...]:
     return tuple(tokens)
 
 
+def _profile_namespace(tokens: tuple[_CppToken, ...], declaration: int) -> None:
+    """Require the literal in the one supported namespace, with standard type lookup.
+
+    This is a scope boundary, not a C++ evaluator. Other namespaces, aliases,
+    preprocessing operators and rebinding of std are outside the contract.
+    """
+
+    opening = (
+        _CppToken("identifier", "namespace"),
+        _CppToken("identifier", "firmware_identity"),
+        _CppToken("symbol", "{"),
+    )
+    cursor = 0
+    while cursor < len(tokens) and tokens[cursor].kind == "directive":
+        cursor += 1
+    if tokens[cursor : cursor + 3] != opening:
+        raise ReleaseContractError("firmware build profile authority requires its direct namespace")
+    depth = 1
+    for index in range(cursor + 3, len(tokens)):
+        token = tokens[index]
+        if depth == 0 or token.kind == "directive":
+            raise ReleaseContractError("firmware build profile authority has unsupported scope syntax")
+        if token.kind == "identifier":
+            if token.value in {"namespace", "using", "typedef", "_Pragma", "__pragma", "asm", "__asm", "__asm__"}:
+                raise ReleaseContractError("firmware build profile authority has unsupported scope syntax")
+            if token.value == "std" and tokens[index + 1 : index + 3] != (
+                _CppToken("symbol", ":"), _CppToken("symbol", ":")
+            ):
+                raise ReleaseContractError("firmware build profile authority cannot rebind std")
+        if index == declaration and (
+            depth != 1 or tokens[index - 1] not in {_CppToken("symbol", ";"), _CppToken("symbol", "{")}
+        ):
+            raise ReleaseContractError("firmware build profile authority requires a direct declaration")
+        if token == _CppToken("symbol", "{"):
+            depth += 1
+        elif token == _CppToken("symbol", "}"):
+            depth -= 1
+    if depth != 0:
+        raise ReleaseContractError("firmware build profile authority has unbalanced scope")
+
+
 def validate_release_version(value: str) -> str:
     if _RELEASE_VERSION.fullmatch(value) is None:
         raise ReleaseContractError(
@@ -136,7 +184,7 @@ def validate_source_revision(value: str) -> str:
 
 
 def read_build_profile(source_root: Path) -> str:
-    """Read the exact compiled profile from the explicitly selected source."""
+    """Read a literal profile under the bounded identity-header grammar."""
 
     header = (
         source_root.resolve()
@@ -179,6 +227,7 @@ def read_build_profile(source_root: Path) -> str:
         or _BUILD_PROFILE.fullmatch(declarations[0]) is None
     ):
         raise ReleaseContractError("firmware build profile authority is missing or invalid")
+    _profile_namespace(tokens, occurrences[0] - 6)
     return declarations[0]
 
 

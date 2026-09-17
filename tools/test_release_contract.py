@@ -6,8 +6,11 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
+from build_firmware_artifact import build
+from firmware_artifact import ArtifactError
 from release_contract import (
     ReleaseContractError,
     read_build_profile,
@@ -75,7 +78,8 @@ class ReleaseContractTests(unittest.TestCase):
             )
             header = identity / "firmware_identity.hpp"
             header.write_text(
-                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";\n',
+                'namespace firmware_identity {\n'
+                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";\n}\n',
                 encoding="utf-8",
             )
             historical = read_release_contract(root)
@@ -86,7 +90,8 @@ class ReleaseContractTests(unittest.TestCase):
                 "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0085.tar.gz",
             )
             header.write_text(
-                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";\n',
+                'namespace firmware_identity {\n'
+                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";\n}\n',
                 encoding="utf-8",
             )
             current = read_release_contract(root)
@@ -147,6 +152,7 @@ inline constexpr auto example = R"tag("; inline constexpr std::string_view kBuil
             self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
             with self.assertRaisesRegex(ReleaseContractError, "unsupported raw string literal"):
                 read_build_profile(root)
+            self._assert_authority_rejected(root)
 
     def test_profile_parser_rejects_all_standard_raw_string_prefixes(self) -> None:
         for prefix in ("R", "u8R", "uR", "UR", "LR"):
@@ -164,6 +170,114 @@ inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";
                     ReleaseContractError, "unsupported raw string literal"
                 ):
                     read_build_profile(root)
+                self._assert_authority_rejected(root)
+
+    def test_profile_parser_rejects_preprocessing_and_scope_counterexamples(self) -> None:
+        cases = {
+            "digraph-directives": '''
+namespace firmware_identity {
+%:if 0
+; inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";
+%:endif
+%:define PROFILE_ID kBuildPro %:%: file
+inline constexpr std::string_view PROFILE_ID = "freenove-fnk0085";
+}
+''',
+            "local-include": '''
+#include "active.hpp"
+namespace example {
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";
+}
+''',
+            "pragma-decoy": '''
+#pragma once inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";
+#include "active.hpp"
+''',
+            "type-rebinding": '''
+namespace firmware_identity {
+struct std {
+    struct string_view {
+        constexpr string_view(const char*) {}
+        constexpr operator const char*() const { return "freenove-fnk0085"; }
+    };
+};
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";
+}
+''',
+            "namespace-alias": '''
+namespace example {
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";
+}
+namespace firmware_identity = example;
+''',
+            "nested-authority": '''
+namespace firmware_identity {
+namespace example {
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";
+}
+using namespace example;
+}
+''',
+        }
+        for name, source in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                header = self._write_identity_header(root, source)
+                (header.parent / "active.hpp").write_text(
+                    'namespace firmware_identity {\n'
+                    'inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";\n}\n',
+                    encoding="utf-8",
+                )
+                self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
+                self._assert_authority_rejected(root)
+
+    def test_profile_parser_rejects_extended_splices_and_preprocessing_operators(self) -> None:
+        for whitespace in (" ", "\t"):
+            source = (
+                'namespace firmware_identity {\n'
+                '// comment \\' + whitespace + '\n'
+                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";\n'
+                'inline constexpr std::string_view kBuildPro\\' + whitespace + '\n'
+                'file = "freenove-fnk0085";\n}\n'
+            )
+            with self.subTest(whitespace=repr(whitespace)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                header = self._write_identity_header(root, source)
+                self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
+                self._assert_authority_rejected(root)
+        for source in (
+            'namespace firmware_identity {\n_Pragma("once")\n'
+            'inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";\n}\n',
+            'namespace firmware_identity {\n'
+            'inline constexpr std::string_view kBuildProfile = ("freenove-fnk0085");\n}\n',
+            '#define PROFILE "freenove-fnk0085"\nnamespace firmware_identity {\n'
+            'inline constexpr std::string_view kBuildProfile = PROFILE;\n}\n',
+            '#define IGNORED 1\nnamespace firmware_identity {\n'
+            'inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";\n}\n',
+        ):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                header = self._write_identity_header(root, source)
+                self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
+                self._assert_authority_rejected(root)
+
+    def _assert_authority_rejected(self, root: Path) -> None:
+        (root / "firmware/version.txt").write_text("0.3.0\n", encoding="utf-8")
+        (root / "host").mkdir()
+        (root / "host/pyproject.toml").write_text(
+            '[project]\nversion = "0.3.0"\n', encoding="utf-8"
+        )
+        with self.assertRaises(ReleaseContractError):
+            read_build_profile(root)
+        with self.assertRaises(ReleaseContractError):
+            read_release_contract(root)
+        output = root / "output/s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0099.tar.gz"
+        with self.assertRaisesRegex(ArtifactError, "firmware build profile authority"):
+            build(Namespace(
+                source_root=root, source_revision="a" * 40, source_date_epoch=0,
+                output=output, container_image=None,
+            ))
+        self.assertFalse(output.parent.exists())
 
     def test_profile_parser_rejects_physical_line_splicing(self) -> None:
         for newline in ("\n", "\r\n"):
@@ -188,6 +302,7 @@ inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";
                     ReleaseContractError, "unsupported physical line splicing"
                 ):
                     read_build_profile(root)
+                self._assert_authority_rejected(root)
 
     def test_profile_parser_fails_closed_on_ambiguous_or_unsupported_authority(self) -> None:
         cases = (
