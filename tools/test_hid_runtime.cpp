@@ -1551,6 +1551,26 @@ void test_release_ticket_failure_and_lifecycle_cancellation() {
     assert(!snapshot.active);
 }
 
+void test_unresolved_usb_release_cannot_finalize_as_success() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    assert(state.queue_keyboard_report(0, {4, 0, 0, 0, 0, 0}));
+    state.execute(Sink::submit, &sink);
+    state.report_complete(0);
+    state.begin_release_all();
+    auto snapshot = state.release_all_snapshot();
+    assert(snapshot.keyboard ==
+           hid_runtime::ReleaseAllInterfaceState::kUnresolved);
+    assert(snapshot.mouse ==
+           hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    state.finalize_release_all();
+    snapshot = state.release_all_snapshot();
+    assert(snapshot.state ==
+           hid_runtime::ReleaseAllTransactionState::kTimedOut);
+    assert(!snapshot.success_committed);
+}
+
 void test_release_ticket_partial_and_clean_unmounted() {
     hid_runtime::StateMachine state;
     Sink sink;
@@ -2865,6 +2885,7 @@ int main() {
     test_unmount_preserves_uncertainty_for_fresh_generation_reconciliation();
     test_release_ticket_states_and_historical_submission();
     test_release_ticket_failure_and_lifecycle_cancellation();
+    test_unresolved_usb_release_cannot_finalize_as_success();
     test_release_ticket_partial_and_clean_unmounted();
     test_keyboard_report_ticket_and_confirmed_state();
     test_keyboard_report_ticket_cancellation_and_barriers();

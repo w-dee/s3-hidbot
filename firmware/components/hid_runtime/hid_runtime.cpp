@@ -3112,14 +3112,19 @@ void StateMachine::finalize_release_all() {
             terminal = ReleaseAllTransactionState::kFinalizedFailure;
         } else if (transaction == ReleaseAllTransactionState::kAdmitting ||
                    transaction == ReleaseAllTransactionState::kOpen) {
+            const auto keyboard =
+                release_ticket_.keyboard.load(std::memory_order_acquire);
+            const auto mouse =
+                release_ticket_.mouse.load(std::memory_order_acquire);
+            const auto interface_complete = [](ReleaseAllInterfaceState value) {
+                return value == ReleaseAllInterfaceState::kAlreadyUp ||
+                       value == ReleaseAllInterfaceState::kSubmitted;
+            };
             const bool usb_complete =
                 transaction == ReleaseAllTransactionState::kOpen &&
                 release_ticket_.transport.load(std::memory_order_acquire) ==
                     HidTransport::kUsb &&
-                release_ticket_.keyboard.load(std::memory_order_acquire) !=
-                    ReleaseAllInterfaceState::kPending &&
-                release_ticket_.mouse.load(std::memory_order_acquire) !=
-                    ReleaseAllInterfaceState::kPending;
+                interface_complete(keyboard) && interface_complete(mouse);
             terminal = usb_complete
                 ? ReleaseAllTransactionState::kFinalizedSuccess
                 : ReleaseAllTransactionState::kTimedOut;
