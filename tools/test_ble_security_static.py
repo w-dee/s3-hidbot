@@ -54,8 +54,8 @@ def main() -> int:
     assert "return BLE_HS_ESTORE_CAP;" in transport
     assert transport.count("original_store_write_(object_type, value)") == 1
     assert transport.count("original_store_delete_(object_type, key)") == 1
-    assert "ble_store_read_our_sec(&key, &our)" in transport
-    assert "ble_store_read_peer_sec(&key, &peer)" in transport
+    assert "read_security_raw(true, key, our)" in transport
+    assert "read_security_raw(false, key, peer)" in transport
 
     control = re.search(r"kControlPoint\),(.*?)\.val_handle", service, re.S)
     assert control and "BLE_GATT_CHR_F_WRITE_NO_RSP" in control.group(1)

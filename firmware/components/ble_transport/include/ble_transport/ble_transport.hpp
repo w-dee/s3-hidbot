@@ -7,6 +7,7 @@
 
 #include "ble_security/ble_security.hpp"
 #include "ble_transport/lifecycle_watchdog.hpp"
+#include "ble_transport/bond_association.hpp"
 #include "ble_transport/route_release_grace_ownership.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
 #include "esp_timer.h"
@@ -122,6 +123,12 @@ class Backend final : public hid_control_executor::BleBackend {
                                std::int32_t status,
                                bool persistent_store_unhealthy,
                                std::uint16_t connection_handle);
+    int read_security_raw(bool our, const ble_store_key_sec &key, ble_store_value_sec &value) const;
+    bool compatible_association(const ble_addr_t &identity) const;
+    detail::AssociationCreation association_creation_{};
+    std::uint64_t host_connection_incarnation_ = 0;
+    std::uint64_t active_host_connection_ = 0;
+    std::uint16_t host_connection_handle_ = ble_lifecycle::kNoConnection;
     static int store_read(int object_type, const union ble_store_key *key,
                           union ble_store_value *value);
     static int store_write(int object_type,

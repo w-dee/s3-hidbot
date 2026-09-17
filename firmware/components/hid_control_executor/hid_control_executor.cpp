@@ -3042,7 +3042,9 @@ void Controller::reconcile_gatt_cache() {
         return;
     }
     const auto fail_store = [this](GattSchemaStoreResult result) {
-        if (result.kind == Kind::kCapacityFull) {
+        if (result.kind == Kind::kIncompatible) {
+            terminate_security_connection(ble_pairing::LastResult::kSecurityPolicy, false);
+        } else if (result.kind == Kind::kCapacityFull) {
             ble_backend_->apply_store_failure(
                 ble_hid_peer_.generation, ble_hid_peer_.connection_handle,
                 ble_security::StoreFailureKind::kCapacityFull, result.status);
@@ -3066,7 +3068,11 @@ void Controller::reconcile_gatt_cache() {
         }
         ble_hid_peer_.schema_checked = true;
     }
-    if (ble_hid_peer_.report_map_read) {
+    const auto &profile = selected_profile();
+    const bool strict = profile.id == ble_fixture_profile::ProfileId::kStrictComposite;
+    const bool fresh_inputs = (ble_hid_peer_.fresh_input_subscriptions & profile.required_input_subscriptions) ==
+        profile.required_input_subscriptions;
+    if (ble_hid_peer_.report_map_read && (strict || fresh_inputs)) {
         const auto result = ble_backend_->persist_gatt_schema_current(
             ble_hid_peer_.generation, ble_hid_peer_.connection_handle);
         if (result.kind != Kind::kCurrent) {
@@ -3074,7 +3080,7 @@ void Controller::reconcile_gatt_cache() {
         }
         return;
     }
-    if (ble_hid_peer_.service_changed_indicate_enabled &&
+    if (strict && ble_hid_peer_.service_changed_indicate_enabled &&
         !ble_hid_peer_.refresh_requested) {
         ble_hid_peer_.refresh_requested = true;
         (void)ble_backend_->request_gatt_cache_refresh(
@@ -3490,14 +3496,21 @@ void Controller::process_ble_event(BleEvent event) {
                 event.subscription_reason == BleSubscriptionReason::kUnknown) {
                 return;
             }
+            if (event.attribute_handle == 0) return;
+            hid_capability::ReportMask role = 0;
             if (event.hid_interface == BleHidInterface::kKeyboard &&
                 event.attribute_handle == ble_hid_peer_.handles.keyboard_value) {
                 ble_hid_peer_.keyboard_notify_enabled = event.notify_enabled;
+                role = hid_capability::kKeyboardInput;
             } else if (event.hid_interface == BleHidInterface::kMouse &&
-                       event.attribute_handle ==
-                           ble_hid_peer_.handles.mouse_value) {
+                       event.attribute_handle == ble_hid_peer_.handles.mouse_value) {
                 ble_hid_peer_.mouse_notify_enabled = event.notify_enabled;
+                role = hid_capability::kMouseInput;
             }
+            if (event.subscription_reason == BleSubscriptionReason::kWrite && event.notify_enabled)
+                ble_hid_peer_.fresh_input_subscriptions |= role;
+            else if (!event.notify_enabled) ble_hid_peer_.fresh_input_subscriptions &= ~role;
+            if (role != 0) reconcile_gatt_cache();
             return;
         }
         case BleEventKind::kControlPoint:

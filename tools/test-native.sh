@@ -13,6 +13,7 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 "$repository_root/tools/test-ble-route-release-grace-ownership.sh"
 "$repository_root/tools/test-ble-fixture-profile.sh"
 "$repository_root/tools/test-ble-security.sh"
+"$repository_root/tools/test-ble-bond-association.sh"
 "$repository_root/tools/test-ble-pairing.sh"
 "$repository_root/tools/test-hid-route.sh"
 "$repository_root/tools/test-ble-hid-control-point-gatt.sh"

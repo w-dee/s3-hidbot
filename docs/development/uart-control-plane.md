@@ -1600,8 +1600,8 @@ not a schematic, direct-rail, backfeed, or general electrical-safety claim.
 `ble.fixture-profile-v1` adds `ble.profile.list`, `ble.profile.status`, and
 `ble.profile.select`. The catalog is finite; it accepts no descriptor, packet,
 GATT or arbitrary configuration upload. The initial public catalog contains
-only `strict_composite`. Standalone public selection remains pending durable
-bond/cache association integration; this checkpoint does not claim P0 completion.
+only `strict_composite`. Standalone public selection remains pending the final
+integration/rehearsal gate; this checkpoint does not claim P0 completion.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
 
 `ble.profile.list` and `ble.profile.status` accept no params (omitted or `{}`).
@@ -1634,7 +1634,8 @@ bond write/deletion, session retirement, advertising or route restoration.
 Exact request retries replay the existing cache without another selection.
 
 The reviewed internal mouse definition is deliberately absent from this public
-catalog until controlled restart and durable bond association are integrated.
+catalog until controlled restart and durable bond association pass their final
+integration/rehearsal gate.
 The internal controller can switch reviewed definitions through proven stop,
 hidden initialization and exact stack-incarnation fencing. Stop completion has
 a 5-second owner deadline, followed by a 10-second synchronization deadline.
@@ -1653,3 +1654,27 @@ They require the advertised capability. The host permits up to 17 capabilities
 only in the hello capability array; other generic arrays retain their 16-item
 bound and the machine response frame remains 1024 bytes. Older host versions
 with a 16-capability limit must be updated for this development firmware.
+
+The internal shared-store association uses bounded `hid_assoc` U32 records,
+keyed by the existing exact peer identity. Format 1 has explicit pending and
+complete states and a finite non-strict association class. Metadata-less bonds
+retain the legacy strict interpretation without a rewrite. Healthy incompatible
+bonds remain healthy inventory; selection never deletes or migrates them.
+Inventory `verified` and `schema_current` describe the retained association
+and its schema, not compatibility with the selected profile.
+Exact key lookup rejects incompatible retained records without reporting them
+as absent. Non-strict creation commits and rereads pending metadata before the
+first security write; only the same host connection incarnation can complete
+it after both durable keys validate. A failed write inhibits further creation.
+Interrupted pending metadata is never adopted by another connection or boot.
+Startup fails closed and preserves incomplete records for explicit recovery;
+this initial conservative implementation may require authorized NVS recovery.
+Journaled exact bond deletion removes association only after all target keys
+are durably absent, so interrupted deletion cannot import a bond as legacy strict.
+
+Non-strict CCCD restore is filtered before NimBLE consumes it and requires both
+matching association and schema. A fresh non-strict schema requires a Report Map
+read and fresh WRITE subscriptions for every required input. RESTORE alone does
+not satisfy that fence. A different retained non-strict schema is incompatible
+and is not migrated through Service Changed. Strict's existing schema-1 behavior
+is preserved. These internal mechanisms do not expand the public catalog.

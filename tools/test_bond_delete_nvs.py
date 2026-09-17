@@ -22,6 +22,7 @@ def body(source, signature):
 
 PRE = r'''
 #include "bond_delete_transaction.hpp"
+#include "ble_transport/bond_association.hpp"
 #include <cassert>
 #include <map>
 #include <string>
@@ -32,10 +33,11 @@ using esp_err_t = int;
 using nvs_handle_t = int;
 enum { ESP_OK=0, ESP_ERR_NVS_NOT_FOUND=101, ESP_ERR_NVS_INVALID_LENGTH=102,
        ESP_ERR_INVALID_STATE=103, NVS_READONLY=0, NVS_READWRITE=1,
-       NVS_TYPE_ANY=255, NVS_TYPE_BLOB=66, NVS_TYPE_U8=1 };
+       NVS_TYPE_ANY=255, NVS_TYPE_BLOB=66, NVS_TYPE_U8=1, NVS_TYPE_U32=4 };
 struct ble_addr_t { uint8_t type; uint8_t val[6]; };
 constexpr char kSchemaKeyHex[]="0123456789abcdef";
 constexpr char kSchemaNamespace[]="hid_schema";
+constexpr char kAssociationNamespace[]="hid_assoc";
 constexpr char kNimbleStoreNamespace[]="nimble_bond";
 namespace secure_memory { void zero(void*p,size_t n){std::memset(p,0,n);} }
 using Key=std::pair<std::string,std::string>;
@@ -57,6 +59,12 @@ int nvs_get_blob(int h,const char*k,void*p,size_t*n){
  if(it->second.type!=NVS_TYPE_BLOB)return ESP_ERR_INVALID_STATE;
  if(*n<it->second.bytes.size()){*n=it->second.bytes.size();return ESP_ERR_NVS_INVALID_LENGTH;}
  *n=it->second.bytes.size();std::memcpy(p,it->second.bytes.data(),*n);return 0;
+}
+int nvs_get_u32(int h,const char*k,uint32_t*p){
+ if(fail())return 77;
+ auto it=disk.find({handles.at(h),k});if(it==disk.end())return ESP_ERR_NVS_NOT_FOUND;
+ if(it->second.type!=NVS_TYPE_U32||it->second.bytes.size()!=4)return ESP_ERR_INVALID_STATE;
+ std::memcpy(p,it->second.bytes.data(),4);return 0;
 }
 int nvs_get_u8(int h,const char*k,uint8_t*p){
  if(fail())return 77;
@@ -101,11 +109,14 @@ Disk fixture(){Disk result;
  for(unsigned peer=1;peer<=3;peer++){
   for(auto&c:detail::kDeleteCategories){std::vector<uint8_t>b(c.size);b[c.identity_offset]=1;b[c.identity_offset+1]=peer;
    result[{kNimbleStoreNamespace,std::string(c.prefix)+std::to_string(peer)}]={NVS_TYPE_BLOB,b};}
-  result[{kSchemaNamespace,sk(peer)}]={NVS_TYPE_U8,{1}};
+  result[{kSchemaNamespace,sk(peer)}]={NVS_TYPE_U8,{2}};
+  const uint32_t association=0xa5010102U;
+  std::vector<uint8_t> bytes(4);std::memcpy(bytes.data(),&association,4);
+  result[{kAssociationNamespace,sk(peer)}]={NVS_TYPE_U32,bytes};
  }
  result[{"other","keep"}]={NVS_TYPE_U8,{42}};return result;
 }
-bool target(const Key&k){return k==Key{kSchemaNamespace,sk(3)}||(k.first==kNimbleStoreNamespace&&k.second.back()=='3');}
+bool target(const Key&k){return k==Key{kSchemaNamespace,sk(3)}||k==Key{kAssociationNamespace,sk(3)}||(k.first==kNimbleStoreNamespace&&k.second.back()=='3');}
 Disk keep(const Disk&d){Disk result;for(auto&[k,v]:d)if(!target(k)&&k.first!=detail::kDeleteNamespace)result[k]=v;return result;}
 bool absent(){for(auto&[k,v]:disk){(void)v;if(target(k))return false;}return true;}
 int run(){PersistentDeleteStore store;return detail::run_journaled_removal(store,id(3),[]{return 0;},[]{return 0;});}
@@ -115,6 +126,12 @@ int main(){const auto initial=fixture();const auto preserved=keep(initial);
  for(bool side:{false,true})for(int point=0;point<boundaries;point++){
   reset(initial);cut=point;after=side;assert(run()!=0);assert(keep(disk)==preserved);
   assert(handles.empty()&&live_iterators==0);
+  // Association is provenance: deleting it while keys survive would import
+  // a keyboard bond as legacy strict after a power cut. Check every boundary.
+  if(!disk.count({kAssociationNamespace,sk(3)})) {
+   assert(!disk.count({kNimbleStoreNamespace,"our_sec_3"}));
+   assert(!disk.count({kNimbleStoreNamespace,"peer_sec_3"}));
+  }
   bool pending=disk.count({detail::kDeleteNamespace,detail::kDeleteKey});
   if(!pending)assert(disk==initial||absent());
   cut=-1;calls=0;PersistentDeleteStore store;assert(detail::resume_exact_deletion(store)==0);
@@ -136,13 +153,14 @@ def main():
     source = (ROOT / 'firmware/components/ble_transport/ble_transport.cpp').read_text()
     signatures = ('ble_addr_t nimble_identity(', 'void schema_key(',
                   'esp_err_t read_schema_revision(', 'esp_err_t delete_schema_revision(',
-                  'esp_err_t delete_schema_revision_verified(', 'struct PersistentDeleteStore {')
+                  'esp_err_t delete_schema_revision_verified(', 'detail::AssociationRead read_association(',
+                  'int delete_association_verified(', 'struct PersistentDeleteStore {')
     extracted = '\n'.join(body(source, s) + (';' if s.startswith('struct') else '') for s in signatures)
     with tempfile.TemporaryDirectory(prefix='bond-delete-nvs-test-') as directory:
         path = Path(directory)
         (path/'test.cpp').write_text(PRE + extracted + POST)
         command = [os.environ.get('CXX','c++'),'-std=c++20','-Wall','-Wextra','-Werror','-pedantic']
-        for include in ('ble_transport', 'hid_capability/include',
+        for include in ('ble_transport', 'ble_transport/include', 'hid_capability/include',
                         'ble_fixture_profile/include',
                         'ble_security/include', 'ble_lifecycle/include'):
             command += ['-I'+str(ROOT/'firmware/components'/include)]

@@ -7606,6 +7606,63 @@ void test_cold_mouse_profile_capability_consumption() {
     assert(database.notify_calls == 1 && database.last_characteristic == database.handles.mouse_value);
 }
 
+void test_mouse_cache_requires_map_and_fresh_write_without_migration() {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    using Reason = hid_control_executor::BleSubscriptionReason;
+    for (unsigned scenario = 0; scenario < 3; ++scenario) {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        ble.stored_gatt_schema_current = false;
+        if (scenario == 2) ble.gatt_schema_status_result.kind =
+            hid_control_executor::GattSchemaStoreResultKind::kIncompatible;
+        assert(controller.initialize(&runtime, &usb, &ble, &database));
+        assert(controller.request_profile_select(ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+        assert(ble.event(Event::kConnect, 5)); assert(controller.process_one_for_test());
+        make_security_ready(ble);
+        ble.security_link.authenticated = false;
+        ble.security_persisted.our.authenticated = ble.security_persisted.peer.authenticated = false;
+        assert(ble.event(Event::kEncryptionChange, 5)); assert(controller.process_one_for_test());
+        const auto send = [&](Event kind, std::uint16_t handle, Reason reason) {
+            assert(controller.signal_ble_event({.kind = kind,
+                .generation = controller.ble_snapshot().generation, .connection_handle = 5,
+                .attribute_handle = handle, .hid_interface = hid_control_executor::BleHidInterface::kMouse,
+                .subscription_reason = reason, .notify_enabled = true, .indicate_enabled = true,
+                .stack_incarnation = 1}));
+            assert(controller.process_one_for_test());
+        };
+        if (scenario == 2) {
+            assert(ble.disconnect_calls == 1);
+            assert(!controller.ble_snapshot().recovery_required);
+            assert(!ble.persistent_store_failure_observed());
+            assert(ble.persist_gatt_schema_calls == 0 && ble.gatt_cache_refresh_calls == 0);
+            continue;
+        }
+        send(Event::kServiceChangedSubscription, ble.service_changed_handle, Reason::kWrite);
+        assert(ble.gatt_cache_refresh_calls == 0);
+        if (scenario == 0) {
+            send(Event::kReportMapRead, database.handles.report_map_value, Reason::kUnknown);
+            send(Event::kSubscription, database.handles.mouse_value, Reason::kRestore);
+            assert(ble.persist_gatt_schema_calls == 0 && !controller.ble_link_ready());
+            send(Event::kSubscription, database.handles.mouse_value, Reason::kWrite);
+        } else {
+            send(Event::kSubscription, database.handles.mouse_value, Reason::kWrite);
+            assert(ble.persist_gatt_schema_calls == 0 && !controller.ble_link_ready());
+            send(Event::kReportMapRead, database.handles.report_map_value, Reason::kUnknown);
+        }
+        assert(ble.persist_gatt_schema_calls == 1 && ble.gatt_cache_refresh_calls == 0);
+        assert(controller.ble_link_ready());
+        assert(controller.route_snapshot().route.active == hid_route::OutputRoute::kNone);
+    }
+}
+
 void test_strict_profile_selection_quiescence_and_status() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
@@ -7647,6 +7704,7 @@ int main(int argc, char **argv) {
     test_hidden_reset_sync_and_new_stack_reset_budget();
     test_stale_reset_cannot_clear_current_peer();
     test_cold_mouse_profile_capability_consumption();
+    test_mouse_cache_requires_map_and_fresh_write_without_migration();
     if (argc == 2 &&
         std::string_view(argv[1]) == "--controller-grace-authority-only") {
         test_controller_grace_authority_closes_both_replacement_windows();

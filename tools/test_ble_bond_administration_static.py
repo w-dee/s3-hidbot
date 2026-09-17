@@ -53,8 +53,8 @@ def main() -> int:
         "hid_control_executor::BleBondRemoveResult Backend::remove_bond(",
     )
     for required in (
-        "ble_store_read_our_sec",
-        "ble_store_read_peer_sec",
+        "read_security_raw(true,",
+        "read_security_raw(false,",
         "persisted_bond_is_valid",
         "read_schema_revision",
         "std::strcmp",
@@ -81,8 +81,8 @@ def main() -> int:
         "run_schema_first_removal",
         "delete_schema_revision_verified(target)",
         "ble_store_util_delete_peer(&target)",
-        "ble_store_read_our_sec",
-        "ble_store_read_peer_sec",
+        "read_security_raw(true,",
+        "read_security_raw(false,",
         "read_schema_revision(target",
         "verify_peer_auxiliary_absent(target)",
         "after = list_bonds()",

@@ -402,10 +402,11 @@ def main() -> int:
     assert missing_revision is not None and "Kind::kStale" in missing_revision.group(1)
     assert "descriptor.peer_id_addr" in transport
     assert "identity.type" in transport and "identity.val[index]" in transport
-    # Schema deletion plus the bounded, journaled exact-target adapter only.
-    assert transport.count("nvs_erase_key(handle, key)") == 2
+    # Schema, association, and bounded journaled exact-target adapter only.
+    assert transport.count("nvs_erase_key(handle, key)") == 3
     deletion_adapter = transport.split("struct PersistentDeleteStore {", 1)[1].split("bool peer_identity(", 1)[0]
     assert deletion_adapter.count("nvs_erase_key(handle, key)") == 1
+    assert "delete_association_verified(peer)" in deletion_adapter
     assert "detail::run_journaled_removal" in transport
     store_delete_start = transport.index("int Backend::store_delete(")
     store_delete_end = transport.index("int Backend::store_status(")
@@ -420,6 +421,7 @@ def main() -> int:
         "return BLE_HS_ESTORE_FAIL",
     ):
         assert token in store_delete
+    assert "delete_association_verified" not in store_delete
     assert store_delete.index(
         "delete_schema_revision_verified(key->sec.peer_addr)") < store_delete.index(
             "original_store_delete_(object_type, key)")

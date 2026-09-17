@@ -153,6 +153,7 @@ struct BleHidPeerSnapshot {
     bool service_changed_indicate_enabled : 1 = false;
     bool schema_checked : 1 = false;
     bool refresh_requested : 1 = false;
+    hid_capability::ReportMask fresh_input_subscriptions = 0;
 };
 
 inline constexpr std::uint16_t kGattChangedStartHandle = 0x0001;
@@ -160,6 +161,7 @@ inline constexpr std::uint16_t kGattChangedEndHandle = 0xffff;
 
 enum class GattSchemaStoreResultKind : std::uint8_t {
     kCurrent,
+    kIncompatible,
     kStale,
     kCapacityFull,
     kStorageFailure,

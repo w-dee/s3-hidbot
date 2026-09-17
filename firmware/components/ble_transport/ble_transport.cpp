@@ -5,6 +5,7 @@
 #include "store_delete_result.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstring>
 
 #include "ble_fixture_profile/ble_fixture_profile.hpp"
@@ -397,6 +398,191 @@ struct StartupRecoveryResult {
     std::int32_t status = 0;
 };
 
+constexpr char kAssociationNamespace[] = "hid_assoc";
+
+detail::AssociationPeer association_peer(const ble_addr_t &identity) {
+    detail::AssociationPeer result{};
+    result[0] = identity.type;
+    std::copy_n(identity.val, 6, result.begin() + 1);
+    return result;
+}
+ble_addr_t association_address(const detail::AssociationPeer &peer) {
+    ble_addr_t result{};
+    result.type = peer[0];
+    std::copy_n(peer.begin() + 1, 6, result.val);
+    return result;
+}
+
+detail::AssociationRead read_association(const ble_addr_t &identity) {
+    nvs_handle_t handle{};
+    auto status = nvs_open(kAssociationNamespace, NVS_READONLY, &handle);
+    std::uint32_t word{};
+    if (status == ESP_OK) {
+        char key[16]{};
+        schema_key(identity, key);
+        status = nvs_get_u32(handle, key, &word);
+        nvs_close(handle);
+    }
+    if (status == ESP_ERR_NVS_NOT_FOUND) return {};
+    if (status != ESP_OK) return {.status = status};
+    return {.record = detail::decode_association(word)};
+}
+
+// Count and validate every sidecar, including metadata-only interrupted
+// creation. Never truncate the bounded namespace or interpret unknown formats.
+int validate_association_namespace(bool startup, std::size_t *count_out = nullptr) {
+    if (count_out) *count_out = 0;
+    nvs_handle_t handle{};
+    auto status = nvs_open(kAssociationNamespace, NVS_READONLY, &handle);
+    if (status == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (status != ESP_OK) return status;
+    nvs_iterator_t iterator = nullptr;
+    status = nvs_entry_find_in_handle(handle, NVS_TYPE_ANY, &iterator);
+    std::size_t count = 0;
+    while (status == ESP_OK) {
+        nvs_entry_info_t info{};
+        status = nvs_entry_info(iterator, &info);
+        detail::StoreIdentity identity{};
+        std::uint32_t word{};
+        if (status != ESP_OK) break;
+        if (++count > ble_security::kBondCapacity || info.type != NVS_TYPE_U32 ||
+            !parse_schema_key(info.key, identity)) { status = ESP_ERR_INVALID_STATE; break; }
+        status = nvs_get_u32(handle, info.key, &word);
+        if (status != ESP_OK) break;
+        const auto record = detail::decode_association(word);
+        if (record.state == detail::AssociationState::kInvalid ||
+            (startup && record.state != detail::AssociationState::kComplete)) {
+            status = ESP_ERR_INVALID_STATE; break;
+        }
+        status = nvs_entry_next(&iterator);
+    }
+    nvs_release_iterator(iterator);
+    nvs_close(handle);
+    if (count_out) *count_out = count;
+    return status == ESP_ERR_NVS_NOT_FOUND ? 0 : status;
+}
+
+int delete_association_verified(const ble_addr_t &identity) {
+    nvs_handle_t handle{};
+    int status = nvs_open(kAssociationNamespace, NVS_READWRITE, &handle);
+    if (status == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (status == ESP_OK) {
+        char key[16]{};
+        schema_key(identity, key);
+        status = nvs_erase_key(handle, key);
+        if (status == ESP_ERR_NVS_NOT_FOUND) status = 0;
+        else if (status == ESP_OK) status = nvs_commit(handle);
+        nvs_close(handle);
+    }
+    if (status) return status;
+    const auto read = read_association(identity);
+    return read.status ? read.status : read.record.state == detail::AssociationState::kMissing
+        ? 0 : ESP_ERR_INVALID_STATE;
+}
+
+struct AssociationStore {
+    ble_store_read_fn *raw_read = nullptr;
+    detail::AssociationRead read(const detail::AssociationPeer &peer) {
+        return read_association(association_address(peer));
+    }
+    int write(const detail::AssociationPeer &peer, detail::AssociationRecord record) {
+        std::size_t count{};
+        int status = validate_association_namespace(false, &count);
+        if (status) return status;
+        const auto before = read(peer);
+        if (before.status) return before.status;
+        if (before.record.state == detail::AssociationState::kMissing && count >= ble_security::kBondCapacity)
+            return ESP_ERR_NVS_NOT_ENOUGH_SPACE;
+        nvs_handle_t handle{};
+        status = nvs_open(kAssociationNamespace, NVS_READWRITE, &handle);
+        if (status == ESP_OK) {
+            char key[16]{};
+            schema_key(association_address(peer), key);
+            status = nvs_set_u32(handle, key, detail::encode_association(record));
+            if (status == ESP_OK) status = nvs_commit(handle);
+            nvs_close(handle);
+        }
+        // Validate the post-write bound too; no new key becomes usable if a
+        // full store or preexisting metadata would exceed the global ceiling.
+        return status ? status : validate_association_namespace(false);
+    }
+    detail::AssociationPair durable_pair(const detail::AssociationPeer &peer) {
+        detail::AssociationPair result{};
+        nvs_handle_t handle{};
+        result.status = nvs_open(kNimbleStoreNamespace, NVS_READONLY, &handle);
+        if (result.status == ESP_ERR_NVS_NOT_FOUND) return {};
+        if (result.status) return result;
+        result.status = validate_nimble_security_key_layout(handle);
+        const auto identity = association_address(peer);
+        for (const bool our : {true, false}) {
+            auto &record = our ? result.records.our : result.records.peer;
+            for (const char *key : our ? kNimbleOurSecurityKeys : kNimblePeerSecurityKeys) {
+                if (result.status) break;
+                ble_store_value_sec value{};
+                std::size_t size = sizeof(value);
+                auto status = nvs_get_blob(handle, key, &value, &size);
+                if (status == ESP_ERR_NVS_NOT_FOUND) continue;
+                if (status || size != sizeof(value) || !valid_identity(value.peer_addr)) {
+                    result.status = status ? status : ESP_ERR_INVALID_STATE;
+                } else if (same_identity(value.peer_addr, identity)) {
+                    if (record.found) result.status = ESP_ERR_INVALID_STATE;
+                    else record = security_record(identity, 0, value);
+                }
+                secure_memory::zero(&value, sizeof(value));
+            }
+        }
+        nvs_close(handle);
+        return result;
+    }
+    int prove_security_absent(const detail::AssociationPeer &peer) {
+        if (raw_read == nullptr) return -1;
+        const auto durable = durable_pair(peer);
+        if (durable.status) return -1;
+        if (durable.records.our.found || durable.records.peer.found) return 0;
+        union ble_store_key key{};
+        key.sec.peer_addr = association_address(peer);
+        for (const int type : {BLE_STORE_OBJ_TYPE_OUR_SEC, BLE_STORE_OBJ_TYPE_PEER_SEC}) {
+            union ble_store_value value{};
+            const int status = raw_read(type, &key, &value);
+            secure_memory::zero(&value, sizeof(value));
+            if (status == 0) return 0;
+            if (status != BLE_HS_ENOENT) return -1;
+        }
+        return 1;
+    }
+};
+
+int validate_complete_associations() {
+    int status = validate_association_namespace(true);
+    if (status) return status;
+    nvs_handle_t handle{};
+    status = nvs_open(kAssociationNamespace, NVS_READONLY, &handle);
+    if (status == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (status) return status;
+    nvs_iterator_t iterator = nullptr;
+    status = nvs_entry_find_in_handle(handle, NVS_TYPE_ANY, &iterator);
+    while (status == 0) {
+        nvs_entry_info_t info{};
+        status = nvs_entry_info(iterator, &info);
+        detail::StoreIdentity identity{};
+        if (status) break;
+        if (!parse_schema_key(info.key, identity)) { status = ESP_ERR_INVALID_STATE; break; }
+        const auto address = nimble_identity(identity);
+        const auto read = read_association(address);
+        const auto *profile = detail::association_profile(read.record.bond_class);
+        AssociationStore store;
+        const auto pair = store.durable_pair(association_peer(address));
+        if (read.status || pair.status || !profile ||
+            !ble_security::State{}.persisted_bond_is_valid(pair.records, profile->id)) {
+            status = ESP_ERR_INVALID_STATE; break;
+        }
+        status = nvs_entry_next(&iterator);
+    }
+    nvs_release_iterator(iterator);
+    nvs_close(handle);
+    return status == ESP_ERR_NVS_NOT_FOUND ? 0 : status;
+}
+
 StartupRecoveryResult recover_orphan_schema_records() {
     detail::SecurityIdentitySet persistent_our{};
     detail::SecurityIdentitySet persistent_peer{};
@@ -532,13 +718,19 @@ struct PersistentDeleteStore {
         return status == ESP_ERR_NVS_NOT_FOUND ? 0 : status;
     }
     int delete_schema(const detail::StoreIdentity &identity) {
-        return delete_schema_revision_verified(nimble_identity(identity));
+        const auto peer = nimble_identity(identity);
+        const int status = delete_schema_revision_verified(peer);
+        return status ? status : delete_association_verified(peer);
     }
     int verify_schema_absent(const detail::StoreIdentity &identity) {
         std::uint8_t revision{};
-        return detail::absence_status(
-            read_schema_revision(nimble_identity(identity), revision),
+        const auto peer = nimble_identity(identity);
+        const int status = detail::absence_status(read_schema_revision(peer, revision),
             ESP_ERR_NVS_NOT_FOUND, ESP_ERR_INVALID_STATE);
+        if (status) return status;
+        const auto association = read_association(peer);
+        return association.status ? association.status :
+            association.record.state == detail::AssociationState::kMissing ? 0 : ESP_ERR_INVALID_STATE;
     }
     void wipe(void *bytes, std::size_t size) { secure_memory::zero(bytes, size); }
 };
@@ -626,9 +818,9 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     ble_hs_cfg.sm_their_key_dist =
         nimble_key_distribution(smp.peer_key_distribution);
 
-    // Install the supported NimBLE store, then interpose only enough to
-    // observe failures. Every wrapper delegates to the saved implementation
-    // exactly once and never examines or logs secret material.
+    // Install the supported store, then fence finite association before key
+    // lookup/write and CCCD restore. Admitted operations delegate once. Key
+    // contents never leave the store/readiness boundary or enter telemetry.
     ble_store_config_init();
     original_store_read_ = ble_hs_cfg.store_read_cb;
     original_store_write_ = ble_hs_cfg.store_write_cb;
@@ -644,6 +836,12 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     ble_hs_cfg.store_delete_cb = store_delete;
     ble_hs_cfg.store_status_cb = store_status;
     ble_hs_cfg.store_status_arg = this;
+    result = validate_complete_associations();
+    if (result != ESP_OK) {
+        observe_store_failure(ble_security::StoreFailureKind::kRead, result, true,
+                              ble_lifecycle::kNoConnection);
+        return result;
+    }
     const auto recovery = recover_orphan_schema_records();
     if (recovery.failure_kind != ble_security::StoreFailureKind::kNone) {
         observe_store_failure(recovery.failure_kind, recovery.status, true,
@@ -985,6 +1183,9 @@ void Backend::on_sync() {
 
 void Backend::on_reset(int reason) {
     if (instance_ != nullptr) {
+        instance_->association_creation_.retire();
+        instance_->active_host_connection_ = 0;
+        instance_->host_connection_handle_ = ble_lifecycle::kNoConnection;
         if (instance_->sink_ != nullptr) {
             instance_->sink_->retire_dle_on_reset(
                 instance_->generation_.load(std::memory_order_acquire));
@@ -1027,6 +1228,12 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
     }
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0) {
+                backend->association_creation_.retire();
+                backend->active_host_connection_ = backend->host_connection_incarnation_ == UINT64_MAX
+                    ? 0 : ++backend->host_connection_incarnation_;
+                backend->host_connection_handle_ = event->connect.conn_handle;
+            }
             (void)backend->signal(
                 event->connect.status == 0
                     ? hid_control_executor::BleEventKind::kConnect
@@ -1034,6 +1241,9 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 event->connect.conn_handle, event->connect.status);
             break;
         case BLE_GAP_EVENT_DISCONNECT:
+            backend->association_creation_.retire();
+            backend->active_host_connection_ = 0;
+            backend->host_connection_handle_ = ble_lifecycle::kNoConnection;
             // Transfer progress ownership to the queued event before removing
             // the disconnect watchdog. If publication fails, leaving the
             // watchdog armed provides another bounded terminal observation.
@@ -1080,8 +1290,8 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 ble_gap_conn_find(event->authorize.conn_handle, &descriptor) ==
                     0 &&
                 descriptor.sec_state.encrypted &&
-                (!attributes.authenticated ||
-                 descriptor.sec_state.authenticated) &&
+                (!attributes.authenticated || descriptor.sec_state.authenticated) &&
+                static_cast<bool>(descriptor.sec_state.authenticated) == backend->profile_->security.authenticated &&
                 descriptor.sec_state.key_size == attributes.key_size;
             event->authorize.out_response =
                 accepted ? BLE_GAP_AUTHORIZE_ACCEPT
@@ -1290,6 +1500,25 @@ std::int32_t Backend::set_connection_data_length(std::uint16_t connection_handle
 }
 
 std::int32_t Backend::initiate_security(std::uint16_t connection_handle) {
+    ble_addr_t identity{};
+    if (peer_identity(connection_handle, identity) && valid_identity(identity)) {
+        const auto association = read_association(identity);
+        if (association.status || association.record.state == detail::AssociationState::kInvalid) {
+            observe_store_failure(ble_security::StoreFailureKind::kRead, BLE_HS_ESTORE_FAIL, true,
+                                  connection_handle);
+            return BLE_HS_ESTORE_FAIL;
+        }
+        if (association.record.state != detail::AssociationState::kMissing &&
+            detail::association_compatibility(association.record, profile_->bond_class) !=
+                detail::AssociationDecision::kAllowed) return BLE_HS_ESTORE_FAIL;
+        if (association.record.state == detail::AssociationState::kMissing &&
+            profile_->id != ble_fixture_profile::ProfileId::kStrictComposite) {
+            AssociationStore store{original_store_read_};
+            if (store.prove_security_absent(association_peer(identity)) != 1) return BLE_HS_ESTORE_FAIL;
+        }
+    }
+    // An unresolved RPA may classify later; exact key lookup and persistence
+    // recheck association, and HID readiness never trusts discovery alone.
     return ble_gap_security_initiate(connection_handle);
 }
 
@@ -1425,8 +1654,9 @@ hid_control_executor::GattSchemaStoreResult Backend::gatt_schema_status(
     if (result != ESP_OK) {
         return {.kind = Kind::kStorageFailure, .status = result};
     }
-    if (revision != ble_hid_service::kGattSchemaRevision) {
-        return {.kind = Kind::kStale};
+    if (revision != profile_->cache.schema_revision) {
+        return {.kind = profile_->id == ble_fixture_profile::ProfileId::kStrictComposite
+            ? Kind::kStale : Kind::kIncompatible};
     }
     gatt_schema_current_.store(true, std::memory_order_release);
     return {.kind = Kind::kCurrent};
@@ -1447,13 +1677,21 @@ Backend::persist_gatt_schema_current(
     if (!peer_identity(connection_handle, identity)) {
         return {.kind = Kind::kStaleIdentity};
     }
+    if (profile_->id != ble_fixture_profile::ProfileId::kStrictComposite) {
+        std::uint8_t old_revision{};
+        const int old_status = read_schema_revision(identity, old_revision);
+        if (old_status != ESP_OK && old_status != ESP_ERR_NVS_NOT_FOUND)
+            return {.kind = Kind::kStorageFailure, .status = old_status};
+        if (old_status == ESP_OK && old_revision != profile_->cache.schema_revision)
+            return {.kind = Kind::kIncompatible};
+    }
     char key[16]{};
     schema_key(identity, key);
     nvs_handle_t handle = 0;
     esp_err_t result = nvs_open(kSchemaNamespace, NVS_READWRITE, &handle);
     if (result == ESP_OK) {
         result = nvs_set_u8(handle, key,
-                            ble_hid_service::kGattSchemaRevision);
+                            profile_->cache.schema_revision);
     }
     if (result == ESP_OK) {
         result = nvs_commit(handle);
@@ -1470,7 +1708,7 @@ Backend::persist_gatt_schema_current(
     std::uint8_t verified = 0;
     result = read_schema_revision(identity, verified);
     if (result != ESP_OK ||
-        verified != ble_hid_service::kGattSchemaRevision) {
+        verified != profile_->cache.schema_revision) {
         return {.kind = Kind::kStorageFailure,
                 .status = result != ESP_OK ? result : ESP_ERR_INVALID_STATE};
     }
@@ -1530,8 +1768,8 @@ hid_control_executor::BleBondListResult Backend::list_bonds() {
             ble_store_key_sec key{};
             key.idx = index;
             ble_store_value_sec value{};
-            const int result = our ? ble_store_read_our_sec(&key, &value)
-                                   : ble_store_read_peer_sec(&key, &value);
+            const int result = our ? read_security_raw(true, key, value)
+                                   : read_security_raw(false, key, value);
             if (result == BLE_HS_ENOENT) {
                 return 0;
             }
@@ -1584,8 +1822,15 @@ hid_control_executor::BleBondListResult Backend::list_bonds() {
         }
         output.our_sec = peer.our.found;
         output.peer_sec = peer.peer.found;
-        output.verified = security_.persisted_bond_is_valid(
-            {.our = peer.our, .peer = peer.peer});
+        const auto association = read_association(peer.identity);
+        if (association.status || association.record.state == detail::AssociationState::kInvalid)
+            return fail_storage(association.status ? association.status : BLE_HS_ESTORE_FAIL);
+        const auto retained_class = association.record.state == detail::AssociationState::kMissing
+            ? detail::BondClass::kStrictComposite : association.record.bond_class;
+        const auto *retained_profile = detail::association_profile(retained_class);
+        output.verified = retained_profile != nullptr &&
+            association.record.state != detail::AssociationState::kPending &&
+            security_.persisted_bond_is_valid({.our = peer.our, .peer = peer.peer}, retained_profile->id);
         std::uint8_t revision = 0;
         const esp_err_t schema_result =
             read_schema_revision(peer.identity, revision);
@@ -1593,7 +1838,7 @@ hid_control_executor::BleBondListResult Backend::list_bonds() {
             output.schema_revision_present = true;
             output.schema_revision = revision;
             output.schema_current =
-                revision == ble_hid_service::kGattSchemaRevision;
+                retained_profile != nullptr && revision == retained_profile->cache.schema_revision;
         } else if (schema_result != ESP_ERR_NVS_NOT_FOUND) {
             return fail_storage(schema_result);
         }
@@ -1713,9 +1958,9 @@ hid_control_executor::BleBondRemoveResult Backend::remove_bond(
             ble_store_value_sec our_value{};
             ble_store_value_sec peer_value{};
             const int our_status =
-                ble_store_read_our_sec(&key, &our_value);
+                read_security_raw(true, key, our_value);
             const int peer_status =
-                ble_store_read_peer_sec(&key, &peer_value);
+                read_security_raw(false, key, peer_value);
             const int auxiliary_status =
                 verify_peer_auxiliary_absent(target);
             std::uint8_t revision = 0;
@@ -1799,8 +2044,8 @@ void Backend::refresh_security(std::uint16_t connection_handle,
     key.peer_addr = descriptor.peer_id_addr;
     ble_store_value_sec our{};
     ble_store_value_sec peer{};
-    const int our_result = ble_store_read_our_sec(&key, &our);
-    const int peer_result = ble_store_read_peer_sec(&key, &peer);
+    const int our_result = read_security_raw(true, key, our);
+    const int peer_result = read_security_raw(false, key, peer);
     const auto record = [&key](int result,
                                const ble_store_value_sec &value) {
         return ble_security::StoredSecurityRecord{
@@ -1822,7 +2067,10 @@ void Backend::refresh_security(std::uint16_t connection_handle,
              our_result == 0 && peer_result == 0 && our.sc != 0 && peer.sc != 0,
          .identity_resolved = identity_resolved,
          .key_size = static_cast<std::uint8_t>(descriptor.sec_state.key_size)},
-        {.our = record(our_result, our), .peer = record(peer_result, peer)});
+        {.our = record(compatible_association(descriptor.peer_id_addr) ? our_result : BLE_HS_ESTORE_FAIL, our),
+         .peer = record(compatible_association(descriptor.peer_id_addr) ? peer_result : BLE_HS_ESTORE_FAIL, peer)});
+    secure_memory::zero(&our, sizeof(our));
+    secure_memory::zero(&peer, sizeof(peer));
 }
 
 void Backend::observe_store_failure(ble_security::StoreFailureKind kind,
@@ -1845,29 +2093,107 @@ void Backend::observe_store_failure(ble_security::StoreFailureKind kind,
     }
 }
 
-int Backend::store_read(int object_type, const union ble_store_key *key,
-                        union ble_store_value *value) {
-    if (instance_ == nullptr || instance_->original_store_read_ == nullptr) {
-        return BLE_HS_EINVAL;
-    }
-    return instance_->original_store_read_(object_type, key, value);
+int Backend::read_security_raw(bool our, const ble_store_key_sec &key,
+                                ble_store_value_sec &value) const {
+    if (original_store_read_ == nullptr) return BLE_HS_EINVAL;
+    union ble_store_key input{};
+    union ble_store_value output{};
+    input.sec = key;
+    const int status = original_store_read_(our ? BLE_STORE_OBJ_TYPE_OUR_SEC :
+        BLE_STORE_OBJ_TYPE_PEER_SEC, &input, &output);
+    if (status == 0) value = output.sec;
+    secure_memory::zero(&output, sizeof(output));
+    return status;
 }
 
-int Backend::store_write(int object_type,
-                         const union ble_store_value *value) {
-    if (instance_ == nullptr || instance_->original_store_write_ == nullptr) {
+bool Backend::compatible_association(const ble_addr_t &identity) const {
+    const auto read = read_association(identity);
+    return !read.status && detail::association_compatibility(read.record, profile_->bond_class) ==
+        detail::AssociationDecision::kAllowed;
+}
+
+int Backend::store_read(int object_type, const union ble_store_key *key,
+                        union ble_store_value *value) {
+    if (instance_ == nullptr || instance_->original_store_read_ == nullptr || key == nullptr || value == nullptr)
         return BLE_HS_EINVAL;
+    const bool security = object_type == BLE_STORE_OBJ_TYPE_OUR_SEC || object_type == BLE_STORE_OBJ_TYPE_PEER_SEC;
+    const bool cccd = object_type == BLE_STORE_OBJ_TYPE_CCCD;
+    const auto *peer = security ? &key->sec.peer_addr : cccd ? &key->cccd.peer_addr : nullptr;
+    // ANY enumeration supplies privacy resolution / inventory. Only exact peer
+    // lookup can supply SMP encryption keys or restore CCCDs to a connection.
+    const bool exact = peer != nullptr && valid_identity(*peer);
+    if (exact) {
+        const auto association = read_association(*peer);
+        if (association.status || (association.record.state != detail::AssociationState::kMissing &&
+            detail::association_compatibility(association.record, instance_->profile_->bond_class) !=
+                detail::AssociationDecision::kAllowed)) return BLE_HS_ESTORE_FAIL;
+        if (cccd && instance_->profile_->id != ble_fixture_profile::ProfileId::kStrictComposite) {
+            // Suppress restoration before NimBLE installs flags/queues pending
+            // notifications; the later SUBSCRIBE callback is already too late.
+            std::uint8_t revision{};
+            if (!instance_->compatible_association(*peer) ||
+                read_schema_revision(*peer, revision) != ESP_OK ||
+                revision != instance_->profile_->cache.schema_revision) return BLE_HS_ENOENT;
+        }
     }
-    const int result = instance_->original_store_write_(object_type, value);
-    if (result != 0) {
-        instance_->observe_store_failure(
-            result == BLE_HS_ESTORE_CAP
-                ? ble_security::StoreFailureKind::kCapacityFull
-                : ble_security::StoreFailureKind::kWrite,
-            result, result != BLE_HS_ESTORE_CAP,
-            instance_->current_connection_.load(std::memory_order_acquire));
+    const int result = instance_->original_store_read_(object_type, key, value);
+    if (result == 0 && exact && security && !instance_->compatible_association(*peer)) {
+        secure_memory::zero(&value->sec, sizeof(value->sec));
+        // Existing incompatible is not "no bond": ENOENT would permit fresh
+        // SMP and overwrite. Preserve the intact retained record instead.
+        return BLE_HS_ESTORE_FAIL;
     }
     return result;
+}
+
+int Backend::store_write(int object_type, const union ble_store_value *value) {
+    if (instance_ == nullptr || instance_->original_store_write_ == nullptr || value == nullptr)
+        return BLE_HS_EINVAL;
+    auto &backend = *instance_;
+    const bool security = object_type == BLE_STORE_OBJ_TYPE_OUR_SEC || object_type == BLE_STORE_OBJ_TYPE_PEER_SEC;
+    AssociationStore association_store{backend.original_store_read_};
+    detail::AssociationPeer peer{};
+    if (security) {
+        if (!valid_identity(value->sec.peer_addr)) return BLE_HS_ESTORE_FAIL;
+        peer = association_peer(value->sec.peer_addr);
+        if (backend.profile_->id != ble_fixture_profile::ProfileId::kStrictComposite) {
+            if (backend.security_inhibit_.inhibits(backend.generation_.load(std::memory_order_acquire),
+                    backend.current_connection_.load(std::memory_order_acquire))) return BLE_HS_ESTORE_FAIL;
+            const auto record = security_record(value->sec.peer_addr, 0, value->sec);
+            if (!backend.security_.persisted_bond_is_valid({.our = record, .peer = record}, backend.profile_->id))
+                return BLE_HS_ESTORE_FAIL;
+            ble_addr_t connected{};
+            if (backend.active_host_connection_ == 0 ||
+                !peer_identity(backend.host_connection_handle_, connected) ||
+                !same_identity(connected, value->sec.peer_addr)) return BLE_HS_ESTORE_FAIL;
+        }
+        const auto decision = detail::prepare_association(association_store, backend.association_creation_,
+            backend.active_host_connection_, peer, backend.profile_->bond_class);
+        if (decision != detail::AssociationDecision::kAllowed) {
+            if (decision == detail::AssociationDecision::kStorageFailure)
+                backend.observe_store_failure(ble_security::StoreFailureKind::kWrite,
+                    BLE_HS_ESTORE_FAIL, true, backend.current_connection_.load(std::memory_order_acquire));
+            return BLE_HS_ESTORE_FAIL;
+        }
+    } else if (object_type == BLE_STORE_OBJ_TYPE_CCCD &&
+               !backend.compatible_association(value->cccd.peer_addr)) {
+        return BLE_HS_ESTORE_FAIL;
+    }
+    const int result = backend.original_store_write_(object_type, value);
+    if (result != 0) {
+        backend.observe_store_failure(result == BLE_HS_ESTORE_CAP
+            ? ble_security::StoreFailureKind::kCapacityFull : ble_security::StoreFailureKind::kWrite,
+            result, result != BLE_HS_ESTORE_CAP,
+            backend.current_connection_.load(std::memory_order_acquire));
+        return result;
+    }
+    if (security && detail::complete_association(association_store, backend.association_creation_,
+            backend.active_host_connection_, peer, backend.profile_->bond_class) != detail::AssociationDecision::kAllowed) {
+        backend.observe_store_failure(ble_security::StoreFailureKind::kWrite, BLE_HS_ESTORE_FAIL,
+            true, backend.current_connection_.load(std::memory_order_acquire));
+        return BLE_HS_ESTORE_FAIL;
+    }
+    return 0;
 }
 
 int Backend::store_delete(int object_type, const union ble_store_key *key) {
