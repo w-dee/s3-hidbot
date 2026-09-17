@@ -2920,6 +2920,71 @@ void test_stale_usb_failure_cannot_terminalize_replacement_release() {
     assert(!state.finalize_release_all(second).success_committed);
 }
 
+void hold_both_usb_interfaces(hid_runtime::StateMachine &state, Sink &sink) {
+    ready(state);
+    assert(state.queue_keyboard_report(0, {0x73, 0, 0, 0, 0, 0}));
+    state.execute(Sink::submit, &sink); state.report_complete(0);
+    assert(state.queue_mouse_report(1, 0, 0, 0, 0));
+    state.execute(Sink::submit, &sink); state.report_complete(1);
+}
+
+Sink dual_release_sink;
+unsigned dual_release_polls = 0;
+void drive_dual_usb_release(hid_runtime::StateMachine *state) {
+    ++dual_release_polls;
+    const int before = dual_release_sink.calls;
+    state->execute(Sink::submit, &dual_release_sink);
+    assert(dual_release_sink.calls <= before + 1); // Existing one-call SOF bound.
+    if (dual_release_sink.calls != before) {
+        assert(dual_release_sink.instance == before); // Keyboard then Mouse.
+        assert(dual_release_sink.length == (before == 0 ? 8 : 5));
+        assert(dual_release_sink.report == (std::array<std::uint8_t, 8>{}));
+        state->report_complete(dual_release_sink.instance);
+    }
+}
+
+void test_public_dual_usb_release_retains_second_interface_debt() {
+    hid_runtime::Runtime runtime;
+    auto &state = runtime.state_machine(); Sink initial;
+    hold_both_usb_interfaces(state, initial);
+    const auto route = state.route_snapshot();
+    dual_release_sink = {}; dual_release_polls = 0;
+    runtime.set_release_poll_hook_for_test(drive_dual_usb_release);
+    const auto result = runtime.release_all();
+    runtime.set_release_poll_hook_for_test(nullptr);
+    assert(result.success && !result.authority_lost);
+    assert(result.keyboard == hid_runtime::ReleaseAllInterfaceState::kSubmitted);
+    assert(result.mouse == hid_runtime::ReleaseAllInterfaceState::kSubmitted);
+    assert(dual_release_sink.calls == 2 && dual_release_polls == 2);
+    assert((state.keyboard_state().keycodes == std::array<std::uint8_t, 6>{}));
+    assert((state.mouse_state().buttons == 0));
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kUsb &&
+           state.route_snapshot().generation == route.generation);
+    assert(state.begin_mouse_report(0, 1, 0, 0, 0) == hid_runtime::MouseReportBeginResult::kPublished);
+}
+
+void test_generic_dual_usb_release_latches_unready_second_interface() {
+    for (const bool mouse_ready : {false, true}) {
+        hid_runtime::StateMachine state; Sink sink;
+        hold_both_usb_interfaces(state, sink);
+        state.set_ready(hid_runtime::Interface::kMouse, mouse_ready);
+        state.request_release_all();
+        state.execute(Sink::submit, &sink);
+        assert(sink.calls == 3 && sink.instance == 0 && sink.report[0] == 0);
+        assert(state.safety_required(hid_runtime::Interface::kMouse));
+        state.report_complete(0);
+        if (!mouse_ready) {
+            state.execute(Sink::submit, &sink);
+            assert(sink.calls == 3 && state.safety_required(hid_runtime::Interface::kMouse));
+            state.set_ready(hid_runtime::Interface::kMouse, true);
+        }
+        state.execute(Sink::submit, &sink);
+        assert(sink.calls == 4 && sink.instance == 1 && sink.report[0] == 0);
+        state.report_complete(1);
+        assert((state.keyboard_state().keycodes == std::array<std::uint8_t, 6>{}) && (state.mouse_state().buttons == 0));
+    }
+}
+
 void test_profile_quiescence_rejects_sequence_and_held_work() {
     hid_runtime::StateMachine state;
     Sink sink;
@@ -2940,6 +3005,8 @@ void test_profile_quiescence_rejects_sequence_and_held_work() {
 }
 
 int main() {
+    test_public_dual_usb_release_retains_second_interface_debt();
+    test_generic_dual_usb_release_latches_unready_second_interface();
     test_profile_quiescence_rejects_sequence_and_held_work();
     test_stale_usb_failure_cannot_terminalize_replacement_release();
     audit_usb_public_outcome();

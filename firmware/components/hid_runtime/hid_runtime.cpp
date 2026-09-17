@@ -3811,22 +3811,9 @@ void StateMachine::execute(SubmitFn submit, void *context) {
         release_requested && request_generation == current_generation &&
         request_authority_epoch == current_authority_epoch &&
         request_release_epoch == release_epoch_.load(std::memory_order_acquire);
-    // A public keyboard ticket has priority over ordinary mailboxes. It is a
-    // single immediate TinyUSB call; a canceled/stale ticket never falls
-    // through to a later SOF for replay.
-    const bool keyboard_submitted = process_keyboard_ticket(
-        submit, context, current_generation, current_authority_epoch);
-    if (keyboard_submitted) {
-        return;
-    }
-    // Mouse public work has the same immediate, task-affine semantics. Safety
-    // requests cancel published mouse work before this point, and the final
-    // epoch/safety checks above prevent a stale relative report.
-    const bool mouse_submitted = process_mouse_ticket(
-        submit, context, current_generation, current_authority_epoch);
-    if (mouse_submitted) {
-        return;
-    }
+    // The SOF submission loop stops after one accepted report. Publish every
+    // interface's release debt first, so that consuming the one-shot request
+    // cannot strand Mouse after Keyboard consumes this frame's submission.
     for (const Interface interface : {Interface::kKeyboard, Interface::kMouse}) {
         InterfaceState &interface_state = state(interface);
         if (release_requested_for_current_attach) {
@@ -3856,6 +3843,25 @@ void StateMachine::execute(SubmitFn submit, void *context) {
                 interface_state.safety_required.store(true, std::memory_order_release);
             }
         }
+    }
+    // A public keyboard ticket has priority over ordinary mailboxes. It is a
+    // single immediate TinyUSB call; a canceled/stale ticket never falls
+    // through to a later SOF for replay.
+    const bool keyboard_submitted = process_keyboard_ticket(
+        submit, context, current_generation, current_authority_epoch);
+    if (keyboard_submitted) {
+        return;
+    }
+    // Mouse public work has the same immediate, task-affine semantics. Safety
+    // requests cancel published mouse work before this point, and the final
+    // epoch/safety checks above prevent a stale relative report.
+    const bool mouse_submitted = process_mouse_ticket(
+        submit, context, current_generation, current_authority_epoch);
+    if (mouse_submitted) {
+        return;
+    }
+    for (const Interface interface : {Interface::kKeyboard, Interface::kMouse}) {
+        InterfaceState &interface_state = state(interface);
         if (interface_state.slot_state.load(std::memory_order_acquire) == kSlotCanceled) {
             interface_state.slot_state.store(kSlotEmpty, std::memory_order_release);
             continue;

@@ -512,3 +512,10 @@ Retained reconnect coverage distinguishes the initial non-strict schema fence
 from an already current matching association: an exact restored subscription
 makes the latter link ready without a map reread, cache rewrite or automatic
 route selection. Every finite single-input profile exercises both cases.
+
+The dual-interface USB release regression runs the public Runtime release loop
+with successive SOF executions: held Keyboard and Mouse must both submit
+neutral reports under one exact release transaction. Generic safety coverage
+also preserves a temporarily unready Mouse obligation after Keyboard uses the
+first frame. These tests reject deriving safety debt only inside the loop that
+stops after its first accepted report.
