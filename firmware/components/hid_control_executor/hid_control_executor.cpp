@@ -3252,25 +3252,25 @@ void Controller::process_ble_event(BleEvent event) {
     }
     switch (event.kind) {
         case BleEventKind::kSync: {
-            if (active_operation_.load(std::memory_order_acquire) ==
-                    ControlOperation::kProfileSelection) {
-                const auto current = ble_state_.snapshot();
-                if (event.generation != current.generation ||
-                    current.observed != ble_lifecycle::ObservedState::kEnabling ||
-                    current.desired != ble_lifecycle::DesiredExposure::kHidden) return;
-                if (ble_backend_->monotonic_time_us() >= profile_deadline_us_ ||
+            const auto current = ble_state_.snapshot();
+            const auto owner = active_operation_.load(std::memory_order_acquire);
+            if (current.desired == ble_lifecycle::DesiredExposure::kHidden) {
+                if (event.generation != current.generation || current.recovery_required ||
+                    current.stack_ready || (current.observed != ble_lifecycle::ObservedState::kEnabling &&
+                     current.observed != ble_lifecycle::ObservedState::kIdle)) return;
+                if ((owner == ControlOperation::kProfileSelection &&
+                     ble_backend_->monotonic_time_us() >= profile_deadline_us_) ||
                     ble_backend_->persistent_store_failure_observed() ||
                     ble_database_ == nullptr ||
                     ble_database_->validate_registered_database() != 0 ||
                     !ble_state_.complete_hidden_sync(event.generation)) {
-                    fail_ble(event.generation, ble_lifecycle::Operation::kRuntime,
-                             -10, ControlOperation::kProfileSelection);
+                    fail_ble(event.generation, ble_lifecycle::Operation::kRuntime, -10, owner);
                     return;
                 }
                 profile_deadline_us_ = 0;
                 publish_profile(true, ble_fixture_profile::SelectionTransition::kStable);
                 ble_backend_->record_heap_checkpoint(BleBackend::HeapCheckpoint::kHiddenIdle);
-                release_operation(ControlOperation::kProfileSelection);
+                if (owner == ControlOperation::kProfileSelection) release_operation(owner);
                 return;
             }
             if (!ble_state_.complete_sync(event.generation)) {
@@ -3350,6 +3350,8 @@ void Controller::process_ble_event(BleEvent event) {
             return;
         case BleEventKind::kReset: {
             const auto before_reset = ble_state_.snapshot();
+            if (event.generation != before_reset.generation || before_reset.recovery_required ||
+                before_reset.observed == ble_lifecycle::ObservedState::kFault) return;
             clear_ble_hid_peer();
             pairing_state_.reset();
             pairing_deadline_us_ = 0;
@@ -3363,7 +3365,8 @@ void Controller::process_ble_event(BleEvent event) {
             pairing_complete_seen_ = false;
             pairing_terminal_committed_ = false;
             if (!ble_state_.begin_reset_recovery(event.generation, event.status)) {
-                release_operation(active_operation_.load(std::memory_order_acquire));
+                fail_ble(ble_state_.generation(), ble_lifecycle::Operation::kRuntime,
+                         event.status, active_operation_.load(std::memory_order_acquire));
                 return;
             }
             const auto generation = ble_state_.generation();

@@ -7438,6 +7438,74 @@ void test_profile_restart_hidden_and_exact_incarnation() {
     assert(ble.initialize_calls == 3 && ble.advertising_calls == 1);
 }
 
+void test_hidden_reset_sync_and_new_stack_reset_budget() {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    advertise_ble(runtime, usb, ble, database, controller);
+    assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(Event::kReset)); assert(controller.process_one_for_test());
+    assert(!controller.ble_snapshot().stack_ready);
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().stack_ready);
+    assert(ble.advertising_calls == 1 && ble.initialize_calls == 1);
+    // A duplicate hidden Sync is inert, including after a reset recovery.
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(!controller.ble_snapshot().recovery_required);
+    assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.initialize_calls == 1 && ble.advertising_calls == 2);
+    assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    // Explicit enable has its historical recovery budget; consume that too
+    // immediately before stop, so only new-stack initialization can reset it.
+    assert(ble.event(Event::kReset)); assert(controller.process_one_for_test());
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().stack_ready);
+    assert(controller.request_profile_select(ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.stop_transaction.complete(ble.last_stop_id, ble_lifecycle::StopStatus::kStopped));
+    controller.drive_profile_selection_for_test();
+    assert(ble.initialize_calls == 2);
+    // The proven new stack has its own single reset recovery allowance.
+    assert(ble.event(Event::kReset)); assert(controller.process_one_for_test());
+    assert(!controller.ble_snapshot().recovery_required);
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(controller.profile_snapshot().active_present);
+    assert(controller.ble_snapshot().stack_ready);
+    assert(controller.ble_snapshot().desired == ble_lifecycle::DesiredExposure::kHidden);
+    assert(ble.advertising_calls == 2);
+    assert(ble.event(Event::kReset)); assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().recovery_required);
+    const auto terminal = controller.ble_snapshot().generation;
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(ble.event(Event::kReset)); assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().generation == terminal);
+    assert(controller.ble_snapshot().recovery_required);
+}
+
+void test_stale_reset_cannot_clear_current_peer() {
+    ReadyBleRouteFixture fixture(239);
+    const auto before = fixture.runtime.state_machine().ble_route_authority_snapshot();
+    assert(fixture.ble.event_for_generation(hid_control_executor::BleEventKind::kReset,
+        fixture.generation - 1U));
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.controller.ble_link_ready());
+    assert(fixture.controller.route_snapshot().ready);
+    const auto after = fixture.runtime.state_machine().ble_route_authority_snapshot();
+    assert(after.authority_epoch == before.authority_epoch);
+    assert(after.profile_activation_epoch == before.profile_activation_epoch);
+    assert(fixture.controller.queue_ble_mouse_report(0, 1, 0, 0, 0) ==
+        hid_runtime::MouseReportBeginResult::kPublished);
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.database.notify_calls == 1);
+}
+
 void test_profile_restart_failure_and_deadline_matrix() {
     using namespace ble_fixture_profile;
     using Event = hid_control_executor::BleEventKind;
@@ -7476,6 +7544,13 @@ void test_profile_restart_failure_and_deadline_matrix() {
             if (failure == 6) controller.drive_profile_selection_for_test();
             assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
         }
+        // Current-incarnation Reset/Sync cannot revive a terminal switch fault.
+        const auto terminal_generation = controller.ble_snapshot().generation;
+        for (const auto kind : {Event::kReset, Event::kSync}) {
+            controller.process_for_test(hid_control_executor::Controller::Action::with_ble_event({
+                .kind = kind, .generation = terminal_generation, .stack_incarnation = 1}));
+        }
+        assert(controller.ble_snapshot().generation == terminal_generation);
         assert(controller.profile_snapshot().transition == SelectionTransition::kFault);
         assert(!controller.profile_snapshot().active_present);
         assert(controller.ble_snapshot().desired == ble_lifecycle::DesiredExposure::kHidden);
@@ -7569,6 +7644,8 @@ int main(int argc, char **argv) {
     test_strict_profile_selection_quiescence_and_status();
     test_profile_restart_hidden_and_exact_incarnation();
     test_profile_restart_failure_and_deadline_matrix();
+    test_hidden_reset_sync_and_new_stack_reset_budget();
+    test_stale_reset_cannot_clear_current_peer();
     test_cold_mouse_profile_capability_consumption();
     if (argc == 2 &&
         std::string_view(argv[1]) == "--controller-grace-authority-only") {

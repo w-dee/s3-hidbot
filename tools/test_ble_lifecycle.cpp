@@ -63,5 +63,7 @@ int main() {
     assert(!state.begin_reset_recovery(recovery_generation, 24));
     const auto fault = state.snapshot();
     assert(fault.observed == ObservedState::kFault && fault.recovery_required);
+    assert(!state.begin_reset_recovery(fault.generation, 25));
+    assert(state.generation() == fault.generation);
     assert(fault.last_error.present && fault.last_error.operation == Operation::kRuntime);
 }

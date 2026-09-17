@@ -115,6 +115,7 @@ bool StateMachine::begin_hidden_initialization(Generation generation) {
     if (current.generation != generation || current.recovery_required ||
         current.desired != DesiredExposure::kHidden ||
         current.observed != ObservedState::kDisabling) return false;
+    reset_recovery_used_.store(false, std::memory_order_release);
     publish(DesiredExposure::kHidden, ObservedState::kEnabling,
             false, false, false, false);
     return true;
@@ -124,7 +125,9 @@ bool StateMachine::complete_hidden_sync(Generation generation) {
     const auto current = snapshot();
     if (current.generation != generation || current.recovery_required ||
         current.desired != DesiredExposure::kHidden ||
-        current.observed != ObservedState::kEnabling) return false;
+        (current.observed != ObservedState::kEnabling &&
+         !(current.observed == ObservedState::kIdle &&
+           reset_recovery_used_.load(std::memory_order_acquire)))) return false;
     publish(DesiredExposure::kHidden, ObservedState::kIdle,
             true, false, false, false);
     return true;
@@ -203,7 +206,8 @@ bool StateMachine::complete_disable(Generation generation) {
 
 bool StateMachine::begin_reset_recovery(Generation generation, std::int32_t reason) {
     const Snapshot current = snapshot();
-    if (generation != current.generation) {
+    if (generation != current.generation || current.recovery_required ||
+        current.observed == ObservedState::kFault) {
         return false;
     }
     advance_generation();
