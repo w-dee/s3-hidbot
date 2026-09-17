@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <string_view>
+#include <vector>
 
 #include "ble_hid_service/ble_hid_service.hpp"
 #include "host/ble_att.h"
@@ -26,20 +27,45 @@ namespace {
 
 constexpr std::uint16_t kControlPointUuid = 0x2a4c;
 constexpr std::uint16_t kHidServiceUuid = 0x1812;
+constexpr std::uint16_t kHidInformationUuid = 0x2a4a;
+constexpr std::uint16_t kReportMapUuid = 0x2a4b;
+constexpr std::uint16_t kReportUuid = 0x2a4d;
+constexpr std::uint16_t kReportReferenceUuid = 0x2908;
 constexpr std::uint16_t kAssignedControlPointHandle = 0x7a4c;
 constexpr ble_lifecycle::Generation kDistinctiveGeneration = 0xa1b2c3d4U;
 constexpr std::uint16_t kDistinctiveConnectionHandle = 0xbeef;
 
+// Frozen strict expectations are intentionally independent of the production
+// profile object and adapter aliases whose wiring this test exercises.
+constexpr std::array<std::uint8_t, 116> kExpectedStrictReportMap{
+    0x05,0x01,0x09,0x06,0xa1,0x01,0x85,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,
+    0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,
+    0x81,0x01,0x95,0x06,0x75,0x08,0x15,0x00,0x26,0xff,0x00,0x19,0x00,0x2a,
+    0xff,0x00,0x81,0x00,0xc0,
+    0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x02,0x09,0x01,0xa1,0x00,0x05,0x09,
+    0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,0x75,0x01,0x81,0x02,
+    0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,
+    0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,0x05,0x0c,0x0a,0x38,
+    0x02,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x01,0x81,0x06,0xc0,0xc0};
+constexpr std::array<std::uint8_t, 4> kExpectedHidInformation{
+    0x11, 0x01, 0x00, 0x00};
+constexpr std::array<std::uint8_t, 2> kExpectedKeyboardReference{0x01, 0x01};
+constexpr std::array<std::uint8_t, 2> kExpectedMouseReference{0x02, 0x01};
+constexpr std::array<std::uint8_t, 8> kExpectedNeutralKeyboard{};
+constexpr std::array<std::uint8_t, 5> kExpectedNeutralMouse{};
+
 const ble_gatt_svc_def *g_registered_services = nullptr;
 int g_count_calls = 0;
 int g_add_calls = 0;
+std::vector<std::uint8_t> g_appended_bytes;
 
 bool uuid16_equals(const ble_uuid_t *uuid, std::uint16_t value) {
     return uuid != nullptr && uuid->type == BLE_UUID_TYPE_16 &&
            reinterpret_cast<const ble_uuid16_t *>(uuid)->value == value;
 }
-const ble_gatt_chr_def *find_characteristic(std::uint16_t service_uuid,
-                                             std::uint16_t characteristic_uuid) {
+const ble_gatt_chr_def *find_characteristic(
+    std::uint16_t service_uuid, std::uint16_t characteristic_uuid,
+    std::size_t occurrence = 0) {
     if (g_registered_services == nullptr) {
         return nullptr;
     }
@@ -50,10 +76,27 @@ const ble_gatt_chr_def *find_characteristic(std::uint16_t service_uuid,
             continue;
         }
         for (const ble_gatt_chr_def *characteristic = service->characteristics;
-             characteristic->uuid != nullptr; ++characteristic) {
+            characteristic->uuid != nullptr; ++characteristic) {
             if (uuid16_equals(characteristic->uuid, characteristic_uuid)) {
-                return characteristic;
+                if (occurrence == 0) {
+                    return characteristic;
+                }
+                --occurrence;
             }
+        }
+    }
+    return nullptr;
+}
+
+const ble_gatt_dsc_def *find_descriptor(
+    const ble_gatt_chr_def *characteristic, std::uint16_t descriptor_uuid) {
+    if (characteristic == nullptr || characteristic->descriptors == nullptr) {
+        return nullptr;
+    }
+    for (const ble_gatt_dsc_def *descriptor = characteristic->descriptors;
+         descriptor->uuid != nullptr; ++descriptor) {
+        if (uuid16_equals(descriptor->uuid, descriptor_uuid)) {
+            return descriptor;
         }
     }
     return nullptr;
@@ -69,6 +112,58 @@ void require(bool condition, std::string_view case_name,
     if (!condition) {
         fail(case_name, detail);
     }
+}
+
+template <std::size_t Size>
+void require_served_value(const ble_gatt_chr_def *characteristic,
+                          const std::array<std::uint8_t, Size> &expected,
+                          std::string_view case_name) {
+    require(characteristic != nullptr, case_name,
+            "registered characteristic not found");
+    require(characteristic->access_cb == &ble_hid_service::Database::access &&
+                characteristic->arg != nullptr &&
+                characteristic->val_handle != nullptr,
+            case_name, "characteristic does not use the production adapter");
+    g_appended_bytes.clear();
+    os_mbuf output{};
+    ble_gatt_access_ctxt context{};
+    context.op = BLE_GATT_ACCESS_OP_READ_CHR;
+    context.om = &output;
+    context.chr = characteristic;
+    const int result = characteristic->access_cb(
+        kDistinctiveConnectionHandle, *characteristic->val_handle, &context,
+        characteristic->arg);
+    require(result == 0, case_name, "production read callback rejected access");
+    require(g_appended_bytes.size() == expected.size(), case_name,
+            "production read callback served the wrong length");
+    require(std::equal(g_appended_bytes.begin(), g_appended_bytes.end(),
+                       expected.begin(), expected.end()),
+            case_name, "production read callback served the wrong bytes");
+}
+
+template <std::size_t Size>
+void require_served_value(const ble_gatt_dsc_def *descriptor,
+                          const std::array<std::uint8_t, Size> &expected,
+                          std::string_view case_name) {
+    require(descriptor != nullptr, case_name,
+            "registered descriptor not found");
+    require(descriptor->access_cb == &ble_hid_service::Database::access &&
+                descriptor->arg != nullptr,
+            case_name, "descriptor does not use the production adapter");
+    g_appended_bytes.clear();
+    os_mbuf output{};
+    ble_gatt_access_ctxt context{};
+    context.op = BLE_GATT_ACCESS_OP_READ_DSC;
+    context.om = &output;
+    context.dsc = descriptor;
+    const int result = descriptor->access_cb(
+        kDistinctiveConnectionHandle, 0x7d5c, &context, descriptor->arg);
+    require(result == 0, case_name, "production read callback rejected access");
+    require(g_appended_bytes.size() == expected.size(), case_name,
+            "production read callback served the wrong length");
+    require(std::equal(g_appended_bytes.begin(), g_appended_bytes.end(),
+                       expected.begin(), expected.end()),
+            case_name, "production read callback served the wrong bytes");
 }
 
 class RecordingSink final : public hid_control_executor::BleEventSink {
@@ -247,7 +342,10 @@ extern "C" os_mbuf *ble_hs_mbuf_from_flat(const void *, std::uint16_t) {
     return nullptr;
 }
 
-extern "C" int os_mbuf_append(os_mbuf *, const void *, std::uint16_t) {
+extern "C" int os_mbuf_append(os_mbuf *, const void *data,
+                               std::uint16_t length) {
+    const auto *bytes = static_cast<const std::uint8_t *>(data);
+    g_appended_bytes.insert(g_appended_bytes.end(), bytes, bytes + length);
     return 0;
 }
 
@@ -297,6 +395,30 @@ int main() {
             "production service registration failed");
     require(g_count_calls == 1 && g_add_calls == 1, "registration",
             "production registration did not use the normal NimBLE path");
+
+    const ble_gatt_chr_def *hid_information =
+        find_characteristic(kHidServiceUuid, kHidInformationUuid);
+    const ble_gatt_chr_def *report_map =
+        find_characteristic(kHidServiceUuid, kReportMapUuid);
+    const ble_gatt_chr_def *keyboard_report =
+        find_characteristic(kHidServiceUuid, kReportUuid, 0);
+    const ble_gatt_chr_def *mouse_report =
+        find_characteristic(kHidServiceUuid, kReportUuid, 1);
+    require_served_value(hid_information, kExpectedHidInformation,
+                         "GATT HID Information");
+    require_served_value(report_map, kExpectedStrictReportMap,
+                         "GATT Report Map");
+    require_served_value(keyboard_report, kExpectedNeutralKeyboard,
+                         "GATT keyboard neutral report");
+    require_served_value(mouse_report, kExpectedNeutralMouse,
+                         "GATT mouse neutral report");
+    require_served_value(
+        find_descriptor(keyboard_report, kReportReferenceUuid),
+        kExpectedKeyboardReference, "GATT keyboard Report Reference");
+    require_served_value(find_descriptor(mouse_report, kReportReferenceUuid),
+                         kExpectedMouseReference,
+                         "GATT mouse Report Reference");
+    std::cout << "PASS: production GATT-served strict HID values\n";
 
     const ble_gatt_chr_def *control_point =
         find_characteristic(kHidServiceUuid, kControlPointUuid);
