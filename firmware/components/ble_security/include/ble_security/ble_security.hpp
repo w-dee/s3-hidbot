@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 
+#include "ble_fixture_profile/ble_fixture_profile.hpp"
 #include "ble_lifecycle/ble_lifecycle.hpp"
 
 namespace ble_security {
@@ -14,7 +15,8 @@ static_assert(std::atomic<std::uint16_t>::is_always_lock_free,
 static_assert(std::atomic_bool::is_always_lock_free,
               "BLE callback coordination requires lock-free bool atomics");
 
-constexpr std::uint8_t kRequiredKeySize = 16;
+constexpr std::uint8_t kRequiredKeySize =
+    ble_fixture_profile::strict_composite().security.key_size;
 constexpr std::uint8_t kBondCapacity = 3;
 
 enum class StoreFailureKind : std::uint8_t {
@@ -124,8 +126,8 @@ class State final {
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle) const;
 
-    static bool persisted_bond_is_valid(
-        const PersistedSecurityEvidence &persisted);
+    bool persisted_bond_is_valid(
+        const PersistedSecurityEvidence &persisted) const;
 
   private:
     enum Flag : std::uint32_t {

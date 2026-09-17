@@ -100,7 +100,7 @@ ble_gatt_chr_def s_characteristics[] = {
      .access_cb = Database::access,
      .arg = target(AccessTarget::kControlPoint),
      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_AUTHEN,
-     .min_key_size = 16,
+     .min_key_size = kStrictProfile.attributes.key_size,
      .val_handle = &s_control_point_value_handle},
     {.uuid = &s_report.u,
      .access_cb = Database::access,
@@ -109,7 +109,7 @@ ble_gatt_chr_def s_characteristics[] = {
      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_AUTHEN |
               BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN |
               BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR,
-     .min_key_size = 16,
+     .min_key_size = kStrictProfile.attributes.key_size,
      .val_handle = &s_keyboard_value_handle},
     {.uuid = &s_report.u,
      .access_cb = Database::access,
@@ -118,7 +118,7 @@ ble_gatt_chr_def s_characteristics[] = {
      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_AUTHEN |
               BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN |
               BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR,
-     .min_key_size = 16,
+     .min_key_size = kStrictProfile.attributes.key_size,
      .val_handle = &s_mouse_value_handle},
     {},
 };
@@ -134,9 +134,8 @@ ble_gatt_svc_def s_services[] = {
     {},
 };
 
-template <std::size_t Size>
-int append(struct os_mbuf *buffer,
-           const std::array<std::uint8_t, Size> &value) {
+template <typename ByteRange>
+int append(struct os_mbuf *buffer, const ByteRange &value) {
     return os_mbuf_append(buffer, value.data(), value.size()) == 0
                ? 0
                : BLE_ATT_ERR_INSUFFICIENT_RES;

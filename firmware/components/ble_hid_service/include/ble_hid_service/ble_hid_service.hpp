@@ -4,16 +4,22 @@
 #include <atomic>
 #include <cstdint>
 
+#include "ble_fixture_profile/ble_fixture_profile.hpp"
 #include "hid_control_executor/hid_control_executor.hpp"
 
 struct ble_gatt_access_ctxt;
 
 namespace ble_hid_service {
 
+inline constexpr const auto &kStrictProfile =
+    ble_fixture_profile::strict_composite();
+
 // Bump only when bonded clients must refresh cache-relevant GATT/HID
 // interpretation.  Missing per-peer metadata is legacy revision zero.
-inline constexpr std::uint8_t kGattSchemaRevision = 1;
-inline constexpr std::array<std::uint8_t, 1> kGattSchemaEpochValue{0x01};
+inline constexpr std::uint8_t kGattSchemaRevision =
+    kStrictProfile.cache.schema_revision;
+inline constexpr const auto &kGattSchemaEpochValue =
+    kStrictProfile.cache.schema_epoch_value;
 
 // ESP-IDF v5.5.4 registers the configured GAP and GATT services at 0x0001
 // through 0x000d.  Revision 1 consumes the old HID start with one three-
@@ -21,20 +27,34 @@ inline constexpr std::array<std::uint8_t, 1> kGattSchemaEpochValue{0x01};
 // Runtime validation below fails closed if the target database no longer
 // matches this compile-time topology contract.  Published HID work continues
 // to use the handles assigned by NimBLE, never these constants.
-inline constexpr std::uint16_t kGattServiceStartHandle = 0x0006;
-inline constexpr std::uint16_t kLegacyHidServiceStartHandle = 0x000e;
-inline constexpr std::uint16_t kLegacyReportMapValueHandle = 0x0012;
-inline constexpr std::uint16_t kLegacyKeyboardValueHandle = 0x0016;
-inline constexpr std::uint16_t kLegacyMouseValueHandle = 0x001a;
-inline constexpr std::uint16_t kRevision1EpochAttributeCount = 3;
-inline constexpr std::uint16_t kRevision1EpochServiceStartHandle = 0x000e;
-inline constexpr std::uint16_t kRevision1EpochServiceEndHandle = 0x0010;
-inline constexpr std::uint16_t kRevision1HidServiceStartHandle = 0x0011;
-inline constexpr std::uint16_t kRevision1ReportMapValueHandle = 0x0015;
-inline constexpr std::uint16_t kRevision1ControlPointValueHandle = 0x0017;
-inline constexpr std::uint16_t kRevision1KeyboardValueHandle = 0x0019;
-inline constexpr std::uint16_t kRevision1MouseValueHandle = 0x001d;
-inline constexpr std::uint16_t kRevision1HidLastAttributeHandle = 0x001f;
+inline constexpr std::uint16_t kGattServiceStartHandle =
+    kStrictProfile.layout.gatt_service_start;
+inline constexpr std::uint16_t kLegacyHidServiceStartHandle =
+    kStrictProfile.layout.legacy_hid_service_start;
+inline constexpr std::uint16_t kLegacyReportMapValueHandle =
+    kStrictProfile.layout.legacy_report_map_value;
+inline constexpr std::uint16_t kLegacyKeyboardValueHandle =
+    kStrictProfile.layout.legacy_keyboard_value;
+inline constexpr std::uint16_t kLegacyMouseValueHandle =
+    kStrictProfile.layout.legacy_mouse_value;
+inline constexpr std::uint16_t kRevision1EpochAttributeCount =
+    kStrictProfile.layout.epoch_attribute_count;
+inline constexpr std::uint16_t kRevision1EpochServiceStartHandle =
+    kStrictProfile.layout.epoch_service_start;
+inline constexpr std::uint16_t kRevision1EpochServiceEndHandle =
+    kStrictProfile.layout.epoch_service_end;
+inline constexpr std::uint16_t kRevision1HidServiceStartHandle =
+    kStrictProfile.layout.hid_service_start;
+inline constexpr std::uint16_t kRevision1ReportMapValueHandle =
+    kStrictProfile.layout.report_map_value;
+inline constexpr std::uint16_t kRevision1ControlPointValueHandle =
+    kStrictProfile.layout.control_point_value;
+inline constexpr std::uint16_t kRevision1KeyboardValueHandle =
+    kStrictProfile.layout.keyboard_value;
+inline constexpr std::uint16_t kRevision1MouseValueHandle =
+    kStrictProfile.layout.mouse_value;
+inline constexpr std::uint16_t kRevision1HidLastAttributeHandle =
+    kStrictProfile.layout.hid_last_attribute;
 
 static_assert(kGattSchemaRevision == 1);
 static_assert(kGattSchemaEpochValue.size() == 1);
@@ -62,23 +82,18 @@ static_assert(kLegacyKeyboardValueHandle !=
               kLegacyKeyboardValueHandle != kRevision1MouseValueHandle &&
               kLegacyMouseValueHandle != kRevision1KeyboardValueHandle &&
               kLegacyMouseValueHandle != kRevision1MouseValueHandle);
-inline constexpr std::array<std::uint8_t, 4> kHidInformation{
-    0x11, 0x01, 0x00, 0x00};
-inline constexpr std::array<std::uint8_t, 8> kNeutralKeyboard{};
-inline constexpr std::array<std::uint8_t, 5> kNeutralMouse{};
-inline constexpr std::array<std::uint8_t, 2> kKeyboardReportReference{0x01, 0x01};
-inline constexpr std::array<std::uint8_t, 2> kMouseReportReference{0x02, 0x01};
-
-inline constexpr std::array<std::uint8_t, 116> kReportMap{
-    0x05,0x01,0x09,0x06,0xa1,0x01,0x85,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,
-    0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,
-    0x81,0x01,0x95,0x06,0x75,0x08,0x15,0x00,0x26,0xff,0x00,0x19,0x00,0x2a,
-    0xff,0x00,0x81,0x00,0xc0,
-    0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x02,0x09,0x01,0xa1,0x00,0x05,0x09,
-    0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,0x75,0x01,0x81,0x02,
-    0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,
-    0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,0x05,0x0c,0x0a,0x38,
-    0x02,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x01,0x81,0x06,0xc0,0xc0};
+inline constexpr const auto &kHidInformation = kStrictProfile.hid_information;
+inline constexpr const auto &kKeyboardReport = *ble_fixture_profile::find_report(
+    kStrictProfile, ble_fixture_profile::ReportRole::kKeyboardInput);
+inline constexpr const auto &kMouseReport = *ble_fixture_profile::find_report(
+    kStrictProfile, ble_fixture_profile::ReportRole::kMouseInput);
+inline constexpr const auto &kNeutralKeyboard = kKeyboardReport.neutral_value;
+inline constexpr const auto &kNeutralMouse = kMouseReport.neutral_value;
+inline constexpr const auto &kKeyboardReportReference =
+    kKeyboardReport.report_reference;
+inline constexpr const auto &kMouseReportReference =
+    kMouseReport.report_reference;
+inline constexpr const auto &kReportMap = kStrictProfile.report_map;
 
 class Database final : public hid_control_executor::BleDatabase {
   public:

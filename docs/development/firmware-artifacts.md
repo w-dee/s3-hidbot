@@ -80,8 +80,10 @@ usage is the actual generated application `.bin` file size. Static RAM is the
 ESP-IDF v5.5.4 size JSON sum of DRAM and DIRAM `.data` plus `.bss`; it is not a
 normal-profile estimate or a text-summary approximation.
 
-The machine limits are application `<= 672784` bytes and static RAM
-`<= 39832` bytes. Product functionality and correctness are primary. The
+The forward-development machine limits are application `<= 738320` bytes and
+static RAM `<= 72600` bytes. Historical release measurements remain evaluated
+against the limits recorded with that release; these limits do not reinterpret
+or alter earlier release evidence. Product functionality and correctness are primary. The
 application limit is a capacity guard, not a target that normal feature work
 should approach through flash-size micro-optimization. Do not complicate
 normal feature implementations solely to save small amounts of application

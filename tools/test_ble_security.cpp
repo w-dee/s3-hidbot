@@ -29,30 +29,35 @@ PersistedSecurityEvidence valid_persisted(bool sc = true) {
     return {.our = valid_record(sc), .peer = valid_record(sc)};
 }
 
+bool persisted_bond_is_valid(const PersistedSecurityEvidence &evidence) {
+    const State state;
+    return state.persisted_bond_is_valid(evidence);
+}
+
 void verification_matrix() {
-    assert(State::persisted_bond_is_valid(valid_persisted(true)));
-    assert(State::persisted_bond_is_valid(valid_persisted(false)));
+    assert(persisted_bond_is_valid(valid_persisted(true)));
+    assert(persisted_bond_is_valid(valid_persisted(false)));
     auto evidence = valid_persisted();
     evidence.our.found = false;
-    assert(!State::persisted_bond_is_valid(evidence));
+    assert(!persisted_bond_is_valid(evidence));
     evidence = valid_persisted();
     evidence.peer.found = false;
-    assert(!State::persisted_bond_is_valid(evidence));
+    assert(!persisted_bond_is_valid(evidence));
     evidence = valid_persisted();
     evidence.peer.identity_matches = false;
-    assert(!State::persisted_bond_is_valid(evidence));
+    assert(!persisted_bond_is_valid(evidence));
     evidence = valid_persisted();
     evidence.our.ltk_present = false;
-    assert(!State::persisted_bond_is_valid(evidence));
+    assert(!persisted_bond_is_valid(evidence));
     evidence = valid_persisted();
     evidence.peer.authenticated = false;
-    assert(!State::persisted_bond_is_valid(evidence));
+    assert(!persisted_bond_is_valid(evidence));
     evidence = valid_persisted();
     evidence.our.key_size = 15;
-    assert(!State::persisted_bond_is_valid(evidence));
+    assert(!persisted_bond_is_valid(evidence));
     evidence = valid_persisted();
     evidence.peer.secure_connections = false;
-    assert(!State::persisted_bond_is_valid(evidence));
+    assert(!persisted_bond_is_valid(evidence));
 }
 
 void readiness_and_fencing() {
@@ -68,6 +73,12 @@ void readiness_and_fencing() {
     assert(state.security_ready_for_hid(generation, handle));
     assert(!state.security_ready_for_hid(generation - 1, handle));
     assert(!state.security_ready_for_hid(generation, handle + 1));
+
+    State authenticated_legacy;
+    authenticated_legacy.begin_connection(generation, handle);
+    authenticated_legacy.apply_verification(
+        generation, handle, valid_link(false), valid_persisted(false));
+    assert(authenticated_legacy.security_ready_for_hid(generation, handle));
 
     for (unsigned condition = 0; condition < 5; ++condition) {
         State weak;
@@ -294,7 +305,7 @@ void orphan_recovery_and_restore_integrity_matrix() {
     plan = ble_transport::detail::make_recovery_plan(
         bond_a, bond_a, bond_a, bond_a, empty_schema);
     assert(plan.kind == RecoveryPlanKind::kReady && plan.orphan_count == 0);
-    assert(State::persisted_bond_is_valid(valid_persisted()));
+    assert(persisted_bond_is_valid(valid_persisted()));
 
     // Orphan 5 and 6: either half-bond direction fails before mutation.
     plan = ble_transport::detail::make_recovery_plan(
@@ -491,7 +502,7 @@ void schema_first_removal_and_crash_cut_matrix() {
     assert(result.stage == SchemaFirstRemovalStage::kPeerDelete);
     assert(!peer_failure.schema && peer_failure.our && peer_failure.peer);
     assert(peer_failure.order_count == 2);
-    assert(State::persisted_bond_is_valid(valid_persisted()));
+    assert(persisted_bond_is_valid(valid_persisted()));
 
     // Cut 3 / Removal 4: completed peer deletion has no schema or auxiliary
     // residue and leaves the unrelated peer unchanged.

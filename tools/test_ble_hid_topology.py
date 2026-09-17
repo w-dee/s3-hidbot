@@ -12,14 +12,18 @@ HEADER = (
     ROOT
     / "firmware/components/ble_hid_service/include/ble_hid_service/ble_hid_service.hpp"
 )
+PROFILE = (
+    ROOT
+    / "firmware/components/ble_fixture_profile/include/ble_fixture_profile/ble_fixture_profile.hpp"
+)
 SERVICE = ROOT / "firmware/components/ble_hid_service/ble_hid_service.cpp"
 TRANSPORT = ROOT / "firmware/components/ble_transport/ble_transport.cpp"
 SDKCONFIG_DEFAULTS = ROOT / "firmware/sdkconfig.defaults"
 
 
-def integer_constant(source: str, name: str) -> int:
+def designated_integer(source: str, name: str) -> int:
     match = re.search(
-        rf"\b{re.escape(name)}\s*=\s*(0x[0-9a-fA-F]+|[0-9]+)\s*;",
+        rf"\.{re.escape(name)}\s*=\s*(0x[0-9a-fA-F]+|[0-9]+)\s*,",
         source,
     )
     assert match is not None, name
@@ -48,6 +52,7 @@ def canonical_uuid(little_endian: bytes) -> str:
 
 def main() -> int:
     header = HEADER.read_text(encoding="utf-8")
+    profile = PROFILE.read_text(encoding="utf-8")
     service = SERVICE.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
     sdkconfig = SDKCONFIG_DEFAULTS.read_text(encoding="utf-8")
@@ -133,9 +138,7 @@ def main() -> int:
     gatt_start = gap_start + gap_attributes
     gatt_attributes = 8
     epoch_start = gatt_start + gatt_attributes
-    epoch_attributes = integer_constant(
-        header, "kRevision1EpochAttributeCount"
-    )
+    epoch_attributes = designated_integer(profile, "epoch_attribute_count")
     assert epoch_attributes == 1 + 2 * epoch_body.count(".uuid =") == 3
     hid_start = epoch_start + epoch_attributes
     hid_attributes = 15
@@ -154,9 +157,27 @@ def main() -> int:
         "kRevision1MouseValueHandle": hid_start + 12,
         "kRevision1HidLastAttributeHandle": hid_start + hid_attributes - 1,
     }
+    profile_fields = {
+        "kGattServiceStartHandle": "gatt_service_start",
+        "kLegacyHidServiceStartHandle": "legacy_hid_service_start",
+        "kLegacyReportMapValueHandle": "legacy_report_map_value",
+        "kLegacyKeyboardValueHandle": "legacy_keyboard_value",
+        "kLegacyMouseValueHandle": "legacy_mouse_value",
+        "kRevision1EpochAttributeCount": "epoch_attribute_count",
+        "kRevision1EpochServiceStartHandle": "epoch_service_start",
+        "kRevision1EpochServiceEndHandle": "epoch_service_end",
+        "kRevision1HidServiceStartHandle": "hid_service_start",
+        "kRevision1ReportMapValueHandle": "report_map_value",
+        "kRevision1ControlPointValueHandle": "control_point_value",
+        "kRevision1KeyboardValueHandle": "keyboard_value",
+        "kRevision1MouseValueHandle": "mouse_value",
+        "kRevision1HidLastAttributeHandle": "hid_last_attribute",
+    }
     for name, value in expected.items():
-        assert integer_constant(header, name) == value, (name, value)
-    assert integer_constant(header, "kGattSchemaRevision") == 1
+        assert designated_integer(profile, profile_fields[name]) == value, (name, value)
+        assert f"{name} =\n    kStrictProfile.layout.{profile_fields[name]};" in header
+    assert designated_integer(profile, "schema_revision") == 1
+    assert "kGattSchemaRevision =\n    kStrictProfile.cache.schema_revision;" in header
     assert epoch_start == 0x000E and hid_start == 0x0011
     assert "ble_svc_gap_init();" in transport
     assert "ble_svc_gatt_init();" in transport

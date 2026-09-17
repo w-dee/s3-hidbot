@@ -7,6 +7,7 @@
 #include <array>
 #include <cstring>
 
+#include "ble_fixture_profile/ble_fixture_profile.hpp"
 #include "ble_hid_service/ble_hid_service.hpp"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -33,6 +34,8 @@ extern "C" void ble_store_config_init(void);
 
 namespace ble_transport {
 namespace {
+inline constexpr const auto &kStrictProfile =
+    ble_fixture_profile::strict_composite();
 constexpr char kDeviceName[] = "s3-hidbot";
 constexpr std::uint16_t kHidAppearance = 0x03c0;
 constexpr std::uint16_t kAdvertisingInterval = 64;  // 40 ms in 0.625-ms units.
@@ -76,6 +79,28 @@ struct StoredPeer {
 };
 
 bool has_exact_identity(const ble_addr_t &identity);
+
+std::uint8_t nimble_io_capability(ble_fixture_profile::IoCapability value) {
+    switch (value) {
+        case ble_fixture_profile::IoCapability::kKeyboardOnly:
+            return BLE_SM_IO_CAP_KEYBOARD_ONLY;
+    }
+    return BLE_SM_IO_CAP_KEYBOARD_ONLY;
+}
+
+std::uint8_t nimble_key_distribution(
+    ble_fixture_profile::KeyDistribution value) {
+    std::uint8_t result = 0;
+    if (ble_fixture_profile::has_key_distribution(
+            value, ble_fixture_profile::KeyDistribution::kEncryption)) {
+        result |= BLE_SM_PAIR_KEY_DIST_ENC;
+    }
+    if (ble_fixture_profile::has_key_distribution(
+            value, ble_fixture_profile::KeyDistribution::kIdentity)) {
+        result |= BLE_SM_PAIR_KEY_DIST_ID;
+    }
+    return result;
+}
 
 detail::StoreIdentity model_identity(const ble_addr_t &identity) {
     detail::StoreIdentity output{.type = identity.type};
@@ -579,15 +604,17 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     }
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_KEYBOARD_ONLY;
-    ble_hs_cfg.sm_bonding = 1;
-    ble_hs_cfg.sm_mitm = 1;
-    ble_hs_cfg.sm_sc = 1;
-    ble_hs_cfg.sm_sc_only = 0;
-    ble_hs_cfg.sm_sec_lvl = 3;
-    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
+    const auto &smp = kStrictProfile.smp;
+    ble_hs_cfg.sm_io_cap = nimble_io_capability(smp.io_capability);
+    ble_hs_cfg.sm_bonding = smp.bonding;
+    ble_hs_cfg.sm_mitm = smp.mitm;
+    ble_hs_cfg.sm_sc = smp.secure_connections;
+    ble_hs_cfg.sm_sc_only = smp.secure_connections_only;
+    ble_hs_cfg.sm_sec_lvl = smp.security_level;
+    ble_hs_cfg.sm_our_key_dist =
+        nimble_key_distribution(smp.our_key_distribution);
     ble_hs_cfg.sm_their_key_dist =
-        BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+        nimble_key_distribution(smp.peer_key_distribution);
 
     // Install the supported NimBLE store, then interpose only enough to
     // observe failures. Every wrapper delegates to the saved implementation
@@ -890,13 +917,14 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
             return BLE_GAP_REPEAT_PAIRING_IGNORE;
         case BLE_GAP_EVENT_AUTHORIZE: {
             ble_gap_conn_desc descriptor{};
+            const auto &attributes = kStrictProfile.attributes;
             const bool accepted =
                 ble_gap_conn_find(event->authorize.conn_handle, &descriptor) ==
                     0 &&
                 descriptor.sec_state.encrypted &&
-                descriptor.sec_state.authenticated &&
-                descriptor.sec_state.key_size ==
-                    ble_security::kRequiredKeySize;
+                (!attributes.authenticated ||
+                 descriptor.sec_state.authenticated) &&
+                descriptor.sec_state.key_size == attributes.key_size;
             event->authorize.out_response =
                 accepted ? BLE_GAP_AUTHORIZE_ACCEPT
                          : BLE_GAP_AUTHORIZE_REJECT;
@@ -1438,7 +1466,7 @@ hid_control_executor::BleBondListResult Backend::list_bonds() {
         }
         output.our_sec = peer.our.found;
         output.peer_sec = peer.peer.found;
-        output.verified = ble_security::State::persisted_bond_is_valid(
+        output.verified = security_.persisted_bond_is_valid(
             {.our = peer.our, .peer = peer.peer});
         std::uint8_t revision = 0;
         const esp_err_t schema_result =

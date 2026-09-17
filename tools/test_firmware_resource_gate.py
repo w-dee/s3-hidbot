@@ -60,6 +60,10 @@ def size_document(**updates: object) -> dict[str, object]:
 
 
 class FirmwareResourceGateTests(unittest.TestCase):
+    def test_owner_authorized_forward_limits(self) -> None:
+        self.assertEqual(APPLICATION_LIMIT, 738_320)
+        self.assertEqual(STATIC_RAM_LIMIT, 72_600)
+
     def test_static_ram_is_dram_and_diram_data_plus_bss(self) -> None:
         self.assertEqual(parse_static_ram(json.dumps(size_document())), 100)
 

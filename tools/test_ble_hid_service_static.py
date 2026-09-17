@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "firmware/components/ble_hid_service/include/ble_hid_service/ble_hid_service.hpp"
+PROFILE = ROOT / "firmware/components/ble_fixture_profile/include/ble_fixture_profile/ble_fixture_profile.hpp"
 SERVICE = ROOT / "firmware/components/ble_hid_service/ble_hid_service.cpp"
 TRANSPORT = ROOT / "firmware/components/ble_transport/ble_transport.cpp"
 EXECUTOR_HEADER = ROOT / "firmware/components/hid_control_executor/include/hid_control_executor/hid_control_executor.hpp"
@@ -81,13 +82,27 @@ def macro_two_argument_value(body: str, name: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def integer_constant(source: str, name: str) -> int:
+def designated_integer(source: str, name: str) -> int:
     match = re.search(
-        rf"\b{re.escape(name)}\s*=\s*(0x[0-9a-fA-F]+|[0-9]+)\s*;",
+        rf"\.{re.escape(name)}\s*=\s*(0x[0-9a-fA-F]+|[0-9]+)\s*,",
         source,
     )
-    assert match is not None
+    assert match is not None, name
     return int(match.group(1), 0)
+
+
+def report_reference(source: str, role: str) -> bytes:
+    match = re.search(
+        rf"\.role = ReportRole::{re.escape(role)},.*?"
+        r"\.report_reference = \{(.*?)\}",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None, role
+    return bytes(
+        int(value, 16)
+        for value in re.findall(r"0x([0-9a-fA-F]{2})", match.group(1))
+    )
 
 
 def byte_array(source: str, name: str) -> bytes:
@@ -116,6 +131,7 @@ def uuid128_little_endian(source: str, name: str) -> bytes:
 
 def main() -> int:
     header = HEADER.read_text(encoding="utf-8")
+    profile = PROFILE.read_text(encoding="utf-8")
     service = SERVICE.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
     executor_header = EXECUTOR_HEADER.read_text(encoding="utf-8")
@@ -131,7 +147,7 @@ def main() -> int:
     host_cli = HOST_CLI.read_text(encoding="utf-8")
     dependencies_lock = DEPENDENCIES_LOCK.read_text(encoding="utf-8")
 
-    report_body = re.search(r"kReportMap\{(.*?)\};", header, re.DOTALL)
+    report_body = re.search(r"kStrictReportMap\{(.*?)\};", profile, re.DOTALL)
     assert report_body is not None
     report_map = bytes(int(value, 16) for value in re.findall(r"0x([0-9a-fA-F]{2})", report_body.group(1)))
     assert len(report_map) == 116
@@ -141,26 +157,23 @@ def main() -> int:
     assert bytes((0x95, 0x03, 0x81, 0x06)) in report_map  # X/Y/wheel
     assert bytes((0x95, 0x01, 0x81, 0x06)) in report_map  # pan
 
-    revision_match = re.search(
-        r"kGattSchemaRevision\s*=\s*(\d+)", header
-    )
-    assert revision_match is not None
-    schema_revision = int(revision_match.group(1))
+    schema_revision = designated_integer(profile, "schema_revision")
+    topology_profile_fields = {
+        "kGattServiceStartHandle": "gatt_service_start",
+        "kLegacyHidServiceStartHandle": "legacy_hid_service_start",
+        "kRevision1EpochAttributeCount": "epoch_attribute_count",
+        "kRevision1EpochServiceStartHandle": "epoch_service_start",
+        "kRevision1EpochServiceEndHandle": "epoch_service_end",
+        "kRevision1HidServiceStartHandle": "hid_service_start",
+        "kRevision1ReportMapValueHandle": "report_map_value",
+        "kRevision1ControlPointValueHandle": "control_point_value",
+        "kRevision1KeyboardValueHandle": "keyboard_value",
+        "kRevision1MouseValueHandle": "mouse_value",
+        "kRevision1HidLastAttributeHandle": "hid_last_attribute",
+    }
     topology_fields = tuple(
-        integer_constant(header, name)
-        for name in (
-            "kGattServiceStartHandle",
-            "kLegacyHidServiceStartHandle",
-            "kRevision1EpochAttributeCount",
-            "kRevision1EpochServiceStartHandle",
-            "kRevision1EpochServiceEndHandle",
-            "kRevision1HidServiceStartHandle",
-            "kRevision1ReportMapValueHandle",
-            "kRevision1ControlPointValueHandle",
-            "kRevision1KeyboardValueHandle",
-            "kRevision1MouseValueHandle",
-            "kRevision1HidLastAttributeHandle",
-        )
+        designated_integer(profile, field)
+        for field in topology_profile_fields.values()
     )
     cache_schema = (
         b"s3-hidbot-cache-schema\x00"
@@ -170,9 +183,9 @@ def main() -> int:
         + uuid128_little_endian(service, "s_schema_epoch_characteristic")
         + b"epoch-primary-read-only-u8\x00"
         + b"".join(value.to_bytes(2, "little") for value in topology_fields)
-        + byte_array(header, "kGattSchemaEpochValue")
-        + byte_array(header, "kKeyboardReportReference")
-        + byte_array(header, "kMouseReportReference")
+        + bytes((schema_revision,))
+        + report_reference(profile, "kKeyboardInput")
+        + report_reference(profile, "kMouseInput")
         + report_map
     )
     schema_fingerprints = {
@@ -184,6 +197,12 @@ def main() -> int:
         schema_revision,
         cache_schema_fingerprint,
     )
+    assert hashlib.sha256(report_map).hexdigest() == (
+        "ef1be45d8fe7d0637568c8954b64bab971d5b5f57bf3d44f1cc040e8fe5c3d32"
+    )
+    assert byte_array(profile, "kStrictReportMapSha256") == hashlib.sha256(
+        report_map
+    ).digest()
 
     keyboard_fields = [
         field for field in parse_hid_input_fields(report_map)
@@ -255,11 +274,22 @@ def main() -> int:
     assert firmware_maximum <= keyboard_array["usage_maximum"]
     assert firmware_maximum <= keyboard_array["logical_maximum"]
 
-    assert "kHidInformation{\n    0x11, 0x01, 0x00, 0x00}" in header
-    assert "kNeutralKeyboard{}" in header and "uint8_t, 8" in header
-    assert "kNeutralMouse{}" in header and "uint8_t, 5" in header
-    assert "kKeyboardReportReference{0x01, 0x01}" in header
-    assert "kMouseReportReference{0x02, 0x01}" in header
+    assert "kStrictHidInformation{\n    0x11, 0x01, 0x00, 0x00}" in profile
+    assert "kStrictNeutralKeyboard{}" in profile and "uint8_t, 8" in profile
+    assert "kStrictNeutralMouse{}" in profile and "uint8_t, 5" in profile
+    assert report_reference(profile, "kKeyboardInput") == bytes((0x01, 0x01))
+    assert report_reference(profile, "kMouseInput") == bytes((0x02, 0x01))
+    for alias in (
+        "kHidInformation = kStrictProfile.hid_information",
+        "kNeutralKeyboard =",
+        "kNeutralMouse =",
+        "kKeyboardReportReference =",
+        "kMouseReportReference =",
+        "kReportMap =",
+    ):
+        assert alias in header
+    for constant, field in topology_profile_fields.items():
+        assert f"{constant} =\n    kStrictProfile.layout.{field};" in header
 
     assert service.count("BLE_UUID16_INIT(0x1812)") == 1
     for uuid in ("0x2a4a", "0x2a4b", "0x2a4c"):

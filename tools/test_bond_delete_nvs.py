@@ -142,7 +142,8 @@ def main():
         path = Path(directory)
         (path/'test.cpp').write_text(PRE + extracted + POST)
         command = [os.environ.get('CXX','c++'),'-std=c++20','-Wall','-Wextra','-Werror','-pedantic']
-        for include in ('ble_transport','ble_security/include','ble_lifecycle/include'):
+        for include in ('ble_transport', 'ble_fixture_profile/include',
+                        'ble_security/include', 'ble_lifecycle/include'):
             command += ['-I'+str(ROOT/'firmware/components'/include)]
         subprocess.run(command+[str(path/'test.cpp'),'-o',str(path/'test')],check=True)
         subprocess.run([str(path/'test')],check=True)

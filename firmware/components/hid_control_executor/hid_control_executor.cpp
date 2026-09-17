@@ -13,10 +13,28 @@
 #include <cstring>
 #include <limits>
 
+#include "ble_fixture_profile/ble_fixture_profile.hpp"
 #include "secure_memory/secure_memory.hpp"
 
 namespace hid_control_executor {
 namespace {
+
+inline constexpr const auto &kStrictProfile =
+    ble_fixture_profile::strict_composite();
+
+ble_fixture_profile::ReportMask subscription_mask(
+    const BleHidPeerSnapshot &peer) {
+    ble_fixture_profile::ReportMask result = 0;
+    if (peer.keyboard_notify_enabled) {
+        result |= ble_fixture_profile::report_bit(
+            ble_fixture_profile::ReportRole::kKeyboardInput);
+    }
+    if (peer.mouse_notify_enabled) {
+        result |= ble_fixture_profile::report_bit(
+            ble_fixture_profile::ReportRole::kMouseInput);
+    }
+    return result;
+}
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
 std::mutex s_dle_mux;
@@ -171,8 +189,8 @@ bool Controller::ble_link_ready() const {
     if (ble_backend_ == nullptr || ble_database_ == nullptr ||
         ble_lifecycle_handoff_failure_.load(std::memory_order_acquire) ||
         !ble_hid_peer_.active || ble_hid_peer_.suspended ||
-        !ble_hid_peer_.keyboard_notify_enabled ||
-        !ble_hid_peer_.mouse_notify_enabled) {
+        !ble_fixture_profile::subscriptions_ready(
+            kStrictProfile, subscription_mask(ble_hid_peer_))) {
         return false;
     }
     const auto lifecycle = ble_state_.snapshot();
@@ -859,7 +877,9 @@ void Controller::begin_ble_hid_peer(
         return;
     }
     const auto handles = ble_database_->hid_handles();
-    if (handles.report_map_value == 0 || handles.keyboard_value == 0 ||
+    if (!ble_fixture_profile::reports_present(
+            kStrictProfile, kStrictProfile.required_input_subscriptions) ||
+        handles.report_map_value == 0 || handles.keyboard_value == 0 ||
         handles.mouse_value == 0 ||
         handles.control_point_value == 0 ||
         handles.report_map_value == handles.keyboard_value ||
@@ -913,10 +933,15 @@ bool Controller::ble_hid_interface_ready(
     const std::uint16_t current_handle =
         interface == BleHidInterface::kKeyboard ? handles.keyboard_value
                                                 : handles.mouse_value;
+    const auto role = interface == BleHidInterface::kKeyboard
+                          ? ble_fixture_profile::ReportRole::kKeyboardInput
+                          : ble_fixture_profile::ReportRole::kMouseInput;
     const bool subscribed = interface == BleHidInterface::kKeyboard
                                 ? ble_hid_peer_.keyboard_notify_enabled
                                 : ble_hid_peer_.mouse_notify_enabled;
-    return current_handle == identity.characteristic_handle && subscribed &&
+    return ble_fixture_profile::reports_present(
+               kStrictProfile, ble_fixture_profile::report_bit(role)) &&
+           current_handle == identity.characteristic_handle && subscribed &&
            lifecycle.generation == identity.generation &&
            lifecycle.desired == ble_lifecycle::DesiredExposure::kExposed &&
            lifecycle.observed == ble_lifecycle::ObservedState::kConnected &&
@@ -2422,8 +2447,11 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
     if (terminal_evidence_ready && pairing_complete_seen_ &&
         security.coherent && security.connected && security.encrypted &&
         security.identity_resolved && security.store_healthy) {
-        if (!security.authenticated ||
-            security.key_size != ble_security::kRequiredKeySize) {
+        const auto &policy = kStrictProfile.security;
+        if (security.authenticated != policy.authenticated ||
+            security.key_size != policy.key_size ||
+            (policy.secure_connections_required &&
+             !security.secure_connections)) {
             terminate_security_connection(
                 ble_pairing::LastResult::kSecurityPolicy, false);
         } else if (!security.project_verified_bond_persisted) {

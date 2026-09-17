@@ -8,17 +8,34 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> int:
     transport = (ROOT / "firmware/components/ble_transport/ble_transport.cpp").read_text()
     service = (ROOT / "firmware/components/ble_hid_service/ble_hid_service.cpp").read_text()
+    profile = (ROOT / "firmware/components/ble_fixture_profile/include/ble_fixture_profile/ble_fixture_profile.hpp").read_text()
     defaults = (ROOT / "firmware/sdkconfig.defaults").read_text()
     protocol = (ROOT / "firmware/components/control_protocol/control_protocol.cpp").read_text()
+    for policy_value in (
+        ".io_capability = IoCapability::kKeyboardOnly,",
+        ".bonding = true,", ".mitm = true,",
+        ".secure_connections = true,",
+        ".secure_connections_only = false,",
+        ".security_level = 3,",
+        ".our_key_distribution = KeyDistribution::kEncryption,",
+    ):
+        assert profile.count(policy_value) >= 1
+    assert ".peer_key_distribution = KeyDistribution::kEncryption |" in profile
+    assert "KeyDistribution::kIdentity," in profile
     for assignment in (
-        "ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_KEYBOARD_ONLY;",
-        "ble_hs_cfg.sm_bonding = 1;", "ble_hs_cfg.sm_mitm = 1;",
-        "ble_hs_cfg.sm_sc = 1;", "ble_hs_cfg.sm_sc_only = 0;",
-        "ble_hs_cfg.sm_sec_lvl = 3;",
-        "ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;",
+        "ble_hs_cfg.sm_io_cap = nimble_io_capability(smp.io_capability);",
+        "ble_hs_cfg.sm_bonding = smp.bonding;",
+        "ble_hs_cfg.sm_mitm = smp.mitm;",
+        "ble_hs_cfg.sm_sc = smp.secure_connections;",
+        "ble_hs_cfg.sm_sc_only = smp.secure_connections_only;",
+        "ble_hs_cfg.sm_sec_lvl = smp.security_level;",
+        "nimble_key_distribution(smp.our_key_distribution);",
+        "nimble_key_distribution(smp.peer_key_distribution);",
     ):
         assert transport.count(assignment) == 1
-    assert "BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID" in transport
+    assert "return BLE_SM_IO_CAP_KEYBOARD_ONLY;" in transport
+    assert "result |= BLE_SM_PAIR_KEY_DIST_ENC;" in transport
+    assert "result |= BLE_SM_PAIR_KEY_DIST_ID;" in transport
     assert "BLE_SM_PAIR_KEY_DIST_SIGN" not in transport
     assert "BLE_SM_PAIR_KEY_DIST_LINK" not in transport
     for value in (
@@ -43,7 +60,7 @@ def main() -> int:
     control = re.search(r"kControlPoint\),(.*?)\.val_handle", service, re.S)
     assert control and "BLE_GATT_CHR_F_WRITE_NO_RSP" in control.group(1)
     assert "BLE_GATT_CHR_F_WRITE_AUTHEN" in control.group(1)
-    assert ".min_key_size = 16" in control.group(1)
+    assert ".min_key_size = kStrictProfile.attributes.key_size" in control.group(1)
     for report in ("kKeyboardReport", "kMouseReport"):
         body = re.search(rf"{report}\),(.*?)\.val_handle", service, re.S)
         assert body
@@ -51,7 +68,8 @@ def main() -> int:
                      "BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN",
                      "BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR"):
             assert flag in body.group(1)
-        assert ".min_key_size = 16" in body.group(1)
+        assert ".min_key_size = kStrictProfile.attributes.key_size" in body.group(1)
+    assert profile.count(".key_size = 16,") == 2
     assert service.count(".att_flags = BLE_ATT_F_READ") == 2
     # Two Report Reference descriptors and the public, read-only schema epoch
     # characteristic intentionally have no encryption-key-size requirement.

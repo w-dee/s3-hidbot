@@ -3,9 +3,15 @@
 namespace ble_security {
 namespace {
 
+inline constexpr const auto &kStrictPolicy =
+    ble_fixture_profile::strict_composite().security;
+
 bool record_is_valid(const StoredSecurityRecord &record) {
     return record.found && record.identity_matches && record.ltk_present &&
-           record.authenticated && record.key_size == kRequiredKeySize;
+           record.authenticated == kStrictPolicy.authenticated &&
+           record.key_size == kStrictPolicy.key_size &&
+           (!kStrictPolicy.secure_connections_required ||
+            record.secure_connections);
 }
 
 }  // namespace
@@ -238,15 +244,22 @@ bool State::security_ready_for_hid(
     const Snapshot value = snapshot();
     return value.coherent && value.generation == generation &&
            value.connection_handle == connection_handle && value.connected &&
-           value.encrypted && value.authenticated && value.nimble_bonded &&
-           value.project_verified_bond_persisted && value.identity_resolved &&
-           value.key_size == kRequiredKeySize && value.store_healthy &&
+           value.encrypted == kStrictPolicy.encrypted &&
+           value.authenticated == kStrictPolicy.authenticated &&
+           value.nimble_bonded == kStrictPolicy.bonded &&
+           value.project_verified_bond_persisted ==
+               kStrictPolicy.persisted_bond &&
+           value.identity_resolved == kStrictPolicy.identity_resolved &&
+           (!kStrictPolicy.secure_connections_required ||
+            value.secure_connections) &&
+           value.key_size == kStrictPolicy.key_size && value.store_healthy &&
            value.lifecycle_healthy;
 }
 
 bool State::persisted_bond_is_valid(
-    const PersistedSecurityEvidence &persisted) {
-    return record_is_valid(persisted.our) && record_is_valid(persisted.peer) &&
+    const PersistedSecurityEvidence &persisted) const {
+    return record_is_valid(persisted.our) &&
+           record_is_valid(persisted.peer) &&
            persisted.our.secure_connections ==
                persisted.peer.secure_connections;
 }

@@ -1,0 +1,329 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+
+namespace ble_fixture_profile {
+
+enum class ProfileId : std::uint8_t {
+    kStrictComposite = 0,
+};
+
+enum class TopologyId : std::uint8_t {
+    kStrictComposite = 0,
+};
+
+enum class GattTemplateId : std::uint8_t {
+    kStrictComposite = 0,
+};
+
+enum class GattLayoutId : std::uint8_t {
+    kStrictRevision1 = 0,
+};
+
+enum class SmpPolicyId : std::uint8_t {
+    kAuthenticatedKeyboardOnly = 0,
+};
+
+enum class SecurityPolicyId : std::uint8_t {
+    kAuthenticatedBonded = 0,
+};
+
+enum class AttributePolicyId : std::uint8_t {
+    kAuthenticated = 0,
+};
+
+enum class CachePolicyId : std::uint8_t {
+    kStrictRevision1 = 0,
+};
+
+enum class ReportRole : std::uint8_t {
+    kKeyboardInput = 0,
+    kMouseInput = 1,
+};
+
+enum class ReportType : std::uint8_t {
+    kInput = 1,
+};
+
+template <typename T>
+struct View {
+    const T *values;
+    std::size_t length;
+
+    constexpr const T *begin() const { return values; }
+    constexpr const T *end() const { return values + length; }
+    constexpr const T *data() const { return values; }
+    constexpr std::size_t size() const { return length; }
+};
+
+using ByteView = View<std::uint8_t>;
+
+using ReportMask = std::uint8_t;
+
+constexpr ReportMask report_bit(ReportRole role) {
+    return static_cast<ReportMask>(1U << static_cast<std::uint8_t>(role));
+}
+
+enum class IoCapability : std::uint8_t {
+    kKeyboardOnly = 0,
+};
+
+enum class KeyDistribution : std::uint8_t {
+    kNone = 0,
+    kEncryption = 1U << 0,
+    kIdentity = 1U << 1,
+};
+
+constexpr KeyDistribution operator|(KeyDistribution left,
+                                    KeyDistribution right) {
+    return static_cast<KeyDistribution>(static_cast<std::uint8_t>(left) |
+                                        static_cast<std::uint8_t>(right));
+}
+
+constexpr bool has_key_distribution(KeyDistribution value,
+                                    KeyDistribution required) {
+    return (static_cast<std::uint8_t>(value) &
+            static_cast<std::uint8_t>(required)) != 0;
+}
+
+struct ReportDefinition {
+    ReportRole role;
+    ReportType type;
+    std::uint8_t report_id;
+    std::uint8_t value_size;
+    std::array<std::uint8_t, 2> report_reference;
+    ByteView neutral_value;
+};
+
+struct SmpPolicy {
+    SmpPolicyId id;
+    IoCapability io_capability;
+    bool bonding;
+    bool mitm;
+    bool secure_connections;
+    bool secure_connections_only;
+    std::uint8_t security_level;
+    KeyDistribution our_key_distribution;
+    KeyDistribution peer_key_distribution;
+};
+
+struct SecurityOutcomePolicy {
+    SecurityPolicyId id;
+    bool encrypted;
+    bool authenticated;
+    bool bonded;
+    bool persisted_bond;
+    bool identity_resolved;
+    bool secure_connections_required;
+    std::uint8_t key_size;
+};
+
+struct AttributePolicy {
+    AttributePolicyId id;
+    bool authenticated;
+    std::uint8_t key_size;
+};
+
+struct CachePolicy {
+    CachePolicyId id;
+    std::uint8_t schema_revision;
+    std::array<std::uint8_t, 1> schema_epoch_value;
+};
+
+struct GattLayout {
+    GattLayoutId id;
+    std::uint16_t gatt_service_start;
+    std::uint16_t legacy_hid_service_start;
+    std::uint16_t legacy_report_map_value;
+    std::uint16_t legacy_keyboard_value;
+    std::uint16_t legacy_mouse_value;
+    std::uint16_t epoch_attribute_count;
+    std::uint16_t epoch_service_start;
+    std::uint16_t epoch_service_end;
+    std::uint16_t hid_service_start;
+    std::uint16_t report_map_value;
+    std::uint16_t control_point_value;
+    std::uint16_t keyboard_value;
+    std::uint16_t mouse_value;
+    std::uint16_t hid_last_attribute;
+};
+
+inline constexpr std::array<std::uint8_t, 4> kStrictHidInformation{
+    0x11, 0x01, 0x00, 0x00};
+inline constexpr std::array<std::uint8_t, 8> kStrictNeutralKeyboard{};
+inline constexpr std::array<std::uint8_t, 5> kStrictNeutralMouse{};
+
+inline constexpr std::array<std::uint8_t, 116> kStrictReportMap{
+    0x05,0x01,0x09,0x06,0xa1,0x01,0x85,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,
+    0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,
+    0x81,0x01,0x95,0x06,0x75,0x08,0x15,0x00,0x26,0xff,0x00,0x19,0x00,0x2a,
+    0xff,0x00,0x81,0x00,0xc0,
+    0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x02,0x09,0x01,0xa1,0x00,0x05,0x09,
+    0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,0x75,0x01,0x81,0x02,
+    0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,
+    0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,0x05,0x0c,0x0a,0x38,
+    0x02,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x01,0x81,0x06,0xc0,0xc0};
+
+inline constexpr std::array<std::uint8_t, 32> kStrictReportMapSha256{
+    0xef,0x1b,0xe4,0x5d,0x8f,0xe7,0xd0,0x63,
+    0x75,0x68,0xc8,0x95,0x4b,0x64,0xba,0xb9,
+    0x71,0xd5,0xb5,0xf5,0x7b,0xf3,0xd4,0x4f,
+    0x1c,0xc0,0x40,0xe8,0xfe,0x5c,0x3d,0x32};
+
+inline constexpr std::array<ReportDefinition, 2> kStrictReports{{
+    {.role = ReportRole::kKeyboardInput,
+     .type = ReportType::kInput,
+     .report_id = 1,
+     .value_size = 8,
+     .report_reference = {0x01, 0x01},
+     .neutral_value = {kStrictNeutralKeyboard.data(),
+                       kStrictNeutralKeyboard.size()}},
+    {.role = ReportRole::kMouseInput,
+     .type = ReportType::kInput,
+     .report_id = 2,
+     .value_size = 5,
+     .report_reference = {0x02, 0x01},
+     .neutral_value = {kStrictNeutralMouse.data(), kStrictNeutralMouse.size()}},
+}};
+
+struct ProfileDefinition {
+    ProfileId id;
+    std::uint16_t revision;
+    TopologyId topology;
+    GattTemplateId gatt_template;
+    GattLayout layout;
+    View<ReportDefinition> reports;
+    ReportMask supported_reports;
+    ReportMask required_input_subscriptions;
+    ByteView report_map;
+    std::array<std::uint8_t, 32> report_map_sha256;
+    std::array<std::uint8_t, 4> hid_information;
+    SmpPolicy smp;
+    SecurityOutcomePolicy security;
+    AttributePolicy attributes;
+    CachePolicy cache;
+};
+
+inline constexpr ProfileDefinition kStrictComposite{
+    .id = ProfileId::kStrictComposite,
+    .revision = 1,
+    .topology = TopologyId::kStrictComposite,
+    .gatt_template = GattTemplateId::kStrictComposite,
+    .layout = {
+        .id = GattLayoutId::kStrictRevision1,
+        .gatt_service_start = 0x0006,
+        .legacy_hid_service_start = 0x000e,
+        .legacy_report_map_value = 0x0012,
+        .legacy_keyboard_value = 0x0016,
+        .legacy_mouse_value = 0x001a,
+        .epoch_attribute_count = 3,
+        .epoch_service_start = 0x000e,
+        .epoch_service_end = 0x0010,
+        .hid_service_start = 0x0011,
+        .report_map_value = 0x0015,
+        .control_point_value = 0x0017,
+        .keyboard_value = 0x0019,
+        .mouse_value = 0x001d,
+        .hid_last_attribute = 0x001f,
+    },
+    .reports = {kStrictReports.data(), kStrictReports.size()},
+    .supported_reports = report_bit(ReportRole::kKeyboardInput) |
+                         report_bit(ReportRole::kMouseInput),
+    .required_input_subscriptions = report_bit(ReportRole::kKeyboardInput) |
+                                    report_bit(ReportRole::kMouseInput),
+    .report_map = {kStrictReportMap.data(), kStrictReportMap.size()},
+    .report_map_sha256 = kStrictReportMapSha256,
+    .hid_information = kStrictHidInformation,
+    .smp = {
+        .id = SmpPolicyId::kAuthenticatedKeyboardOnly,
+        .io_capability = IoCapability::kKeyboardOnly,
+        .bonding = true,
+        .mitm = true,
+        .secure_connections = true,
+        .secure_connections_only = false,
+        .security_level = 3,
+        .our_key_distribution = KeyDistribution::kEncryption,
+        .peer_key_distribution = KeyDistribution::kEncryption |
+                                 KeyDistribution::kIdentity,
+    },
+    .security = {
+        .id = SecurityPolicyId::kAuthenticatedBonded,
+        .encrypted = true,
+        .authenticated = true,
+        .bonded = true,
+        .persisted_bond = true,
+        .identity_resolved = true,
+        .secure_connections_required = false,
+        .key_size = 16,
+    },
+    .attributes = {
+        .id = AttributePolicyId::kAuthenticated,
+        .authenticated = true,
+        .key_size = 16,
+    },
+    .cache = {
+        .id = CachePolicyId::kStrictRevision1,
+        .schema_revision = 1,
+        .schema_epoch_value = {0x01},
+    },
+};
+
+inline constexpr std::array<const ProfileDefinition *, 1> kCatalog{
+    &kStrictComposite};
+
+constexpr const ProfileDefinition &strict_composite() {
+    return kStrictComposite;
+}
+
+constexpr const ReportDefinition *find_report(const ProfileDefinition &profile,
+                                              ReportRole role) {
+    for (const ReportDefinition &report : profile.reports) {
+        if (report.role == role) {
+            return &report;
+        }
+    }
+    return nullptr;
+}
+
+constexpr bool reports_present(const ProfileDefinition &profile,
+                               ReportMask reports) {
+    return (profile.supported_reports & reports) == reports;
+}
+
+constexpr bool subscriptions_ready(const ProfileDefinition &profile,
+                                   ReportMask subscriptions) {
+    return (subscriptions & profile.required_input_subscriptions) ==
+           profile.required_input_subscriptions;
+}
+
+static_assert(kStrictComposite.report_map.size() == 116);
+static_assert(kCatalog.size() == 1 &&
+              kCatalog[0]->id == ProfileId::kStrictComposite);
+static_assert(kStrictReports[0].report_id == 1 &&
+              kStrictReports[0].value_size == 8);
+static_assert(kStrictReports[1].report_id == 2 &&
+              kStrictReports[1].value_size == 5);
+static_assert(kStrictReports[0].role != kStrictReports[1].role &&
+              (kStrictReports[0].report_id != kStrictReports[1].report_id ||
+               kStrictReports[0].type != kStrictReports[1].type));
+static_assert(kStrictReports[0].report_reference[0] ==
+                  kStrictReports[0].report_id &&
+              kStrictReports[0].report_reference[1] ==
+                  static_cast<std::uint8_t>(kStrictReports[0].type) &&
+              kStrictReports[1].report_reference[0] ==
+                  kStrictReports[1].report_id &&
+              kStrictReports[1].report_reference[1] ==
+                  static_cast<std::uint8_t>(kStrictReports[1].type));
+static_assert(kStrictComposite.required_input_subscriptions == 0x03);
+static_assert(reports_present(
+    kStrictComposite, kStrictComposite.required_input_subscriptions));
+static_assert(kStrictComposite.smp.mitm &&
+              kStrictComposite.smp.secure_connections &&
+              !kStrictComposite.smp.secure_connections_only);
+static_assert(kStrictComposite.security.authenticated &&
+              !kStrictComposite.security.secure_connections_required &&
+              kStrictComposite.security.key_size == 16);
+
+}  // namespace ble_fixture_profile
