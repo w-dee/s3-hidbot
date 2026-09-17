@@ -47,6 +47,12 @@ constexpr std::array<std::uint8_t, 116> kExpectedStrictReportMap{
     0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,
     0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,0x05,0x0c,0x0a,0x38,
     0x02,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x01,0x81,0x06,0xc0,0xc0};
+constexpr std::array<std::uint8_t, 69> kExpectedMouseReportMap{
+    0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x02,0x09,0x01,0xa1,0x00,0x05,0x09,
+    0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,0x75,0x01,0x81,0x02,
+    0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,
+    0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,0x05,0x0c,0x0a,0x38,
+    0x02,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x01,0x81,0x06,0xc0,0xc0};
 constexpr std::array<std::uint8_t, 4> kExpectedHidInformation{
     0x11, 0x01, 0x00, 0x00};
 constexpr std::array<std::uint8_t, 2> kExpectedKeyboardReference{0x01, 0x01};
@@ -57,6 +63,7 @@ constexpr std::array<std::uint8_t, 5> kExpectedNeutralMouse{};
 const ble_gatt_svc_def *g_registered_services = nullptr;
 int g_count_calls = 0;
 int g_add_calls = 0;
+bool g_topology_mode = false;
 std::vector<std::uint8_t> g_appended_bytes;
 
 bool uuid16_equals(const ble_uuid_t *uuid, std::uint16_t value) {
@@ -306,6 +313,23 @@ extern "C" int ble_gatts_add_svcs(const ble_gatt_svc_def *services) {
     ++g_add_calls;
     g_registered_services = services;
     std::uint16_t next_handle = 0x7001;
+    if (g_topology_mode) {
+        // Independent sequential ATT allocator: service, declaration, value,
+        // automatic CCCD, then explicit descriptors (pinned NimBLE ordering).
+        next_handle = 0x000e;
+        for (const auto *service = services; service->type != BLE_GATT_SVC_TYPE_END;
+             ++service) {
+            ++next_handle;
+            for (const auto *chr = service->characteristics; chr->uuid != nullptr; ++chr) {
+                ++next_handle;
+                *chr->val_handle = next_handle++;
+                if ((chr->flags & BLE_GATT_CHR_F_NOTIFY) != 0) ++next_handle;
+                for (const auto *dsc = chr->descriptors;
+                     dsc != nullptr && dsc->uuid != nullptr; ++dsc) ++next_handle;
+            }
+        }
+        return 0;
+    }
     for (const ble_gatt_svc_def *service = services;
          service != nullptr && service->type != BLE_GATT_SVC_TYPE_END; ++service) {
         if (service->characteristics == nullptr) {
@@ -324,13 +348,30 @@ extern "C" int ble_gatts_add_svcs(const ble_gatt_svc_def *services) {
     return 0;
 }
 
-extern "C" int ble_gatts_find_svc(const ble_uuid_t *, std::uint16_t *) {
-    return BLE_HS_ENOENT;
+extern "C" int ble_gatts_find_svc(const ble_uuid_t *uuid, std::uint16_t *handle) {
+    if (!g_topology_mode) return BLE_HS_ENOENT;
+    if (uuid16_equals(uuid, 0x1801)) *handle = 6;
+    else if (uuid16_equals(uuid, kHidServiceUuid)) *handle = 0x0011;
+    else if (uuid->type == BLE_UUID_TYPE_128) *handle = 0x000e;
+    else return BLE_HS_ENOENT;
+    return 0;
 }
 
-extern "C" int ble_gatts_find_chr(const ble_uuid_t *, const ble_uuid_t *,
-                                   std::uint16_t *, std::uint16_t *) {
-    return BLE_HS_ENOENT;
+extern "C" int ble_gatts_find_chr(const ble_uuid_t *service_uuid,
+                                   const ble_uuid_t *uuid,
+                                   std::uint16_t *, std::uint16_t *handle) {
+    if (!g_topology_mode) return BLE_HS_ENOENT;
+    if (service_uuid->type == BLE_UUID_TYPE_128 && uuid->type == BLE_UUID_TYPE_128) {
+        *handle = *g_registered_services[0].characteristics[0].val_handle;
+        return 0;
+    }
+    if (!uuid16_equals(service_uuid, kHidServiceUuid) || uuid->type != BLE_UUID_TYPE_16)
+        return BLE_HS_ENOENT;
+    const auto *chr = find_characteristic(kHidServiceUuid,
+        reinterpret_cast<const ble_uuid16_t *>(uuid)->value);
+    if (chr == nullptr) return BLE_HS_ENOENT;
+    *handle = *chr->val_handle;
+    return 0;
 }
 
 extern "C" int ble_gatts_notify_custom(std::uint16_t, std::uint16_t,
@@ -517,6 +558,65 @@ int main() {
     require(callback.invoke(cp12) == 0, "CP12", "chained payload was rejected");
     callback.require_exact_event("CP12", false);
     std::cout << "PASS: CP12 zero-length head plus one-byte fragment\n";
+
+    using ble_fixture_profile::ProfileId;
+    require(!database.configure_profile(ProfileId::kStandaloneMouseJustWorks),
+            "mouse", "live database accepted mutation");
+    // Model an external, proven full host teardown. Neither API can mutate
+    // the live service; the executor is responsible for proving stop first.
+    database.reset_after_stop();
+    g_topology_mode = true;
+    require(!database.configure_profile(static_cast<ProfileId>(255)),
+            "mouse", "unknown finite profile accepted");
+    require(database.configure_profile(ProfileId::kStandaloneMouseJustWorks),
+            "mouse", "stopped database rejected mouse definition");
+    require(database.register_database() == 0, "mouse", "registration failed");
+    require(database.validate_registered_database() == 0,
+            "mouse topology", "registered topology rejected");
+    require(database.hid_handles().mouse_value == 0x0019,
+            "mouse topology", "mouse expected value handle changed");
+    require_served_value(g_registered_services[0].characteristics,
+                         std::array<std::uint8_t, 1>{2}, "mouse schema epoch");
+    require(database.hid_handles().keyboard_value == 0,
+            "mouse", "stale keyboard handle survived teardown");
+    require(find_characteristic(kHidServiceUuid, kReportUuid, 1) == nullptr,
+            "mouse", "extra input characteristic/CCCD exposed");
+    const auto *input = find_characteristic(kHidServiceUuid, kReportUuid);
+    require(input != nullptr && input->flags ==
+                (BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC |
+                 BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC |
+                 BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR) && input->min_key_size == 16,
+            "mouse", "input ATT security is not encrypted/key-size 16");
+    require_served_value(input, kExpectedNeutralMouse, "mouse neutral");
+    require_served_value(find_descriptor(input, kReportReferenceUuid),
+                         kExpectedMouseReference, "mouse reference");
+    require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid),
+                         kExpectedMouseReportMap, "mouse report map");
+    const auto *mouse_control = find_characteristic(kHidServiceUuid, kControlPointUuid);
+    require(mouse_control->flags ==
+                (BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC) &&
+                mouse_control->min_key_size == 16,
+            "mouse", "Control Point accidentally requires authentication");
+    require(database.notify_custom(1, 0, kExpectedNeutralKeyboard.data(), 8) ==
+                hid_control_executor::BleNotifyBackendResult::kStackRejected,
+            "mouse", "absent keyboard handle accepted");
+    database.reset_after_stop();
+    require(database.configure_profile(ProfileId::kStrictComposite),
+            "strict restore", "strict selection failed");
+    require(database.register_database() == 0, "strict restore", "registration failed");
+    require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid),
+                         kExpectedStrictReportMap, "strict restored map");
+    require(find_characteristic(kHidServiceUuid, kReportUuid, 1) != nullptr,
+            "strict restore", "composite topology not restored");
+    require(database.validate_registered_database() == 0,
+            "strict topology", "strict registered topology rejected");
+    require_served_value(g_registered_services[0].characteristics,
+                         std::array<std::uint8_t, 1>{1}, "strict schema epoch");
+    const auto *restored_mouse = find_characteristic(kHidServiceUuid, kReportUuid, 1);
+    *restored_mouse->val_handle = 0;
+    require(database.validate_registered_database() != 0,
+            "strict topology", "missing required mouse handle accepted");
+    std::cout << "PASS: finite mouse GATT consumption and strict restoration\n";
 
     std::cout << "PASS: production BLE HID Control Point GATT boundary\n";
     return 0;

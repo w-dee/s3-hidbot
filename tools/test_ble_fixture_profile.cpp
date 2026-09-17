@@ -7,6 +7,28 @@ int main() {
     using namespace ble_fixture_profile;
     const auto &profile = strict_composite();
 
+    const auto &mouse_definition = kStandaloneMouseJustWorks;
+    assert(find_definition(ProfileId::kStandaloneMouseJustWorks) == &mouse_definition);
+    assert(find_profile(ProfileId::kStandaloneMouseJustWorks) == nullptr);
+    assert(mouse_definition.report_map.size() == 69);
+    assert(mouse_definition.reports.size() == 1);
+    assert(mouse_definition.smp.io_capability == IoCapability::kNoInputNoOutput);
+    assert(!mouse_definition.smp.mitm && mouse_definition.smp.bonding);
+    assert(mouse_definition.smp.secure_connections &&
+           !mouse_definition.smp.secure_connections_only);
+    assert(mouse_definition.smp.security_level == 2);
+    assert(!mouse_definition.security.authenticated &&
+           mouse_definition.security.encrypted &&
+           mouse_definition.security.key_size == 16);
+    assert(mouse_definition.bond_class != profile.bond_class);
+    assert(mouse_definition.cache.schema_revision != profile.cache.schema_revision);
+    assert(mouse_definition.identity_class == profile.identity_class);
+    assert(mouse_definition.layout.keyboard_value == 0);
+    assert(mouse_definition.layout.mouse_value == 0x0019);
+    assert(mouse_definition.layout.hid_last_attribute == 0x001b);
+    assert(subscriptions_ready(mouse_definition, report_bit(ReportRole::kMouseInput)));
+    assert(!subscriptions_ready(mouse_definition, report_bit(ReportRole::kKeyboardInput)));
+
     assert(kCatalog.size() == 1);
     assert(kCatalog[0] == &profile);
     assert(profile.id == ProfileId::kStrictComposite);

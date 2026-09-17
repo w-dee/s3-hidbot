@@ -97,6 +97,8 @@ inline constexpr const auto &kReportMap = kStrictProfile.report_map;
 
 class Database final : public hid_control_executor::BleDatabase {
   public:
+    bool configure_profile(ble_fixture_profile::ProfileId id) override;
+    void reset_after_stop() override;
     int register_database() override;
     int validate_registered_database() override;
     void bind_event_sink(hid_control_executor::BleEventSink *sink) override;
@@ -115,6 +117,8 @@ class Database final : public hid_control_executor::BleDatabase {
     bool capture_control_point(std::uint16_t connection_handle,
                                bool suspended);
 
+    const ble_fixture_profile::ProfileDefinition *profile_ = &kStrictProfile;
+    bool registered_ = false;
     hid_control_executor::BleEventSink *event_sink_ = nullptr;
     std::atomic<ble_lifecycle::Generation> generation_{0};
 };

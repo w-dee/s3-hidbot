@@ -270,6 +270,11 @@ class BleEventSink {
 class BleDatabase {
   public:
     virtual ~BleDatabase() = default;
+    // Called only with the old host proven stopped (or before first init).
+    virtual bool configure_profile(ble_fixture_profile::ProfileId id) {
+        return id == ble_fixture_profile::ProfileId::kStrictComposite;
+    }
+    virtual void reset_after_stop() {}
     virtual int register_database() = 0;
     // Called only after the NimBLE GATT server has started. A zero result is
     // required before any project HID advertisement may become visible.

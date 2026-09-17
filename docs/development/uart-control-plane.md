@@ -1633,6 +1633,13 @@ transition, and no lifecycle recovery fault. Nonquiescent selection returns
 bond write/deletion, session retirement, advertising or route restoration.
 Exact request retries replay the existing cache without another selection.
 
+The reviewed internal mouse definition is deliberately absent from this public
+catalog until controlled restart and durable bond association are integrated.
+Its GATT consumer and per-connection security policy are native-tested: one
+5-byte mouse input, Report ID 2, no keyboard characteristic, encrypted 16-byte
+key access, and an unauthenticated bonded outcome. This foundation does not
+make the standalone profile selectable or constitute a hardware qualification.
+
 The Python APIs are `Client.ble_profile_list()`, `ble_profile_status()` and
 `ble_profile_select(BleProfileId.STRICT_COMPOSITE)`. CLI counterparts are
 `ble-profile-list`, `ble-profile-status` and `ble-profile-select strict_composite`.

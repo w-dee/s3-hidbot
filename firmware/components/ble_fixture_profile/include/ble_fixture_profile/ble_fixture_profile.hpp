@@ -11,10 +11,13 @@ namespace ble_fixture_profile {
 
 enum class ProfileId : std::uint8_t {
     kStrictComposite = 0,
+    kStandaloneMouseJustWorks = 1,
 };
 
 // Profile identity and bond/cache interpretation are separate namespaces.
-enum class BondAssociationClass : std::uint8_t { kStrictComposite = 0 };
+enum class BondAssociationClass : std::uint8_t {
+    kStrictComposite = 0, kStandaloneMouseJustWorks = 1
+};
 enum class LogicalIdentityClass : std::uint8_t { kSharedFixture = 0 };
 enum class SelectionTransition : std::uint8_t { kStable, kInitializing, kFault };
 struct SelectionSnapshot {
@@ -31,30 +34,37 @@ struct SelectionOutcome {
 
 enum class TopologyId : std::uint8_t {
     kStrictComposite = 0,
+    kMouseOnly = 1,
 };
 
 enum class GattTemplateId : std::uint8_t {
     kStrictComposite = 0,
+    kMouseOnly = 1,
 };
 
 enum class GattLayoutId : std::uint8_t {
     kStrictRevision1 = 0,
+    kMouseRevision2 = 1,
 };
 
 enum class SmpPolicyId : std::uint8_t {
     kAuthenticatedKeyboardOnly = 0,
+    kNoInputNoOutput = 1,
 };
 
 enum class SecurityPolicyId : std::uint8_t {
     kAuthenticatedBonded = 0,
+    kUnauthenticatedBonded = 1,
 };
 
 enum class AttributePolicyId : std::uint8_t {
     kAuthenticated = 0,
+    kEncrypted = 1,
 };
 
 enum class CachePolicyId : std::uint8_t {
     kStrictRevision1 = 0,
+    kMouseRevision2 = 1,
 };
 
 using ReportRole = hid_capability::ReportRole;
@@ -81,6 +91,7 @@ using hid_capability::report_bit;
 
 enum class IoCapability : std::uint8_t {
     kKeyboardOnly = 0,
+    kNoInputNoOutput = 1,
 };
 
 enum class KeyDistribution : std::uint8_t {
@@ -289,8 +300,67 @@ inline constexpr ProfileDefinition kStrictComposite{
     },
 };
 
+// Finite next-profile definition. It is not selectable until lifecycle and
+// durable association consumers are installed; the public catalog stays strict.
+inline constexpr std::array<std::uint8_t, 69> kMouseReportMap{
+    0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x02,0x09,0x01,0xa1,0x00,0x05,0x09,
+    0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,0x75,0x01,0x81,0x02,
+    0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,
+    0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,0x05,0x0c,0x0a,0x38,
+    0x02,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x01,0x81,0x06,0xc0,0xc0};
+inline constexpr std::array<std::uint8_t, 32> kMouseReportMapSha256{
+    0xc2,0xfb,0x16,0x5f,0xfe,0x3f,0x84,0xfc,0x41,0x60,0xb0,0x13,0xe1,0x59,
+    0x14,0xdf,0xfb,0xde,0xcb,0xc3,0x30,0xc3,0xc3,0x15,0x05,0x1d,0xc6,0x92,
+    0x22,0x62,0xe9,0x24};
+inline constexpr std::array<ReportDefinition, 1> kMouseReports{{
+    {.role = ReportRole::kMouseInput,
+     .type = ReportType::kInput,
+     .report_id = 2,
+     .value_size = 5,
+     .report_reference = {2, 1},
+     .neutral_value = {kStrictNeutralMouse.data(), kStrictNeutralMouse.size()}},
+}};
+inline constexpr ProfileDefinition kStandaloneMouseJustWorks = [] {
+    auto profile = kStrictComposite;
+    profile.id = ProfileId::kStandaloneMouseJustWorks;
+    profile.name = "standalone_mouse_just_works";
+    profile.bond_class = BondAssociationClass::kStandaloneMouseJustWorks;
+    profile.topology = TopologyId::kMouseOnly;
+    profile.gatt_template = GattTemplateId::kMouseOnly;
+    profile.layout.id = GattLayoutId::kMouseRevision2;
+    profile.layout.keyboard_value = 0;
+    profile.layout.mouse_value = 0x0019;
+    profile.layout.hid_last_attribute = 0x001b;
+    profile.reports = {kMouseReports.data(), kMouseReports.size()};
+    profile.supported_reports = report_bit(ReportRole::kMouseInput);
+    profile.required_input_subscriptions = report_bit(ReportRole::kMouseInput);
+    profile.report_map = {kMouseReportMap.data(), kMouseReportMap.size()};
+    profile.report_map_sha256 = kMouseReportMapSha256;
+    profile.smp.id = SmpPolicyId::kNoInputNoOutput;
+    profile.smp.io_capability = IoCapability::kNoInputNoOutput;
+    profile.smp.mitm = false;
+    profile.smp.security_level = 2;
+    profile.security.id = SecurityPolicyId::kUnauthenticatedBonded;
+    profile.security.authenticated = false;
+    profile.attributes.id = AttributePolicyId::kEncrypted;
+    profile.attributes.authenticated = false;
+    profile.cache.id = CachePolicyId::kMouseRevision2;
+    profile.cache.schema_revision = 2;
+    profile.cache.schema_epoch_value = {2};
+    return profile;
+}();
+
 inline constexpr std::array<const ProfileDefinition *, 1> kCatalog{
     &kStrictComposite};
+
+// Internal reviewed definitions can precede public lifecycle enablement.
+constexpr const ProfileDefinition *find_definition(ProfileId id) {
+    switch (id) {
+        case ProfileId::kStrictComposite: return &kStrictComposite;
+        case ProfileId::kStandaloneMouseJustWorks: return &kStandaloneMouseJustWorks;
+    }
+    return nullptr;
+}
 
 constexpr const ProfileDefinition *find_profile(std::string_view name) {
     for (const auto *profile : kCatalog) {

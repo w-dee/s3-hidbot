@@ -87,6 +87,8 @@ std::uint8_t nimble_io_capability(ble_fixture_profile::IoCapability value) {
     switch (value) {
         case ble_fixture_profile::IoCapability::kKeyboardOnly:
             return BLE_SM_IO_CAP_KEYBOARD_ONLY;
+        case ble_fixture_profile::IoCapability::kNoInputNoOutput:
+            return BLE_SM_IO_CAP_NO_IO;
     }
     return BLE_SM_IO_CAP_KEYBOARD_ONLY;
 }

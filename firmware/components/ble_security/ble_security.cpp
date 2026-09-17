@@ -3,14 +3,13 @@
 namespace ble_security {
 namespace {
 
-inline constexpr const auto &kStrictPolicy =
-    ble_fixture_profile::strict_composite().security;
-
-bool record_is_valid(const StoredSecurityRecord &record) {
+bool record_is_valid(
+    const StoredSecurityRecord &record,
+    const ble_fixture_profile::SecurityOutcomePolicy &policy) {
     return record.found && record.identity_matches && record.ltk_present &&
-           record.authenticated == kStrictPolicy.authenticated &&
-           record.key_size == kStrictPolicy.key_size &&
-           (!kStrictPolicy.secure_connections_required ||
+           record.authenticated == policy.authenticated &&
+           record.key_size == policy.key_size &&
+           (!policy.secure_connections_required ||
             record.secure_connections);
 }
 
@@ -84,8 +83,10 @@ void State::end_write() {
 
 void State::begin_connection(ble_lifecycle::Generation generation,
                              std::uint16_t connection_handle,
-                             bool lifecycle_healthy) {
+                             bool lifecycle_healthy,
+                             ble_fixture_profile::ProfileId profile) {
     begin_write();
+    profile_.store(profile, std::memory_order_relaxed);
     generation_.store(generation, std::memory_order_relaxed);
     connection_handle_.store(connection_handle, std::memory_order_relaxed);
     std::uint32_t flags = kConnected;
@@ -180,7 +181,7 @@ void State::apply_verification(ble_lifecycle::Generation generation,
     if (current.store_healthy &&
         persistent_store_healthy_.load(std::memory_order_relaxed)) {
         flags |= kStoreHealthy;
-        if (persisted_bond_is_valid(persisted)) {
+        if (persisted_bond_is_valid(persisted, current.profile)) {
             flags |= kPersisted;
         }
     }
@@ -211,6 +212,7 @@ Snapshot State::snapshot() const {
             continue;
         }
         Snapshot result{};
+        result.profile = profile_.load(std::memory_order_relaxed);
         result.generation = generation_.load(std::memory_order_relaxed);
         result.connection_handle =
             connection_handle_.load(std::memory_order_relaxed);
@@ -242,24 +244,30 @@ bool State::security_ready_for_hid(
     ble_lifecycle::Generation generation,
     std::uint16_t connection_handle) const {
     const Snapshot value = snapshot();
+    const auto *definition = ble_fixture_profile::find_definition(value.profile);
+    if (definition == nullptr) return false;
+    const auto &policy = definition->security;
     return value.coherent && value.generation == generation &&
            value.connection_handle == connection_handle && value.connected &&
-           value.encrypted == kStrictPolicy.encrypted &&
-           value.authenticated == kStrictPolicy.authenticated &&
-           value.nimble_bonded == kStrictPolicy.bonded &&
+           value.encrypted == policy.encrypted &&
+           value.authenticated == policy.authenticated &&
+           value.nimble_bonded == policy.bonded &&
            value.project_verified_bond_persisted ==
-               kStrictPolicy.persisted_bond &&
-           value.identity_resolved == kStrictPolicy.identity_resolved &&
-           (!kStrictPolicy.secure_connections_required ||
+               policy.persisted_bond &&
+           value.identity_resolved == policy.identity_resolved &&
+           (!policy.secure_connections_required ||
             value.secure_connections) &&
-           value.key_size == kStrictPolicy.key_size && value.store_healthy &&
+           value.key_size == policy.key_size && value.store_healthy &&
            value.lifecycle_healthy;
 }
 
 bool State::persisted_bond_is_valid(
-    const PersistedSecurityEvidence &persisted) const {
-    return record_is_valid(persisted.our) &&
-           record_is_valid(persisted.peer) &&
+    const PersistedSecurityEvidence &persisted,
+    ble_fixture_profile::ProfileId profile) const {
+    const auto *definition = ble_fixture_profile::find_definition(profile);
+    if (definition == nullptr) return false;
+    return record_is_valid(persisted.our, definition->security) &&
+           record_is_valid(persisted.peer, definition->security) &&
            persisted.our.secure_connections ==
                persisted.peer.secure_connections;
 }

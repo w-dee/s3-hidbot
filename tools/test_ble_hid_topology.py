@@ -92,7 +92,7 @@ def main() -> int:
         re.DOTALL,
     )
     assert epoch_access is not None
-    assert "append(context->om, kGattSchemaEpochValue)" in epoch_access.group(1)
+    assert "append(context->om, s_database->profile_->cache.schema_epoch_value)" in epoch_access.group(1)
     assert "signal_ble_event" not in epoch_access.group(1)
 
     services = re.search(
@@ -199,7 +199,9 @@ def main() -> int:
     assert "ble_gatts_find_svc(&s_hid_service.u" in service
     for name in expected:
         if name.startswith("kRevision1") and name != "kRevision1EpochAttributeCount":
-            assert name in service or name == "kRevision1HidLastAttributeHandle"
+            assert (name in service or
+                    f"!= layout.{profile_fields[name]}" in service or
+                    name == "kRevision1HidLastAttributeHandle")
 
     # NimBLE stores CCCDs by peer identity and characteristic value handle.
     # Its v5.5.4 restore path ignores old handles for live client-config state

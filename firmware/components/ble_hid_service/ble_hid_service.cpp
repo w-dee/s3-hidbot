@@ -123,6 +123,10 @@ ble_gatt_chr_def s_characteristics[] = {
     {},
 };
 
+// Fixed storage for one reviewed mouse-only template. No public descriptor
+// input is accepted, and this storage is rewritten only after a proven stop.
+ble_gatt_chr_def s_mouse_characteristics[5]{};
+
 ble_gatt_svc_def s_services[] = {
     {.type = BLE_GATT_SVC_TYPE_PRIMARY,
      .uuid = &s_schema_epoch_service.u,
@@ -143,11 +147,45 @@ int append(struct os_mbuf *buffer, const ByteRange &value) {
 
 }  // namespace
 
+bool Database::configure_profile(ble_fixture_profile::ProfileId id) {
+    if (registered_) return false;
+    const auto *definition = ble_fixture_profile::find_definition(id);
+    if (definition == nullptr) return false;
+    profile_ = definition;
+    return true;
+}
+
+void Database::reset_after_stop() {
+    registered_ = false;
+    s_keyboard_value_handle = s_mouse_value_handle = 0;
+    s_schema_epoch_value_handle = s_information_value_handle = 0;
+    s_report_map_value_handle = s_control_point_value_handle = 0;
+    if (s_database == this) s_database = nullptr;
+}
+
 int Database::register_database() {
     if (s_database != nullptr && s_database != this) {
         return BLE_HS_EALREADY;
     }
+    if (registered_) return BLE_HS_EALREADY;
     s_database = this;
+    registered_ = true; // Even a partial registration requires proven teardown.
+    s_services[1].characteristics = s_characteristics;
+    if (profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly) {
+        s_mouse_characteristics[0] = s_characteristics[0];
+        s_mouse_characteristics[1] = s_characteristics[1];
+        s_mouse_characteristics[2] = s_characteristics[2];
+        s_mouse_characteristics[2].flags =
+            BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC;
+        s_mouse_characteristics[3] = s_characteristics[4];
+        s_mouse_characteristics[3].flags =
+            BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC |
+            BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC |
+            BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR;
+        s_mouse_characteristics[2].min_key_size = profile_->attributes.key_size;
+        s_mouse_characteristics[3].min_key_size = profile_->attributes.key_size;
+        s_services[1].characteristics = s_mouse_characteristics;
+    }
     int result = ble_gatts_count_cfg(s_services);
     if (result == 0) {
         result = ble_gatts_add_svcs(s_services);
@@ -206,12 +244,15 @@ int Database::validate_registered_database() {
             return result != 0 ? result : BLE_HS_ENOENT;
         }
     }
-    if (s_keyboard_value_handle == 0 || s_mouse_value_handle == 0 ||
-        s_keyboard_value_handle == s_mouse_value_handle ||
-        s_report_map_value_handle != kRevision1ReportMapValueHandle ||
-        s_control_point_value_handle != kRevision1ControlPointValueHandle ||
-        s_keyboard_value_handle != kRevision1KeyboardValueHandle ||
-        s_mouse_value_handle != kRevision1MouseValueHandle) {
+    const auto &layout = profile_->layout;
+    if ((layout.keyboard_value != 0 && s_keyboard_value_handle == 0) ||
+        (layout.mouse_value != 0 && s_mouse_value_handle == 0) ||
+        (s_keyboard_value_handle != 0 &&
+         s_keyboard_value_handle == s_mouse_value_handle) ||
+        s_report_map_value_handle != layout.report_map_value ||
+        s_control_point_value_handle != layout.control_point_value ||
+        s_keyboard_value_handle != layout.keyboard_value ||
+        s_mouse_value_handle != layout.mouse_value) {
         return BLE_HS_ENOENT;
     }
     return 0;
@@ -237,9 +278,11 @@ hid_control_executor::BleHidHandles Database::hid_handles() const {
 hid_control_executor::BleNotifyBackendResult Database::notify_custom(
     std::uint16_t connection_handle, std::uint16_t characteristic_handle,
     const std::uint8_t *payload, std::uint16_t payload_length) {
-    const bool keyboard = characteristic_handle == s_keyboard_value_handle &&
+    const bool keyboard = s_keyboard_value_handle != 0 &&
+                          characteristic_handle == s_keyboard_value_handle &&
                           payload_length == kNeutralKeyboard.size();
-    const bool mouse = characteristic_handle == s_mouse_value_handle &&
+    const bool mouse = s_mouse_value_handle != 0 &&
+                       characteristic_handle == s_mouse_value_handle &&
                        payload_length == kNeutralMouse.size();
     if (payload == nullptr || (!keyboard && !mouse)) {
         return hid_control_executor::BleNotifyBackendResult::kStackRejected;
@@ -274,18 +317,19 @@ bool Database::capture_control_point(std::uint16_t connection_handle,
 int Database::access(std::uint16_t connection_handle,
                      std::uint16_t attribute_handle,
                      struct ble_gatt_access_ctxt *context, void *argument) {
-    if (context == nullptr || argument == nullptr) {
+    if (context == nullptr || argument == nullptr || s_database == nullptr) {
         return BLE_ATT_ERR_UNLIKELY;
     }
     switch (target_from(argument)) {
         case AccessTarget::kSchemaEpoch:
             return context->op == BLE_GATT_ACCESS_OP_READ_CHR
-                       ? append(context->om, kGattSchemaEpochValue)
+                       ? append(context->om, s_database->profile_->cache.schema_epoch_value)
                        : BLE_ATT_ERR_READ_NOT_PERMITTED;
         case AccessTarget::kInformation:
-            return append(context->om, kHidInformation);
+            return append(context->om, s_database->profile_->hid_information);
         case AccessTarget::kReportMap: {
-            const int result = append(context->om, kReportMap);
+            const auto &report_map = s_database->profile_->report_map;
+            const int result = append(context->om, report_map);
             if (result == 0 && context->op == BLE_GATT_ACCESS_OP_READ_CHR &&
                 s_database != nullptr && s_database->event_sink_ != nullptr) {
                 (void)s_database->event_sink_->signal_ble_event({
@@ -299,13 +343,19 @@ int Database::access(std::uint16_t connection_handle,
             return result;
         }
         case AccessTarget::kKeyboardReport:
-            return append(context->om, kNeutralKeyboard);
+            return s_keyboard_value_handle != 0
+                ? append(context->om, kNeutralKeyboard) : BLE_ATT_ERR_UNLIKELY;
         case AccessTarget::kMouseReport:
             return append(context->om, kNeutralMouse);
         case AccessTarget::kKeyboardReference:
-            return append(context->om, kKeyboardReportReference);
-        case AccessTarget::kMouseReference:
-            return append(context->om, kMouseReportReference);
+            return s_keyboard_value_handle != 0
+                ? append(context->om, kKeyboardReportReference) : BLE_ATT_ERR_UNLIKELY;
+        case AccessTarget::kMouseReference: {
+            const auto *report = ble_fixture_profile::find_report(
+                *s_database->profile_, ble_fixture_profile::ReportRole::kMouseInput);
+            return report != nullptr ? append(context->om, report->report_reference)
+                                     : BLE_ATT_ERR_UNLIKELY;
+        }
         case AccessTarget::kControlPoint: {
             if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR ||
                 OS_MBUF_PKTLEN(context->om) != 1 || s_database == nullptr) {

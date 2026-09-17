@@ -51,6 +51,8 @@ struct LinkSecurityEvidence {
 };
 
 struct Snapshot {
+    ble_fixture_profile::ProfileId profile =
+        ble_fixture_profile::ProfileId::kStrictComposite;
     ble_lifecycle::Generation generation = 0;
     std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
     bool connected = false;
@@ -107,7 +109,9 @@ class State final {
   public:
     void begin_connection(ble_lifecycle::Generation generation,
                           std::uint16_t connection_handle,
-                          bool lifecycle_healthy = true);
+                          bool lifecycle_healthy = true,
+                          ble_fixture_profile::ProfileId profile =
+                              ble_fixture_profile::ProfileId::kStrictComposite);
     void retire_connection(ble_lifecycle::Generation generation,
                            std::uint16_t connection_handle);
     void apply_store_failure(ble_lifecycle::Generation generation,
@@ -127,7 +131,9 @@ class State final {
         std::uint16_t connection_handle) const;
 
     bool persisted_bond_is_valid(
-        const PersistedSecurityEvidence &persisted) const;
+        const PersistedSecurityEvidence &persisted,
+        ble_fixture_profile::ProfileId profile =
+            ble_fixture_profile::ProfileId::kStrictComposite) const;
 
   private:
     enum Flag : std::uint32_t {
@@ -145,6 +151,8 @@ class State final {
     void begin_write();
     void end_write();
 
+    std::atomic<ble_fixture_profile::ProfileId> profile_{
+        ble_fixture_profile::ProfileId::kStrictComposite};
     std::atomic<std::uint32_t> sequence_{0};
     std::atomic<ble_lifecycle::Generation> generation_{0};
     std::atomic<std::uint16_t> connection_handle_{ble_lifecycle::kNoConnection};

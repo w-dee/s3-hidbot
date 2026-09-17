@@ -133,6 +133,10 @@ def uuid128_little_endian(source: str, name: str) -> bytes:
 def main() -> int:
     header = HEADER.read_text(encoding="utf-8")
     profile = PROFILE.read_text(encoding="utf-8")
+    mouse_map = byte_array(profile, "kMouseReportMap")
+    assert len(mouse_map) == 69
+    assert hashlib.sha256(mouse_map).digest() == byte_array(profile, "kMouseReportMapSha256")
+    assert mouse_map == byte_array(profile, "kStrictReportMap")[47:]
     service = SERVICE.read_text(encoding="utf-8")
     transport = TRANSPORT.read_text(encoding="utf-8")
     grace_ownership = GRACE_OWNERSHIP.read_text(encoding="utf-8")
@@ -298,10 +302,10 @@ def main() -> int:
         assert service.count(f"BLE_UUID16_INIT({uuid})") == 1
     assert service.count("BLE_UUID16_INIT(0x2a4d)") == 1
     assert service.count("BLE_UUID16_INIT(0x2908)") == 1
-    assert service.count("BLE_GATT_CHR_F_NOTIFY") == 6
+    assert service.count("BLE_GATT_CHR_F_NOTIFY") == 9
     assert service.count("BLE_GATT_CHR_F_READ_AUTHEN") == 2
     assert service.count("BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN") == 2
-    assert service.count("BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR") == 2
+    assert service.count("BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR") == 3
     assert "BLE_GATT_CHR_F_WRITE_NO_RSP" in service
     for forbidden in ("0x2a4e", "0x2a22", "0x2a33", "0x180f", "0x180a", "0x2a50"):
         assert forbidden not in service.lower()
@@ -342,7 +346,8 @@ def main() -> int:
     )
     assert report_map_access is not None
     report_map_access_body = report_map_access.group(1)
-    assert "append(context->om, kReportMap)" in report_map_access_body
+    assert "const auto &report_map = s_database->profile_->report_map;" in report_map_access_body
+    assert "append(context->om, report_map)" in report_map_access_body
     assert "result == 0" in report_map_access_body
     assert "context->op == BLE_GATT_ACCESS_OP_READ_CHR" in report_map_access_body
     assert "BleEventKind::kReportMapRead" in report_map_access_body
@@ -352,7 +357,7 @@ def main() -> int:
         ".attribute_handle = attribute_handle",
     ):
         assert exact_field in report_map_access_body
-    assert report_map_access_body.index("append(context->om, kReportMap)") < (
+    assert report_map_access_body.index("append(context->om, report_map)") < (
         report_map_access_body.index("BleEventKind::kReportMapRead")
     )
     assert "value == 0" in service

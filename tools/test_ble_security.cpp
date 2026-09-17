@@ -34,6 +34,56 @@ bool persisted_bond_is_valid(const PersistedSecurityEvidence &evidence) {
     return state.persisted_bond_is_valid(evidence);
 }
 
+void finite_policy_isolation() {
+    using ble_fixture_profile::ProfileId;
+    State state;
+    auto link = valid_link();
+    auto persisted = valid_persisted();
+    link.authenticated = false;
+    persisted.our.authenticated = persisted.peer.authenticated = false;
+    state.begin_connection(17, 9, true, ProfileId::kStandaloneMouseJustWorks);
+    state.apply_verification(17, 9, link, persisted);
+    assert(state.security_ready_for_hid(17, 9));
+    assert(!state.snapshot().authenticated);
+    // Inventory validates the stored association, not whichever profile is active.
+    assert(state.persisted_bond_is_valid(persisted,
+                                        ProfileId::kStandaloneMouseJustWorks));
+    assert(!state.persisted_bond_is_valid(persisted));
+    // Authenticated retained keys are not representative Just Works state.
+    state.apply_verification(17, 9, valid_link(), valid_persisted());
+    assert(!state.security_ready_for_hid(17, 9));
+    state.apply_verification(17, 9, link, persisted);
+    assert(state.security_ready_for_hid(17, 9));
+    for (unsigned missing = 0; missing < 6; ++missing) {
+        auto bad_link = link;
+        auto bad_persisted = persisted;
+        if (missing == 0) bad_link.encrypted = false;
+        if (missing == 1) bad_link.nimble_bonded = false;
+        if (missing == 2) bad_link.key_size = 15;
+        if (missing == 3) bad_link.identity_resolved = false;
+        if (missing == 4) bad_persisted.peer.found = false;
+        if (missing == 5) bad_persisted.our.key_size = 15;
+        state.apply_verification(17, 9, bad_link, bad_persisted);
+        assert(!state.security_ready_for_hid(17, 9));
+    }
+    // SC remains preferred for the mouse; authenticated Legacy remains strict.
+    link.secure_connections = false;
+    persisted.our.secure_connections = persisted.peer.secure_connections = false;
+    state.apply_verification(17, 9, link, persisted);
+    assert(state.security_ready_for_hid(17, 9));
+    state.retire_connection(17, 9);
+    state.begin_connection(18, 9); // The default is still strict.
+    state.apply_verification(17, 9, link, persisted); // stale same-handle owner
+    assert(!state.security_ready_for_hid(18, 9));
+    state.apply_verification(18, 9, link, persisted);
+    assert(!state.security_ready_for_hid(18, 9));
+    state.apply_verification(18, 9, valid_link(false), valid_persisted(false));
+    assert(state.security_ready_for_hid(18, 9));
+    state.begin_connection(19, 9, true, static_cast<ProfileId>(255));
+    state.apply_verification(19, 9, valid_link(), valid_persisted());
+    assert(!state.security_ready_for_hid(19, 9));
+}
+
 void verification_matrix() {
     assert(persisted_bond_is_valid(valid_persisted(true)));
     assert(persisted_bond_is_valid(valid_persisted(false)));
@@ -543,6 +593,7 @@ void schema_first_removal_and_crash_cut_matrix() {
 }  // namespace
 
 int main() {
+    finite_policy_isolation();
     verification_matrix();
     readiness_and_fencing();
     immediate_inhibit_identity_fencing();
