@@ -37,6 +37,8 @@ from .protocol import (
     BleBondList,
     BleBondRemoveResult,
     BleExposureStatus,
+    BleProfileId,
+    BleProfileStatus,
     BlePairingRespondResult,
     BlePairingStatus,
     HidRouteStatus,
@@ -269,6 +271,9 @@ def _parser() -> argparse.ArgumentParser:
         ("ble-exposure-status", "show explicit BLE exposure lifecycle state"),
         ("ble-enable", "explicitly initialize/reuse BLE and advertise"),
         ("ble-disable", "hide BLE while retaining the initialized stack"),
+        ("ble-profile-list", "list finite BLE fixture profiles"),
+        ("ble-profile-status", "show selected and active BLE fixture profiles"),
+        ("ble-profile-select", "select a finite BLE fixture profile while quiescent"),
         ("ble-pairing-status", "show the current BLE pairing transaction"),
         ("ble-pairing-respond", "respond to one BLE pairing transaction"),
         ("ble-bond-list", "list firmware-side BLE bonds"),
@@ -309,6 +314,8 @@ def _parser() -> argparse.ArgumentParser:
             suppress_defaults=True,
             hidden_help=hidden_help,
         )
+        if name == "ble-profile-select":
+            command.add_argument("profile", choices=[profile.value for profile in BleProfileId])
         if name == "hid-route-set":
             command.add_argument(
                 "route",
@@ -428,6 +435,11 @@ def _result_value(command: str, result: object) -> object:
         return value
     if command == "ble-pairing-respond":
         assert isinstance(result, BlePairingRespondResult)
+        return asdict(result)
+    if command == "ble-profile-list":
+        return {"profiles": [asdict(profile) for profile in result]}
+    if command in {"ble-profile-status", "ble-profile-select"}:
+        assert isinstance(result, BleProfileStatus)
         return asdict(result)
     if command == "ble-bond-list":
         assert isinstance(result, BleBondList)
@@ -789,6 +801,12 @@ def main(
                 result = client.ble_exposure_status()
             elif args.command == "ble-enable":
                 result = client.ble_enable()
+            elif args.command == "ble-profile-list":
+                result = client.ble_profile_list()
+            elif args.command == "ble-profile-status":
+                result = client.ble_profile_status()
+            elif args.command == "ble-profile-select":
+                result = client.ble_profile_select(args.profile)
             elif args.command == "ble-disable":
                 result = client.ble_disable()
             elif args.command == "ble-pairing-status":

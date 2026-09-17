@@ -331,6 +331,48 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
     return true;
 }
 
+ble_fixture_profile::SelectionSnapshot Controller::profile_snapshot() const {
+    const auto lifecycle = ble_state_.snapshot();
+    using Transition = ble_fixture_profile::SelectionTransition;
+    return {.selected = ble_fixture_profile::ProfileId::kStrictComposite,
+            .active = ble_fixture_profile::ProfileId::kStrictComposite,
+            .active_present = lifecycle.stack_ready && !lifecycle.recovery_required,
+            .transition = lifecycle.recovery_required ? Transition::kFault
+                : !lifecycle.stack_ready &&
+                  lifecycle.observed == ble_lifecycle::ObservedState::kEnabling
+                    ? Transition::kInitializing : Transition::kStable};
+}
+
+ble_fixture_profile::SelectionOutcome Controller::request_profile_select(
+    ble_fixture_profile::ProfileId id) {
+    // The first public catalog contains only the existing strict definition.
+    // Even a no-op selection observes the future switch quiescence contract.
+    constexpr auto operation = ControlOperation::kProfileSelection;
+    if (!initialized_ || runtime_ == nullptr || ble_backend_ == nullptr ||
+        ble_fixture_profile::find_profile(id) == nullptr || !claim_operation(operation)) {
+        return {};
+    }
+    const auto route = runtime_->state_machine().route_snapshot();
+    const auto lifecycle = ble_state_.snapshot();
+    const auto pairing = pairing_state_.snapshot();
+    const bool quiescent = route.coherent && !route.invalidation_pending &&
+        route.desired == hid_route::OutputRoute::kNone &&
+        route.active == hid_route::OutputRoute::kNone &&
+        route.transition == hid_route::Transition::kStable &&
+        runtime_->state_machine().profile_switch_quiescent() &&
+        lifecycle.desired == ble_lifecycle::DesiredExposure::kHidden &&
+        !lifecycle.connected && !lifecycle.advertising && !lifecycle.recovery_required &&
+        (lifecycle.observed == ble_lifecycle::ObservedState::kUninitialized ||
+         lifecycle.observed == ble_lifecycle::ObservedState::kIdle) &&
+        pairing.coherent && !pairing.pairing_active &&
+        pairing.live_state == ble_pairing::LiveState::kIdle;
+    const auto snapshot = profile_snapshot();
+    release_operation(operation);
+    return {.result = quiescent ? ble_fixture_profile::SelectionResult::kNoOp
+                               : ble_fixture_profile::SelectionResult::kBusy,
+            .snapshot = snapshot};
+}
+
 BleCommandOutcome Controller::request_ble_enable() {
     constexpr ControlOperation operation = ControlOperation::kBleEnable;
     if (!initialized_ || ble_backend_ == nullptr || !claim_operation(operation)) {

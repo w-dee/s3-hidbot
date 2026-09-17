@@ -7331,7 +7331,38 @@ void test_action_tagged_union_constructs_each_payload_without_identity_loss() {
     assert(grace.kind == Kind::kBleRouteReleaseGrace);
 }
 
+void test_strict_profile_selection_quiescence_and_status() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    using namespace ble_fixture_profile;
+    assert(controller.profile_snapshot().selected == ProfileId::kStrictComposite);
+    assert(!controller.profile_snapshot().active_present);
+    assert(controller.request_profile_select(ProfileId::kStrictComposite).result == SelectionResult::kNoOp);
+    assert(ble.initialize_calls == 0);
+    assert(controller.request_profile_select(static_cast<ProfileId>(255)).result == SelectionResult::kBusy);
+    assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.profile_snapshot().transition == SelectionTransition::kInitializing);
+    assert(controller.request_profile_select(ProfileId::kStrictComposite).result == SelectionResult::kBusy);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kSync));
+    assert(controller.process_one_for_test());
+    assert(controller.profile_snapshot().active_present);
+    assert(controller.request_profile_select(ProfileId::kStrictComposite).result == SelectionResult::kBusy);
+    assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.request_profile_select(ProfileId::kStrictComposite).result == SelectionResult::kNoOp);
+    assert(ble.initialize_calls == 1);
+    ReadyBleRouteFixture connected(231);
+    assert(connected.controller.request_profile_select(ProfileId::kStrictComposite).result == SelectionResult::kBusy);
+    assert(connected.controller.route_snapshot().ready);
+}
+
 int main(int argc, char **argv) {
+    test_strict_profile_selection_quiescence_and_status();
     if (argc == 2 &&
         std::string_view(argv[1]) == "--controller-grace-authority-only") {
         test_controller_grace_authority_closes_both_replacement_windows();

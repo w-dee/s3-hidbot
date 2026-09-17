@@ -17,14 +17,15 @@ sequence commands. It implements
 `hid.keyboard.report`, `hid.mouse.report`, `hid.sequence.start`,
 `hid.sequence.status`, `ble.exposure.status`, `ble.enable`,
 `ble.disable`, `ble.pairing.status`, `ble.pairing.respond`, `ble.bond.list`, and
-`ble.bond.remove`. There is still no keyboard
+`ble.bond.remove`, `ble.profile.list`, `ble.profile.status`, and
+`ble.profile.select`. There is still no keyboard
 helper, high-level keyboard/mouse automation, asynchronous event, GPIO action,
 or reset command. Primitive report CLI commands are documented below and
 remain explicitly unsafe.
 
 U7.3 adds `ble.exposure.status`, `ble.enable`, and `ble.disable` under
 `ble.exposure-control-v1`; protocol remains 1. With the later pairing and route
-extensions and the HID sequence executor, the full identity hello has 16
+extensions and the HID sequence executor, the full identity hello has 17
 unique capabilities. BLE is
 uninitialized/non-advertising at boot and lazy
 initialization occurs only after accepted enable. Normal disable retains the
@@ -499,7 +500,7 @@ initial capability list:
   hid.mouse-report-v1, hid.sequence-v1, firmware.identity-v1, hid.output-route-v1,
   hid.output-route-v2,
   ble.exposure-control-v1, ble.pairing-transaction-v1,
-  ble.bond-administration-v1
+  ble.bond-administration-v1, ble.fixture-profile-v1
 ```
 
 For a successful hello, top-level `session` equals `result.session`. Both are
@@ -509,7 +510,7 @@ attempt; `boot_id` identifies the MCU boot epoch.
 The complete successful-hello shape is:
 
 ```json
-{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","hid.sequence-v1","firmware.identity-v1","hid.output-route-v1","hid.output-route-v2","ble.exposure-control-v1","ble.pairing-transaction-v1","ble.bond-administration-v1"]}}
+{"type":"response","v":1,"id":1,"session":"<new-session>","ok":true,"result":{"project":"s3-hidbot","protocol_version":1,"client_nonce":"<request-client-nonce>","boot_id":"<boot-id>","session":"<new-session>","lease_ms":5000,"capabilities":["protocol.hello-v1","system.ping-v1","system.info-v1","usb.status-v1","usb.exposure-control-v1","hid.lease-v1","hid.release-all-v1","hid.keyboard-report-v1","hid.mouse-report-v1","hid.sequence-v1","firmware.identity-v1","hid.output-route-v1","hid.output-route-v2","ble.exposure-control-v1","ble.pairing-transaction-v1","ble.bond-administration-v1","ble.fixture-profile-v1"]}}
 ```
 
 The angle-bracket values above are documentation placeholders only; wire
@@ -1592,3 +1593,50 @@ physical OTG cable removal was identified. The tested FNK0099 fixture did not
 provide an independently observable native-port VBUS-loss condition usable by
 the product while USB-UART continued powering it. That direct observation is
 not a schematic, direct-rail, backfeed, or general electrical-safety claim.
+
+
+## Finite BLE fixture profile development API
+
+`ble.fixture-profile-v1` adds `ble.profile.list`, `ble.profile.status`, and
+`ble.profile.select`. The catalog is finite; it accepts no descriptor, packet,
+GATT or arbitrary configuration upload. The initial public catalog contains
+only `strict_composite`. Standalone profiles and full stack replacement are
+subsequent implementation slices; this checkpoint does not claim P0 completion.
+Cold boot selects strict composite in RAM. No profile setting is persisted.
+
+`ble.profile.list` and `ble.profile.status` accept no params (omitted or `{}`).
+The list result is exactly `{"profiles":[DEFINITION,...]}`. Each definition has
+exactly `id` (finite string), `rev` (positive U16), `schema` (positive U8), `map`
+(64 lowercase hex SHA256 of Report Map bytes), `bond` (finite association class)
+and `identity` (finite logical identity class). Strict uses revision 1, schema 1,
+bond class 0 and shared-fixture identity class 0. These namespaces have separate
+meanings; equal numeric values do not imply interchangeable authority.
+
+Status and selection results are exactly:
+
+```json
+{"selected":"strict_composite","active":null,"transition":"stable"}
+```
+
+`active` is null before synchronization or when recovery is required, otherwise
+the synchronized finite profile ID. `transition` is `stable`, `initializing`,
+or `fault`. Advertising and connections do not by themselves change the profile
+transition. Exposure/readiness remain in their existing status APIs. Profile
+revision/schema/bond class do not replace internal runtime activation fencing.
+
+`ble.profile.select` requires exactly `{"profile":"strict_composite"}` at this
+checkpoint. Unknown IDs, additional fields, and embedded NUL are invalid.
+Selection requires stable route-none, known ALL_UP, no Sequence or pending HID
+work, hidden/nonadvertising/disconnected BLE, no pairing or conflicting control
+transition, and no lifecycle recovery fault. Nonquiescent selection returns
+`HID_BUSY`. Selecting the already selected profile is a no-op: no restart,
+bond write/deletion, session retirement, advertising or route restoration.
+Exact request retries replay the existing cache without another selection.
+
+The Python APIs are `Client.ble_profile_list()`, `ble_profile_status()` and
+`ble_profile_select(BleProfileId.STRICT_COMPOSITE)`. CLI counterparts are
+`ble-profile-list`, `ble-profile-status` and `ble-profile-select strict_composite`.
+They require the advertised capability. The host permits up to 17 capabilities
+only in the hello capability array; other generic arrays retain their 16-item
+bound and the machine response frame remains 1024 bytes. Older host versions
+with a 16-capability limit must be updated for this development firmware.

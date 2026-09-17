@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 #include "hid_capability/hid_capability.hpp"
 
@@ -10,6 +11,22 @@ namespace ble_fixture_profile {
 
 enum class ProfileId : std::uint8_t {
     kStrictComposite = 0,
+};
+
+// Profile identity and bond/cache interpretation are separate namespaces.
+enum class BondAssociationClass : std::uint8_t { kStrictComposite = 0 };
+enum class LogicalIdentityClass : std::uint8_t { kSharedFixture = 0 };
+enum class SelectionTransition : std::uint8_t { kStable, kInitializing, kFault };
+struct SelectionSnapshot {
+    ProfileId selected = ProfileId::kStrictComposite;
+    ProfileId active = ProfileId::kStrictComposite;
+    bool active_present = false;
+    SelectionTransition transition = SelectionTransition::kStable;
+};
+enum class SelectionResult : std::uint8_t { kNoOp, kBusy };
+struct SelectionOutcome {
+    SelectionResult result = SelectionResult::kBusy;
+    SelectionSnapshot snapshot{};
 };
 
 enum class TopologyId : std::uint8_t {
@@ -186,6 +203,9 @@ inline constexpr std::array<ReportDefinition, 2> kStrictReports{{
 
 struct ProfileDefinition {
     ProfileId id;
+    const char *name;
+    BondAssociationClass bond_class;
+    LogicalIdentityClass identity_class;
     std::uint16_t revision;
     TopologyId topology;
     GattTemplateId gatt_template;
@@ -204,6 +224,9 @@ struct ProfileDefinition {
 
 inline constexpr ProfileDefinition kStrictComposite{
     .id = ProfileId::kStrictComposite,
+    .name = "strict_composite",
+    .bond_class = BondAssociationClass::kStrictComposite,
+    .identity_class = LogicalIdentityClass::kSharedFixture,
     .revision = 1,
     .topology = TopologyId::kStrictComposite,
     .gatt_template = GattTemplateId::kStrictComposite,
@@ -268,6 +291,20 @@ inline constexpr ProfileDefinition kStrictComposite{
 
 inline constexpr std::array<const ProfileDefinition *, 1> kCatalog{
     &kStrictComposite};
+
+constexpr const ProfileDefinition *find_profile(std::string_view name) {
+    for (const auto *profile : kCatalog) {
+        if (name == profile->name) return profile;
+    }
+    return nullptr;
+}
+
+constexpr const ProfileDefinition *find_profile(ProfileId id) {
+    for (const auto *profile : kCatalog) {
+        if (id == profile->id) return profile;
+    }
+    return nullptr;
+}
 
 constexpr const ProfileDefinition &strict_composite() {
     return kStrictComposite;

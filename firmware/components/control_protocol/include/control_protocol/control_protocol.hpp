@@ -5,6 +5,7 @@
 #include <array>
 #include <string_view>
 
+#include "ble_fixture_profile/ble_fixture_profile.hpp"
 #include "control_framing/control_framing.hpp"
 #include "control_session/control_session.hpp"
 #include "firmware_identity/firmware_identity.hpp"
@@ -87,6 +88,10 @@ struct UsbExposureActionOutcome {
 
 using UsbExposureStatusProvider = UsbExposureStatus (*)(void *context);
 using UsbExposureActionProvider = UsbExposureActionOutcome (*)(void *context);
+
+using BleProfileStatusProvider = ble_fixture_profile::SelectionSnapshot (*)(void *context);
+using BleProfileSelectProvider = ble_fixture_profile::SelectionOutcome (*)(
+    void *context, ble_fixture_profile::ProfileId id);
 
 enum class BleExposureDesired : std::uint8_t { kHidden, kExposed };
 enum class BleExposureObserved : std::uint8_t {
@@ -374,6 +379,10 @@ struct Config {
     void *ble_enable_context;
     BleExposureActionProvider ble_disable_provider;
     void *ble_disable_context;
+    BleProfileStatusProvider ble_profile_status_provider;
+    void *ble_profile_status_context;
+    BleProfileSelectProvider ble_profile_select_provider;
+    void *ble_profile_select_context;
     BlePairingStatusProvider ble_pairing_status_provider;
     void *ble_pairing_status_context;
     BlePairingRespondProvider ble_pairing_respond_provider;

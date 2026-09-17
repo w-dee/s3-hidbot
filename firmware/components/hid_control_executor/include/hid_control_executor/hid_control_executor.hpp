@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "ble_fixture_profile/ble_fixture_profile.hpp"
 #include "ble_pairing/ble_pairing.hpp"
 #include "ble_security/ble_security.hpp"
 #include "hid_route/hid_route.hpp"
@@ -23,6 +24,7 @@ enum class ControlOperation : std::uint8_t {
     kBleEnable,
     kBleDisable,
     kBondAdministration,
+    kProfileSelection,
 };
 
 enum class BackendResultKind : std::uint8_t {
@@ -557,6 +559,9 @@ class Controller final : public usb_lifecycle::Executor,
         hid_runtime::ReportOriginOwnerId originating_local_owner_id = 0);
     ExposureSnapshot snapshot() const;
     hid_runtime::RouteStatusSnapshot route_snapshot();
+    ble_fixture_profile::SelectionSnapshot profile_snapshot() const;
+    ble_fixture_profile::SelectionOutcome request_profile_select(
+        ble_fixture_profile::ProfileId id);
     BleCommandOutcome request_ble_enable();
     BleCommandOutcome request_ble_disable();
     ble_lifecycle::Snapshot ble_snapshot() const;

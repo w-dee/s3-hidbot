@@ -20,6 +20,13 @@ from .errors import (
 from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
+    BLE_FIXTURE_PROFILE_CAPABILITY,
+    BleProfileId,
+    BleFixtureProfile,
+    BleProfileStatus,
+    build_ble_profile_select_frame,
+    validate_ble_profile_list,
+    validate_ble_profile_status,
     BLE_BOND_ADMINISTRATION_CAPABILITY,
     BLE_PAIRING_TRANSACTION_CAPABILITY,
     HID_OUTPUT_ROUTE_V1_CAPABILITY,
@@ -457,6 +464,23 @@ class Client:
         with self._lock:
             self._require_capability_locked("ble.exposure-control-v1")
             return validate_ble_exposure_status(self._request_locked("ble.enable"))
+
+    def ble_profile_list(self) -> tuple[BleFixtureProfile, ...]:
+        with self._lock:
+            self._require_capability_locked(BLE_FIXTURE_PROFILE_CAPABILITY)
+            return validate_ble_profile_list(self._request_locked("ble.profile.list"))
+
+    def ble_profile_status(self) -> BleProfileStatus:
+        with self._lock:
+            self._require_capability_locked(BLE_FIXTURE_PROFILE_CAPABILITY)
+            return validate_ble_profile_status(self._request_locked("ble.profile.status"))
+
+    def ble_profile_select(self, profile: BleProfileId | str) -> BleProfileStatus:
+        with self._lock:
+            self._require_capability_locked(BLE_FIXTURE_PROFILE_CAPABILITY)
+            request_id, session = self._allocate_request_id_locked()
+            frame = build_ble_profile_select_frame(request_id, session, profile)
+            return validate_ble_profile_status(self._request_frame_locked(request_id, session, frame))
 
     def ble_disable(self) -> BleExposureStatus:
         """Hide BLE while retaining an initialized stack for later reuse."""

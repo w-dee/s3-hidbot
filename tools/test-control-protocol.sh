@@ -15,6 +15,7 @@ trap 'rm -f "$temporary_directory/cjson.o" "$temporary_directory/test_control_pr
   -c "$IDF_PATH/components/json/cJSON/cJSON.c" \
   -o "$temporary_directory/cjson.o"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -pedantic \
+  -I"$repository_root/firmware/components/ble_fixture_profile/include" \
   -I"$repository_root/firmware/components/hid_capability/include" \
   -I"$repository_root/firmware/components/control_framing/include" \
   -I"$repository_root/firmware/components/control_session/include" \

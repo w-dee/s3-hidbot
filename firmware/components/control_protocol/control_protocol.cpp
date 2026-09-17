@@ -25,9 +25,9 @@ constexpr std::size_t kMaxMetadataBytes = 32;
 constexpr std::size_t kMaxSequenceCodeBytes = 320;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\",\"ble.fixture-profile-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\",\"ble.fixture-profile-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -561,6 +561,54 @@ const char *ble_exposure_operation_json(BleExposureOperation operation) {
         case BleExposureOperation::kRuntime:
         default: return "runtime";
     }
+}
+
+bool make_profile_status(control_session::ResponseFrame *frame,
+                         ResponseSession session, std::int32_t id,
+                         ble_fixture_profile::SelectionSnapshot status) {
+    char session_field[kSessionFieldBytes]{};
+    const auto *selected = ble_fixture_profile::find_profile(status.selected);
+    const auto *active = ble_fixture_profile::find_profile(status.active);
+    if (!format_session_field(session_field, session) || selected == nullptr ||
+        (status.active_present && active == nullptr)) return false;
+    char active_json[64]{};
+    std::snprintf(active_json, sizeof(active_json), status.active_present ? "\"%s\"" : "null",
+                  active == nullptr ? "" : active->name);
+    using Transition = ble_fixture_profile::SelectionTransition;
+    const char *transition = status.transition == Transition::kFault ? "fault"
+        : status.transition == Transition::kInitializing ? "initializing" : "stable";
+    return format_frame(frame,
+        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+        "\"session\":%s,\"ok\":true,\"result\":{\"selected\":\"%s\","
+        "\"active\":%s,\"transition\":\"%s\"}}\n",
+        static_cast<long>(id), session_field, selected->name, active_json, transition);
+}
+
+bool make_profile_list(control_session::ResponseFrame *frame,
+                       ResponseSession session, std::int32_t id) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session)) return false;
+    char entries[800]{};
+    std::size_t used = 0;
+    for (const auto *profile : ble_fixture_profile::kCatalog) {
+        char digest[65]{};
+        for (std::size_t i = 0; i < profile->report_map_sha256.size(); ++i) {
+            std::snprintf(digest + i * 2, 3, "%02x", profile->report_map_sha256[i]);
+        }
+        const int written = std::snprintf(entries + used, sizeof(entries) - used,
+            "%s{\"id\":\"%s\",\"rev\":%u,\"schema\":%u,\"map\":\"%s\","
+            "\"bond\":%u,\"identity\":%u}", used == 0 ? "" : ",", profile->name,
+            static_cast<unsigned>(profile->revision),
+            static_cast<unsigned>(profile->cache.schema_revision), digest,
+            static_cast<unsigned>(profile->bond_class),
+            static_cast<unsigned>(profile->identity_class));
+        if (written < 0 || static_cast<std::size_t>(written) >= sizeof(entries) - used) return false;
+        used += static_cast<std::size_t>(written);
+    }
+    return format_frame(frame,
+        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+        "\"session\":%s,\"ok\":true,\"result\":{\"profiles\":[%s]}}\n",
+        static_cast<long>(id), session_field, entries);
 }
 
 bool make_ble_exposure_status(control_session::ResponseFrame *frame,
@@ -1216,6 +1264,7 @@ bool Protocol::initialize(const Config &config,
     if (config.output == nullptr || config.usb_status_provider == nullptr ||
         config.usb_exposure_status_provider == nullptr || config.usb_attach_provider == nullptr ||
         config.usb_detach_provider == nullptr || config.hid_route_status_provider == nullptr ||
+        config.ble_profile_status_provider == nullptr || config.ble_profile_select_provider == nullptr ||
         config.ble_exposure_status_provider == nullptr || config.ble_enable_provider == nullptr ||
         config.ble_disable_provider == nullptr ||
         config.ble_pairing_status_provider == nullptr ||
@@ -1732,6 +1781,39 @@ void Protocol::handle_frame(std::string_view payload) {
                     finish();
                     return;
                 }
+            }
+        }
+    } else if (command == "ble.profile.list" || command == "ble.profile.status") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "BLE profile query accepts no params");
+        } else {
+            semantically_valid = true;
+            completed = command == "ble.profile.list"
+                ? make_profile_list(&response, current_session, id)
+                : make_profile_status(&response, current_session, id,
+                    config_.ble_profile_status_provider(config_.ble_profile_status_context));
+        }
+    } else if (command == "ble.profile.select") {
+        static constexpr const char *fields[] = {"profile"};
+        std::string_view name;
+        const ble_fixture_profile::ProfileDefinition *profile = nullptr;
+        if (payload.find("\\u0000") != std::string_view::npos ||
+            !cJSON_IsObject(params) || !object_has_only_fields(params, fields, 1) ||
+            cJSON_GetArraySize(params) != 1 ||
+            !get_bounded_nonempty_string(params, "profile", 48, &name) ||
+            (profile = ble_fixture_profile::find_profile(name)) == nullptr) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS",
+                       "finite BLE profile ID is required");
+        } else {
+            semantically_valid = true;
+            const auto outcome = config_.ble_profile_select_provider(
+                config_.ble_profile_select_context, profile->id);
+            if (outcome.result == ble_fixture_profile::SelectionResult::kBusy) {
+                completed = make_error(&response, current_session, true, id,
+                                       "HID_BUSY", "BLE profile selection requires quiescence");
+            } else {
+                completed = make_profile_status(&response, current_session, id, outcome.snapshot);
             }
         }
     } else if (command == "ble.exposure.status") {

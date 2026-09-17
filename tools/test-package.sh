@@ -181,6 +181,7 @@ expected_tests = {
     "tests/test_flashing.py",
     "tests/test_framing.py",
     "tests/test_pairing.py",
+    "tests/test_ble_profiles.py",
     "tests/test_pairing_tty.py",
     "tests/test_protocol.py",
     "tests/test_provisioning.py",

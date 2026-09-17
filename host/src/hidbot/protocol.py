@@ -23,6 +23,7 @@ MAX_TOKEN_LENGTH = 32
 MAX_JSON_DEPTH = 8
 MAX_OBJECT_MEMBERS = 16
 MAX_ARRAY_MEMBERS = 16
+MAX_CAPABILITIES = 17
 MAX_STRING_BYTES = 256
 MAX_FIRMWARE_VERSION_BYTES = 31
 MAX_SOURCE_REVISION_BYTES = 40
@@ -32,6 +33,7 @@ MAX_USB_GENERATION = 0xFFFF_FFFF
 MAX_UINT32 = 0xFFFF_FFFF
 MAX_BLE_KEY_SIZE = 16
 BLE_PAIRING_TRANSACTION_CAPABILITY = "ble.pairing-transaction-v1"
+BLE_FIXTURE_PROFILE_CAPABILITY = "ble.fixture-profile-v1"
 BLE_BOND_ADMINISTRATION_CAPABILITY = "ble.bond-administration-v1"
 MAX_BONDS = 3
 HID_OUTPUT_ROUTE_V1_CAPABILITY = "hid.output-route-v1"
@@ -68,6 +70,7 @@ OPTIONAL_CAPABILITIES = frozenset(
         "ble.exposure-control-v1",
         BLE_PAIRING_TRANSACTION_CAPABILITY,
         BLE_BOND_ADMINISTRATION_CAPABILITY,
+        BLE_FIXTURE_PROFILE_CAPABILITY,
     }
 )
 KNOWN_OPTIONAL_CAPABILITIES = OPTIONAL_CAPABILITIES
@@ -372,7 +375,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return output
 
 
-def _validate_tree(value: Any, depth: int = 0) -> None:
+def _validate_tree(value: Any, depth: int = 0, path: tuple[str, ...] = ()) -> None:
     if depth > MAX_JSON_DEPTH:
         raise ProtocolError("response JSON nesting exceeds the host bound")
     if isinstance(value, str):
@@ -388,10 +391,11 @@ def _validate_tree(value: Any, depth: int = 0) -> None:
             raise ProtocolError("response JSON number is not finite")
         return
     if isinstance(value, list):
-        if len(value) > MAX_ARRAY_MEMBERS:
+        bound = MAX_CAPABILITIES if path == ("result", "capabilities") else MAX_ARRAY_MEMBERS
+        if len(value) > bound:
             raise ProtocolError("response JSON array exceeds the host bound")
         for child in value:
-            _validate_tree(child, depth + 1)
+            _validate_tree(child, depth + 1, path + ("*",))
         return
     if isinstance(value, dict):
         if len(value) > MAX_OBJECT_MEMBERS:
@@ -399,7 +403,7 @@ def _validate_tree(value: Any, depth: int = 0) -> None:
         for key, child in value.items():
             if not isinstance(key, str) or len(key.encode("utf-8")) > MAX_STRING_BYTES:
                 raise ProtocolError("response JSON key exceeds the host bound")
-            _validate_tree(child, depth + 1)
+            _validate_tree(child, depth + 1, path + (key,))
         return
     raise ProtocolError("response JSON contains an unsupported value")
 
@@ -774,7 +778,7 @@ def validate_hello_response(
     if (
         not isinstance(capabilities, list)
         or not all(isinstance(item, str) and item for item in capabilities)
-        or len(capabilities) > MAX_ARRAY_MEMBERS
+        or len(capabilities) > MAX_CAPABILITIES
         or len(set(capabilities)) != len(capabilities)
         or any(len(item.encode("utf-8")) > MAX_STRING_BYTES for item in capabilities)
     ):
@@ -1367,7 +1371,7 @@ def validate_system_info(
     ):
         raise ProtocolError("system.info capabilities are invalid")
     try:
-        if len(capabilities) > MAX_ARRAY_MEMBERS or len(set(capabilities)) != len(capabilities):
+        if len(capabilities) > MAX_CAPABILITIES or len(set(capabilities)) != len(capabilities):
             raise ProtocolError("system.info capabilities are invalid")
         capability_set = set(capabilities)
     except (TypeError, ValueError) as exc:
@@ -1468,3 +1472,83 @@ def evaluate_compatibility(
         firmware_identity=system_info.firmware,
         target_supported=target_supported,
     )
+
+
+class BleProfileId(str, Enum):
+    STRICT_COMPOSITE = "strict_composite"
+
+
+@dataclass(frozen=True)
+class BleFixtureProfile:
+    profile_id: BleProfileId
+    revision: int
+    schema: int
+    report_map_sha256: str
+    bond_class: int
+    identity_class: int
+
+
+@dataclass(frozen=True)
+class BleProfileStatus:
+    selected: BleProfileId
+    active: BleProfileId | None
+    transition: Literal["stable", "initializing", "fault"]
+
+
+def _profile_id(value: Any) -> BleProfileId:
+    if not isinstance(value, str):
+        raise ProtocolError("BLE profile ID must be a finite name")
+    try:
+        return BleProfileId(value)
+    except ValueError as exc:
+        raise ProtocolError("unknown BLE profile ID") from exc
+
+
+def validate_ble_profile_list(value: Any) -> tuple[BleFixtureProfile, ...]:
+    if not isinstance(value, dict) or set(value) != {"profiles"}:
+        raise ProtocolError("BLE profile list fields are invalid")
+    profiles = value["profiles"]
+    if not isinstance(profiles, list) or not 1 <= len(profiles) <= len(BleProfileId):
+        raise ProtocolError("BLE profile catalog size is invalid")
+    result = []
+    for item in profiles:
+        if not isinstance(item, dict) or set(item) != {"id", "rev", "schema", "map", "bond", "identity"}:
+            raise ProtocolError("BLE profile definition fields are invalid")
+        profile_id = _profile_id(item["id"])
+        if type(item["rev"]) is not int or not 1 <= item["rev"] <= 65535:
+            raise ProtocolError("BLE profile revision is invalid")
+        if type(item["schema"]) is not int or not 1 <= item["schema"] <= 255:
+            raise ProtocolError("BLE profile schema is invalid")
+        if not isinstance(item["map"], str) or APP_ELF_SHA256_PATTERN.fullmatch(item["map"]) is None:
+            raise ProtocolError("BLE Report Map digest is invalid")
+        if type(item["bond"]) is not int or item["bond"] not in {0}:
+            raise ProtocolError("BLE bond association class is invalid")
+        if type(item["identity"]) is not int or item["identity"] != 0:
+            raise ProtocolError("BLE logical identity class is invalid")
+        if any(profile.profile_id == profile_id for profile in result):
+            raise ProtocolError("duplicate BLE profile ID")
+        result.append(BleFixtureProfile(profile_id, item["rev"], item["schema"],
+                                        item["map"], item["bond"], item["identity"]))
+    return tuple(result)
+
+
+def validate_ble_profile_status(value: Any) -> BleProfileStatus:
+    if not isinstance(value, dict) or set(value) != {"selected", "active", "transition"}:
+        raise ProtocolError("BLE profile status fields are invalid")
+    selected = _profile_id(value["selected"])
+    active = None if value["active"] is None else _profile_id(value["active"])
+    transition = value["transition"]
+    if not isinstance(transition, str) or transition not in {"stable", "initializing", "fault"}:
+        raise ProtocolError("BLE profile transition is invalid")
+    if active is not None and (active != selected or transition != "stable"):
+        raise ProtocolError("BLE active profile is incoherent")
+    return BleProfileStatus(selected, active, transition)
+
+
+def build_ble_profile_select_frame(request_id: int, session: str,
+                                    profile: BleProfileId | str) -> bytes:
+    selected = _profile_id(profile)
+    # Reuse the normal ID/session validator before adding the finite parameter.
+    build_command_frame(request_id, session, "ble.profile.select")
+    return _serialize_request({"v": PROTOCOL_VERSION, "id": request_id,
+        "session": session, "cmd": "ble.profile.select", "params": {"profile": selected.value}})

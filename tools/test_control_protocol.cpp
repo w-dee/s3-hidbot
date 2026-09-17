@@ -281,6 +281,20 @@ struct ExposureSource {
     }
 };
 
+struct ProfileSource {
+    ble_fixture_profile::SelectionSnapshot snapshot{};
+    ble_fixture_profile::SelectionResult result = ble_fixture_profile::SelectionResult::kNoOp;
+    int selections = 0;
+    static ble_fixture_profile::SelectionSnapshot get(void *context) {
+        return static_cast<ProfileSource *>(context)->snapshot;
+    }
+    static ble_fixture_profile::SelectionOutcome select(void *context, ble_fixture_profile::ProfileId) {
+        auto &source = *static_cast<ProfileSource *>(context);
+        ++source.selections;
+        return {.result = source.result, .snapshot = source.snapshot};
+    }
+};
+
 struct BleSource {
     control_protocol::BleExposureStatus status{};
     control_protocol::BleExposureActionResult enable_result =
@@ -572,6 +586,7 @@ struct LeaseFixture {
     AuthoritySource authority;
     ExposureSource exposure;
     BleSource ble;
+    ProfileSource profile;
     PairingSource pairing;
     BondSource bonds;
     RouteSource route;
@@ -654,6 +669,10 @@ struct LeaseFixture {
             .ble_enable_context = &ble,
             .ble_disable_provider = BleSource::disable,
             .ble_disable_context = &ble,
+            .ble_profile_status_provider = ProfileSource::get,
+            .ble_profile_status_context = &profile,
+            .ble_profile_select_provider = ProfileSource::select,
+            .ble_profile_select_context = &profile,
             .ble_pairing_status_provider = PairingSource::get,
             .ble_pairing_status_context = &pairing,
             .ble_pairing_respond_provider = PairingSource::respond,
@@ -738,6 +757,7 @@ struct Fixture {
     AuthoritySource authority;
     ExposureSource exposure;
     BleSource ble;
+    ProfileSource profile;
     PairingSource pairing;
     BondSource bonds;
     RouteSource route;
@@ -784,6 +804,10 @@ struct Fixture {
             .ble_enable_context = &ble,
             .ble_disable_provider = BleSource::disable,
             .ble_disable_context = &ble,
+            .ble_profile_status_provider = ProfileSource::get,
+            .ble_profile_status_context = &profile,
+            .ble_profile_select_provider = ProfileSource::select,
+            .ble_profile_select_context = &profile,
             .ble_pairing_status_provider = PairingSource::get,
             .ble_pairing_status_context = &pairing,
             .ble_pairing_respond_provider = PairingSource::respond,
@@ -1761,7 +1785,7 @@ void test_hid_route_schema_frozen_retry_and_errors() {
     const std::string session = extract_string(hello, "session");
     assert(count_occurrences(hello, "\"hid.output-route-v1\"") == 1);
     assert(count_occurrences(hello, "\"hid.output-route-v2\"") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 15);
+    assert(count_occurrences(hello, "-v1\"") == 16);
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
 
     fixture.payload(request(2, session, "hid.route.status"));
@@ -1947,7 +1971,7 @@ void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
     const std::string session = extract_string(hello, "session");
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
     assert(count_occurrences(hello, "ble.exposure-control-v1") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 15);
+    assert(count_occurrences(hello, "-v1\"") == 16);
 
     fixture.payload(request(2, session, "ble.exposure.status"));
     const std::string cold = fixture.sink.last();
@@ -2015,7 +2039,7 @@ void test_ble_pairing_status_exact_schema() {
     assert(count_occurrences(hello, "ble.pairing-transaction-v1") == 1);
     assert(hello.find("ble.pairing-control-v1") == std::string::npos);
     assert(hello.find("ble.bond-store-v1") == std::string::npos);
-    assert(count_occurrences(hello, "-v1\"") == 15);
+    assert(count_occurrences(hello, "-v1\"") == 16);
 
     fixture.payload(request(2, session, "ble.pairing.status"));
     require_contains(
@@ -2728,7 +2752,42 @@ void test_pairing_rng_failure_is_startup_fail_closed() {
 
 }  // namespace
 
+void test_finite_profile_api_and_retry() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    const auto hello = fixture.sink.last();
+    assert(count_occurrences(hello, "ble.fixture-profile-v1") == 1);
+    assert(hello.size() <= kMaxLogicalMachineFrameBytes);
+    const auto session = extract_string(hello, "session");
+    fixture.payload(request(2, session, "ble.profile.list"));
+    require_contains(fixture.sink.last(), "\"id\":\"strict_composite\",\"rev\":1,\"schema\":1");
+    require_contains(fixture.sink.last(), "ef1be45d8fe7d0637568c8954b64bab971d5b5f57bf3d44f1cc040e8fe5c3d32");
+    require_contains(fixture.sink.last(), "\"bond\":0,\"identity\":0");
+    fixture.payload(request(3, session, "ble.profile.status"));
+    require_contains(fixture.sink.last(), "\"selected\":\"strict_composite\",\"active\":null,\"transition\":\"stable\"");
+    const auto select = request(4, session, "ble.profile.select", "{\"profile\":\"strict_composite\"}");
+    fixture.payload(select);
+    const auto response = fixture.sink.last();
+    fixture.profile.result = ble_fixture_profile::SelectionResult::kBusy;
+    fixture.payload(select);
+    assert(response == fixture.sink.last() && fixture.profile.selections == 1);
+    fixture.payload(request(5, session, "ble.profile.select", "{\"profile\":\"strict_composite\"}"));
+    require_contains(fixture.sink.last(), "\"code\":\"HID_BUSY\"");
+    const int calls = fixture.profile.selections;
+    int id = 6;
+    for (const auto *params : {"{}", "{\"profile\":3}", "{\"profile\":\"unknown\"}",
+                              "{\"profile\":\"strict_composite\",\"upload\":true}",
+                              "{\"profile\":\"strict_composite\\u0000x\"}"}) {
+        fixture.payload(request(id++, session, "ble.profile.select", params));
+        require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    }
+    assert(fixture.profile.selections == calls);
+    fixture.payload(request(id++, session, "system.ping"));
+    require_contains(fixture.sink.last(), "\"pong\":true");
+}
+
 int main() {
+    test_finite_profile_api_and_retry();
     cJSON_Hooks hooks{tracked_cjson_malloc, tracked_cjson_free};
     cJSON_InitHooks(&hooks);
     test_strict_envelope_and_framing();

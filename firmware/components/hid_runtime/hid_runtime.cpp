@@ -336,6 +336,15 @@ bool StateMachine::release_interface_work_pending(Interface interface) const {
            ticket == MouseReportTicketState::kClaimed;
 }
 
+bool StateMachine::profile_switch_quiescent() const {
+    return !sequence_active() && !release_producers_blocked() &&
+           !release_requested_.load(std::memory_order_acquire) &&
+           known_all_up(Interface::kKeyboard) && known_all_up(Interface::kMouse) &&
+           !release_interface_work_pending(Interface::kKeyboard) &&
+           !release_interface_work_pending(Interface::kMouse) &&
+           lifecycle_detach_safety_clean();
+}
+
 bool StateMachine::release_producers_blocked() const {
     return release_transaction_active(
         release_ticket_.state.load(std::memory_order_acquire));

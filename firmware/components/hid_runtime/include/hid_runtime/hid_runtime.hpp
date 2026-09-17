@@ -620,6 +620,7 @@ class StateMachine {
     bool sequence_authority_current(SequenceAuthority authority) const;
     void end_sequence(SequenceAuthority authority);
     void revoke_sequence();
+    bool profile_switch_quiescent() const;
     bool sequence_active() const;
 
 #ifdef HID_RUNTIME_NATIVE_TEST

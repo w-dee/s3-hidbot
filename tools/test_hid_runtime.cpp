@@ -2920,7 +2920,27 @@ void test_stale_usb_failure_cannot_terminalize_replacement_release() {
     assert(!state.finalize_release_all(second).success_committed);
 }
 
+void test_profile_quiescence_rejects_sequence_and_held_work() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    assert(state.profile_switch_quiescent());
+    hid_runtime::ConfirmedHidState confirmed{};
+    hid_runtime::SequenceAuthority authority{};
+    assert(state.begin_sequence(&confirmed, &authority) == hid_runtime::SequenceAdmissionResult::kAccepted);
+    assert(!state.profile_switch_quiescent());
+    state.end_sequence(authority);
+    assert(state.profile_switch_quiescent());
+    assert(state.queue_keyboard_report(0, {4, 0, 0, 0, 0, 0}));
+    assert(!state.profile_switch_quiescent());
+    state.execute(Sink::submit, &sink);
+    assert(!state.profile_switch_quiescent());
+    state.report_complete(0);
+    assert(!state.profile_switch_quiescent());
+}
+
 int main() {
+    test_profile_quiescence_rejects_sequence_and_held_work();
     test_stale_usb_failure_cannot_terminalize_replacement_release();
     audit_usb_public_outcome();
     test_release_id_nonreuse_and_stale_finalizer();

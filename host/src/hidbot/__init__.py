@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Any
 from .client import Client, HelloResult
 from .protocol import (
     CompatibilityResult,
+    BleProfileId,
+    BleFixtureProfile,
+    BleProfileStatus,
     BleExposureDesired,
     BleExposureLastError,
     BleExposureObserved,
@@ -60,6 +63,9 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "Client",
     "HelloResult",
+    "BleProfileId",
+    "BleFixtureProfile",
+    "BleProfileStatus",
     "ReleaseAllResult",
     "KeyboardReportResult",
     "MouseReportResult",
