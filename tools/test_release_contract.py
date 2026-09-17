@@ -112,6 +112,83 @@ inline /* placement */ constexpr std::string_view
             self.assertEqual(read_build_profile(root), "freenove-fnk0085")
             self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
 
+    def test_current_and_frozen_profiles_match_compiler_semantics(self) -> None:
+        current_header = (
+            ROOT
+            / "firmware/components/firmware_identity/include/firmware_identity/firmware_identity.hpp"
+        )
+        self.assertEqual(read_build_profile(ROOT), "freenove-fnk0099")
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(
+                self._compiled_profile(Path(temporary), current_header),
+                "freenove-fnk0099",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            frozen_header = self._write_identity_header(
+                root,
+                "namespace firmware_identity {\n"
+                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";\n'
+                "}\n",
+            )
+            self.assertEqual(read_build_profile(root), "freenove-fnk0085")
+            self.assertEqual(self._compiled_profile(root, frozen_header), "freenove-fnk0085")
+
+    def test_profile_parser_rejects_raw_string_bypass_before_authority(self) -> None:
+        source = r'''
+namespace firmware_identity {
+inline constexpr auto example = R"tag("; inline constexpr std::string_view kBuildProfile = "freenove-fnk0099"; )tag"; inline constexpr std::string_view kBuildProfile = "freenove-fnk0085"; // "
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            header = self._write_identity_header(root, source)
+            self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
+            with self.assertRaisesRegex(ReleaseContractError, "unsupported raw string literal"):
+                read_build_profile(root)
+
+    def test_profile_parser_rejects_all_standard_raw_string_prefixes(self) -> None:
+        for prefix in ("R", "u8R", "uR", "UR", "LR"):
+            source = f'''
+namespace firmware_identity {{
+inline constexpr auto example = {prefix}"arb_42(kBuildProfile = fake)arb_42";
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";
+}}
+'''
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                header = self._write_identity_header(root, source)
+                self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
+                with self.assertRaisesRegex(
+                    ReleaseContractError, "unsupported raw string literal"
+                ):
+                    read_build_profile(root)
+
+    def test_profile_parser_rejects_physical_line_splicing(self) -> None:
+        for newline in ("\n", "\r\n"):
+            source = (
+                "namespace firmware_identity {" + newline
+                + '// inline constexpr std::string_view kBuildProfile = "freenove-fnk0099"; \\'
+                + newline
+                + 'inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";'
+                + newline
+                + "inline constexpr std::string_view kBuildPro\\"
+                + newline
+                + 'file = "freenove-fnk0085";'
+                + newline
+                + "}"
+                + newline
+            )
+            with self.subTest(newline=repr(newline)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                header = self._write_identity_header(root, source)
+                self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
+                with self.assertRaisesRegex(
+                    ReleaseContractError, "unsupported physical line splicing"
+                ):
+                    read_build_profile(root)
+
     def test_profile_parser_fails_closed_on_ambiguous_or_unsupported_authority(self) -> None:
         cases = (
             """

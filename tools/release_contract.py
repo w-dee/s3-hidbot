@@ -24,6 +24,7 @@ DISTRIBUTION = "s3-hidbot-host"
 _RELEASE_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _SOURCE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _BUILD_PROFILE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+_RAW_STRING_LITERAL = re.compile(r'(?:u8|u|U|L)?R"')
 
 
 class ReleaseContractError(ValueError):
@@ -38,6 +39,15 @@ class _CppToken:
 
 def _cpp_tokens(text: str) -> tuple[_CppToken, ...]:
     """Tokenize the deliberately narrow C++ subset used by the identity header."""
+
+    if _RAW_STRING_LITERAL.search(text) is not None:
+        raise ReleaseContractError(
+            "firmware build profile authority uses an unsupported raw string literal"
+        )
+    if "\\\n" in text or "\\\r\n" in text:
+        raise ReleaseContractError(
+            "firmware build profile authority uses unsupported physical line splicing"
+        )
 
     tokens: list[_CppToken] = []
     cursor = 0
