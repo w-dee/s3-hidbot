@@ -2963,6 +2963,35 @@ void test_public_dual_usb_release_retains_second_interface_debt() {
     assert(state.begin_mouse_report(0, 1, 0, 0, 0) == hid_runtime::MouseReportBeginResult::kPublished);
 }
 
+void submit_usb_safety_before_release_admission(hid_runtime::StateMachine *state) {
+    state->set_before_release_admission_hook_for_test(nullptr);
+    drive_dual_usb_release(state);
+}
+
+void test_dual_usb_pending_admission_still_drains_both_interfaces() {
+    hid_runtime::Runtime runtime;
+    auto &state = runtime.state_machine(); Sink initial;
+    hold_both_usb_interfaces(state, initial);
+    dual_release_sink = {}; dual_release_polls = 0;
+    // SOF consumes the generic request before the public transaction owns it.
+    state.set_before_release_admission_hook_for_test(submit_usb_safety_before_release_admission);
+    const auto pending = runtime.release_all();
+    const auto first = state.release_all_snapshot();
+    assert(!pending.success && !pending.authority_lost);
+    assert(pending.mouse == hid_runtime::ReleaseAllInterfaceState::kPending);
+    assert(first.state == hid_runtime::ReleaseAllTransactionState::kTimedOut);
+    assert(dual_release_sink.calls == 1 && state.safety_required(hid_runtime::Interface::kMouse));
+    // No new public mutation is needed to drain the retained Mouse obligation.
+    drive_dual_usb_release(&state);
+    assert(dual_release_sink.calls == 2 && state.mouse_state().buttons == 0);
+    // A distinct request reevaluates the now-clean state; the old result stays pending.
+    const auto settled = runtime.release_all();
+    assert(settled.success && settled.keyboard == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp &&
+           settled.mouse == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    assert(state.release_all_snapshot().id != first.id && dual_release_sink.calls == 2);
+    assert(!pending.success);
+}
+
 void test_generic_dual_usb_release_latches_unready_second_interface() {
     for (const bool mouse_ready : {false, true}) {
         hid_runtime::StateMachine state; Sink sink;
@@ -3006,6 +3035,7 @@ void test_profile_quiescence_rejects_sequence_and_held_work() {
 
 int main() {
     test_public_dual_usb_release_retains_second_interface_debt();
+    test_dual_usb_pending_admission_still_drains_both_interfaces();
     test_generic_dual_usb_release_latches_unready_second_interface();
     test_profile_quiescence_rejects_sequence_and_held_work();
     test_stale_usb_failure_cannot_terminalize_replacement_release();
