@@ -2841,7 +2841,90 @@ void test_report_origin_owner_is_bound_to_exact_async_work() {
 
 }  // namespace
 
+void audit_usb_failure(hid_runtime::StateMachine *target) {
+    auto &state = *target;
+    state.set_before_release_finalize_hook_for_test(nullptr);
+    assert(state.report_in_flight(hid_runtime::Interface::kKeyboard));
+    state.report_failed(0);
+    assert(state.release_all_snapshot().state == hid_runtime::ReleaseAllTransactionState::kFailed);
+}
+struct AuditReleaseWake final : hid_runtime::AuthorityEventSink {
+    hid_runtime::StateMachine *state;
+    Sink sink;
+    bool first = true;
+    void signal_hid_authority_change() override {
+        if (first) { first=false; state->execute(Sink::submit,&sink); }
+    }
+};
+void audit_usb_public_outcome() {
+    hid_runtime::Runtime runtime;
+    auto &state = runtime.state_machine();
+    Sink sink;
+    ready(state);
+    assert(state.queue_keyboard_report(0,{4,0,0,0,0,0}));
+    state.execute(Sink::submit,&sink);
+    state.report_complete(0);
+    AuditReleaseWake wake;
+    wake.state=&state;
+    runtime.bind_authority_event_sink(&wake);
+    state.set_before_release_finalize_hook_for_test(audit_usb_failure);
+    const auto result=runtime.release_all();
+    const auto terminal=state.release_all_snapshot();
+    assert(terminal.state == hid_runtime::ReleaseAllTransactionState::kFinalizedFailure);
+    assert(!result.success && "public USB success must agree with failed terminal ownership");
+}
+
+
+void test_release_id_nonreuse_and_stale_finalizer() {
+    hid_runtime::StateMachine state;
+    ready(state);
+    const auto first = state.begin_release_all();
+    assert(first != 0);
+    assert(state.finalize_release_all(first).success_committed);
+    const auto second = state.begin_release_all();
+    assert(second != first);
+    assert(state.finalize_release_all(first).canceled);
+    assert(state.release_all_snapshot().id == second);
+    assert(state.release_all_snapshot().active);
+    assert(state.finalize_release_all(second).success_committed);
+    state.set_next_release_id_for_test(UINT64_MAX);
+    const auto last = state.begin_release_all();
+    assert(last == UINT64_MAX);
+    assert(state.finalize_release_all(last).success_committed);
+    assert(state.begin_release_all() == 0);
+}
+void test_stale_usb_failure_cannot_terminalize_replacement_release() {
+    hid_runtime::StateMachine state;
+    Sink sink;
+    ready(state);
+    assert(state.queue_keyboard_report(0, {4, 0, 0, 0, 0, 0}));
+    state.execute(Sink::submit, &sink);
+    state.report_complete(0);
+    const auto first = state.begin_release_all();
+    state.execute(Sink::submit, &sink);
+    const auto old_token = state.in_flight_token(hid_runtime::Interface::kKeyboard);
+    assert(state.finalize_release_all(first).success_committed);
+    // Compress a complete legacy-epoch wrap while the old transfer is pending.
+    // Report metadata retains the nonreused transaction ID across the wrap.
+    state.set_release_epoch_for_test(old_token.release_epoch - 1U);
+    const auto second = state.begin_release_all();
+    const auto before = state.release_all_snapshot();
+    assert(second != first && before.release_epoch == old_token.release_epoch);
+    assert(before.state == hid_runtime::ReleaseAllTransactionState::kOpen);
+    assert(state.report_failed_for_token(0, old_token, nullptr, 0));
+    const auto after = state.release_all_snapshot();
+    assert(after.id == second);
+    assert(after.state == before.state &&
+           "old USB failure cannot terminalize a new release owner");
+    assert(after.keyboard == before.keyboard);
+    assert(!state.finalize_release_all(second).success_committed);
+}
+
 int main() {
+    test_stale_usb_failure_cannot_terminalize_replacement_release();
+    audit_usb_public_outcome();
+    test_release_id_nonreuse_and_stale_finalizer();
+
     test_lifecycle_and_generation_cancellation();
     test_readiness_refresh_after_mount_without_hid_work();
     test_sequence_admission_snapshot_and_producer_exclusion();

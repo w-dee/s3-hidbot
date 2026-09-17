@@ -4403,6 +4403,140 @@ void test_explicit_ble_release_transaction_race_closure() {
     release_race_fixture = nullptr;
 }
 
+void audit_timeout_replacement(hid_runtime::StateMachine *state) {
+    state->set_before_release_success_claim_hook_for_test(nullptr);
+    const auto a = state->release_all_snapshot();
+    assert(a.state == hid_runtime::ReleaseAllTransactionState::kOpen);
+    state->finalize_release_all();
+    assert(state->release_all_snapshot().state == hid_runtime::ReleaseAllTransactionState::kTimedOut);
+    state->begin_release_all();
+    const auto b = state->release_all_snapshot();
+    assert(b.state == hid_runtime::ReleaseAllTransactionState::kOpen);
+    assert(b.release_epoch != a.release_epoch);
+    assert(a.id != 0 && b.id != a.id);
+    const auto stale_finalizer = state->finalize_release_all(a.id);
+    assert(stale_finalizer.canceled);
+    assert(state->release_all_snapshot().id == b.id);
+    assert(state->release_all_snapshot().state == hid_runtime::ReleaseAllTransactionState::kOpen);
+    state->fail_ble_release_all(a, hid_runtime::Interface::kKeyboard);
+    assert(state->release_all_snapshot().state == hid_runtime::ReleaseAllTransactionState::kOpen);
+}
+void audit_stale_success_claim() {
+    ReadyBleRouteFixture fixture(211);
+    auto &state = fixture.runtime.state_machine();
+    state.begin_release_all();
+    state.set_before_release_success_claim_hook_for_test(audit_timeout_replacement);
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    const auto result = state.release_all_snapshot();
+    assert(!result.success_committed && "stale A must not commit success into B");
+}
+
+void audit_mount_at_owner_gate(hid_runtime::StateMachine *state) {
+    state->set_after_release_barrier_hook_for_test(nullptr);
+    assert(state->release_all_snapshot().state == hid_runtime::ReleaseAllTransactionState::kAdmitting);
+    state->on_mount();
+    assert(state->release_all_snapshot().canceled);
+}
+void audit_canceled_active_gate() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    connect_ble(runtime, usb, ble, database, controller, 212);
+    assert(action(controller.request_attach()) == usb_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    const auto generation = controller.ble_snapshot().generation;
+    subscribe_composite(controller, database, generation, 212);
+    make_security_ready(ble); ble.refresh_security(212);
+    assert(controller.request_route(hid_route::OutputRoute::kBle).action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    auto &state=runtime.state_machine();
+    state.set_after_release_barrier_hook_for_test(audit_mount_at_owner_gate);
+    state.begin_release_all();
+    state.finalize_release_all();
+    auto snapshot=state.release_all_snapshot();
+    assert(snapshot.canceled && !snapshot.active);
+
+    controller.signal_hid_authority_change();
+    assert(controller.process_wake_cycle_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect,212));
+    assert(controller.process_one_for_test());
+    assert(state.route_snapshot().active == hid_route::OutputRoute::kNone);
+    state.set_ready(hid_runtime::Interface::kKeyboard,true);
+    state.set_ready(hid_runtime::Interface::kMouse,true);
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    assert(controller.route_snapshot().ready);
+    const auto report = state.begin_keyboard_report(0,{4,0,0,0,0,0});
+    assert(report == hid_runtime::KeyboardReportBeginResult::kPublished && "stale active gate must not block a ready replacement USB route");
+
+}
+
+
+void test_stale_release_continuity_cannot_poison_replacement() {
+    ReadyBleRouteFixture fixture(213);
+    auto &state = fixture.runtime.state_machine();
+    const auto old = state.ble_route_authority_snapshot();
+    drive_healthy_ble_release(fixture);
+    const auto id = state.begin_release_all();
+    state.note_ble_route_continuity_loss(old);
+    assert(state.release_all_snapshot().id == id);
+    assert(state.release_all_snapshot().state == hid_runtime::ReleaseAllTransactionState::kOpen);
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    assert(state.finalize_release_all(id).success_committed);
+}
+
+void replace_release_with_colliding_legacy_fields(hid_runtime::StateMachine *state) {
+    state->set_before_release_success_claim_hook_for_test(nullptr);
+    const auto old = state->release_all_snapshot();
+    assert(state->finalize_release_all(old.id).state ==
+           hid_runtime::ReleaseAllTransactionState::kTimedOut);
+    // Model a wrap/collision of legacy 32-bit epochs. Only the independent
+    // nonreused release ID distinguishes these two exact mailbox occupants.
+    state->set_release_epoch_for_test(state->ble_route_authority_snapshot().release_epoch);
+    const auto replacement = state->begin_release_all();
+    const auto current = state->release_all_snapshot();
+    assert(replacement != old.id);
+    assert(current.release_epoch == old.release_epoch);
+    assert(current.profile_activation_epoch == old.profile_activation_epoch);
+    assert(current.transport == old.transport);
+    assert(current.state == old.state);
+}
+
+void test_release_identity_excludes_legacy_field_aba() {
+    ReadyBleRouteFixture fixture(214);
+    auto &state = fixture.runtime.state_machine();
+    const auto old = state.begin_release_all();
+    state.set_before_release_success_claim_hook_for_test(replace_release_with_colliding_legacy_fields);
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    const auto current = state.release_all_snapshot();
+    assert(current.id != old);
+    assert(!current.success_committed);
+    assert(current.state == hid_runtime::ReleaseAllTransactionState::kOpen);
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    assert(state.finalize_release_all(current.id).success_committed);
+}
+
+
+void safety_after_healthy_capture(hid_runtime::StateMachine *state) {
+    state->set_before_release_admission_hook_for_test(nullptr);
+    state->request_release_all();
+}
+
+void test_safety_between_capture_and_release_admission() {
+    ReadyBleRouteFixture fixture(215);
+    auto &state = fixture.runtime.state_machine();
+    state.set_before_release_admission_hook_for_test(safety_after_healthy_capture);
+    assert(state.begin_release_all() == 0);
+    fixture.controller.signal_hid_authority_change();
+    assert(fixture.controller.process_wake_cycle_for_test());
+    assert(!state.release_all_snapshot().success_committed);
+    assert(state.route_snapshot().transition == hid_route::Transition::kReleasing);
+}
+
 void test_explicit_ble_release_preserves_clean_and_held_routes() {
     {
         ReadyBleRouteFixture fixture(180);
@@ -7289,6 +7423,11 @@ int main(int argc, char **argv) {
     test_internal_ble_route_activation_and_exact_payloads();
     test_ble_release_serializes_stack_accepted_report();
     test_explicit_ble_release_transaction_race_closure();
+    audit_stale_success_claim();
+    audit_canceled_active_gate();
+    test_stale_release_continuity_cannot_poison_replacement();
+    test_release_identity_excludes_legacy_field_aba();
+    test_safety_between_capture_and_release_admission();
     test_explicit_ble_release_preserves_clean_and_held_routes();
     test_explicit_ble_release_loss_and_retirement_win();
     test_explicit_ble_release_incarnation_and_stale_work();

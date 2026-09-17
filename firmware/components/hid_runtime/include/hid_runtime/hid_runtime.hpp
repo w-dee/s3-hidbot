@@ -370,10 +370,10 @@ enum class BleReleaseAllAction : std::uint8_t {
     kSubmitNeutral,
 };
 
-// One authoritative lifecycle for a public release transaction.  The BLE
-// owner may act only in kOpen.  Success, a safety/loss veto, cancellation, and
-// timeout compete through this single word, so contradictory terminal states
-// cannot be assembled from independently published flags.
+// A public release has a nonreused ID and one authoritative lifecycle. The
+// short release metadata lock qualifies every mutation by that ID and phase.
+// This atomic state alone also gates producers; there is no separate active
+// flag that a canceled admission can resurrect.
 enum class ReleaseAllTransactionState : std::uint8_t {
     kInactive,
     kAdmitting,
@@ -387,11 +387,15 @@ enum class ReleaseAllTransactionState : std::uint8_t {
     kFinalizedFailure,
 };
 
+using ReleaseAllId = std::uint64_t;
+
 // Fixed-size, heap-free outcome bridge between the UART/control task and the
 // selected transport owner. Interface outcomes are historical: kSubmitted
 // means the local USB or BLE stack accepted the all-up report, not that the
 // host or peer received it.
 struct ReleaseAllTicket {
+    // Protected with all transaction mutations by release_ticket_lock_.
+    ReleaseAllId id = 0;
     std::atomic<UsbGeneration> transport_generation{0};
     std::atomic<AuthorityEpoch> authority_epoch{0};
     std::atomic<RouteGeneration> route_generation{0};
@@ -407,11 +411,11 @@ struct ReleaseAllTicket {
     std::atomic<ReleaseAllInterfaceState> mouse{ReleaseAllInterfaceState::kUnresolved};
     std::atomic<ReleaseAllTransactionState> state{
         ReleaseAllTransactionState::kInactive};
-    std::atomic_bool active{false};
     std::atomic_bool ble_continuity_lost{false};
 };
 
 struct ReleaseAllSnapshot {
+    ReleaseAllId id = 0;
     UsbGeneration transport_generation = 0;
     AuthorityEpoch authority_epoch = 0;
     RouteGeneration route_generation = 0;
@@ -568,9 +572,14 @@ class StateMachine {
     // Internal safety primitive. It may be called repeatedly; only interfaces
     // with held or uncertain host state require an all-up report.
     void request_release_all();
-    void begin_release_all();
+    ReleaseAllId begin_release_all();
     ReleaseAllSnapshot release_all_snapshot() const;
-    void finalize_release_all();
+    ReleaseAllSnapshot finalize_release_all(ReleaseAllId expected_id);
+#ifdef HID_RUNTIME_NATIVE_TEST
+    ReleaseAllSnapshot finalize_release_all() {
+        return finalize_release_all(release_all_snapshot().id);
+    }
+#endif
     BleReleaseAllAction prepare_ble_release_all_interface(
         ReleaseAllSnapshot expected, Interface interface);
     bool complete_ble_release_all_interface(ReleaseAllSnapshot expected,
@@ -623,6 +632,9 @@ class StateMachine {
     void set_after_release_barrier_hook_for_test(TestHook hook);
     void set_before_release_scan_write_hook_for_test(TestHook hook);
     void set_before_release_success_claim_hook_for_test(TestHook hook);
+    void set_before_release_finalize_hook_for_test(TestHook hook);
+    void set_before_release_admission_hook_for_test(TestHook hook);
+    void set_next_release_id_for_test(ReleaseAllId id);
     void publish_release_request_only_for_test();
     bool release_requested_for_test() const;
     std::uint32_t release_request_epoch_for_test() const;
@@ -661,6 +673,7 @@ class StateMachine {
         HidTransport slot_transport = HidTransport::kUsb;
         HidTicketId slot_ticket_id = 0;
         std::uint32_t slot_release_epoch = 0;
+        ReleaseAllId slot_release_id = 0;
         std::uint32_t slot_sequence_generation = 0;
         ReportOriginOwnerId slot_originating_local_owner_id = 0;
         ReportKind slot_kind = ReportKind::kUnsafeKeyboard;
@@ -674,6 +687,7 @@ class StateMachine {
         HidTransport in_flight_transport = HidTransport::kUsb;
         HidTicketId in_flight_ticket_id = 0;
         std::uint32_t in_flight_release_epoch = 0;
+        ReleaseAllId in_flight_release_id = 0;
         std::uint32_t in_flight_sequence_generation = 0;
         ReportOriginOwnerId in_flight_originating_local_owner_id = 0;
         ReportKind in_flight_kind = ReportKind::kUnsafeKeyboard;
@@ -743,9 +757,17 @@ class StateMachine {
     void cancel_mouse_ticket(MouseReportTicketOutcome outcome);
     bool known_all_up(Interface interface) const;
     bool release_interface_work_pending(Interface interface) const;
-    bool release_ticket_matches(ReleaseAllSnapshot expected) const;
-    bool fail_open_ble_release(bool continuity_lost);
-    void set_release_outcome(Interface interface, ReleaseAllInterfaceState outcome);
+    bool ble_release_all_route_continuity_matches_locked(
+        BleRouteAuthoritySnapshot expected) const;
+    bool release_ticket_matches_locked(ReleaseAllSnapshot expected) const;
+    ReleaseAllSnapshot release_all_snapshot_locked() const;
+    bool release_producers_blocked() const;
+    bool fail_release_locked(ReleaseAllId expected_id, bool continuity_lost);
+    void set_release_outcome_locked(Interface interface, ReleaseAllInterfaceState outcome);
+    void note_usb_release_outcome(ReleaseAllId expected_id, Interface interface,
+                                  UsbGeneration generation,
+                                  AuthorityEpoch epoch, std::uint32_t release_epoch,
+                                  ReleaseAllInterfaceState outcome);
     void write_confirmed_keyboard(const std::uint8_t *report);
     std::array<std::uint8_t, 8> read_confirmed_keyboard() const;
     bool confirmed_keyboard_equals(const std::uint8_t *report) const;
@@ -839,6 +861,8 @@ class StateMachine {
     std::atomic<std::uint32_t> ble_route_release_epoch_{0};
     InterfaceState interfaces_[2]{};
     ReleaseAllTicket release_ticket_{};
+    mutable TicketMetadataLock release_ticket_lock_{};
+    ReleaseAllId next_release_id_ = 1;
     mutable TicketMetadataLock ticket_id_lock_{};
     mutable TicketMetadataLock keyboard_ticket_lock_{};
     mutable TicketMetadataLock mouse_ticket_lock_{};
@@ -853,6 +877,8 @@ class StateMachine {
     TestHook after_release_barrier_hook_ = nullptr;
     TestHook before_release_scan_write_hook_ = nullptr;
     TestHook before_release_success_claim_hook_ = nullptr;
+    TestHook before_release_finalize_hook_ = nullptr;
+    TestHook before_release_admission_hook_ = nullptr;
     TestHook inside_ticket_cancel_hook_ = nullptr;
     TestHook inside_ticket_finalize_hook_ = nullptr;
     TestHook before_terminal_ticket_publish_hook_ = nullptr;
@@ -926,6 +952,12 @@ class Runtime {
 
     StateMachine &state_machine() { return state_machine_; }
 
+#ifdef HID_RUNTIME_NATIVE_TEST
+    void set_release_poll_hook_for_test(StateMachine::TestHook hook) {
+        release_poll_hook_ = hook;
+    }
+#endif
+
   private:
     static bool submit_report(void *, std::uint8_t instance,
                               const std::uint8_t *report, std::uint16_t length);
@@ -936,6 +968,9 @@ class Runtime {
     std::atomic<AuthorityEventSink *> authority_event_sink_{nullptr};
     std::atomic<std::uint8_t> result_bits_{0};  // sent bits 0/1, failed bits 2/3
     std::atomic<void *> lifecycle_safety_waiter_{nullptr};
+#ifdef HID_RUNTIME_NATIVE_TEST
+    StateMachine::TestHook release_poll_hook_ = nullptr;
+#endif
 };
 
 }  // namespace hid_runtime

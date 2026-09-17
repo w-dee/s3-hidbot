@@ -1379,6 +1379,16 @@ route generation remain in place and become ready again only after that exact
 commit. Work admitted under the pre-release activation remains permanently
 stale.
 
+Each release has a boot-lifetime, nonreused internal 64-bit transaction ID.
+Admission, terminal arbitration, and finalization serialize short metadata
+updates against that exact ID; transport calls and bounded waits stay outside
+that lock. USB neutral-report callbacks retain the same owner ID. The producer
+gate derives from transaction state, so canceling an admission cannot resurrect
+an independent active flag. Public success comes from the finalized result,
+including a competing report failure, rather than a pre-finalization sample.
+ID exhaustion fails closed without wrapping. These IDs remain internal and do
+not change the wire schema or request-cache semantics.
+
 Route preservation requires the same connection, activation, report handles,
 required CCCDs, security, cache, lifecycle, and route authority to remain
 valid continuously. A callback-observed loss permanently vetoes preservation
