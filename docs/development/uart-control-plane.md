@@ -990,6 +990,13 @@ operation therefore returns `HID_SAFETY_PENDING`; an occupied ticket or
 in-flight report returns `HID_BUSY`; an inactive endpoint or a false TinyUSB
 submission returns `HID_NOT_READY`.
 
+After those existing validation, ownership, safety, and stable-route checks,
+an otherwise valid keyboard or mouse operation returns
+`HID_UNSUPPORTED_OPERATION` when the active route authority does not contain
+that report role. The capability check happens before ticket allocation and
+before held-state mutation. USB and the strict BLE fixture both provide the
+keyboard and mouse roles.
+
 The success result is exactly one of:
 
 ```json
@@ -1396,6 +1403,12 @@ Execution has a 4000 ms admission-to-completion deadline and one active plan.
 Parsing and state simulation finish before the first sequence HID report, so
 malformed syntax or a transition beyond six simultaneous ordinary keys has no
 sequence HID side effect. Repeated presses and absent releases are idempotent.
+The complete parsed plan also records every keyboard and mouse role it uses.
+Before publishing accepted status or executing a token, admission rejects the
+plan with `HID_UNSUPPORTED_OPERATION` if those roles are not a subset of the
+stable route authority. The rejection releases the temporary reservation and
+preserves the preceding retained terminal status; leading waits and supported
+tokens do not execute first.
 
 Default delay starts at zero. A HID operation receives the current default
 delay only when another token follows. A `dN` token consumes no time, and a

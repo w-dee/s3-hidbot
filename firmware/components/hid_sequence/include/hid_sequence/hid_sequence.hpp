@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <string_view>
 
+#include "hid_capability/hid_capability.hpp"
+
 namespace hid_sequence {
 
 inline constexpr std::size_t kMaximumCodeBytes = 320;
@@ -26,6 +28,10 @@ struct ExecutionAuthority {
     std::uint32_t generation = 0;
     std::uint32_t authority_epoch = 0;
     std::uint32_t release_epoch = 0;
+    std::uint32_t profile_activation_epoch = 0;
+    hid_capability::ReportMask active_roles = 0;
+    std::uint8_t transport = 0;
+    std::uint32_t route_generation = 0;
 };
 
 enum class OperationKind : std::uint8_t {
@@ -47,6 +53,7 @@ struct Plan {
     std::size_t count = 0;
     std::uint32_t scheduled_duration_ms = 0;
     HidState initial_state{};
+    hid_capability::ReportMask required_roles = 0;
 };
 
 bool parse(std::string_view code, const HidState &initial_state, Plan *plan);
@@ -66,6 +73,7 @@ enum class AdmissionResult : std::uint8_t {
     kBusy,
     kNotReady,
     kSafetyPending,
+    kUnsupportedOperation,
 };
 
 enum class ReportResult : std::uint8_t {

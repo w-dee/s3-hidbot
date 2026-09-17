@@ -7,6 +7,7 @@ trap 'rm -f "$temporary_directory/test_hid_sequence"' EXIT
 
 c++ -std=c++20 -Wall -Wextra -Werror -pedantic \
   -DHID_SEQUENCE_NATIVE_TEST \
+  -I"$repository_root/firmware/components/hid_capability/include" \
   -I"$repository_root/firmware/components/hid_sequence/include" \
   "$repository_root/tools/test_hid_sequence.cpp" \
   "$repository_root/firmware/components/hid_sequence/hid_sequence.cpp" \

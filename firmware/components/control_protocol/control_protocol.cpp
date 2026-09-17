@@ -1145,6 +1145,10 @@ bool make_keyboard_error(control_session::ResponseFrame *frame,
             code = "SESSION_MISMATCH";
             message = "request session is not active";
             break;
+        case KeyboardReportFailure::kUnsupportedOperation:
+            code = "HID_UNSUPPORTED_OPERATION";
+            message = "active HID route has no keyboard report role";
+            break;
         case KeyboardReportFailure::kNotReady:
         case KeyboardReportFailure::kNone:
             break;
@@ -1188,6 +1192,10 @@ bool make_mouse_error(control_session::ResponseFrame *frame,
         case MouseReportFailure::kAuthorityLost:
             code = "SESSION_MISMATCH";
             message = "request session is not active";
+            break;
+        case MouseReportFailure::kUnsupportedOperation:
+            code = "HID_UNSUPPORTED_OPERATION";
+            message = "active HID route has no mouse report role";
             break;
         case MouseReportFailure::kNotReady:
         case MouseReportFailure::kNone:
@@ -1981,6 +1989,12 @@ void Protocol::handle_frame(std::string_view payload) {
                 } else if (result == SequenceStartResult::kNotReady) {
                     completed = make_error(&response, current_session, true, id,
                                            "HID_NOT_READY", "HID route is not ready");
+                } else if (result ==
+                           SequenceStartResult::kUnsupportedOperation) {
+                    completed = make_error(
+                        &response, current_session, true, id,
+                        "HID_UNSUPPORTED_OPERATION",
+                        "active HID route lacks a sequence report role");
                 } else {
                     completed = make_sequence_start(&response, current_session, id);
                 }

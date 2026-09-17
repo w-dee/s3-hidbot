@@ -55,6 +55,8 @@ bool same_work_token(HidWorkToken left, HidWorkToken right) {
            left.route_generation == right.route_generation &&
            left.transport == right.transport &&
            left.transport_generation == right.transport_generation &&
+           left.profile_activation_epoch ==
+               right.profile_activation_epoch &&
            left.ticket_id == right.ticket_id &&
            left.release_epoch == right.release_epoch &&
            left.sequence_generation == right.sequence_generation &&
@@ -774,21 +776,30 @@ BleRouteAuthoritySnapshot StateMachine::ble_route_authority_snapshot() const {
         if ((before & 1U) != 0) {
             continue;
         }
-        const BleRouteAuthoritySnapshot result{
+        BleRouteAuthoritySnapshot result{
             .authority_epoch = ble_route_authority_epoch_.load(std::memory_order_relaxed),
             .route_generation = ble_route_generation_.load(std::memory_order_relaxed),
             .ble_generation = ble_route_transport_generation_.load(std::memory_order_relaxed),
             .connection_handle = ble_route_connection_.load(std::memory_order_relaxed),
-            .keyboard_characteristic_handle =
-                ble_route_keyboard_handle_.load(std::memory_order_relaxed),
-            .mouse_characteristic_handle =
-                ble_route_mouse_handle_.load(std::memory_order_relaxed),
+            .profile_activation_epoch =
+                ble_route_profile_activation_epoch_.load(
+                    std::memory_order_relaxed),
+            .present_roles =
+                ble_route_present_roles_.load(std::memory_order_relaxed),
+            .required_input_subscriptions =
+                ble_route_required_subscriptions_.load(
+                    std::memory_order_relaxed),
             .active = ble_route_active_.load(std::memory_order_relaxed),
             .releasing = ble_route_releasing_.load(std::memory_order_relaxed),
             .release_epoch =
                 ble_route_release_epoch_.load(std::memory_order_relaxed),
             .coherent = true,
         };
+        for (std::size_t index = 0;
+             index < hid_capability::kReportRoleCount; ++index) {
+            result.report_handles.values[index] =
+                ble_route_handles_[index].load(std::memory_order_relaxed);
+        }
         const std::uint32_t after =
             ble_route_sequence_.load(std::memory_order_acquire);
         if (before == after && (after & 1U) == 0) {
@@ -808,10 +819,17 @@ void StateMachine::publish_ble_route_authority(
                                           std::memory_order_relaxed);
     ble_route_connection_.store(activation.connection_handle,
                                 std::memory_order_relaxed);
-    ble_route_keyboard_handle_.store(activation.keyboard_characteristic_handle,
-                                     std::memory_order_relaxed);
-    ble_route_mouse_handle_.store(activation.mouse_characteristic_handle,
-                                  std::memory_order_relaxed);
+    ble_route_profile_activation_epoch_.store(
+        activation.profile_activation_epoch, std::memory_order_relaxed);
+    ble_route_present_roles_.store(activation.present_roles,
+                                   std::memory_order_relaxed);
+    ble_route_required_subscriptions_.store(
+        activation.required_input_subscriptions, std::memory_order_relaxed);
+    for (std::size_t index = 0;
+         index < hid_capability::kReportRoleCount; ++index) {
+        ble_route_handles_[index].store(activation.report_handles.values[index],
+                                        std::memory_order_relaxed);
+    }
     ble_route_active_.store(true, std::memory_order_relaxed);
     ble_route_releasing_.store(false, std::memory_order_relaxed);
     ble_route_release_epoch_.store(
@@ -829,8 +847,12 @@ void StateMachine::clear_ble_route_authority() {
     ble_route_generation_.store(0, std::memory_order_relaxed);
     ble_route_transport_generation_.store(0, std::memory_order_relaxed);
     ble_route_connection_.store(kNoBleConnection, std::memory_order_relaxed);
-    ble_route_keyboard_handle_.store(0, std::memory_order_relaxed);
-    ble_route_mouse_handle_.store(0, std::memory_order_relaxed);
+    ble_route_profile_activation_epoch_.store(0, std::memory_order_relaxed);
+    ble_route_present_roles_.store(0, std::memory_order_relaxed);
+    ble_route_required_subscriptions_.store(0, std::memory_order_relaxed);
+    for (auto &handle : ble_route_handles_) {
+        handle.store(0, std::memory_order_relaxed);
+    }
     ble_route_sequence_.fetch_add(1, std::memory_order_release);
 }
 
@@ -961,10 +983,10 @@ RouteTransitionOutcome StateMachine::request_route_ble(
     BleRouteActivation activation) {
     const hid_route::Snapshot before = route_.snapshot();
     if (activation.connection_handle == kNoBleConnection ||
-        activation.keyboard_characteristic_handle == 0 ||
-        activation.mouse_characteristic_handle == 0 ||
-        activation.keyboard_characteristic_handle ==
-            activation.mouse_characteristic_handle ||
+        !hid_capability::input_route_definition_valid(
+            activation.present_roles,
+            activation.required_input_subscriptions,
+            activation.report_handles) ||
         activation.expected_authority_epoch != authority_epoch() ||
         activation.expected_route_generation != before.generation) {
         return RouteTransitionOutcome{
@@ -987,6 +1009,16 @@ RouteTransitionOutcome StateMachine::request_route_ble(
             .snapshot = RouteStatusSnapshot{.route = before, .ready = false},
         };
     }
+    ProfileActivationEpoch profile_activation_epoch = 0;
+    if (!allocate_generation(&next_profile_activation_epoch_,
+                             &profile_activation_epoch)) {
+        return RouteTransitionOutcome{
+            .action_result = RouteTransitionResult::kNotReady,
+            .snapshot_valid = true,
+            .snapshot = RouteStatusSnapshot{.route = before, .ready = false},
+        };
+    }
+    activation.profile_activation_epoch = profile_activation_epoch;
     retire_unsafe_route_authority();
     if (!route_.commit_ble_if_none()) {
         return RouteTransitionOutcome{
@@ -1028,10 +1060,13 @@ bool StateMachine::retire_ble_route_if_matches(
                        current.route_generation == expected.route_generation &&
                        current.ble_generation == expected.ble_generation &&
                        current.connection_handle == expected.connection_handle &&
-                       current.keyboard_characteristic_handle ==
-                           expected.keyboard_characteristic_handle &&
-                       current.mouse_characteristic_handle ==
-                           expected.mouse_characteristic_handle &&
+                       current.profile_activation_epoch ==
+                           expected.profile_activation_epoch &&
+                       current.present_roles == expected.present_roles &&
+                       current.required_input_subscriptions ==
+                           expected.required_input_subscriptions &&
+                       current.report_handles.values ==
+                           expected.report_handles.values &&
                        current.release_epoch == expected.release_epoch &&
                        route.coherent && !route.invalidation_pending &&
                        route.active == hid_route::OutputRoute::kBle &&
@@ -1077,10 +1112,12 @@ bool StateMachine::ble_route_normal_authority_matches(
            current.route_generation == expected.route_generation &&
            current.ble_generation == expected.ble_generation &&
            current.connection_handle == expected.connection_handle &&
-           current.keyboard_characteristic_handle ==
-               expected.keyboard_characteristic_handle &&
-           current.mouse_characteristic_handle ==
-               expected.mouse_characteristic_handle &&
+           current.profile_activation_epoch ==
+               expected.profile_activation_epoch &&
+           current.present_roles == expected.present_roles &&
+           current.required_input_subscriptions ==
+               expected.required_input_subscriptions &&
+           current.report_handles.values == expected.report_handles.values &&
            current.release_epoch == expected.release_epoch &&
            authority_epoch() == expected.authority_epoch &&
            release_epoch_.load(std::memory_order_acquire) ==
@@ -1097,10 +1134,12 @@ bool StateMachine::ble_route_release_matches(
            current.route_generation == expected.route_generation &&
            current.ble_generation == expected.ble_generation &&
            current.connection_handle == expected.connection_handle &&
-           current.keyboard_characteristic_handle ==
-               expected.keyboard_characteristic_handle &&
-           current.mouse_characteristic_handle ==
-               expected.mouse_characteristic_handle &&
+           current.profile_activation_epoch ==
+               expected.profile_activation_epoch &&
+           current.present_roles == expected.present_roles &&
+           current.required_input_subscriptions ==
+               expected.required_input_subscriptions &&
+           current.report_handles.values == expected.report_handles.values &&
            current.release_epoch == expected.release_epoch &&
            release_epoch_.load(std::memory_order_acquire) ==
                expected.release_epoch &&
@@ -1274,6 +1313,11 @@ void StateMachine::set_next_sequence_generation_for_test(
     next_sequence_generation_.store(generation, std::memory_order_release);
 }
 
+void StateMachine::set_next_profile_activation_epoch_for_test(
+    ProfileActivationEpoch epoch) {
+    next_profile_activation_epoch_.store(epoch, std::memory_order_release);
+}
+
 void StateMachine::set_next_public_ticket_id_for_test(HidTicketId ticket_id) {
     const ScopedTicketMetadataLock lock(ticket_id_lock_);
     next_public_ticket_id_ = ticket_id;
@@ -1372,14 +1416,17 @@ bool StateMachine::unsafe_work_current(Interface interface,
                mounted_and_active(interface);
     }
     const BleRouteAuthoritySnapshot ble = ble_route_authority_snapshot();
-    const std::uint16_t expected_handle =
-        interface == Interface::kKeyboard
-            ? ble.keyboard_characteristic_handle
-            : ble.mouse_characteristic_handle;
+    const ReportRole role = interface == Interface::kKeyboard
+                                ? ReportRole::kKeyboardInput
+                                : ReportRole::kMouseInput;
+    const std::uint16_t expected_handle = ble.report_handles.get(role);
     return ble.coherent && ble.active &&
            ble.authority_epoch == token.authority_epoch &&
            ble.route_generation == token.route_generation &&
            ble.ble_generation == token.transport_generation &&
+           ble.profile_activation_epoch ==
+               token.profile_activation_epoch &&
+           hid_capability::has_role(ble.present_roles, role) &&
            ble.connection_handle == token.connection_handle &&
            expected_handle != 0 &&
            expected_handle == token.characteristic_handle;
@@ -1601,27 +1648,20 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
     if (sequence.generation != 0 && !sequence_authority_current(sequence)) {
         return KeyboardReportBeginResult::kAuthorityLost;
     }
-    // Reap only terminal ticket states. A submitted ticket may still have a
-    // report-complete callback pending, but report_in_flight remains the
-    // authoritative busy barrier for a replacement request.
     {
         const ScopedTicketMetadataLock lock(keyboard_ticket_lock_);
         const auto ticket_state =
             keyboard_ticket_.state.load(std::memory_order_relaxed);
-        if (ticket_state == KeyboardReportTicketState::kSubmitted ||
+        const bool terminal =
+            ticket_state == KeyboardReportTicketState::kFree ||
+            ticket_state == KeyboardReportTicketState::kSubmitted ||
             ticket_state == KeyboardReportTicketState::kNotReady ||
-            ticket_state == KeyboardReportTicketState::kCanceled) {
-            if (ticket_state == KeyboardReportTicketState::kCanceled &&
-                keyboard_ticket_.ble_action_pending) {
-                return KeyboardReportBeginResult::kBusy;
-            }
-            keyboard_ticket_.state.store(KeyboardReportTicketState::kFree,
-                                         std::memory_order_release);
-        } else if (ticket_state != KeyboardReportTicketState::kFree) {
+            (ticket_state == KeyboardReportTicketState::kCanceled &&
+             !keyboard_ticket_.ble_action_pending);
+        if (!terminal) {
             return KeyboardReportBeginResult::kBusy;
         }
     }
-
     const StatusSnapshot snapshot = status();
     const hid_route::Snapshot route = route_.snapshot();
     const BleRouteAuthoritySnapshot ble = ble_route_authority_snapshot();
@@ -1643,6 +1683,29 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
     if (release_ticket_.active.load(std::memory_order_acquire) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
         return KeyboardReportBeginResult::kSafetyPending;
+    }
+    if (ble_route && !hid_capability::has_role(
+                         ble.present_roles, ReportRole::kKeyboardInput)) {
+        return KeyboardReportBeginResult::kUnsupportedOperation;
+    }
+    // Capability rejection precedes every ticket mutation. Reap only terminal
+    // ticket states after the stable route has proved this role is present.
+    {
+        const ScopedTicketMetadataLock lock(keyboard_ticket_lock_);
+        const auto ticket_state =
+            keyboard_ticket_.state.load(std::memory_order_relaxed);
+        if (ticket_state == KeyboardReportTicketState::kSubmitted ||
+            ticket_state == KeyboardReportTicketState::kNotReady ||
+            ticket_state == KeyboardReportTicketState::kCanceled) {
+            if (ticket_state == KeyboardReportTicketState::kCanceled &&
+                keyboard_ticket_.ble_action_pending) {
+                return KeyboardReportBeginResult::kBusy;
+            }
+            keyboard_ticket_.state.store(KeyboardReportTicketState::kFree,
+                                         std::memory_order_release);
+        } else if (ticket_state != KeyboardReportTicketState::kFree) {
+            return KeyboardReportBeginResult::kBusy;
+        }
     }
     InterfaceState &keyboard = state(Interface::kKeyboard);
     if (keyboard.in_flight.load(std::memory_order_acquire) ||
@@ -1684,6 +1747,8 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
         keyboard_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
         keyboard_ticket_.route_generation.store(route.generation, std::memory_order_relaxed);
         keyboard_ticket_.transport.store(transport, std::memory_order_relaxed);
+        keyboard_ticket_.profile_activation_epoch =
+            usb_route ? 0 : ble.profile_activation_epoch;
         keyboard_ticket_.ticket_id = new_ticket_id;
         keyboard_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
         keyboard_ticket_.sequence_generation.store(sequence.generation,
@@ -1693,7 +1758,8 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
         keyboard_ticket_.connection_handle =
             usb_route ? kNoBleConnection : ble.connection_handle;
         keyboard_ticket_.characteristic_handle =
-            usb_route ? 0 : ble.keyboard_characteristic_handle;
+            usb_route ? 0
+                      : ble.report_handles.get(ReportRole::kKeyboardInput);
         keyboard_ticket_.ble_action_pending = false;
         std::memcpy(keyboard_ticket_.report, report, sizeof(report));
         keyboard_ticket_.outcome = KeyboardReportTicketOutcome::kNone;
@@ -1708,14 +1774,16 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
     const HidWorkToken token{
         .authority_epoch = epoch,
         .route_generation = route.generation,
-        .transport = transport,
         .transport_generation = generation,
+        .profile_activation_epoch =
+            keyboard_ticket_.profile_activation_epoch,
         .ticket_id = new_ticket_id,
         .release_epoch = release_epoch,
         .sequence_generation = sequence.generation,
         .originating_local_owner_id = originating_local_owner_id,
         .connection_handle = keyboard_ticket_.connection_handle,
         .characteristic_handle = keyboard_ticket_.characteristic_handle,
+        .transport = transport,
         .report_kind = ReportKind::kUnsafeKeyboard,
     };
     const bool ordinary_sequence_conflict =
@@ -1887,26 +1955,20 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     if (sequence.generation != 0 && !sequence_authority_current(sequence)) {
         return MouseReportBeginResult::kAuthorityLost;
     }
-    // Reap only terminal ticket states. The in-flight interface bit remains
-    // the authoritative barrier until TinyUSB reports completion.
     {
         const ScopedTicketMetadataLock lock(mouse_ticket_lock_);
         const auto ticket_state =
             mouse_ticket_.state.load(std::memory_order_relaxed);
-        if (ticket_state == MouseReportTicketState::kSubmitted ||
+        const bool terminal =
+            ticket_state == MouseReportTicketState::kFree ||
+            ticket_state == MouseReportTicketState::kSubmitted ||
             ticket_state == MouseReportTicketState::kNotReady ||
-            ticket_state == MouseReportTicketState::kCanceled) {
-            if (ticket_state == MouseReportTicketState::kCanceled &&
-                mouse_ticket_.ble_action_pending) {
-                return MouseReportBeginResult::kBusy;
-            }
-            mouse_ticket_.state.store(MouseReportTicketState::kFree,
-                                      std::memory_order_release);
-        } else if (ticket_state != MouseReportTicketState::kFree) {
+            (ticket_state == MouseReportTicketState::kCanceled &&
+             !mouse_ticket_.ble_action_pending);
+        if (!terminal) {
             return MouseReportBeginResult::kBusy;
         }
     }
-
     const StatusSnapshot snapshot = status();
     const hid_route::Snapshot route = route_.snapshot();
     const BleRouteAuthoritySnapshot ble = ble_route_authority_snapshot();
@@ -1928,6 +1990,27 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     if (release_ticket_.active.load(std::memory_order_acquire) ||
         release_requested_.load(std::memory_order_acquire) || any_safety_required()) {
         return MouseReportBeginResult::kSafetyPending;
+    }
+    if (ble_route && !hid_capability::has_role(
+                         ble.present_roles, ReportRole::kMouseInput)) {
+        return MouseReportBeginResult::kUnsupportedOperation;
+    }
+    {
+        const ScopedTicketMetadataLock lock(mouse_ticket_lock_);
+        const auto ticket_state =
+            mouse_ticket_.state.load(std::memory_order_relaxed);
+        if (ticket_state == MouseReportTicketState::kSubmitted ||
+            ticket_state == MouseReportTicketState::kNotReady ||
+            ticket_state == MouseReportTicketState::kCanceled) {
+            if (ticket_state == MouseReportTicketState::kCanceled &&
+                mouse_ticket_.ble_action_pending) {
+                return MouseReportBeginResult::kBusy;
+            }
+            mouse_ticket_.state.store(MouseReportTicketState::kFree,
+                                      std::memory_order_release);
+        } else if (ticket_state != MouseReportTicketState::kFree) {
+            return MouseReportBeginResult::kBusy;
+        }
     }
     InterfaceState &mouse = state(Interface::kMouse);
     if (mouse.in_flight.load(std::memory_order_acquire) ||
@@ -1967,6 +2050,8 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
         mouse_ticket_.authority_epoch.store(epoch, std::memory_order_relaxed);
         mouse_ticket_.route_generation.store(route.generation, std::memory_order_relaxed);
         mouse_ticket_.transport.store(transport, std::memory_order_relaxed);
+        mouse_ticket_.profile_activation_epoch =
+            usb_route ? 0 : ble.profile_activation_epoch;
         mouse_ticket_.ticket_id = new_ticket_id;
         mouse_ticket_.release_epoch.store(release_epoch, std::memory_order_relaxed);
         mouse_ticket_.sequence_generation.store(sequence.generation,
@@ -1975,7 +2060,8 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
         mouse_ticket_.connection_handle =
             usb_route ? kNoBleConnection : ble.connection_handle;
         mouse_ticket_.characteristic_handle =
-            usb_route ? 0 : ble.mouse_characteristic_handle;
+            usb_route ? 0
+                      : ble.report_handles.get(ReportRole::kMouseInput);
         mouse_ticket_.ble_action_pending = false;
         mouse_ticket_.report[0] = static_cast<std::uint8_t>(buttons & 0x1fU);
         mouse_ticket_.report[1] = static_cast<std::uint8_t>(x);
@@ -1994,14 +2080,15 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     const HidWorkToken token{
         .authority_epoch = epoch,
         .route_generation = route.generation,
-        .transport = transport,
         .transport_generation = generation,
+        .profile_activation_epoch = mouse_ticket_.profile_activation_epoch,
         .ticket_id = new_ticket_id,
         .release_epoch = release_epoch,
         .sequence_generation = sequence.generation,
         .originating_local_owner_id = originating_local_owner_id,
         .connection_handle = mouse_ticket_.connection_handle,
         .characteristic_handle = mouse_ticket_.characteristic_handle,
+        .transport = transport,
         .report_kind = ReportKind::kUnsafeMouse,
     };
     const bool ordinary_sequence_conflict =
@@ -2170,8 +2257,9 @@ HidWorkToken StateMachine::current_report_token_locked(Interface interface) cons
         return HidWorkToken{
             .authority_epoch = keyboard_ticket_.authority_epoch.load(std::memory_order_relaxed),
             .route_generation = keyboard_ticket_.route_generation.load(std::memory_order_relaxed),
-            .transport = keyboard_ticket_.transport.load(std::memory_order_relaxed),
             .transport_generation = keyboard_ticket_.transport_generation.load(std::memory_order_relaxed),
+            .profile_activation_epoch =
+                keyboard_ticket_.profile_activation_epoch,
             .ticket_id = keyboard_ticket_.ticket_id,
             .release_epoch = keyboard_ticket_.release_epoch.load(std::memory_order_relaxed),
             .sequence_generation = keyboard_ticket_.sequence_generation.load(
@@ -2180,14 +2268,15 @@ HidWorkToken StateMachine::current_report_token_locked(Interface interface) cons
                 keyboard_ticket_.originating_local_owner_id,
             .connection_handle = keyboard_ticket_.connection_handle,
             .characteristic_handle = keyboard_ticket_.characteristic_handle,
+            .transport = keyboard_ticket_.transport.load(std::memory_order_relaxed),
             .report_kind = ReportKind::kUnsafeKeyboard,
         };
     }
     return HidWorkToken{
         .authority_epoch = mouse_ticket_.authority_epoch.load(std::memory_order_relaxed),
         .route_generation = mouse_ticket_.route_generation.load(std::memory_order_relaxed),
-        .transport = mouse_ticket_.transport.load(std::memory_order_relaxed),
         .transport_generation = mouse_ticket_.transport_generation.load(std::memory_order_relaxed),
+        .profile_activation_epoch = mouse_ticket_.profile_activation_epoch,
         .ticket_id = mouse_ticket_.ticket_id,
         .release_epoch = mouse_ticket_.release_epoch.load(std::memory_order_relaxed),
         .sequence_generation = mouse_ticket_.sequence_generation.load(
@@ -2196,6 +2285,7 @@ HidWorkToken StateMachine::current_report_token_locked(Interface interface) cons
             mouse_ticket_.originating_local_owner_id,
         .connection_handle = mouse_ticket_.connection_handle,
         .characteristic_handle = mouse_ticket_.characteristic_handle,
+        .transport = mouse_ticket_.transport.load(std::memory_order_relaxed),
         .report_kind = ReportKind::kUnsafeMouse,
     };
 }
@@ -3332,13 +3422,13 @@ HidWorkToken StateMachine::in_flight_token(Interface interface) const {
     return HidWorkToken{
         .authority_epoch = interface_state.in_flight_authority_epoch,
         .route_generation = interface_state.in_flight_route_generation,
-        .transport = interface_state.in_flight_transport,
         .transport_generation = interface_state.in_flight_transport_generation,
         .ticket_id = interface_state.in_flight_ticket_id,
         .release_epoch = interface_state.in_flight_release_epoch,
         .sequence_generation = interface_state.in_flight_sequence_generation,
         .originating_local_owner_id =
             interface_state.in_flight_originating_local_owner_id,
+        .transport = interface_state.in_flight_transport,
     };
 }
 
@@ -3618,6 +3708,12 @@ SequenceAdmissionResult StateMachine::begin_sequence(
         .generation = generation,
         .authority_epoch = admission_authority,
         .release_epoch = release_epoch_.load(std::memory_order_acquire),
+        .profile_activation_epoch =
+            usb_ready ? 0 : ble.profile_activation_epoch,
+        .active_roles = usb_ready ? hid_capability::kInputRoles
+                                  : ble.present_roles,
+        .transport = usb_ready ? HidTransport::kUsb : HidTransport::kBle,
+        .route_generation = route.generation,
     };
     if (!sequence_authority_current(admitted)) {
         abandon();
@@ -3628,15 +3724,32 @@ SequenceAdmissionResult StateMachine::begin_sequence(
 }
 
 bool StateMachine::sequence_authority_current(SequenceAuthority sequence) const {
-    return sequence.generation != 0 &&
-           sequence_generation_.load(std::memory_order_acquire) ==
-               sequence.generation &&
-           authority_epoch() == sequence.authority_epoch &&
-           release_epoch_.load(std::memory_order_acquire) ==
-               sequence.release_epoch &&
-           !release_ticket_.active.load(std::memory_order_acquire) &&
-           !release_requested_.load(std::memory_order_acquire) &&
-           !any_safety_required();
+    if (sequence.generation == 0 ||
+        sequence_generation_.load(std::memory_order_acquire) !=
+            sequence.generation ||
+        authority_epoch() != sequence.authority_epoch ||
+        release_epoch_.load(std::memory_order_acquire) !=
+            sequence.release_epoch ||
+        release_ticket_.active.load(std::memory_order_acquire) ||
+        release_requested_.load(std::memory_order_acquire) ||
+        any_safety_required()) {
+        return false;
+    }
+    if (sequence.transport == HidTransport::kUsb) {
+        return sequence.profile_activation_epoch == 0 &&
+               sequence.active_roles == hid_capability::kInputRoles &&
+               unsafe_route_active(sequence.route_generation,
+                                   HidTransport::kUsb);
+    }
+    const BleRouteAuthoritySnapshot ble = ble_route_authority_snapshot();
+    return ble.coherent && ble.active &&
+           ble.authority_epoch == sequence.authority_epoch &&
+           ble.route_generation == sequence.route_generation &&
+           ble.profile_activation_epoch ==
+               sequence.profile_activation_epoch &&
+           ble.present_roles == sequence.active_roles &&
+           unsafe_route_active(sequence.route_generation,
+                               HidTransport::kBle);
 }
 
 void StateMachine::end_sequence(SequenceAuthority sequence) {
@@ -3753,6 +3866,8 @@ KeyboardReportResult Runtime::complete_keyboard_report(
         const KeyboardReportFailure failure =
             begin == KeyboardReportBeginResult::kBusy
                 ? KeyboardReportFailure::kBusy
+                : begin == KeyboardReportBeginResult::kUnsupportedOperation
+                      ? KeyboardReportFailure::kUnsupportedOperation
                 : begin == KeyboardReportBeginResult::kSafetyPending
                       ? KeyboardReportFailure::kSafetyPending
                       : begin == KeyboardReportBeginResult::kAuthorityLost
@@ -3877,6 +3992,8 @@ MouseReportResult Runtime::complete_mouse_report(MouseReportBeginResult begin,
         const MouseReportFailure failure =
             begin == MouseReportBeginResult::kBusy
                 ? MouseReportFailure::kBusy
+                : begin == MouseReportBeginResult::kUnsupportedOperation
+                      ? MouseReportFailure::kUnsupportedOperation
                 : begin == MouseReportBeginResult::kSafetyPending
                       ? MouseReportFailure::kSafetyPending
                       : begin == MouseReportBeginResult::kAuthorityLost

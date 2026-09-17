@@ -367,16 +367,221 @@ hid_runtime::BleSubmitResult accept_ble_report(
     return hid_runtime::BleSubmitResult::kStackAccepted;
 }
 
-void make_ble_ready(hid_runtime::StateMachine &state) {
+void make_ble_ready(
+    hid_runtime::StateMachine &state,
+    hid_runtime::ReportMask present_roles = hid_capability::kInputRoles) {
     const auto route = state.route_snapshot();
+    hid_runtime::ReportHandles handles{};
+    if (hid_capability::has_role(
+            present_roles, hid_runtime::ReportRole::kKeyboardInput)) {
+        handles.set(hid_runtime::ReportRole::kKeyboardInput, 13);
+    }
+    if (hid_capability::has_role(
+            present_roles, hid_runtime::ReportRole::kMouseInput)) {
+        handles.set(hid_runtime::ReportRole::kMouseInput, 14);
+    }
     assert(state.request_route_ble({
         .expected_authority_epoch = state.authority_epoch(),
         .expected_route_generation = route.generation,
         .ble_generation = 11,
         .connection_handle = 12,
-        .keyboard_characteristic_handle = 13,
-        .mouse_characteristic_handle = 14,
+        .present_roles = present_roles,
+        .required_input_subscriptions = present_roles,
+        .report_handles = handles,
     }).action_result == hid_runtime::RouteTransitionResult::kAccepted);
+}
+
+void test_capability_aware_ble_routes_and_activation_epoch() {
+    {
+        hid_runtime::StateMachine state;
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+               hid_runtime::KeyboardReportBeginResult::kNotReady);
+        assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kNotReady);
+
+        ready(state);
+        assert(state.begin_keyboard_report(0, {4, 0, 0, 0, 0, 0}) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(state.cancel_keyboard_report(
+            state.keyboard_report_snapshot().ticket_id));
+        state.finalize_keyboard_report();
+        assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        make_ble_ready(state, hid_capability::kMouseInput);
+        const auto authority = state.ble_route_authority_snapshot();
+        assert(authority.profile_activation_epoch != 0);
+        assert(authority.present_roles == hid_capability::kMouseInput);
+        assert(authority.report_handles.get(
+                   hid_runtime::ReportRole::kKeyboardInput) == 0);
+
+        hid_runtime::HidTicketId ticket = 99;
+        assert(state.begin_keyboard_report(
+                   0, {4, 0, 0, 0, 0, 0}, {}, &ticket) ==
+               hid_runtime::KeyboardReportBeginResult::kUnsupportedOperation);
+        assert(ticket == 0);
+        assert(state.keyboard_report_snapshot().state ==
+               hid_runtime::KeyboardReportTicketState::kFree);
+        assert(state.keyboard_state().keycodes[0] == 0);
+
+        assert(state.begin_mouse_report(1, 0, 0, 0, 0, {}, &ticket) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+        const auto work =
+            state.published_report_token(hid_runtime::Interface::kMouse);
+        assert(work.profile_activation_epoch ==
+               authority.profile_activation_epoch);
+        assert(state.mark_ble_report_scheduled(
+            hid_runtime::Interface::kMouse, work));
+        assert(state.process_ble_report(hid_runtime::Interface::kMouse, work,
+                                        accept_ble_report, nullptr));
+        state.finalize_mouse_report();
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        make_ble_ready(state, hid_capability::kKeyboardInput);
+        hid_runtime::HidTicketId ticket = 99;
+        assert(state.begin_mouse_report(1, 0, 0, 0, 0, {}, &ticket) ==
+               hid_runtime::MouseReportBeginResult::kUnsupportedOperation);
+        assert(ticket == 0);
+        assert(state.mouse_report_snapshot().state ==
+               hid_runtime::MouseReportTicketState::kFree);
+        assert(state.mouse_state().buttons == 0);
+
+        assert(state.begin_keyboard_report(
+                   0, {4, 0, 0, 0, 0, 0}, {}, &ticket) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        const auto work =
+            state.published_report_token(hid_runtime::Interface::kKeyboard);
+        assert(state.mark_ble_report_scheduled(
+            hid_runtime::Interface::kKeyboard, work));
+        assert(state.process_ble_report(hid_runtime::Interface::kKeyboard,
+                                        work, accept_ble_report, nullptr));
+        state.finalize_keyboard_report();
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        make_ble_ready(state);
+        assert(state.begin_keyboard_report(
+                   0, {4, 0, 0, 0, 0, 0}) ==
+               hid_runtime::KeyboardReportBeginResult::kPublished);
+        assert(state.cancel_keyboard_report(
+            state.keyboard_report_snapshot().ticket_id));
+        state.finalize_keyboard_report();
+        assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+               hid_runtime::MouseReportBeginResult::kPublished);
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        const auto route = state.route_snapshot();
+        hid_runtime::ReportHandles duplicate{};
+        duplicate.set(hid_runtime::ReportRole::kKeyboardInput, 13);
+        duplicate.set(hid_runtime::ReportRole::kMouseInput, 13);
+        assert(state.request_route_ble({
+            .expected_authority_epoch = state.authority_epoch(),
+            .expected_route_generation = route.generation,
+            .ble_generation = 11,
+            .connection_handle = 12,
+            .present_roles = hid_capability::kInputRoles,
+            .required_input_subscriptions = hid_capability::kInputRoles,
+            .report_handles = duplicate,
+        }).action_result == hid_runtime::RouteTransitionResult::kNotReady);
+    }
+}
+
+void test_stale_profile_activation_epoch_and_release_snapshot() {
+    hid_runtime::StateMachine state;
+    make_ble_ready(state, hid_capability::kMouseInput);
+    const auto first = state.ble_route_authority_snapshot();
+    assert(state.begin_mouse_report(1, 0, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    const auto stale_work =
+        state.published_report_token(hid_runtime::Interface::kMouse);
+
+    auto forged = first;
+    ++forged.profile_activation_epoch;
+    assert(!state.retire_ble_route_if_matches(forged));
+    assert(state.retire_ble_route_if_matches(first));
+    const auto retiring = state.ble_route_authority_snapshot();
+    assert(retiring.releasing && !retiring.active);
+    assert(retiring.profile_activation_epoch ==
+           first.profile_activation_epoch);
+    assert(retiring.present_roles == hid_capability::kMouseInput);
+    assert(state.complete_ble_route_release_if_matches(retiring));
+
+    make_ble_ready(state, hid_capability::kMouseInput);
+    const auto second = state.ble_route_authority_snapshot();
+    assert(second.profile_activation_epoch !=
+           first.profile_activation_epoch);
+    assert(second.report_handles.values == first.report_handles.values);
+    assert(!state.ble_work_token_current(hid_runtime::Interface::kMouse,
+                                         stale_work));
+    assert(!state.process_ble_report(hid_runtime::Interface::kMouse,
+                                     stale_work, accept_ble_report, nullptr));
+}
+
+void test_profile_activation_epoch_exhaustion_never_wraps() {
+    hid_runtime::StateMachine state;
+    state.set_next_profile_activation_epoch_for_test(
+        std::numeric_limits<hid_runtime::ProfileActivationEpoch>::max());
+    make_ble_ready(state, hid_capability::kKeyboardInput);
+    const auto final = state.ble_route_authority_snapshot();
+    assert(final.profile_activation_epoch ==
+           std::numeric_limits<hid_runtime::ProfileActivationEpoch>::max());
+    assert(state.retire_ble_route_if_matches(final));
+    const auto retiring = state.ble_route_authority_snapshot();
+    assert(state.complete_ble_route_release_if_matches(retiring));
+
+    const auto route = state.route_snapshot();
+    hid_runtime::ReportHandles handles{};
+    handles.set(hid_runtime::ReportRole::kKeyboardInput, 13);
+    assert(state.request_route_ble({
+        .expected_authority_epoch = state.authority_epoch(),
+        .expected_route_generation = route.generation,
+        .ble_generation = 11,
+        .connection_handle = 12,
+        .present_roles = hid_capability::kKeyboardInput,
+        .required_input_subscriptions = hid_capability::kKeyboardInput,
+        .report_handles = handles,
+    }).action_result == hid_runtime::RouteTransitionResult::kNotReady);
+}
+
+void test_absent_role_release_is_clean_only_when_proven_clean() {
+    {
+        hid_runtime::StateMachine state;
+        make_ble_ready(state, hid_capability::kMouseInput);
+        state.begin_release_all();
+        const auto release = state.release_all_snapshot();
+        assert(release.keyboard ==
+               hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+        assert(release.mouse ==
+               hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    }
+
+    {
+        hid_runtime::StateMachine state;
+        make_ble_ready(state, hid_capability::kMouseInput);
+        const auto active = state.ble_route_authority_snapshot();
+        assert(state.retire_ble_route_if_matches(
+            active, true, hid_runtime::Interface::kKeyboard));
+        const auto old_activation = state.ble_route_authority_snapshot();
+        assert(old_activation.releasing &&
+               old_activation.profile_activation_epoch ==
+                   active.profile_activation_epoch &&
+               old_activation.present_roles == hid_capability::kMouseInput);
+        state.begin_release_all();
+        const auto release = state.release_all_snapshot();
+        assert(release.keyboard ==
+               hid_runtime::ReleaseAllInterfaceState::kPending);
+        assert(state.host_state_uncertain(
+            hid_runtime::Interface::kKeyboard));
+        assert(state.safety_required(hid_runtime::Interface::kKeyboard));
+    }
 }
 
 void test_ble_terminal_visibility_follows_confirmed_state() {
@@ -1650,10 +1855,10 @@ void test_late_tokenized_callbacks_cannot_affect_new_generation() {
     const hid_runtime::HidWorkToken stale_route = {
         .authority_epoch = new_token.authority_epoch,
         .route_generation = new_token.route_generation + 1,
-        .transport = new_token.transport,
         .transport_generation = new_token.transport_generation,
         .ticket_id = new_token.ticket_id,
         .release_epoch = new_token.release_epoch,
+        .transport = new_token.transport,
     };
     assert(!state.report_complete_for_token(1, stale_route));
     assert(!state.report_complete_for_token(1, old_token));
@@ -2573,6 +2778,10 @@ int main() {
     test_revoked_sequence_authority_cannot_create_or_submit_ticket();
     test_sequence_ticket_paused_before_publication_cannot_survive_release();
     test_sequence_generation_does_not_wrap_to_stale_authority();
+    test_capability_aware_ble_routes_and_activation_epoch();
+    test_stale_profile_activation_epoch_and_release_snapshot();
+    test_profile_activation_epoch_exhaustion_never_wraps();
+    test_absent_role_release_is_clean_only_when_proven_clean();
     test_ble_terminal_visibility_follows_confirmed_state();
     test_mailbox_sequence_exclusion_and_safety_priority();
     test_readiness_refresh_after_reattach();

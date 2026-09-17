@@ -270,6 +270,7 @@ enum class KeyboardReportFailure : std::uint8_t {
     kBusy,
     kSafetyPending,
     kAuthorityLost,
+    kUnsupportedOperation,
 };
 
 struct KeyboardReportRequest {
@@ -299,6 +300,7 @@ enum class MouseReportFailure : std::uint8_t {
     kBusy,
     kSafetyPending,
     kAuthorityLost,
+    kUnsupportedOperation,
 };
 
 struct MouseReportRequest {
@@ -326,6 +328,7 @@ enum class SequenceStartResult : std::uint8_t {
     kBusy,
     kNotReady,
     kSafetyPending,
+    kUnsupportedOperation,
 };
 
 enum class SequenceState : std::uint8_t {

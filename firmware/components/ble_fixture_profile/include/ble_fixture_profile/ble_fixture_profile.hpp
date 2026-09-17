@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "hid_capability/hid_capability.hpp"
+
 namespace ble_fixture_profile {
 
 enum class ProfileId : std::uint8_t {
@@ -38,10 +40,7 @@ enum class CachePolicyId : std::uint8_t {
     kStrictRevision1 = 0,
 };
 
-enum class ReportRole : std::uint8_t {
-    kKeyboardInput = 0,
-    kMouseInput = 1,
-};
+using ReportRole = hid_capability::ReportRole;
 
 enum class ReportType : std::uint8_t {
     kInput = 1,
@@ -60,11 +59,8 @@ struct View {
 
 using ByteView = View<std::uint8_t>;
 
-using ReportMask = std::uint8_t;
-
-constexpr ReportMask report_bit(ReportRole role) {
-    return static_cast<ReportMask>(1U << static_cast<std::uint8_t>(role));
-}
+using ReportMask = hid_capability::ReportMask;
+using hid_capability::report_bit;
 
 enum class IoCapability : std::uint8_t {
     kKeyboardOnly = 0,

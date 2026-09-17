@@ -12,6 +12,7 @@
 #endif
 
 #include "hid_route/hid_route.hpp"
+#include "hid_capability/hid_capability.hpp"
 #include "usb_lifecycle/usb_lifecycle.hpp"
 
 namespace hid_runtime {
@@ -101,6 +102,7 @@ enum class KeyboardReportFailure : std::uint8_t {
     kBusy,
     kSafetyPending,
     kAuthorityLost,
+    kUnsupportedOperation,
 };
 
 enum class KeyboardReportBeginResult : std::uint8_t {
@@ -110,6 +112,7 @@ enum class KeyboardReportBeginResult : std::uint8_t {
     kBusy,
     kSafetyPending,
     kAuthorityLost,
+    kUnsupportedOperation,
 };
 
 enum class KeyboardReportState : std::uint8_t {
@@ -187,6 +190,7 @@ enum class MouseReportFailure : std::uint8_t {
     kBusy,
     kSafetyPending,
     kAuthorityLost,
+    kUnsupportedOperation,
 };
 
 enum class MouseReportBeginResult : std::uint8_t {
@@ -196,6 +200,7 @@ enum class MouseReportBeginResult : std::uint8_t {
     kBusy,
     kSafetyPending,
     kAuthorityLost,
+    kUnsupportedOperation,
 };
 
 enum class MouseReportState : std::uint8_t {
@@ -240,6 +245,10 @@ struct MouseReportResult {
 // lifecycle publication token that defines HID-control authority boundaries.
 // Unsigned wrap is well-defined; practical lifecycle frequency cannot reach it.
 using AuthorityEpoch = std::uint32_t;
+using ProfileActivationEpoch = std::uint32_t;
+using ReportRole = hid_capability::ReportRole;
+using ReportMask = hid_capability::ReportMask;
+using ReportHandles = hid_capability::ReportHandles;
 using UsbGeneration = usb_lifecycle::Generation;
 using RouteGeneration = hid_route::Generation;
 using SofHeartbeat = std::uint32_t;
@@ -269,6 +278,10 @@ struct SequenceAuthority {
     std::uint32_t generation = 0;
     AuthorityEpoch authority_epoch = 0;
     std::uint32_t release_epoch = 0;
+    ProfileActivationEpoch profile_activation_epoch = 0;
+    ReportMask active_roles = 0;
+    HidTransport transport = HidTransport::kUsb;
+    RouteGeneration route_generation = 0;
 };
 
 enum class SequenceAdmissionResult : std::uint8_t {
@@ -285,8 +298,11 @@ struct BleRouteActivation {
     RouteGeneration expected_route_generation = 0;
     std::uint32_t ble_generation = 0;
     std::uint16_t connection_handle = kNoBleConnection;
-    std::uint16_t keyboard_characteristic_handle = 0;
-    std::uint16_t mouse_characteristic_handle = 0;
+    // Assigned by StateMachine when the route commits. Callers leave this 0.
+    ProfileActivationEpoch profile_activation_epoch = 0;
+    ReportMask present_roles = 0;
+    ReportMask required_input_subscriptions = 0;
+    ReportHandles report_handles{};
 };
 
 struct BleRouteAuthoritySnapshot {
@@ -294,8 +310,10 @@ struct BleRouteAuthoritySnapshot {
     RouteGeneration route_generation = 0;
     std::uint32_t ble_generation = 0;
     std::uint16_t connection_handle = kNoBleConnection;
-    std::uint16_t keyboard_characteristic_handle = 0;
-    std::uint16_t mouse_characteristic_handle = 0;
+    ProfileActivationEpoch profile_activation_epoch = 0;
+    ReportMask present_roles = 0;
+    ReportMask required_input_subscriptions = 0;
+    ReportHandles report_handles{};
     // The normal authority is active only in stable BLE. During retirement
     // the exact tuple is retained solely as safety-release authority.
     bool active = false;
@@ -309,14 +327,15 @@ struct BleRouteAuthoritySnapshot {
 struct HidWorkToken {
     AuthorityEpoch authority_epoch = 0;
     RouteGeneration route_generation = 0;
-    HidTransport transport = HidTransport::kUsb;
     std::uint32_t transport_generation = 0;
+    ProfileActivationEpoch profile_activation_epoch = 0;
     HidTicketId ticket_id = 0;
     std::uint32_t release_epoch = 0;
     std::uint32_t sequence_generation = 0;
     ReportOriginOwnerId originating_local_owner_id = 0;
     std::uint16_t connection_handle = kNoBleConnection;
     std::uint16_t characteristic_handle = 0;
+    HidTransport transport = HidTransport::kUsb;
     ReportKind report_kind = ReportKind::kUnsafeKeyboard;
 };
 
@@ -554,6 +573,8 @@ class StateMachine {
     std::uint32_t release_request_epoch_for_test() const;
     void set_release_epoch_for_test(std::uint32_t release_epoch);
     void set_next_sequence_generation_for_test(std::uint32_t generation);
+    void set_next_profile_activation_epoch_for_test(
+        ProfileActivationEpoch epoch);
     void set_next_public_ticket_id_for_test(HidTicketId ticket_id);
     void set_inside_ticket_cancel_hook_for_test(TestHook hook);
     void set_inside_ticket_finalize_hook_for_test(TestHook hook);
@@ -685,6 +706,7 @@ class StateMachine {
         std::atomic<AuthorityEpoch> authority_epoch{0};
         std::atomic<RouteGeneration> route_generation{0};
         std::atomic<HidTransport> transport{HidTransport::kUsb};
+        ProfileActivationEpoch profile_activation_epoch = 0;
         HidTicketId ticket_id = 0;
         std::atomic<std::uint32_t> release_epoch{0};
         std::atomic<std::uint32_t> sequence_generation{0};
@@ -702,6 +724,7 @@ class StateMachine {
         std::atomic<AuthorityEpoch> authority_epoch{0};
         std::atomic<RouteGeneration> route_generation{0};
         std::atomic<HidTransport> transport{HidTransport::kUsb};
+        ProfileActivationEpoch profile_activation_epoch = 0;
         HidTicketId ticket_id = 0;
         std::atomic<std::uint32_t> release_epoch{0};
         std::atomic<std::uint32_t> sequence_generation{0};
@@ -739,14 +762,18 @@ class StateMachine {
     std::atomic_bool release_requested_{false};
     std::atomic<std::uint32_t> sequence_generation_{0};
     std::atomic<std::uint32_t> next_sequence_generation_{1};
+    std::atomic<ProfileActivationEpoch> next_profile_activation_epoch_{1};
     std::atomic_bool unavailable_release_reconciler_active_{false};
     std::atomic<std::uint32_t> ble_route_sequence_{0};
     std::atomic<AuthorityEpoch> ble_route_authority_epoch_{0};
     std::atomic<RouteGeneration> ble_route_generation_{0};
     std::atomic<std::uint32_t> ble_route_transport_generation_{0};
     std::atomic<std::uint16_t> ble_route_connection_{kNoBleConnection};
-    std::atomic<std::uint16_t> ble_route_keyboard_handle_{0};
-    std::atomic<std::uint16_t> ble_route_mouse_handle_{0};
+    std::atomic<ProfileActivationEpoch> ble_route_profile_activation_epoch_{0};
+    std::atomic<ReportMask> ble_route_present_roles_{0};
+    std::atomic<ReportMask> ble_route_required_subscriptions_{0};
+    std::array<std::atomic<std::uint16_t>,
+               hid_capability::kReportRoleCount> ble_route_handles_{};
     std::atomic_bool ble_route_active_{false};
     std::atomic_bool ble_route_releasing_{false};
     std::atomic<std::uint32_t> ble_route_release_epoch_{0};

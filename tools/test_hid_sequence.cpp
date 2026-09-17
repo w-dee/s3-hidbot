@@ -28,7 +28,9 @@ class Backend final : public hid_sequence::Backend {
         *initial_state = initial;
         *authority = {.generation = generation,
                       .authority_epoch = epoch,
-                      .release_epoch = release_epoch};
+                      .release_epoch = release_epoch,
+                      .profile_activation_epoch = profile_activation_epoch,
+                      .active_roles = active_roles};
         owned = true;
         if (wake_during_admission && controller != nullptr) {
             controller->run_for_test();
@@ -38,9 +40,13 @@ class Backend final : public hid_sequence::Backend {
     bool authority_current(hid_sequence::ExecutionAuthority authority) const override {
         return owned && authority.generation == generation &&
                authority.authority_epoch == epoch &&
-               authority.release_epoch == release_epoch;
+               authority.release_epoch == release_epoch &&
+               authority.profile_activation_epoch ==
+                   profile_activation_epoch &&
+               authority.active_roles == active_roles;
     }
     void end_sequence(hid_sequence::ExecutionAuthority authority) override {
+        ++ends;
         if (authority_current(authority)) owned = false;
     }
     void revoke_sequence() override { owned = false; }
@@ -92,9 +98,12 @@ class Backend final : public hid_sequence::Backend {
     std::uint32_t epoch = 7;
     std::uint32_t generation = 3;
     std::uint32_t release_epoch = 5;
+    std::uint32_t profile_activation_epoch = 9;
+    hid_capability::ReportMask active_roles = hid_capability::kInputRoles;
     std::uint64_t report_work_us = 0;
     int admissions = 0;
     int safety_releases = 0;
+    int ends = 0;
     bool owned = false;
     bool wake_during_admission = false;
     bool revoke_during_report = false;
@@ -117,6 +126,7 @@ void parser_contract() {
     assert(hid_sequence::parse("d10;kp4;kr4;w200;mpL;mrL", empty, &plan));
     assert(plan.count == 6);
     assert(plan.scheduled_duration_ms == 230);
+    assert(plan.required_roles == hid_capability::kInputRoles);
     assert(hid_sequence::parse(
         "d0;w0;kp224;kp225;kp226;kp227;kp228;kp229;kp230;kp231;"
         "kr224;kr225;kr226;kr227;kr228;kr229;kr230;kr231;"
@@ -124,6 +134,7 @@ void parser_contract() {
         empty, &plan));
     assert(hid_sequence::parse("d10;kp4", empty, &plan));
     assert(plan.scheduled_duration_ms == 0);
+    assert(plan.required_roles == hid_capability::kKeyboardInput);
     assert(hid_sequence::parse("d10;kp4;w200", empty, &plan));
     assert(plan.scheduled_duration_ms == 210);
     assert(hid_sequence::parse("d10;w200;kp4", empty, &plan));
@@ -156,6 +167,77 @@ void parser_contract() {
     assert(plan.count == 64);
     boundary += ";w0";
     assert(!hid_sequence::parse(boundary, empty, &plan));
+}
+
+void complete_plan_capability_preflight_contract() {
+    Clock clock{};
+    Backend backend{};
+    backend.clock = &clock;
+    hid_sequence::Controller controller;
+    assert(controller.initialize(&backend, Clock::now, &clock));
+
+    assert(controller.start(70, "w0") ==
+           hid_sequence::AdmissionResult::kAccepted);
+    controller.run_for_test();
+    hid_sequence::Status retained{};
+    assert(controller.status(70, &retained));
+    assert(retained.state == hid_sequence::State::kCompleted);
+
+    backend.active_roles = hid_capability::kMouseInput;
+    const int ends_before_mouse_rejection = backend.ends;
+    const std::uint64_t before_mouse_rejection = clock.value;
+    assert(controller.start(71, "w10;mpL;kp4") ==
+           hid_sequence::AdmissionResult::kUnsupportedOperation);
+    assert(clock.value == before_mouse_rejection);
+    assert(backend.report_times.empty());
+    assert(!controller.status(71, &retained));
+    assert(controller.status(70, &retained));
+    assert(retained.state == hid_sequence::State::kCompleted);
+    assert(!controller.active());
+    assert(!backend.owned);
+    assert(backend.ends == ends_before_mouse_rejection + 1);
+
+    backend.active_roles = hid_capability::kKeyboardInput;
+    const int ends_before_keyboard_rejection = backend.ends;
+    const std::uint64_t before_keyboard_rejection = clock.value;
+    assert(controller.start(72, "w10;kp4;mrL") ==
+           hid_sequence::AdmissionResult::kUnsupportedOperation);
+    assert(clock.value == before_keyboard_rejection);
+    assert(backend.report_times.empty());
+    assert(!controller.status(72, &retained));
+    assert(!controller.active());
+    assert(!backend.owned);
+    assert(backend.ends == ends_before_keyboard_rejection + 1);
+
+    backend.active_roles = hid_capability::kMouseInput;
+    assert(controller.start(73, "w0;mpL;mrL") ==
+           hid_sequence::AdmissionResult::kAccepted);
+    controller.run_for_test();
+    assert(controller.status(73, &retained));
+    assert(retained.state == hid_sequence::State::kCompleted &&
+           retained.executed == 3);
+    assert(backend.mouse_buttons.size() == 2);
+
+    backend.report_times.clear();
+    backend.mouse_buttons.clear();
+    backend.active_roles = hid_capability::kKeyboardInput;
+    assert(controller.start(74, "kp4;kr4") ==
+           hid_sequence::AdmissionResult::kAccepted);
+    controller.run_for_test();
+    assert(controller.status(74, &retained));
+    assert(retained.state == hid_sequence::State::kCompleted &&
+           retained.executed == 2);
+    assert(backend.keyboard_keys.size() >= 2);
+
+    backend.active_roles = hid_capability::kMouseInput;
+    assert(controller.start(75, "mpL") ==
+           hid_sequence::AdmissionResult::kAccepted);
+    ++backend.profile_activation_epoch;
+    controller.run_for_test();
+    assert(controller.status(75, &retained));
+    assert(retained.state == hid_sequence::State::kAborted);
+    assert(retained.executed == 0);
+    assert(retained.code == hid_sequence::TerminalCode::kSessionMismatch);
 }
 
 void local_delay_does_not_catch_up() {
@@ -631,6 +713,7 @@ void retired_owner_late_wake_cannot_republish_for_new_owner() {
 
 int main() {
     parser_contract();
+    complete_plan_capability_preflight_contract();
     fixed_key_canonicalizer_matches_six_key_sort_semantics();
     local_delay_does_not_catch_up();
     state_and_failure_contract();

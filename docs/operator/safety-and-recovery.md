@@ -116,6 +116,7 @@ transport, session/protocol, and timeout exits remain 3, 4, and 6.
 | --- | --- |
 | `SESSION_MISMATCH`, `CLIENT_NONCE_CONFLICT` | Do not replay under old authority. Establish a fresh hello session and re-read state. |
 | `HID_NOT_READY`, `HID_BUSY`, `HID_SAFETY_PENDING`, `HID_ROUTE_V2_REQUIRED` | Read route/exposure state and wait for the required lifecycle convergence. Do not direct-switch USB/BLE or replay ambiguous HID. |
+| `HID_UNSUPPORTED_OPERATION` | The stable active route lacks the report role required by the operation. Use an operation supported by that route; do not treat this as transient readiness. |
 | `BLE_NOT_READY` | Initialize or converge BLE using the documented exposure flow, then re-read state. Repeated failure requires diagnosis. |
 | `BLE_PAIRING_NOT_PENDING`, `BLE_PAIRING_FAILED` | Re-read pairing status and use only its current non-null pairing ID. Never reuse a stale passkey transaction. |
 | `BLE_BOND_NOT_FOUND`, `BLE_BOND_AMBIGUOUS`, `BLE_BOND_BUSY` | Re-list bonds and verify exact identity/eligibility. Ambiguity or busy state requires operator/lifecycle resolution, not a broader delete. |

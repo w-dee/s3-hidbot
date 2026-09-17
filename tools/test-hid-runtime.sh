@@ -9,6 +9,7 @@ trap 'rm -f "$temporary_directory/test_hid_runtime"; rmdir "$temporary_directory
   -DHID_RUNTIME_NATIVE_TEST \
   -DUSB_LIFECYCLE_NATIVE_TEST \
   -DHID_ROUTE_NATIVE_TEST \
+  -I"$repository_root/firmware/components/hid_capability/include" \
   -I"$repository_root/firmware/components/hid_runtime/include" \
   -I"$repository_root/firmware/components/hid_route/include" \
   -I"$repository_root/firmware/components/usb_lifecycle/include" \

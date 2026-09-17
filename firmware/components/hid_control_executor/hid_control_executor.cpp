@@ -682,8 +682,13 @@ RouteCommandOutcome Controller::activate_ble_route() {
         .expected_route_generation = route.generation,
         .ble_generation = peer.generation,
         .connection_handle = peer.connection_handle,
-        .keyboard_characteristic_handle = peer.handles.keyboard_value,
-        .mouse_characteristic_handle = peer.handles.mouse_value,
+        .present_roles = hid_capability::kInputRoles,
+        .required_input_subscriptions = hid_capability::kInputRoles,
+        .report_handles = {.values = {
+            peer.handles.keyboard_value,
+            peer.handles.mouse_value,
+            0,
+        }},
     };
     const auto outcome = state.request_route_ble(activation);
     if (outcome.action_result != hid_runtime::RouteTransitionResult::kAccepted) {
@@ -722,9 +727,14 @@ bool Controller::ble_route_ready() const {
            state.ble_route_normal_authority_matches(authority) &&
            peer.generation == authority.ble_generation &&
            peer.connection_handle == authority.connection_handle &&
+           authority.present_roles == hid_capability::kInputRoles &&
+           authority.required_input_subscriptions ==
+               hid_capability::kInputRoles &&
            peer.handles.keyboard_value ==
-               authority.keyboard_characteristic_handle &&
-           peer.handles.mouse_value == authority.mouse_characteristic_handle;
+               authority.report_handles.get(
+                   hid_runtime::ReportRole::kKeyboardInput) &&
+           peer.handles.mouse_value == authority.report_handles.get(
+               hid_runtime::ReportRole::kMouseInput);
 }
 
 bool Controller::enqueue_ble_hid_work(hid_runtime::Interface interface,
@@ -906,14 +916,40 @@ bool Controller::current_ble_hid_identity(
         identity.connection_handle != ble_hid_peer_.connection_handle) {
         return false;
     }
+    const auto role = interface == BleHidInterface::kKeyboard
+                          ? hid_runtime::ReportRole::kKeyboardInput
+                          : hid_runtime::ReportRole::kMouseInput;
     const std::uint16_t expected_handle =
         interface == BleHidInterface::kKeyboard
             ? ble_hid_peer_.handles.keyboard_value
             : interface == BleHidInterface::kMouse
                   ? ble_hid_peer_.handles.mouse_value
                   : 0;
-    return expected_handle != 0 &&
-           identity.characteristic_handle == expected_handle;
+    if (expected_handle == 0 ||
+        identity.characteristic_handle != expected_handle) {
+        return false;
+    }
+    if (identity.profile_activation_epoch == 0) {
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+        // Direct internal adapter tests do not create a runtime route
+        // activation. Production deferred work must always name one.
+        return true;
+#else
+        return false;
+#endif
+    }
+    if (runtime_ == nullptr) {
+        return false;
+    }
+    const auto authority =
+        runtime_->state_machine().ble_route_authority_snapshot();
+    return authority.coherent && authority.active &&
+           authority.profile_activation_epoch ==
+               identity.profile_activation_epoch &&
+           authority.ble_generation == identity.generation &&
+           authority.connection_handle == identity.connection_handle &&
+           hid_capability::has_role(authority.present_roles, role) &&
+           authority.report_handles.get(role) == expected_handle;
 }
 
 bool Controller::ble_hid_interface_ready(
@@ -1017,9 +1053,11 @@ bool Controller::ble_route_release_identity_current(
         .route_generation = identity.route_generation,
         .ble_generation = identity.ble_generation,
         .connection_handle = identity.connection_handle,
-        .keyboard_characteristic_handle =
-            identity.keyboard_characteristic_handle,
-        .mouse_characteristic_handle = identity.mouse_characteristic_handle,
+        .profile_activation_epoch = identity.profile_activation_epoch,
+        .present_roles = identity.present_roles,
+        .required_input_subscriptions =
+            identity.required_input_subscriptions,
+        .report_handles = identity.report_handles,
         .active = false,
         .releasing = true,
         .release_epoch = identity.release_epoch,
@@ -1043,9 +1081,10 @@ bool Controller::ble_safety_release_ready(
     const auto lifecycle = ble_state_.snapshot();
     const auto handles = ble_database_->hid_handles();
     const bool keyboard = interface == BleHidInterface::kKeyboard;
+    const auto role = keyboard ? hid_runtime::ReportRole::kKeyboardInput
+                               : hid_runtime::ReportRole::kMouseInput;
     const std::uint16_t expected_handle =
-        keyboard ? identity.keyboard_characteristic_handle
-                 : identity.mouse_characteristic_handle;
+        identity.report_handles.get(role);
     const std::uint16_t peer_handle =
         keyboard ? ble_hid_peer_.handles.keyboard_value
                  : ble_hid_peer_.handles.mouse_value;
@@ -1054,7 +1093,8 @@ bool Controller::ble_safety_release_ready(
     const bool subscribed = keyboard
                                 ? ble_hid_peer_.keyboard_notify_enabled
                                 : ble_hid_peer_.mouse_notify_enabled;
-    return expected_handle != 0 && peer_handle == expected_handle &&
+    return hid_capability::has_role(identity.present_roles, role) &&
+           expected_handle != 0 && peer_handle == expected_handle &&
            database_handle == expected_handle && subscribed &&
            lifecycle.generation == identity.ble_generation &&
            lifecycle.desired == ble_lifecycle::DesiredExposure::kExposed &&
@@ -1072,12 +1112,15 @@ void Controller::submit_ble_safety_release(
         // a peer acknowledgment and never causes retry.
         (void)ble_database_->notify_custom(
             identity.connection_handle,
-            identity.keyboard_characteristic_handle,
+            identity.report_handles.get(
+                hid_runtime::ReportRole::kKeyboardInput),
             kBleKeyboardAllUp.data(), kBleKeyboardAllUp.size());
     }
     if (ble_safety_release_ready(identity, BleHidInterface::kMouse)) {
         (void)ble_database_->notify_custom(
-            identity.connection_handle, identity.mouse_characteristic_handle,
+            identity.connection_handle,
+            identity.report_handles.get(
+                hid_runtime::ReportRole::kMouseInput),
             kBleMouseAllUp.data(), kBleMouseAllUp.size());
     }
 }
@@ -1121,11 +1164,13 @@ void Controller::note_ble_route_disconnect_result(
     const BleRouteReleaseIdentity identity{
         .authority_epoch = release.authority_epoch,
         .route_generation = release.route_generation,
+        .profile_activation_epoch = release.profile_activation_epoch,
         .ble_generation = release.ble_generation,
         .connection_handle = release.connection_handle,
-        .keyboard_characteristic_handle =
-            release.keyboard_characteristic_handle,
-        .mouse_characteristic_handle = release.mouse_characteristic_handle,
+        .present_roles = release.present_roles,
+        .required_input_subscriptions =
+            release.required_input_subscriptions,
+        .report_handles = release.report_handles,
         .release_epoch = release.release_epoch,
     };
     cancel_ble_route_release_grace(identity);
@@ -1166,11 +1211,13 @@ void Controller::drive_ble_route_retirement() {
     const BleRouteReleaseIdentity identity{
         .authority_epoch = release.authority_epoch,
         .route_generation = release.route_generation,
+        .profile_activation_epoch = release.profile_activation_epoch,
         .ble_generation = release.ble_generation,
         .connection_handle = release.connection_handle,
-        .keyboard_characteristic_handle =
-            release.keyboard_characteristic_handle,
-        .mouse_characteristic_handle = release.mouse_characteristic_handle,
+        .present_roles = release.present_roles,
+        .required_input_subscriptions =
+            release.required_input_subscriptions,
+        .report_handles = release.report_handles,
         .release_epoch = release.release_epoch,
     };
     if (ble_route_disconnect_observed_.exchange(false,
@@ -1232,11 +1279,13 @@ void Controller::complete_ble_route_release_on_disconnect(BleEvent event) {
     const BleRouteReleaseIdentity identity{
         .authority_epoch = release.authority_epoch,
         .route_generation = release.route_generation,
+        .profile_activation_epoch = release.profile_activation_epoch,
         .ble_generation = release.ble_generation,
         .connection_handle = release.connection_handle,
-        .keyboard_characteristic_handle =
-            release.keyboard_characteristic_handle,
-        .mouse_characteristic_handle = release.mouse_characteristic_handle,
+        .present_roles = release.present_roles,
+        .required_input_subscriptions =
+            release.required_input_subscriptions,
+        .report_handles = release.report_handles,
         .release_epoch = release.release_epoch,
     };
     cancel_ble_route_release_grace(identity);
@@ -1271,6 +1320,7 @@ hid_runtime::BleSubmitResult Controller::submit_runtime_ble_report(
     }
     const BleHidWorkIdentity identity{
         .generation = token.transport_generation,
+        .profile_activation_epoch = token.profile_activation_epoch,
         .connection_handle = token.connection_handle,
         .characteristic_handle = token.characteristic_handle,
     };

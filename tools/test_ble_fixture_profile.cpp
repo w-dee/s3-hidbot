@@ -52,6 +52,27 @@ int main() {
         report_bit(ReportRole::kKeyboardInput) |
         report_bit(ReportRole::kMouseInput)));
 
+    hid_capability::ReportHandles mouse_only{};
+    mouse_only.set(ReportRole::kMouseInput, 0x0021);
+    assert(hid_capability::input_route_definition_valid(
+        hid_capability::kMouseInput, hid_capability::kMouseInput,
+        mouse_only));
+    assert(hid_capability::input_route_ready(
+        hid_capability::kMouseInput, hid_capability::kMouseInput,
+        hid_capability::kMouseInput));
+    assert(!hid_capability::input_route_ready(
+        hid_capability::kMouseInput, hid_capability::kMouseInput, 0));
+    hid_capability::ReportHandles duplicate{};
+    duplicate.set(ReportRole::kKeyboardInput, 0x0021);
+    duplicate.set(ReportRole::kMouseInput, 0x0021);
+    assert(!hid_capability::input_route_definition_valid(
+        hid_capability::kInputRoles, hid_capability::kInputRoles,
+        duplicate));
+    assert(!hid_capability::input_route_definition_valid(
+        hid_capability::kMouseInput, hid_capability::kInputRoles,
+        mouse_only));
+    assert(hid_capability::report_bit(ReportRole::kLedOutput) == 0x04);
+
     assert(profile.smp.io_capability == IoCapability::kKeyboardOnly);
     assert(profile.smp.bonding && profile.smp.mitm);
     assert(profile.smp.secure_connections);

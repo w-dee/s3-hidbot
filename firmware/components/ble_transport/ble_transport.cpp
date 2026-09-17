@@ -1071,14 +1071,22 @@ std::int32_t Backend::arm_ble_route_release_grace(
                                          std::memory_order_relaxed);
     route_release_route_generation_.store(identity.route_generation,
                                           std::memory_order_relaxed);
+    route_release_profile_activation_epoch_.store(
+        identity.profile_activation_epoch, std::memory_order_relaxed);
     route_release_ble_generation_.store(identity.ble_generation,
                                         std::memory_order_relaxed);
     route_release_connection_.store(identity.connection_handle,
                                     std::memory_order_relaxed);
-    route_release_keyboard_handle_.store(
-        identity.keyboard_characteristic_handle, std::memory_order_relaxed);
-    route_release_mouse_handle_.store(identity.mouse_characteristic_handle,
-                                      std::memory_order_relaxed);
+    route_release_present_roles_.store(identity.present_roles,
+                                       std::memory_order_relaxed);
+    route_release_required_subscriptions_.store(
+        identity.required_input_subscriptions, std::memory_order_relaxed);
+    for (std::size_t index = 0;
+         index < hid_capability::kReportRoleCount; ++index) {
+        route_release_handles_[index].store(
+            identity.report_handles.values[index],
+            std::memory_order_relaxed);
+    }
     route_release_epoch_.store(identity.release_epoch,
                                std::memory_order_relaxed);
     route_release_timer_active_.store(true, std::memory_order_release);
@@ -1099,14 +1107,23 @@ void Backend::cancel_ble_route_release_grace(
             identity.authority_epoch &&
         route_release_route_generation_.load(std::memory_order_acquire) ==
             identity.route_generation &&
+        route_release_profile_activation_epoch_.load(
+            std::memory_order_acquire) == identity.profile_activation_epoch &&
         route_release_ble_generation_.load(std::memory_order_acquire) ==
             identity.ble_generation &&
         route_release_connection_.load(std::memory_order_acquire) ==
             identity.connection_handle &&
-        route_release_keyboard_handle_.load(std::memory_order_acquire) ==
-            identity.keyboard_characteristic_handle &&
-        route_release_mouse_handle_.load(std::memory_order_acquire) ==
-            identity.mouse_characteristic_handle &&
+        route_release_present_roles_.load(std::memory_order_acquire) ==
+            identity.present_roles &&
+        route_release_required_subscriptions_.load(
+            std::memory_order_acquire) ==
+            identity.required_input_subscriptions &&
+        route_release_handles_[0].load(std::memory_order_acquire) ==
+            identity.report_handles.values[0] &&
+        route_release_handles_[1].load(std::memory_order_acquire) ==
+            identity.report_handles.values[1] &&
+        route_release_handles_[2].load(std::memory_order_acquire) ==
+            identity.report_handles.values[2] &&
         route_release_epoch_.load(std::memory_order_acquire) ==
             identity.release_epoch;
     if (!exact ||
@@ -1132,16 +1149,26 @@ void Backend::route_release_grace_callback(void *context) {
             std::memory_order_acquire),
         .route_generation = backend->route_release_route_generation_.load(
             std::memory_order_acquire),
+        .profile_activation_epoch =
+            backend->route_release_profile_activation_epoch_.load(
+                std::memory_order_acquire),
         .ble_generation = backend->route_release_ble_generation_.load(
             std::memory_order_acquire),
         .connection_handle = backend->route_release_connection_.load(
             std::memory_order_acquire),
-        .keyboard_characteristic_handle =
-            backend->route_release_keyboard_handle_.load(
+        .present_roles = backend->route_release_present_roles_.load(
+            std::memory_order_acquire),
+        .required_input_subscriptions =
+            backend->route_release_required_subscriptions_.load(
                 std::memory_order_acquire),
-        .mouse_characteristic_handle =
-            backend->route_release_mouse_handle_.load(
+        .report_handles = {.values = {
+            backend->route_release_handles_[0].load(
                 std::memory_order_acquire),
+            backend->route_release_handles_[1].load(
+                std::memory_order_acquire),
+            backend->route_release_handles_[2].load(
+                std::memory_order_acquire),
+        }},
         .release_epoch = backend->route_release_epoch_.load(
             std::memory_order_acquire),
     });

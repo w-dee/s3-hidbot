@@ -70,6 +70,12 @@ class SequenceBackend final : public hid_sequence::Backend {
             .generation = runtime_authority.generation,
             .authority_epoch = runtime_authority.authority_epoch,
             .release_epoch = runtime_authority.release_epoch,
+            .profile_activation_epoch =
+                runtime_authority.profile_activation_epoch,
+            .active_roles = runtime_authority.active_roles,
+            .transport = static_cast<std::uint8_t>(
+                runtime_authority.transport),
+            .route_generation = runtime_authority.route_generation,
         };
         return hid_sequence::AdmissionResult::kAccepted;
     }
@@ -80,6 +86,11 @@ class SequenceBackend final : public hid_sequence::Backend {
             .generation = authority.generation,
             .authority_epoch = authority.authority_epoch,
             .release_epoch = authority.release_epoch,
+            .profile_activation_epoch = authority.profile_activation_epoch,
+            .active_roles = authority.active_roles,
+            .transport = static_cast<hid_runtime::HidTransport>(
+                authority.transport),
+            .route_generation = authority.route_generation,
         };
     }
 
@@ -570,6 +581,8 @@ control_protocol::SequenceStartResult sequence_start(
             return control_protocol::SequenceStartResult::kBusy;
         case hid_sequence::AdmissionResult::kSafetyPending:
             return control_protocol::SequenceStartResult::kSafetyPending;
+        case hid_sequence::AdmissionResult::kUnsupportedOperation:
+            return control_protocol::SequenceStartResult::kUnsupportedOperation;
         case hid_sequence::AdmissionResult::kNotReady:
         default:
             return control_protocol::SequenceStartResult::kNotReady;
@@ -628,6 +641,8 @@ control_protocol::KeyboardReportResult keyboard_report(
                 return control_protocol::KeyboardReportFailure::kSafetyPending;
             case hid_runtime::KeyboardReportFailure::kAuthorityLost:
                 return control_protocol::KeyboardReportFailure::kAuthorityLost;
+            case hid_runtime::KeyboardReportFailure::kUnsupportedOperation:
+                return control_protocol::KeyboardReportFailure::kUnsupportedOperation;
             case hid_runtime::KeyboardReportFailure::kNone:
                 return control_protocol::KeyboardReportFailure::kNone;
             case hid_runtime::KeyboardReportFailure::kNotReady:
@@ -659,6 +674,8 @@ control_protocol::MouseReportResult mouse_report(
                 return control_protocol::MouseReportFailure::kSafetyPending;
             case hid_runtime::MouseReportFailure::kAuthorityLost:
                 return control_protocol::MouseReportFailure::kAuthorityLost;
+            case hid_runtime::MouseReportFailure::kUnsupportedOperation:
+                return control_protocol::MouseReportFailure::kUnsupportedOperation;
             case hid_runtime::MouseReportFailure::kNone:
                 return control_protocol::MouseReportFailure::kNone;
             case hid_runtime::MouseReportFailure::kNotReady:

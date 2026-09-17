@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 
 #include "ble_security/ble_security.hpp"
@@ -137,11 +138,16 @@ class Backend final : public hid_control_executor::BleBackend {
     esp_timer_handle_t route_release_timer_ = nullptr;
     std::atomic<hid_runtime::AuthorityEpoch> route_release_authority_epoch_{0};
     std::atomic<hid_runtime::RouteGeneration> route_release_route_generation_{0};
+    std::atomic<hid_runtime::ProfileActivationEpoch>
+        route_release_profile_activation_epoch_{0};
     std::atomic<ble_lifecycle::Generation> route_release_ble_generation_{0};
     std::atomic<std::uint16_t> route_release_connection_{
         ble_lifecycle::kNoConnection};
-    std::atomic<std::uint16_t> route_release_keyboard_handle_{0};
-    std::atomic<std::uint16_t> route_release_mouse_handle_{0};
+    std::atomic<hid_runtime::ReportMask> route_release_present_roles_{0};
+    std::atomic<hid_runtime::ReportMask>
+        route_release_required_subscriptions_{0};
+    std::array<std::atomic<std::uint16_t>,
+               hid_capability::kReportRoleCount> route_release_handles_{};
     std::atomic<std::uint32_t> route_release_epoch_{0};
     std::atomic_bool route_release_timer_active_{false};
 };

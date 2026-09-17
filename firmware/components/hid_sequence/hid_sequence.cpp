@@ -252,6 +252,13 @@ bool parse(std::string_view code, const HidState &initial_state, Plan *plan) {
         if (!apply_transition(operation, &simulated)) {
             return false;
         }
+        if (operation.kind == OperationKind::kKeyPress ||
+            operation.kind == OperationKind::kKeyRelease) {
+            candidate.required_roles |= hid_capability::kKeyboardInput;
+        } else if (operation.kind == OperationKind::kMousePress ||
+                   operation.kind == OperationKind::kMouseRelease) {
+            candidate.required_roles |= hid_capability::kMouseInput;
+        }
         candidate.operations[candidate.count++] = operation;
         if (delimiter == std::string_view::npos) break;
         offset = delimiter + 1;
@@ -355,6 +362,12 @@ AdmissionResult Controller::start(std::uint64_t local_owner_id,
         backend_->end_sequence(authority);
         reserved_generation_.store(0, std::memory_order_release);
         return AdmissionResult::kInvalid;
+    }
+    if (!hid_capability::is_subset(candidate.required_roles,
+                                   authority.active_roles)) {
+        backend_->end_sequence(authority);
+        reserved_generation_.store(0, std::memory_order_release);
+        return AdmissionResult::kUnsupportedOperation;
     }
     plan_ = candidate;
     authority_ = authority;

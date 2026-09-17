@@ -26,6 +26,7 @@ compile_flags=(
     -DHID_RUNTIME_NATIVE_TEST -DHID_CONTROL_EXECUTOR_NATIVE_TEST
     -DHID_ROUTE_NATIVE_TEST -DBLE_LIFECYCLE_NATIVE_TEST
     -DBLE_PAIRING_NATIVE_TEST
+    -I"$repository_root/firmware/components/hid_capability/include"
     -I"$repository_root/firmware/components/ble_fixture_profile/include"
     -I"$repository_root/tools/fakes/esp-idf-v5.5.4-nimble"
     -I"$repository_root/firmware/components/ble_hid_service/include"

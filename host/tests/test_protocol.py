@@ -10,6 +10,7 @@ from hidbot.protocol import (
     BleExposureDesired,
     BleExposureObserved,
     FirmwareIdentity,
+    HID_UNSUPPORTED_OPERATION,
     OutputRoute,
     OutputRouteV2,
     HelloResponse,
@@ -309,6 +310,24 @@ class ProtocolTests(unittest.TestCase):
             parse_response(
                 b'{"type":"response","v":1,"id":0,"session":null,"ok":true,"error":{"code":"X","message":"x"}}'
             )
+
+    def test_unsupported_hid_operation_error_is_preserved(self) -> None:
+        response = parse_response(
+            frame_payload(
+                {
+                    "type": "response",
+                    "v": 1,
+                    "id": 7,
+                    "session": TOKEN,
+                    "ok": False,
+                    "error": {
+                        "code": HID_UNSUPPORTED_OPERATION,
+                        "message": "active HID route lacks the report role",
+                    },
+                }
+            )
+        )
+        self.assertEqual(response.error.code, HID_UNSUPPORTED_OPERATION)
 
     def test_builders_are_compact_and_bounded(self) -> None:
         hello = build_hello_frame(0, TOKEN)

@@ -115,9 +115,16 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
                 route_release_identity.authority_epoch &&
             identity.route_generation ==
                 route_release_identity.route_generation &&
+            identity.profile_activation_epoch ==
+                route_release_identity.profile_activation_epoch &&
             identity.ble_generation == route_release_identity.ble_generation &&
             identity.connection_handle ==
                 route_release_identity.connection_handle &&
+            identity.present_roles == route_release_identity.present_roles &&
+            identity.required_input_subscriptions ==
+                route_release_identity.required_input_subscriptions &&
+            identity.report_handles.values ==
+                route_release_identity.report_handles.values &&
             identity.release_epoch == route_release_identity.release_epoch) {
             route_release_grace_armed = false;
         }
@@ -4113,9 +4120,11 @@ void test_internal_ble_route_activation_and_exact_payloads() {
            fixture.runtime.state_machine().route_snapshot().generation);
     assert(authority.ble_generation == fixture.generation);
     assert(authority.connection_handle == fixture.connection);
-    assert(authority.keyboard_characteristic_handle ==
+    assert(authority.report_handles.get(
+               hid_runtime::ReportRole::kKeyboardInput) ==
            fixture.database.handles.keyboard_value);
-    assert(authority.mouse_characteristic_handle ==
+    assert(authority.report_handles.get(
+               hid_runtime::ReportRole::kMouseInput) ==
            fixture.database.handles.mouse_value);
     const auto status = fixture.controller.route_snapshot();
     assert(status.route.desired == hid_route::OutputRoute::kBle);
@@ -4278,7 +4287,7 @@ void test_ble_route_none_usb_and_no_dual_delivery() {
 void test_ble_work_token_fences_every_authority_field() {
     ReadyBleRouteFixture fixture(83);
     const std::array<std::uint8_t, 6> keys{0x71, 0, 0, 0, 0, 0};
-    for (int mutation = 0; mutation < 6; ++mutation) {
+    for (int mutation = 0; mutation < 7; ++mutation) {
         assert(fixture.controller.queue_ble_keyboard_report(0, keys) ==
                hid_runtime::KeyboardReportBeginResult::kPublished);
         hid_control_executor::Controller::Action work{};
@@ -4291,6 +4300,9 @@ void test_ble_work_token_fences_every_authority_field() {
             case 3: ++work.payload.hid_report.work.connection_handle; break;
             case 4: ++work.payload.hid_report.work.characteristic_handle; break;
             case 5:
+                ++work.payload.hid_report.work.profile_activation_epoch;
+                break;
+            case 6:
                 work.payload.hid_report.work.report_kind =
                     hid_runtime::ReportKind::kUnsafeMouse;
                 break;
@@ -4727,9 +4739,20 @@ void test_u74c_normal_retirement_release_grace_and_cross_transport() {
         fixture.controller.ble_route_release_identity_for_test();
     assert(identity.authority_epoch == initial_authority.authority_epoch);
     assert(identity.route_generation == initial_authority.route_generation);
+    assert(identity.profile_activation_epoch ==
+           initial_authority.profile_activation_epoch);
     assert(identity.ble_generation == initial_authority.ble_generation);
     assert(identity.connection_handle == initial_authority.connection_handle);
+    assert(identity.present_roles == initial_authority.present_roles);
+    assert(identity.required_input_subscriptions ==
+           initial_authority.required_input_subscriptions);
+    assert(identity.report_handles.values ==
+           initial_authority.report_handles.values);
     assert(identity.release_epoch != initial_authority.release_epoch);
+    auto stale_activation = identity;
+    ++stale_activation.profile_activation_epoch;
+    assert(!fixture.controller.signal_ble_route_release_grace(
+        stale_activation));
     assert(fixture.ble.arm_route_release_grace_calls == 1);
     assert(fixture.ble.route_release_grace_armed);
     assert(fixture.ble.disconnect_calls == 0);

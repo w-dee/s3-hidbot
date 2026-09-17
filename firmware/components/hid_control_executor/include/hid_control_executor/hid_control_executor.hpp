@@ -133,6 +133,7 @@ struct BleHidHandles {
 
 struct BleHidWorkIdentity {
     ble_lifecycle::Generation generation = 0;
+    hid_runtime::ProfileActivationEpoch profile_activation_epoch = 0;
     std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
     std::uint16_t characteristic_handle = 0;
 };
@@ -178,10 +179,12 @@ inline constexpr std::uint32_t kBleRouteReleaseGraceMs = 100;
 struct BleRouteReleaseIdentity {
     hid_runtime::AuthorityEpoch authority_epoch = 0;
     hid_runtime::RouteGeneration route_generation = 0;
+    hid_runtime::ProfileActivationEpoch profile_activation_epoch = 0;
     ble_lifecycle::Generation ble_generation = 0;
     std::uint16_t connection_handle = ble_lifecycle::kNoConnection;
-    std::uint16_t keyboard_characteristic_handle = 0;
-    std::uint16_t mouse_characteristic_handle = 0;
+    hid_runtime::ReportMask present_roles = 0;
+    hid_runtime::ReportMask required_input_subscriptions = 0;
+    hid_runtime::ReportHandles report_handles{};
     std::uint32_t release_epoch = 0;
 };
 

@@ -1664,6 +1664,18 @@ void test_keyboard_report_schema_result_and_cache() {
     }
     // Invalid requests do not consume the provider or cache a runtime result.
     assert(fixture.keyboard.calls == 1);
+    fixture.keyboard.result = {
+        .success = false,
+        .authority_lost = false,
+        .state = control_protocol::KeyboardReportState::kSubmitted,
+        .failure =
+            control_protocol::KeyboardReportFailure::kUnsupportedOperation,
+    };
+    fixture.payload(request(
+        40, session, "hid.keyboard.report",
+        "{\"modifiers\":0,\"keys\":[4]}"));
+    require_contains(fixture.sink.last(),
+                     "\"code\":\"HID_UNSUPPORTED_OPERATION\"");
 }
 
 void test_mouse_report_schema_result_and_cache() {
@@ -1727,7 +1739,19 @@ void test_mouse_report_schema_result_and_cache() {
         fixture.payload(request(invalid_id++, session, "hid.mouse.report", params));
         require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
     }
-    assert(fixture.mouse.calls == 3);
+    fixture.mouse.result = {
+        .success = false,
+        .authority_lost = false,
+        .state = control_protocol::MouseReportState::kSubmitted,
+        .failure =
+            control_protocol::MouseReportFailure::kUnsupportedOperation,
+    };
+    fixture.payload(request(
+        50, session, "hid.mouse.report",
+        "{\"buttons\":1,\"x\":0,\"y\":0,\"wheel\":0,\"pan\":0}"));
+    require_contains(fixture.sink.last(),
+                     "\"code\":\"HID_UNSUPPORTED_OPERATION\"");
+    assert(fixture.mouse.calls == 4);
 }
 
 void test_hid_route_schema_frozen_retry_and_errors() {
@@ -2364,6 +2388,13 @@ void test_hid_sequence_schema_status_and_exact_retry() {
     fixture.payload(std::string_view(embedded.data(), embedded.size()));
     require_contains(fixture.sink.last(), "embedded NUL");
     assert(fixture.sequence.start_calls == 2);
+
+    fixture.sequence.start_result =
+        control_protocol::SequenceStartResult::kUnsupportedOperation;
+    fixture.payload(request(8, session, "hid.sequence.start",
+                            "{\"code\":\"kp4\"}"));
+    require_contains(fixture.sink.last(),
+                     "\"code\":\"HID_UNSUPPORTED_OPERATION\"");
 }
 
 void test_hid_sequence_status_retires_with_owning_session() {
