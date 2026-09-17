@@ -6,6 +6,15 @@ from .artifact import (
     derive_source_identity,
 )
 from .btmon import capture_btmon
+from .ble_cleanup import (
+    BleCleanupPhase,
+    FinalBleControlState,
+    ObserverOutcome,
+    ObserverTerminalStatus,
+    classify_observer_error,
+    observation_complete,
+    run_ble_cleanup,
+)
 from .core import (
     BondSnapshot,
     EvidenceDocument,
@@ -38,12 +47,16 @@ from .input import (
 
 __all__ = [
     "BondSnapshot",
+    "BleCleanupPhase",
     "EvidenceDocument",
     "EvdevIdentity",
     "F24Checkpoint",
     "FreshSessionManager",
+    "FinalBleControlState",
     "InputEvent",
     "InputNode",
+    "ObserverOutcome",
+    "ObserverTerminalStatus",
     "PollResult",
     "PollTimeout",
     "QualificationError",
@@ -53,13 +66,16 @@ __all__ = [
     "artifact_preflight",
     "bounded_poll",
     "capture_btmon",
+    "classify_observer_error",
     "classify_node_access",
     "compare_artifact_identity",
     "derive_source_identity",
     "evaluate_outcome",
     "inspect_bluez_paired",
+    "observation_complete",
     "rediscover_input",
     "safe_quiescent_cleanup",
+    "run_ble_cleanup",
     "validate_ble_exposure",
     "validate_delivery_checkpoint",
     "validate_no_automatic_restore",

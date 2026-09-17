@@ -192,7 +192,9 @@ U7.6B adds the hardware-free `tools/test-qualification-harness.sh` suite to
 authority, artifact/source identity, route/exposure/bond invariants,
 identity-based evdev rediscovery, F24/`REL_X` checkpoint rules, bounded btmon
 process control, privacy-safe JSON evidence, read-only BlueZ inspection, and
-independent main/cleanup outcomes through fakes. It opens no serial, evdev, or
+independent main/cleanup outcomes through fakes. BLE cleanup also tests same-session
+release/ALL_UP/quiet-tail/retirement continuity, ambiguous mutation no-replay,
+exact observer retirement, and preexisting kernel held state. It opens no serial, evdev, or
 Bluetooth device and performs no BlueZ mutation. The architecture and later
 physical invocation boundary are documented in
 [`qualification-harness.md`](qualification-harness.md).

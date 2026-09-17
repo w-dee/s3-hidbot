@@ -155,6 +155,53 @@ verdict are separate; product PASS is not erased by a later containment
 failure. Sealed campaign runners remain functional artifacts rather than
 maintained generic tooling.
 
+## BLE continuity cleanup and engineering rehearsal
+
+`qualification_harness.run_ble_cleanup` consumes the caller's existing valid
+attempt session. It keeps that session through workload completion, correlated
+explicit release, exact host ALL_UP proof, a bounded quiet tail, and intentional
+route-none. Same-session ping checks refresh and validate authority before retirement.
+Route selection retires setup authority before the workload session starts;
+accepted route-none intentionally ends that attempt session. A fresh session
+is allowed after this retirement boundary for final lifecycle cleanup/status. Observer callbacks must fit within the lease. No fresh hello or
+mutation replay is allowed to rescue this continuity evidence. In particular,
+`SessionLostError` may follow an executed mutation; it is not evidence of
+non-admission. Any ambiguous result fails continuity and enters separate safe
+recovery. Recovery success never converts the original failure to PASS.
+
+Observer ENODEV/ENOENT is expected only for the exact device after an accepted
+intentional retirement boundary. It never substitutes for pre-retirement
+ALL_UP and quiet-tail evidence. Arbitrary I/O errors, SYN_DROPPED, held input,
+wrong device identity, and premature disappearance fail closed. Final control
+state must establish stable route-none, no active sequence, ALL_UP, disconnected
+BLE and the explicitly required terminal lifecycle state.
+
+The opt-in `tools/ble_cleanup_rehearsal.py` exercises this sequence with no normal
+keyboard, mouse, or Sequence workload. It requires an existing retained strict
+bond, headless host, exact artifact archive SHA256 and source revision, verified
+runtime identity and exact BLE keyboard/mouse evdev observers. EVIOCGKEY checks
+include input held before the observer opened. Its result is always classified
+`CLEANUP_REHEARSAL_ONLY / NOT_QUALIFICATION`; it consumes no official physical
+qualification attempt and makes no report-delivery qualification claim.
+
+A separately authorized physical wrapper must hold the appliance physical lock
+and execute a hashed runner snapshot. With those prerequisites established, the
+runner's explicit invocation is:
+
+```sh
+python3 tools/ble_cleanup_rehearsal.py \
+  --hardware --cleanup-rehearsal-only --not-qualification \
+  --artifact "$ARTIFACT" --expected-source "$SOURCE_REVISION" \
+  --expected-artifact-sha256 "$ARTIFACT_SHA256" --evidence "$EVIDENCE"
+```
+
+No artifact or campaign identity is hardcoded into the reusable runner. It
+checks the expected archive before inspecting or accessing hardware. The
+canonical qualification-harness suite tests session loss after mutation,
+identity replacement, observer loss on either side of retirement, exact
+ordering, kernel held-state inspection, and the production rehearsal adapter's
+same-session handoff using fakes.
+
 ## Intentionally deferred
 
 U7.6D remains responsible for approved physical scenario composition: the
