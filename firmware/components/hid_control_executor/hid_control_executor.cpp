@@ -1480,10 +1480,13 @@ void Controller::drive_ble_explicit_release() {
         }
     }
     transaction = state.release_all_snapshot();
-    if (!ble_explicit_release_ready(transaction,
-                                    BleHidInterface::kKeyboard) ||
-        !ble_explicit_release_ready(transaction,
-                                    BleHidInterface::kMouse) ||
+    // Only roles captured by this exact route transaction can require a
+    // transport subscription. Absent interfaces are already-up; requiring
+    // their nonexistent handle would time out a healthy single-role release.
+    if (((transaction.present_roles & hid_capability::kKeyboardInput) != 0 &&
+         !ble_explicit_release_ready(transaction, BleHidInterface::kKeyboard)) ||
+        ((transaction.present_roles & hid_capability::kMouseInput) != 0 &&
+         !ble_explicit_release_ready(transaction, BleHidInterface::kMouse)) ||
         !state.commit_ble_release_all(transaction)) {
         retire_ble_route_if_unready();
     }

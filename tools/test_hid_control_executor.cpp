@@ -7563,6 +7563,8 @@ void test_profile_restart_failure_and_deadline_matrix() {
     }
 }
 
+hid_control_executor::Controller *finite_release_controller = nullptr;
+
 void test_cold_mouse_profile_capability_consumption() {
     using namespace ble_fixture_profile;
     using Event = hid_control_executor::BleEventKind;
@@ -7604,6 +7606,32 @@ void test_cold_mouse_profile_capability_consumption() {
     assert(controller.queue_ble_mouse_report(1, 0, 0, 0, 0) == hid_runtime::MouseReportBeginResult::kPublished);
     assert(controller.process_one_for_test());
     assert(database.notify_calls == 1 && database.last_characteristic == database.handles.mouse_value);
+    // The public Runtime wait/finalization must preserve a mouse-only route;
+    // no nonexistent keyboard subscription can be a final commit predicate.
+    finite_release_controller = &controller;
+    runtime.set_release_poll_hook_for_test(+[](hid_runtime::StateMachine *) {
+        assert(finite_release_controller->process_wake_cycle_for_test());
+    });
+    const auto generation = runtime.state_machine().route_snapshot().generation;
+    const auto epoch = runtime.state_machine().authority_epoch();
+    const auto released = runtime.release_all();
+    assert(released.success && !released.authority_lost);
+    assert(released.keyboard == hid_runtime::ReleaseAllInterfaceState::kAlreadyUp);
+    assert(released.mouse == hid_runtime::ReleaseAllInterfaceState::kSubmitted);
+    assert(database.notify_calls == 2 && database.last_characteristic == database.handles.mouse_value);
+    assert(controller.route_snapshot().ready && runtime.state_machine().route_snapshot().generation == generation);
+    assert(runtime.state_machine().authority_epoch() == epoch && ble.disconnect_calls == 0);
+    const auto all_up = runtime.release_all();
+    assert(all_up.success && !all_up.authority_lost && database.notify_calls == 2);
+    assert(controller.route_snapshot().ready);
+    // Producer gate is released; a later report still uses this explicit route.
+    assert(controller.queue_ble_mouse_report(1, 0, 0, 0, 0) == hid_runtime::MouseReportBeginResult::kPublished);
+    assert(controller.process_one_for_test());
+    database.notify_result = hid_control_executor::BleNotifyBackendResult::kStackRejected;
+    const auto failed = runtime.release_all();
+    assert(!failed.success && !controller.route_snapshot().ready);
+    runtime.set_release_poll_hook_for_test(nullptr);
+    finite_release_controller = nullptr;
 }
 
 void test_mouse_cache_requires_map_and_fresh_write_without_migration() {
