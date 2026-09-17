@@ -129,6 +129,8 @@ class Backend final : public hid_control_executor::BleBackend {
     std::uint64_t host_connection_incarnation_ = 0;
     std::uint64_t active_host_connection_ = 0;
     std::uint16_t host_connection_handle_ = ble_lifecycle::kNoConnection;
+    ble_addr_t host_connection_identity_{};
+    bool host_identity_valid_ = false;
     static int store_read(int object_type, const union ble_store_key *key,
                           union ble_store_value *value);
     static int store_write(int object_type,

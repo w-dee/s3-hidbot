@@ -480,6 +480,19 @@ int delete_association_verified(const ble_addr_t &identity) {
         ? 0 : ESP_ERR_INVALID_STATE;
 }
 
+// Private administrative lookup kinds. The public NimBLE wrapper owns its
+// mutex; only our configured callback translates these into raw inventory reads.
+// Never use a process-wide bypass flag that could admit an SMP lookup in parallel.
+constexpr int kInventoryOurSecurity = 0x7001;
+constexpr int kInventoryPeerSecurity = 0x7002;
+int read_inventory_security(int type, const union ble_store_key *key,
+                            union ble_store_value *value) {
+    if (type != BLE_STORE_OBJ_TYPE_OUR_SEC && type != BLE_STORE_OBJ_TYPE_PEER_SEC)
+        return BLE_HS_EINVAL;
+    return ble_store_read(type == BLE_STORE_OBJ_TYPE_OUR_SEC
+        ? kInventoryOurSecurity : kInventoryPeerSecurity, key, value);
+}
+
 struct AssociationStore {
     ble_store_read_fn *raw_read = nullptr;
     detail::AssociationRead read(const detail::AssociationPeer &peer) {
@@ -1186,6 +1199,7 @@ void Backend::on_reset(int reason) {
         instance_->association_creation_.retire();
         instance_->active_host_connection_ = 0;
         instance_->host_connection_handle_ = ble_lifecycle::kNoConnection;
+        instance_->host_identity_valid_ = false;
         if (instance_->sink_ != nullptr) {
             instance_->sink_->retire_dle_on_reset(
                 instance_->generation_.load(std::memory_order_acquire));
@@ -1233,6 +1247,10 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 backend->active_host_connection_ = backend->host_connection_incarnation_ == UINT64_MAX
                     ? 0 : ++backend->host_connection_incarnation_;
                 backend->host_connection_handle_ = event->connect.conn_handle;
+                // CONNECT is dispatched outside the host mutex. Store callbacks
+                // run inside it and must consume this host-owned snapshot.
+                backend->host_identity_valid_ = peer_identity(event->connect.conn_handle,
+                    backend->host_connection_identity_) && valid_identity(backend->host_connection_identity_);
             }
             (void)backend->signal(
                 event->connect.status == 0
@@ -1244,6 +1262,7 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
             backend->association_creation_.retire();
             backend->active_host_connection_ = 0;
             backend->host_connection_handle_ = ble_lifecycle::kNoConnection;
+            backend->host_identity_valid_ = false;
             // Transfer progress ownership to the queued event before removing
             // the disconnect watchdog. If publication fails, leaving the
             // watchdog armed provides another bounded terminal observation.
@@ -1260,6 +1279,11 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 event->enc_change.conn_handle, event->enc_change.status);
             break;
         case BLE_GAP_EVENT_IDENTITY_RESOLVED:
+            // The stack publishes canonical identity before its SEC writes.
+            if (backend->host_connection_handle_ == event->identity_resolved.conn_handle) {
+                backend->host_connection_identity_ = event->identity_resolved.peer_id_addr;
+                backend->host_identity_valid_ = valid_identity(backend->host_connection_identity_);
+            }
             (void)backend->signal(
                 hid_control_executor::BleEventKind::kIdentityResolved,
                 event->identity_resolved.conn_handle, 0);
@@ -1513,7 +1537,7 @@ std::int32_t Backend::initiate_security(std::uint16_t connection_handle) {
                 detail::AssociationDecision::kAllowed) return BLE_HS_ESTORE_FAIL;
         if (association.record.state == detail::AssociationState::kMissing &&
             profile_->id != ble_fixture_profile::ProfileId::kStrictComposite) {
-            AssociationStore store{original_store_read_};
+            AssociationStore store{read_inventory_security};
             if (store.prove_security_absent(association_peer(identity)) != 1) return BLE_HS_ESTORE_FAIL;
         }
     }
@@ -2099,7 +2123,7 @@ int Backend::read_security_raw(bool our, const ble_store_key_sec &key,
     union ble_store_key input{};
     union ble_store_value output{};
     input.sec = key;
-    const int status = original_store_read_(our ? BLE_STORE_OBJ_TYPE_OUR_SEC :
+    const int status = read_inventory_security(our ? BLE_STORE_OBJ_TYPE_OUR_SEC :
         BLE_STORE_OBJ_TYPE_PEER_SEC, &input, &output);
     if (status == 0) value = output.sec;
     secure_memory::zero(&output, sizeof(output));
@@ -2116,6 +2140,9 @@ int Backend::store_read(int object_type, const union ble_store_key *key,
                         union ble_store_value *value) {
     if (instance_ == nullptr || instance_->original_store_read_ == nullptr || key == nullptr || value == nullptr)
         return BLE_HS_EINVAL;
+    if (object_type == kInventoryOurSecurity || object_type == kInventoryPeerSecurity)
+        return instance_->original_store_read_(object_type == kInventoryOurSecurity
+            ? BLE_STORE_OBJ_TYPE_OUR_SEC : BLE_STORE_OBJ_TYPE_PEER_SEC, key, value);
     const bool security = object_type == BLE_STORE_OBJ_TYPE_OUR_SEC || object_type == BLE_STORE_OBJ_TYPE_PEER_SEC;
     const bool cccd = object_type == BLE_STORE_OBJ_TYPE_CCCD;
     const auto *peer = security ? &key->sec.peer_addr : cccd ? &key->cccd.peer_addr : nullptr;
@@ -2158,18 +2185,25 @@ int Backend::store_write(int object_type, const union ble_store_value *value) {
         peer = association_peer(value->sec.peer_addr);
         if (backend.profile_->id != ble_fixture_profile::ProfileId::kStrictComposite) {
             if (backend.security_inhibit_.inhibits(backend.generation_.load(std::memory_order_acquire),
-                    backend.current_connection_.load(std::memory_order_acquire))) return BLE_HS_ESTORE_FAIL;
-            const auto record = security_record(value->sec.peer_addr, 0, value->sec);
-            if (!backend.security_.persisted_bond_is_valid({.our = record, .peer = record}, backend.profile_->id))
+                    backend.current_connection_.load(std::memory_order_acquire))) {
+                ESP_LOGW(kLogTag, "bond admission rejected: readiness inhibited");
                 return BLE_HS_ESTORE_FAIL;
-            ble_addr_t connected{};
-            if (backend.active_host_connection_ == 0 ||
-                !peer_identity(backend.host_connection_handle_, connected) ||
-                !same_identity(connected, value->sec.peer_addr)) return BLE_HS_ESTORE_FAIL;
+            }
+            const auto record = security_record(value->sec.peer_addr, 0, value->sec);
+            if (!backend.security_.persisted_bond_is_valid({.our = record, .peer = record}, backend.profile_->id)) {
+                ESP_LOGW(kLogTag, "bond admission rejected: record policy");
+                return BLE_HS_ESTORE_FAIL;
+            }
+            if (backend.active_host_connection_ == 0 || !backend.host_identity_valid_ ||
+                !same_identity(backend.host_connection_identity_, value->sec.peer_addr)) {
+                ESP_LOGW(kLogTag, "bond admission rejected: connection identity");
+                return BLE_HS_ESTORE_FAIL;
+            }
         }
         const auto decision = detail::prepare_association(association_store, backend.association_creation_,
             backend.active_host_connection_, peer, backend.profile_->bond_class);
         if (decision != detail::AssociationDecision::kAllowed) {
+            ESP_LOGW(kLogTag, "bond admission rejected: association %u", static_cast<unsigned>(decision));
             if (decision == detail::AssociationDecision::kStorageFailure)
                 backend.observe_store_failure(ble_security::StoreFailureKind::kWrite,
                     BLE_HS_ESTORE_FAIL, true, backend.current_connection_.load(std::memory_order_acquire));

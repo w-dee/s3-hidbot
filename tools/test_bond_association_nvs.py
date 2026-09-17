@@ -8,6 +8,7 @@ from test_bond_delete_nvs import PRE, ROOT, body
 
 EXTRA = r'''
 #include <atomic>
+#define ESP_LOGW(...) ((void)0)
 #include <algorithm>
 constexpr int ESP_ERR_NVS_NOT_ENOUGH_SPACE=104, BLE_HS_EINVAL=21,
  BLE_HS_ENOENT=22, BLE_HS_ESTORE_FAIL=23, BLE_HS_ESTORE_CAP=24;
@@ -28,7 +29,14 @@ constexpr std::array<const char*,3> kNimblePeerSecurityKeys{"peer_sec_1","peer_s
 int ble_addr_cmp(const ble_addr_t*a,const ble_addr_t*b){return std::memcmp(a,b,sizeof(*a));}
 bool has_exact_identity(const ble_addr_t&a){return a.type<=1 && (a.type||std::any_of(a.val,a.val+6,[](auto b){return b!=0;}));}
 ble_addr_t connected{1,{2,3,4,5,6,7}};
-bool peer_identity(uint16_t connection,ble_addr_t&out){out=connected;return connection==7;}
+bool host_locked=false;
+struct HostLock {HostLock(){assert(!host_locked);host_locked=true;} ~HostLock(){assert(host_locked);host_locked=false;}};
+[[maybe_unused]] bool peer_identity(uint16_t connection,ble_addr_t&out){HostLock lock;out=connected;return connection==7;}
+constexpr int kInventoryOurSecurity=0x7001,kInventoryPeerSecurity=0x7002;
+int ble_store_read(int,const ble_store_key*,ble_store_value*);
+// Match the pinned SDK's public store wrapper lock contract. The production
+// callback and inventory bridge below are extracted, not reimplemented.
+
 int nvs_set_u32(int h,const char*k,uint32_t value){
  const bool error=fail();if(error&&!after)return 77;
  std::vector<uint8_t> bytes(4);std::memcpy(bytes.data(),&value,4);
@@ -37,7 +45,7 @@ int nvs_set_u32(int h,const char*k,uint32_t value){
 int raw_reads=0,raw_writes=0,store_failures=0,raw_fail=0;
 std::map<int,ble_store_value> ram;
 int raw_read(int type,const ble_store_key*,ble_store_value*out){
- ++raw_reads;if(!ram.count(type))return BLE_HS_ENOENT;*out=ram.at(type);return 0;
+ assert(host_locked);++raw_reads;if(!ram.count(type))return BLE_HS_ENOENT;*out=ram.at(type);return 0;
 }
 int raw_write(int type,const ble_store_value*value){
  ++raw_writes;if(raw_fail==1)return 77;ram[type]=*value;
@@ -57,6 +65,8 @@ struct Backend {
  detail::AssociationCreation association_creation_{};
  uint64_t active_host_connection_=1;
  uint16_t host_connection_handle_=7;
+ ble_addr_t host_connection_identity_=connected;
+ bool host_identity_valid_=true;
  std::atomic<uint16_t> current_connection_{7};
  std::atomic<uint32_t> generation_{1};
  ble_security::ReadinessInhibit security_inhibit_{};
@@ -70,6 +80,12 @@ struct Backend {
  }
 };
 Backend* Backend::instance_=nullptr;
+int ble_store_read(int type,const ble_store_key*key,ble_store_value*value){
+ HostLock lock;return Backend::store_read(type,key,value);
+}
+int ble_store_write(int type,const ble_store_value*value){
+ HostLock lock;return Backend::store_write(type,value);
+}
 '''
 
 POST = r'''
@@ -78,43 +94,43 @@ ble_store_value key_value(bool authenticated=false){ble_store_value result{};
  result.sec.peer_addr=connected;result.sec.ltk_present=1;result.sec.authenticated=authenticated;
  result.sec.sc=1;result.sec.key_size=16;result.sec.synthetic_ltk[0]=42;return result;}
 void both(Backend&b){Backend::instance_=&b;auto value=key_value();
- assert(Backend::store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==0);
+ assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==0);
  assert(read_association(connected).record.state==detail::AssociationState::kPending);
- assert(Backend::store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==0);
+ assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==0);
  assert(read_association(connected).record.state==detail::AssociationState::kComplete);}
 int main(){
  using S=detail::AssociationState;
  reset();Backend b;both(b);assert(validate_complete_associations()==0);
  auto complete=disk;auto retained_ram=ram;
  ble_store_key key{};key.sec.peer_addr=connected;ble_store_value out{};
- assert(Backend::store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==0);
+ assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==0);
  assert(out.sec.synthetic_ltk[0]==42);
  // Exact retained class mismatch cannot look like missing or leak key bytes.
  b.profile_=&ble_fixture_profile::kStrictComposite;
- auto before=disk;assert(Backend::store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL);
+ auto before=disk;assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL);
  assert(disk==before&&store_failures==0);
- auto value=key_value(true);assert(Backend::store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==BLE_HS_ESTORE_FAIL);
+ auto value=key_value(true);assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==BLE_HS_ESTORE_FAIL);
  assert(disk==before&&store_failures==0);
  ble_store_value_sec raw{};assert(b.read_security_raw(true,key.sec,raw)==0);
- ble_store_key enumeration{};assert(Backend::store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&enumeration,&out)==0);
+ ble_store_key enumeration{};assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&enumeration,&out)==0);
  // Metadata-less authenticated strict survives; mouse must not adopt it.
  reset();Backend strict;Backend::instance_=&strict;strict.profile_=&ble_fixture_profile::kStrictComposite;
- value=key_value(true);assert(Backend::store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==0);
+ value=key_value(true);assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==0);
  assert(read_association(connected).record.state==S::kMissing);
  strict.profile_=&ble_fixture_profile::kStandaloneMouseJustWorks;
- assert(Backend::store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL);
+ assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL);
  assert(out.sec.synthetic_ltk[0]==0);
- value=key_value();assert(Backend::store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL);
+ value=key_value();assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL);
  assert(read_association(connected).record.state==S::kMissing);
  // Valid CCCD restore requires a matching durable schema before stack consumption.
  reset();Backend c;both(c);ble_store_value cccd{};cccd.cccd.peer_addr=connected;cccd.cccd.chr_val_handle=25;
- assert(Backend::store_write(BLE_STORE_OBJ_TYPE_CCCD,&cccd)==0);
+ assert(ble_store_write(BLE_STORE_OBJ_TYPE_CCCD,&cccd)==0);
  ble_store_key ck{};ck.cccd.peer_addr=connected;
- assert(Backend::store_read(BLE_STORE_OBJ_TYPE_CCCD,&ck,&out)==BLE_HS_ENOENT);
+ assert(ble_store_read(BLE_STORE_OBJ_TYPE_CCCD,&ck,&out)==BLE_HS_ENOENT);
  char name[16]{};schema_key(connected,name);disk[{kSchemaNamespace,name}]={NVS_TYPE_U8,{2}};
- assert(Backend::store_read(BLE_STORE_OBJ_TYPE_CCCD,&ck,&out)==0&&out.cccd.chr_val_handle==25);
+ assert(ble_store_read(BLE_STORE_OBJ_TYPE_CCCD,&ck,&out)==0&&out.cccd.chr_val_handle==25);
  disk[{kSchemaNamespace,name}].bytes={1};
- assert(Backend::store_read(BLE_STORE_OBJ_TYPE_CCCD,&ck,&out)==BLE_HS_ENOENT);
+ assert(ble_store_read(BLE_STORE_OBJ_TYPE_CCCD,&ck,&out)==BLE_HS_ENOENT);
  // Metadata-only, half-pair and fully-written pending are all quarantined at boot.
  for(unsigned phase=0;phase<3;++phase){
   reset();Backend pending;Backend::instance_=&pending;AssociationStore store{raw_read};
@@ -123,16 +139,16 @@ int main(){
   value=key_value();if(phase>0)assert(raw_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==0);
   if(phase>1)assert(raw_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==0);
   before=disk;assert(validate_complete_associations()!=0&&disk==before);
-  assert(Backend::store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL);
-  assert(Backend::store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL&&disk==before);
+  assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL);
+  assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL&&disk==before);
  }
  // Every actual adapter I/O interruption either leaves inert pending/absence,
  // or a complete pair with durable exact provenance. It never auto-repairs.
  reset();Backend count;both(count);const int boundaries=calls;
  for(bool side:{false,true})for(int point=0;point<boundaries;++point){
   reset();Backend fault;Backend::instance_=&fault;cut=point;after=side;
-  value=key_value();(void)Backend::store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value);
-  (void)Backend::store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value);
+  value=key_value();(void)ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value);
+  (void)ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value);
   cut=-1;assert(handles.empty()&&live_iterators==0);
   auto association=read_association(connected);before=disk;
   auto status=validate_complete_associations();assert(disk==before);
@@ -144,15 +160,30 @@ int main(){
  // ignored-error SMP write and preserves pending provenance.
  for(int kind=1;kind<=3;++kind){
   reset();Backend failed;Backend::instance_=&failed;value=key_value();raw_fail=kind;
-  assert(Backend::store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==77);
+  assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==77);
   assert(read_association(connected).record.state==S::kPending);
   before=disk;raw_fail=0;
-  assert(Backend::store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL);
+  assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL);
   assert(raw_writes==1&&disk==before&&store_failures==1);
  }
  // Same-connection repeat writes after completion cannot replace retained keys.
  reset();Backend closed;both(closed);before=disk;value=key_value();value.sec.synthetic_ltk[0]=99;
- assert(Backend::store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==BLE_HS_ESTORE_FAIL&&disk==before);
+ assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==BLE_HS_ESTORE_FAIL&&disk==before);
+ // No valid active connection snapshot: reject before any persistent mutation.
+ for(int invalid=0;invalid<3;++invalid){
+  reset();Backend missing;Backend::instance_=&missing;
+  if(invalid==0)missing.host_identity_valid_=false;
+  if(invalid==1)missing.host_connection_identity_.val[0]^=1;
+  if(invalid==2)missing.active_host_connection_=0;
+  value=key_value();assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==BLE_HS_ESTORE_FAIL);
+  assert(disk.empty()&&ram.empty());
+ }
+ // Administrative reads and pre-pair absence proof acquire the host lock even
+ // when the selected profile is incompatible, without changing SMP filtering.
+ reset();Backend inventory;Backend::instance_=&inventory;
+ AssociationStore synchronized{read_inventory_security};
+ assert(synchronized.prove_security_absent(association_peer(connected))==1);
+ assert(!host_locked);
  // No new record may exceed the three-record namespace bound.
  reset();AssociationStore store{raw_read};
  for(unsigned i=1;i<=3;++i){auto address=connected;address.val[0]=i;
@@ -174,7 +205,7 @@ def main():
         'esp_err_t validate_nimble_security_key_layout(', 'esp_err_t read_schema_revision(',
         'detail::AssociationPeer association_peer(', 'ble_addr_t association_address(',
         'detail::AssociationRead read_association(', 'int validate_association_namespace(',
-        'struct AssociationStore {', 'int validate_complete_associations(',
+        'int read_inventory_security(', 'struct AssociationStore {', 'int validate_complete_associations(',
         'int Backend::read_security_raw(', 'bool Backend::compatible_association(',
         'int Backend::store_read(', 'int Backend::store_write(')
     extracted = '\n'.join(body(source, s) + (';' if s.startswith('struct') else '') for s in signatures)
