@@ -1600,8 +1600,8 @@ not a schematic, direct-rail, backfeed, or general electrical-safety claim.
 `ble.fixture-profile-v1` adds `ble.profile.list`, `ble.profile.status`, and
 `ble.profile.select`. The catalog is finite; it accepts no descriptor, packet,
 GATT or arbitrary configuration upload. The initial public catalog contains
-only `strict_composite`. Standalone profiles and full stack replacement are
-subsequent implementation slices; this checkpoint does not claim P0 completion.
+only `strict_composite`. Standalone public selection remains pending durable
+bond/cache association integration; this checkpoint does not claim P0 completion.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
 
 `ble.profile.list` and `ble.profile.status` accept no params (omitted or `{}`).
@@ -1635,7 +1635,13 @@ Exact request retries replay the existing cache without another selection.
 
 The reviewed internal mouse definition is deliberately absent from this public
 catalog until controlled restart and durable bond association are integrated.
-Its GATT consumer and per-connection security policy are native-tested: one
+The internal controller can switch reviewed definitions through proven stop,
+hidden initialization and exact stack-incarnation fencing. Stop completion has
+a 5-second owner deadline, followed by a 10-second synchronization deadline.
+There is no automatic rollback; a failed/ambiguous transition stays hidden in
+fault. A successful initialized switch requires explicit enable afterward.
+Cold selection changes only RAM and defers initialization until enable.
+The GATT consumer and per-connection security policy are native-tested: one
 5-byte mouse input, Report ID 2, no keyboard characteristic, encrypted 16-byte
 key access, and an unauthenticated bonded outcome. This foundation does not
 make the standalone profile selectable or constitute a hardware qualification.

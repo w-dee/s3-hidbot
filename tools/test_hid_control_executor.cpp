@@ -44,6 +44,35 @@ struct FakeBackend final : hid_control_executor::Backend {
 };
 
 struct FakeBleBackend final : hid_control_executor::BleBackend {
+    bool configure_profile(ble_fixture_profile::ProfileId id, std::uint32_t incarnation) override {
+        profile_id = id;
+        stack_incarnation = incarnation;
+        return !configure_failure;
+    }
+    std::uint64_t begin_stop() override {
+        ++begin_stop_calls;
+        last_stop_id = stop_start_failure ? 0 : stop_transaction.begin();
+        return last_stop_id;
+    }
+    ble_lifecycle::StopStatus poll_stop(std::uint64_t id) const override {
+        return stop_transaction.status(id);
+    }
+    void expire_stop(std::uint64_t id) override { (void)stop_transaction.expire(id); }
+    bool finish_stop(std::uint64_t id) override {
+        if (finish_stop_failure || !stop_transaction.consume(id)) return false;
+        ++finish_stop_calls;
+        active_database->reset_after_stop();
+        return true;
+    }
+    ble_fixture_profile::ProfileId profile_id = ble_fixture_profile::ProfileId::kStrictComposite;
+    std::uint32_t stack_incarnation = 0;
+    ble_lifecycle::StopTransaction stop_transaction;
+    std::uint64_t last_stop_id = 0;
+    int begin_stop_calls = 0;
+    int finish_stop_calls = 0;
+    bool stop_start_failure = false;
+    bool finish_stop_failure = false;
+    bool configure_failure = false;
     std::int32_t initialize(hid_control_executor::BleEventSink *event_sink,
                             hid_control_executor::BleDatabase *database,
                             ble_lifecycle::Generation generation) override {
@@ -67,6 +96,8 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
             return initialize_result;
         }
         if (active_database == nullptr) return -1;
+        if (!active_database->configure_profile(profile_id)) return -1;
+        active_database->set_stack_incarnation(stack_incarnation);
         active_database->bind_event_sink(event_sink);
         active_database->set_generation(generation);
         return active_database->register_database();
@@ -180,7 +211,7 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
                         std::uint16_t connection_handle) override {
         gatt_schema_current = false;
         security_inhibit.begin_connection(generation, connection_handle);
-        security.begin_connection(generation, connection_handle);
+        security.begin_connection(generation, connection_handle, true, profile_id);
     }
     void refresh_security(std::uint16_t connection_handle,
                           bool identity_resolved_event = false) override {
@@ -349,7 +380,8 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
                                       .generation = generation,
                                       .connection_handle = connection,
                                       .status = status,
-                                      .store_failure_kind = failure_kind});
+                                      .store_failure_kind = failure_kind,
+                                      .stack_incarnation = stack_incarnation});
     }
     bool lifecycle_event_for_generation(
         hid_control_executor::BleEventKind kind,
@@ -451,6 +483,21 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
 };
 
 struct FakeBleDatabase final : hid_control_executor::BleDatabase {
+    bool configure_profile(ble_fixture_profile::ProfileId id) override {
+        if (id != profile_id || reset_pending) {
+            handles = {.report_map_value = 5,
+                       .keyboard_value = id == ble_fixture_profile::ProfileId::kStrictComposite
+                           ? std::uint16_t{10} : std::uint16_t{0},
+                       .mouse_value = 20, .control_point_value = 30};
+        }
+        profile_id = id;
+        reset_pending = false;
+        return true;
+    }
+    void reset_after_stop() override { ++reset_calls; handles = {}; reset_pending = true; }
+    ble_fixture_profile::ProfileId profile_id = ble_fixture_profile::ProfileId::kStrictComposite;
+    int reset_calls = 0;
+    bool reset_pending = false;
     int register_database() override {
         ++register_calls;
         return register_result;
@@ -7331,6 +7378,159 @@ void test_action_tagged_union_constructs_each_payload_without_identity_loss() {
     assert(grace.kind == Kind::kBleRouteReleaseGrace);
 }
 
+void test_profile_restart_hidden_and_exact_incarnation() {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    using Operation = hid_control_executor::ControlOperation;
+    using Action = hid_control_executor::Controller::Action;
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    const auto first = controller.request_profile_select(ProfileId::kStandaloneMouseJustWorks);
+    assert(first.result == SelectionResult::kAccepted && !first.snapshot.active_present);
+    assert(first.snapshot.transition == SelectionTransition::kInitializing);
+    assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kBusy);
+    assert(controller.process_one_for_test());
+    assert(ble.begin_stop_calls == 1 && ble.initialize_calls == 1);
+    controller.drive_profile_selection_for_test();
+    assert(ble.initialize_calls == 1);
+    // Old stack callback claims the new generation, but cannot claim its incarnation.
+    assert(controller.signal_ble_event({.kind = Event::kSync,
+        .generation = controller.ble_snapshot().generation, .stack_incarnation = 0}));
+    assert(!controller.process_one_for_test());
+    assert(ble.stop_transaction.complete(ble.last_stop_id, ble_lifecycle::StopStatus::kStopped));
+    controller.drive_profile_selection_for_test();
+    assert(ble.initialize_calls == 2 && database.reset_calls == 1);
+    assert(ble.profile_id == ProfileId::kStandaloneMouseJustWorks && ble.stack_incarnation == 1);
+    assert(ble.advertising_calls == 1 && !controller.profile_snapshot().active_present);
+    controller.process_for_test(Action::with_ble_event({.kind = Event::kSync,
+        .generation = controller.ble_snapshot().generation, .stack_incarnation = 0}));
+    assert(!controller.profile_snapshot().active_present);
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(controller.profile_snapshot().active_present);
+    assert(controller.profile_snapshot().selected == ProfileId::kStandaloneMouseJustWorks);
+    assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kIdle);
+    assert(controller.ble_snapshot().desired == ble_lifecycle::DesiredExposure::kHidden);
+    assert(ble.advertising_calls == 1);
+    assert(runtime.state_machine().route_snapshot().active == hid_route::OutputRoute::kNone);
+    assert(controller.active_operation_for_test() == Operation::kNone);
+    const auto second = controller.request_profile_select(ProfileId::kStrictComposite);
+    assert(second.result == SelectionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    // A delayed action from the previous selection cannot release this owner.
+    controller.process_for_test(Action::with_operation(
+        hid_control_executor::Controller::ActionKind::kProfileSelect, Operation::kProfileSelection, 1));
+    assert(controller.active_operation_for_test() == Operation::kProfileSelection);
+    assert(ble.begin_stop_calls == 2 && ble.initialize_calls == 2);
+    assert(ble.stop_transaction.complete(ble.last_stop_id, ble_lifecycle::StopStatus::kStopped));
+    controller.drive_profile_selection_for_test();
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(controller.profile_snapshot().selected == ProfileId::kStrictComposite);
+    assert(controller.profile_snapshot().active_present && ble.stack_incarnation == 2);
+    assert(ble.initialize_calls == 3 && ble.advertising_calls == 1);
+}
+
+void test_profile_restart_failure_and_deadline_matrix() {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    for (unsigned failure = 0; failure < 8; ++failure) {
+        hid_runtime::Runtime runtime;
+        FakeBackend usb;
+        FakeBleBackend ble;
+        FakeBleDatabase database;
+        hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime, &usb, &ble, &database));
+        assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+        assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        ble.stop_start_failure = failure == 0;
+        assert(controller.request_profile_select(ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        if (failure == 1) {
+            assert(ble.stop_transaction.complete(ble.last_stop_id, ble_lifecycle::StopStatus::kHostStopFailure));
+        } else if (failure > 1) {
+            if (failure != 2)
+                assert(ble.stop_transaction.complete(ble.last_stop_id, ble_lifecycle::StopStatus::kStopped));
+            if (failure == 2 || failure == 3) ble.now_us = 5'000'000;
+            if (failure == 4) ble.initialize_result = -73;
+            if (failure == 5) database.validate_result = -74;
+        }
+        controller.drive_profile_selection_for_test();
+        if (failure == 2)
+            assert(!ble.stop_transaction.complete(ble.last_stop_id, ble_lifecycle::StopStatus::kStopped));
+        if (failure == 5) {
+            assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+        }
+        if (failure >= 6) {
+            ble.now_us = 10'000'000;
+            if (failure == 6) controller.drive_profile_selection_for_test();
+            assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+        }
+        assert(controller.profile_snapshot().transition == SelectionTransition::kFault);
+        assert(!controller.profile_snapshot().active_present);
+        assert(controller.ble_snapshot().desired == ble_lifecycle::DesiredExposure::kHidden);
+        assert(controller.ble_snapshot().recovery_required);
+        assert(controller.active_operation_for_test() == hid_control_executor::ControlOperation::kNone);
+        assert(controller.request_profile_select(ProfileId::kStrictComposite).result == SelectionResult::kBusy);
+        assert(ble.advertising_calls == 1);
+        assert(ble.initialize_calls == (failure >= 4 ? 2 : 1));
+        assert(runtime.state_machine().route_snapshot().active == hid_route::OutputRoute::kNone);
+    }
+}
+
+void test_cold_mouse_profile_capability_consumption() {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_profile_select(ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.initialize_calls == 0 && ble.begin_stop_calls == 0);
+    assert(controller.profile_snapshot().transition == SelectionTransition::kStable);
+    assert(!controller.profile_snapshot().active_present);
+    assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    assert(ble.event(Event::kConnect, 4)); assert(controller.process_one_for_test());
+    make_security_ready(ble);
+    ble.security_link.authenticated = false;
+    ble.security_persisted.our.authenticated = ble.security_persisted.peer.authenticated = false;
+    assert(ble.event(Event::kEncryptionChange, 4)); assert(controller.process_one_for_test());
+    assert(controller.signal_ble_event({.kind = Event::kSubscription,
+        .generation = controller.ble_snapshot().generation, .connection_handle = 4,
+        .attribute_handle = database.handles.mouse_value,
+        .hid_interface = hid_control_executor::BleHidInterface::kMouse,
+        .subscription_reason = hid_control_executor::BleSubscriptionReason::kWrite,
+        .notify_enabled = true, .stack_incarnation = 1}));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+    assert(controller.activate_ble_route_internal().action_result == hid_runtime::RouteTransitionResult::kAccepted);
+    assert(controller.route_snapshot().ready);
+    const auto authority = runtime.state_machine().ble_route_authority_snapshot();
+    assert(authority.present_roles == hid_capability::kMouseInput);
+    const std::array<std::uint8_t, 6> keys{4};
+    assert(controller.queue_ble_keyboard_report(0, keys) == hid_runtime::KeyboardReportBeginResult::kUnsupportedOperation);
+    assert(database.notify_calls == 0);
+    assert(controller.route_snapshot().ready);
+    assert(controller.queue_ble_mouse_report(1, 0, 0, 0, 0) == hid_runtime::MouseReportBeginResult::kPublished);
+    assert(controller.process_one_for_test());
+    assert(database.notify_calls == 1 && database.last_characteristic == database.handles.mouse_value);
+}
+
 void test_strict_profile_selection_quiescence_and_status() {
     hid_runtime::Runtime runtime;
     FakeBackend usb;
@@ -7343,6 +7543,10 @@ void test_strict_profile_selection_quiescence_and_status() {
     assert(!controller.profile_snapshot().active_present);
     assert(controller.request_profile_select(ProfileId::kStrictComposite).result == SelectionResult::kNoOp);
     assert(ble.initialize_calls == 0);
+    controller.set_stack_incarnation_for_test(UINT32_MAX);
+    assert(controller.request_profile_select(ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kBusy);
+    assert(controller.profile_snapshot().selected == ProfileId::kStrictComposite);
+    controller.set_stack_incarnation_for_test(0);
     assert(controller.request_profile_select(static_cast<ProfileId>(255)).result == SelectionResult::kBusy);
     assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
     assert(controller.profile_snapshot().transition == SelectionTransition::kInitializing);
@@ -7363,6 +7567,9 @@ void test_strict_profile_selection_quiescence_and_status() {
 
 int main(int argc, char **argv) {
     test_strict_profile_selection_quiescence_and_status();
+    test_profile_restart_hidden_and_exact_incarnation();
+    test_profile_restart_failure_and_deadline_matrix();
+    test_cold_mouse_profile_capability_consumption();
     if (argc == 2 &&
         std::string_view(argv[1]) == "--controller-grace-authority-only") {
         test_controller_grace_authority_closes_both_replacement_windows();

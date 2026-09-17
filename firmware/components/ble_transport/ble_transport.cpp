@@ -36,8 +36,6 @@ extern "C" void ble_store_config_init(void);
 
 namespace ble_transport {
 namespace {
-inline constexpr const auto &kStrictProfile =
-    ble_fixture_profile::strict_composite();
 constexpr char kDeviceName[] = "s3-hidbot";
 constexpr std::uint16_t kHidAppearance = 0x03c0;
 constexpr std::uint16_t kAdvertisingInterval = 64;  // 40 ms in 0.625-ms units.
@@ -585,6 +583,8 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     database_ = database;
     generation_.store(generation, std::memory_order_release);
     if (database_ != nullptr) {
+        if (!database_->configure_profile(profile_->id)) return ESP_ERR_INVALID_STATE;
+        database_->set_stack_incarnation(stack_incarnation_);
         database_->bind_event_sink(sink_);
         database_->set_generation(generation);
     }
@@ -614,7 +614,7 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     }
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
-    const auto &smp = kStrictProfile.smp;
+    const auto &smp = profile_->smp;
     ble_hs_cfg.sm_io_cap = nimble_io_capability(smp.io_capability);
     ble_hs_cfg.sm_bonding = smp.bonding;
     ble_hs_cfg.sm_mitm = smp.mitm;
@@ -754,6 +754,17 @@ void Backend::host_task(void *) {
     vTaskDelete(nullptr);
 }
 
+bool Backend::configure_profile(ble_fixture_profile::ProfileId id,
+                                 std::uint32_t incarnation) {
+    if (initialized_ || instance_ != nullptr ||
+        !stop_transaction_.initialization_allowed()) return false;
+    const auto *definition = ble_fixture_profile::find_definition(id);
+    if (definition == nullptr) return false;
+    profile_ = definition;
+    stack_incarnation_ = incarnation;
+    return true;
+}
+
 std::uint64_t Backend::begin_stop() {
     if (!stop_transaction_.initialization_allowed() ||
         !initialized_ || instance_ != this || persistent_store_failure_observed() ||
@@ -883,7 +894,7 @@ void Backend::timeout_callback(void *context) {
 void Backend::pairing_timeout_callback(void *context) {
     auto *backend = static_cast<Backend *>(context);
     if (backend != nullptr && backend->sink_ != nullptr) {
-        (void)backend->sink_->signal_ble_event({
+        (void)backend->signal_event({
             .kind = hid_control_executor::BleEventKind::kPairingTimeout,
             .generation = backend->pairing_timer_generation_.load(
                 std::memory_order_acquire),
@@ -922,9 +933,14 @@ void Backend::cancel_timeout(LifecycleTimeoutPurpose purpose) {
     (void)timeout_ownership_.complete_cancel(purpose);
 }
 
+bool Backend::signal_event(hid_control_executor::BleEvent event) {
+    event.stack_incarnation = stack_incarnation_;
+    return sink_ != nullptr && sink_->signal_ble_event(event);
+}
+
 bool Backend::signal(hid_control_executor::BleEventKind kind,
                      std::uint16_t connection_handle, std::int32_t status) {
-    return sink_ != nullptr && sink_->signal_ble_event({
+    return sink_ != nullptr && signal_event({
                                    .kind = kind,
                                    .generation = generation_.load(
                                        std::memory_order_acquire),
@@ -991,7 +1007,7 @@ void Backend::on_reset(int reason) {
         const std::int32_t timeout_result = instance_->arm_timeout(
             kSyncTimeoutUs, LifecycleTimeoutPurpose::kSync);
         if (instance_->sink_ != nullptr) {
-            const bool published = instance_->sink_->signal_ble_event({
+            const bool published = instance_->signal_event({
                 .kind = hid_control_executor::BleEventKind::kReset,
                 .generation = retired,
                 .connection_handle = ble_lifecycle::kNoConnection,
@@ -1059,7 +1075,7 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
             return BLE_GAP_REPEAT_PAIRING_IGNORE;
         case BLE_GAP_EVENT_AUTHORIZE: {
             ble_gap_conn_desc descriptor{};
-            const auto &attributes = kStrictProfile.attributes;
+            const auto &attributes = backend->profile_->attributes;
             const bool accepted =
                 ble_gap_conn_find(event->authorize.conn_handle, &descriptor) ==
                     0 &&
@@ -1101,7 +1117,7 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                             std::memory_order_acquire) &&
                     reason !=
                         hid_control_executor::BleSubscriptionReason::kUnknown) {
-                    (void)backend->sink_->signal_ble_event({
+                    (void)backend->signal_event({
                         .kind = hid_control_executor::BleEventKind::
                             kServiceChangedSubscription,
                         .generation = generation,
@@ -1123,7 +1139,7 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 }
                 if (interface != hid_control_executor::BleHidInterface::kUnknown &&
                     reason != hid_control_executor::BleSubscriptionReason::kUnknown) {
-                    (void)backend->sink_->signal_ble_event({
+                    (void)backend->signal_event({
                         .kind = hid_control_executor::BleEventKind::kSubscription,
                         .generation = generation,
                         .connection_handle = event->subscribe.conn_handle,
@@ -1319,7 +1335,7 @@ void Backend::begin_security(ble_lifecycle::Generation generation,
     identity_resolved_.store(false, std::memory_order_release);
     gatt_schema_current_.store(false, std::memory_order_release);
     security_inhibit_.begin_connection(generation, connection_handle);
-    security_.begin_connection(generation, connection_handle);
+    security_.begin_connection(generation, connection_handle, true, profile_->id);
 }
 
 void Backend::retire_security(ble_lifecycle::Generation generation,
@@ -1817,7 +1833,7 @@ void Backend::observe_store_failure(ble_security::StoreFailureKind kind,
     (void)security_inhibit_.inhibit(generation, connection_handle,
                                     persistent_store_unhealthy);
     if (sink_ != nullptr) {
-        (void)sink_->signal_ble_event({
+        (void)signal_event({
             .kind = persistent_store_unhealthy
                         ? hid_control_executor::BleEventKind::kStorageFailure
                         : hid_control_executor::BleEventKind::kStoreFull,

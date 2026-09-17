@@ -23,6 +23,8 @@ class Backend final : public hid_control_executor::BleBackend {
     std::int32_t initialize(hid_control_executor::BleEventSink *sink,
                             hid_control_executor::BleDatabase *database,
                             ble_lifecycle::Generation generation) override;
+    bool configure_profile(ble_fixture_profile::ProfileId id,
+                            std::uint32_t incarnation) override;
     std::uint64_t begin_stop() override;
     ble_lifecycle::StopStatus poll_stop(std::uint64_t id) const override;
     void expire_stop(std::uint64_t id) override;
@@ -97,6 +99,7 @@ class Backend final : public hid_control_executor::BleBackend {
   private:
     using LifecycleTimeoutPurpose = detail::LifecycleWatchdogPurpose;
 
+    bool signal_event(hid_control_executor::BleEvent event);
     bool signal(hid_control_executor::BleEventKind kind,
                 std::uint16_t connection_handle, std::int32_t status);
     static void host_task(void *context);
@@ -143,6 +146,9 @@ class Backend final : public hid_control_executor::BleBackend {
     ble_store_delete_fn *original_store_delete_ = nullptr;
     std::uint8_t own_address_type_ = 0;
     bool initialized_ = false;
+    const ble_fixture_profile::ProfileDefinition *profile_ =
+        &ble_fixture_profile::kStrictComposite;
+    std::uint32_t stack_incarnation_ = 0;
     esp_timer_handle_t timeout_timer_ = nullptr;
     detail::LifecycleWatchdogOwnership timeout_ownership_{};
     esp_timer_handle_t pairing_timer_ = nullptr;

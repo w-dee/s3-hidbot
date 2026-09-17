@@ -249,6 +249,7 @@ struct BleEvent {
     bool notify_enabled = false;
     bool indicate_enabled = false;
     bool suspended = false;
+    std::uint32_t stack_incarnation = 0;
 };
 
 class BleEventSink {
@@ -276,6 +277,7 @@ class BleDatabase {
         return id == ble_fixture_profile::ProfileId::kStrictComposite;
     }
     virtual void reset_after_stop() {}
+    virtual void set_stack_incarnation(std::uint32_t) {}
     virtual int register_database() = 0;
     // Called only after the NimBLE GATT server has started. A zero result is
     // required before any project HID advertisement may become visible.
@@ -304,6 +306,10 @@ class BleBackend {
                                     ble_lifecycle::Generation generation) = 0;
     // Stop is asynchronous and exact-owner scoped. No worker result alone
     // permits reinitialization; the serialized owner must consume proven stop.
+    virtual bool configure_profile(ble_fixture_profile::ProfileId id,
+                                    std::uint32_t) {
+        return id == ble_fixture_profile::ProfileId::kStrictComposite;
+    }
     virtual std::uint64_t begin_stop() { return 0; }
     virtual ble_lifecycle::StopStatus poll_stop(std::uint64_t) const {
         return ble_lifecycle::StopStatus::kWrongOwner;
@@ -434,6 +440,7 @@ class Controller final : public usb_lifecycle::Executor,
         kRouteRelease,
         kBleEnable,
         kBleDisable,
+        kProfileSelect,
         kBleEvent,
         kRouteBleActivate,
         kPairingStatus,
@@ -647,6 +654,8 @@ class Controller final : public usb_lifecycle::Executor,
     void set_ble_grace_signal_hook_for_test(BleGraceSignalPhase phase,
                                             BleGraceSignalHook hook);
     void set_ble_generation_for_test(ble_lifecycle::Generation generation);
+    void drive_profile_selection_for_test();
+    void set_stack_incarnation_for_test(std::uint32_t value);
     ControlOperation active_operation_for_test() const;
     bool reserve_operation_for_test(ControlOperation operation);
     void release_operation_for_test(ControlOperation operation);
@@ -758,6 +767,9 @@ class Controller final : public usb_lifecycle::Executor,
     };
 
     void process(Action action);
+    void drive_profile_selection();
+    const ble_fixture_profile::ProfileDefinition &selected_profile() const;
+    void publish_profile(bool active, ble_fixture_profile::SelectionTransition transition);
     bool enqueue(Action action);
     void request_executor_wake();
     void request_executor_wake_from_isr();
@@ -848,6 +860,12 @@ class Controller final : public usb_lifecycle::Executor,
     BleDatabase *ble_database_ = nullptr;
     UsbLinkStallSink usb_link_stall_sink_ = nullptr;
     ble_lifecycle::StateMachine ble_state_{};
+    // Profile ID, active presence and transition are one coherent word.
+    std::atomic<std::uint32_t> profile_word_{0};
+    // Separate nonreused callback incarnation; saturates at UINT32_MAX.
+    std::atomic<std::uint32_t> ble_stack_incarnation_{0};
+    std::uint64_t profile_stop_id_ = 0;
+    std::uint64_t profile_deadline_us_ = 0;
     // Protected by the short DLE admission critical section, never across HCI.
     void observe_dle_event(BleEvent event);
     bool claim_dle(BleEvent event);

@@ -20,8 +20,20 @@
 namespace hid_control_executor {
 namespace {
 
-inline constexpr const auto &kStrictProfile =
-    ble_fixture_profile::strict_composite();
+bool profile_handles_valid(const ble_fixture_profile::ProfileDefinition &profile,
+                            BleHidHandles handles) {
+    const hid_capability::ReportHandles reports{
+        .values = {handles.keyboard_value, handles.mouse_value, 0}};
+    if (!hid_capability::input_route_definition_valid(profile.supported_reports,
+            profile.required_input_subscriptions, reports) ||
+        handles.report_map_value == 0 || handles.control_point_value == 0 ||
+        handles.report_map_value == handles.control_point_value) return false;
+    for (const auto handle : reports.values) {
+        if (handle != 0 && (handle == handles.report_map_value ||
+                           handle == handles.control_point_value)) return false;
+    }
+    return true;
+}
 
 ble_fixture_profile::ReportMask subscription_mask(
     const BleHidPeerSnapshot &peer) {
@@ -331,27 +343,45 @@ bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
     return true;
 }
 
+const ble_fixture_profile::ProfileDefinition &Controller::selected_profile() const {
+    const auto id = static_cast<ble_fixture_profile::ProfileId>(
+        profile_word_.load(std::memory_order_acquire) & 0xffU);
+    return *ble_fixture_profile::find_definition(id);
+}
+
+void Controller::publish_profile(bool active,
+                                 ble_fixture_profile::SelectionTransition transition) {
+    const auto id = profile_word_.load(std::memory_order_acquire) & 0xffU;
+    profile_word_.store(id | (active ? 0x100U : 0U) |
+        (static_cast<std::uint32_t>(transition) << 9), std::memory_order_release);
+}
+
 ble_fixture_profile::SelectionSnapshot Controller::profile_snapshot() const {
+    const auto word = profile_word_.load(std::memory_order_acquire);
+    const auto id = static_cast<ble_fixture_profile::ProfileId>(word & 0xffU);
     const auto lifecycle = ble_state_.snapshot();
     using Transition = ble_fixture_profile::SelectionTransition;
-    return {.selected = ble_fixture_profile::ProfileId::kStrictComposite,
-            .active = ble_fixture_profile::ProfileId::kStrictComposite,
-            .active_present = lifecycle.stack_ready && !lifecycle.recovery_required,
-            .transition = lifecycle.recovery_required ? Transition::kFault
-                : !lifecycle.stack_ready &&
-                  lifecycle.observed == ble_lifecycle::ObservedState::kEnabling
-                    ? Transition::kInitializing : Transition::kStable};
+    auto transition = static_cast<Transition>(word >> 9);
+    if (lifecycle.recovery_required) transition = Transition::kFault;
+    else if (!lifecycle.stack_ready &&
+             lifecycle.observed == ble_lifecycle::ObservedState::kEnabling)
+        transition = Transition::kInitializing;
+    return {.selected = id, .active = id,
+            .active_present = (word & 0x100U) != 0 && lifecycle.stack_ready &&
+                              transition == Transition::kStable,
+            .transition = transition};
 }
 
 ble_fixture_profile::SelectionOutcome Controller::request_profile_select(
     ble_fixture_profile::ProfileId id) {
-    // The first public catalog contains only the existing strict definition.
-    // Even a no-op selection observes the future switch quiescence contract.
+    // The wire parser additionally restricts requests to the public catalog.
+    // Internal reviewed definitions can exercise this path before exposure.
     constexpr auto operation = ControlOperation::kProfileSelection;
+    using Transition = ble_fixture_profile::SelectionTransition;
+    using Result = ble_fixture_profile::SelectionResult;
     if (!initialized_ || runtime_ == nullptr || ble_backend_ == nullptr ||
-        ble_fixture_profile::find_profile(id) == nullptr || !claim_operation(operation)) {
-        return {};
-    }
+        ble_database_ == nullptr || ble_fixture_profile::find_definition(id) == nullptr ||
+        !claim_operation(operation)) return {};
     const auto route = runtime_->state_machine().route_snapshot();
     const auto lifecycle = ble_state_.snapshot();
     const auto pairing = pairing_state_.snapshot();
@@ -366,11 +396,68 @@ ble_fixture_profile::SelectionOutcome Controller::request_profile_select(
          lifecycle.observed == ble_lifecycle::ObservedState::kIdle) &&
         pairing.coherent && !pairing.pairing_active &&
         pairing.live_state == ble_pairing::LiveState::kIdle;
-    const auto snapshot = profile_snapshot();
-    release_operation(operation);
-    return {.result = quiescent ? ble_fixture_profile::SelectionResult::kNoOp
-                               : ble_fixture_profile::SelectionResult::kBusy,
-            .snapshot = snapshot};
+    const auto before = profile_snapshot();
+    if (!quiescent || id == before.selected) {
+        release_operation(operation);
+        return {.result = quiescent ? Result::kNoOp : Result::kBusy, .snapshot = before};
+    }
+    const auto old_incarnation = ble_stack_incarnation_.load(std::memory_order_acquire);
+    if (old_incarnation == UINT32_MAX ||
+        (lifecycle.stack_ready && !ble_state_.begin_hidden_restart())) {
+        release_operation(operation);
+        return {};
+    }
+    const auto incarnation = old_incarnation + 1U;
+    ble_stack_incarnation_.store(incarnation, std::memory_order_release);
+    profile_word_.store(static_cast<std::uint32_t>(id) |
+        (static_cast<std::uint32_t>(Transition::kInitializing) << 9),
+        std::memory_order_release);
+    if (!enqueue(Action::with_operation(ActionKind::kProfileSelect, operation, incarnation))) {
+        ble_state_.complete_fault(ble_state_.generation(),
+                                  ble_lifecycle::Operation::kRuntime, -1);
+        publish_profile(false, Transition::kFault);
+        release_operation(operation);
+        return {.result = Result::kBusy, .snapshot = profile_snapshot()};
+    }
+    return {.result = Result::kAccepted, .snapshot = profile_snapshot()};
+}
+
+void Controller::drive_profile_selection() {
+    constexpr auto operation = ControlOperation::kProfileSelection;
+    if (active_operation_.load(std::memory_order_acquire) != operation ||
+        profile_deadline_us_ == 0) return;
+    const auto current = ble_state_.snapshot();
+    const auto now = ble_backend_->monotonic_time_us();
+    if (current.recovery_required || now >= profile_deadline_us_) {
+        fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -4, operation);
+        return;
+    }
+    if (profile_stop_id_ == 0) return; // Waiting for exact new-stack Sync.
+    const auto status = ble_backend_->poll_stop(profile_stop_id_);
+    if (status == ble_lifecycle::StopStatus::kRunning) return;
+    if (status != ble_lifecycle::StopStatus::kStopped ||
+        !ble_backend_->finish_stop(profile_stop_id_)) {
+        fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -5, operation);
+        return;
+    }
+    profile_stop_id_ = 0;
+    {
+        // Proven old host/timer stop also retires callback-side DLE history.
+        DleLock lock;
+        dle_seen_ = false;
+        dle_available_ = false;
+    }
+    const auto &profile = selected_profile();
+    if (!ble_state_.begin_hidden_initialization(current.generation) ||
+        !ble_backend_->configure_profile(profile.id,
+            ble_stack_incarnation_.load(std::memory_order_acquire))) {
+        fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -6, operation);
+        return;
+    }
+    profile_deadline_us_ = now + 10'000'000;
+    const auto result = ble_backend_->initialize(this, ble_database_, current.generation);
+    if (result != 0) fail_ble(current.generation, ble_lifecycle::Operation::kRuntime,
+                              result, operation);
 }
 
 BleCommandOutcome Controller::request_ble_enable() {
@@ -446,7 +533,7 @@ bool Controller::ble_link_ready() const {
         ble_lifecycle_handoff_failure_.load(std::memory_order_acquire) ||
         !ble_hid_peer_.active || ble_hid_peer_.suspended ||
         !ble_fixture_profile::subscriptions_ready(
-            kStrictProfile, subscription_mask(ble_hid_peer_))) {
+            selected_profile(), subscription_mask(ble_hid_peer_))) {
         return false;
     }
     const auto lifecycle = ble_state_.snapshot();
@@ -460,8 +547,7 @@ bool Controller::ble_link_ready() const {
            lifecycle.observed == ble_lifecycle::ObservedState::kConnected &&
            lifecycle.connected && !lifecycle.recovery_required &&
            ble_state_.connection_handle() == ble_hid_peer_.connection_handle &&
-           handles.keyboard_value != 0 && handles.mouse_value != 0 &&
-           handles.control_point_value != 0 &&
+           profile_handles_valid(selected_profile(), handles) &&
            handles.keyboard_value == ble_hid_peer_.handles.keyboard_value &&
            handles.mouse_value == ble_hid_peer_.handles.mouse_value &&
            handles.control_point_value ==
@@ -666,6 +752,8 @@ bool Controller::claim_dle(BleEvent event) {
 }
 
 bool Controller::signal_ble_event(BleEvent event) {
+    if (event.stack_incarnation != ble_stack_incarnation_.load(std::memory_order_acquire))
+        return true; // Retired stack: already safely consumed, no fallback needed.
     observe_dle_event(event);
     const bool loses_current_route =
         event_immediately_loses_ble_hid_readiness(event) &&
@@ -975,8 +1063,8 @@ RouteCommandOutcome Controller::activate_ble_route() {
         .expected_route_generation = route.generation,
         .ble_generation = peer.generation,
         .connection_handle = peer.connection_handle,
-        .present_roles = hid_capability::kInputRoles,
-        .required_input_subscriptions = hid_capability::kInputRoles,
+        .present_roles = selected_profile().supported_reports,
+        .required_input_subscriptions = selected_profile().required_input_subscriptions,
         .report_handles = {.values = {
             peer.handles.keyboard_value,
             peer.handles.mouse_value,
@@ -1022,9 +1110,9 @@ bool Controller::ble_route_ready() const {
            state.ble_route_normal_authority_matches(authority) &&
            peer.generation == authority.ble_generation &&
            peer.connection_handle == authority.connection_handle &&
-           authority.present_roles == hid_capability::kInputRoles &&
+           authority.present_roles == selected_profile().supported_reports &&
            authority.required_input_subscriptions ==
-               hid_capability::kInputRoles &&
+               selected_profile().required_input_subscriptions &&
            peer.handles.keyboard_value ==
                authority.report_handles.get(
                    hid_runtime::ReportRole::kKeyboardInput) &&
@@ -1182,19 +1270,7 @@ void Controller::begin_ble_hid_peer(
         return;
     }
     const auto handles = ble_database_->hid_handles();
-    if (!ble_fixture_profile::reports_present(
-            kStrictProfile, kStrictProfile.required_input_subscriptions) ||
-        handles.report_map_value == 0 || handles.keyboard_value == 0 ||
-        handles.mouse_value == 0 ||
-        handles.control_point_value == 0 ||
-        handles.report_map_value == handles.keyboard_value ||
-        handles.report_map_value == handles.mouse_value ||
-        handles.report_map_value == handles.control_point_value ||
-        handles.keyboard_value == handles.mouse_value ||
-        handles.keyboard_value == handles.control_point_value ||
-        handles.mouse_value == handles.control_point_value) {
-        return;
-    }
+    if (!profile_handles_valid(selected_profile(), handles)) return;
     ble_hid_peer_ = {
         .generation = generation,
         .connection_handle = connection_handle,
@@ -1271,7 +1347,7 @@ bool Controller::ble_hid_interface_ready(
                                 ? ble_hid_peer_.keyboard_notify_enabled
                                 : ble_hid_peer_.mouse_notify_enabled;
     return ble_fixture_profile::reports_present(
-               kStrictProfile, ble_fixture_profile::report_bit(role)) &&
+               selected_profile(), ble_fixture_profile::report_bit(role)) &&
            current_handle == identity.characteristic_handle && subscribed &&
            lifecycle.generation == identity.generation &&
            lifecycle.desired == ble_lifecycle::DesiredExposure::kExposed &&
@@ -2225,12 +2301,42 @@ void Controller::process(Action action) {
     }
     if (action.kind == ActionKind::kBleEvent) {
         const BleEvent event = action.payload.ble_event.event;
+        if (event.stack_incarnation != ble_stack_incarnation_.load(std::memory_order_acquire))
+            return;
         complete_ble_route_release_on_disconnect(event);
         process_ble_event(event);
         if (event_immediately_loses_ble_hid_readiness(event)) {
             clear_ble_route_loss(event.generation);
         }
         retire_ble_route_if_unready();
+        return;
+    }
+    if (action.kind == ActionKind::kProfileSelect) {
+        constexpr auto operation = ControlOperation::kProfileSelection;
+        if (active_operation_.load(std::memory_order_acquire) != operation ||
+            action.payload.operation.mailbox_token !=
+                ble_stack_incarnation_.load(std::memory_order_acquire)) return;
+        clear_ble_hid_peer();
+        const auto current = ble_state_.snapshot();
+        if (current.recovery_required ||
+            !runtime_->state_machine().profile_switch_quiescent()) {
+            fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -7, operation);
+            return;
+        }
+        if (current.observed == ble_lifecycle::ObservedState::kUninitialized) {
+            publish_profile(false, ble_fixture_profile::SelectionTransition::kStable);
+            release_operation(operation);
+            return;
+        }
+        if (current.observed != ble_lifecycle::ObservedState::kDisabling ||
+            current.desired != ble_lifecycle::DesiredExposure::kHidden) {
+            fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -8, operation);
+            return;
+        }
+        profile_deadline_us_ = ble_backend_->monotonic_time_us() + 5'000'000;
+        profile_stop_id_ = ble_backend_->begin_stop();
+        if (profile_stop_id_ == 0)
+            fail_ble(current.generation, ble_lifecycle::Operation::kRuntime, -9, operation);
         return;
     }
     if (action.kind == ActionKind::kBleEnable) {
@@ -2246,6 +2352,11 @@ void Controller::process(Action action) {
         if (!current.stack_ready) {
             ble_backend_->record_heap_checkpoint(
                 BleBackend::HeapCheckpoint::kBeforeFirstEnable);
+            if (!ble_backend_->configure_profile(selected_profile().id,
+                    ble_stack_incarnation_.load(std::memory_order_acquire))) {
+                fail_ble(current.generation, ble_lifecycle::Operation::kEnable, -6, operation);
+                return;
+            }
             const std::int32_t result = ble_backend_->initialize(
                 this, ble_database_, current.generation);
             if (result != 0) {
@@ -2445,6 +2556,12 @@ void Controller::fail_ble(ble_lifecycle::Generation generation,
                           ble_lifecycle::Operation operation, std::int32_t code,
                           ControlOperation owner) {
     const bool current_generation = generation == ble_state_.generation();
+    if (current_generation && owner == ControlOperation::kProfileSelection) {
+        if (profile_stop_id_ != 0) ble_backend_->expire_stop(profile_stop_id_);
+        profile_stop_id_ = 0;
+        profile_deadline_us_ = 0;
+        publish_profile(false, ble_fixture_profile::SelectionTransition::kFault);
+    }
     ble_state_.complete_fault(generation, operation, code);
     if (current_generation) {
         clear_ble_hid_peer();
@@ -2490,6 +2607,8 @@ void Controller::commit_persistent_store_failure(
 }
 
 bool Controller::event_targets_current_ble_authority(BleEvent event) const {
+    if (event.stack_incarnation != ble_stack_incarnation_.load(std::memory_order_acquire))
+        return false;
     const auto generation = ble_state_.generation();
     if (event.generation != generation) {
         return false;
@@ -2897,7 +3016,7 @@ void Controller::reconcile_security(std::uint16_t connection_handle,
     if (terminal_evidence_ready && pairing_complete_seen_ &&
         security.coherent && security.connected && security.encrypted &&
         security.identity_resolved && security.store_healthy) {
-        const auto &policy = kStrictProfile.security;
+        const auto &policy = selected_profile().security;
         if (security.authenticated != policy.authenticated ||
             security.key_size != policy.key_size ||
             (policy.secure_connections_required &&
@@ -3127,11 +3246,33 @@ bool Controller::reconcile_ble_disconnect(BleEvent event, bool expected) {
 }
 
 void Controller::process_ble_event(BleEvent event) {
+    if (event.stack_incarnation != ble_stack_incarnation_.load(std::memory_order_acquire)) return;
     if (ble_backend_ == nullptr) {
         return;
     }
     switch (event.kind) {
         case BleEventKind::kSync: {
+            if (active_operation_.load(std::memory_order_acquire) ==
+                    ControlOperation::kProfileSelection) {
+                const auto current = ble_state_.snapshot();
+                if (event.generation != current.generation ||
+                    current.observed != ble_lifecycle::ObservedState::kEnabling ||
+                    current.desired != ble_lifecycle::DesiredExposure::kHidden) return;
+                if (ble_backend_->monotonic_time_us() >= profile_deadline_us_ ||
+                    ble_backend_->persistent_store_failure_observed() ||
+                    ble_database_ == nullptr ||
+                    ble_database_->validate_registered_database() != 0 ||
+                    !ble_state_.complete_hidden_sync(event.generation)) {
+                    fail_ble(event.generation, ble_lifecycle::Operation::kRuntime,
+                             -10, ControlOperation::kProfileSelection);
+                    return;
+                }
+                profile_deadline_us_ = 0;
+                publish_profile(true, ble_fixture_profile::SelectionTransition::kStable);
+                ble_backend_->record_heap_checkpoint(BleBackend::HeapCheckpoint::kHiddenIdle);
+                release_operation(ControlOperation::kProfileSelection);
+                return;
+            }
             if (!ble_state_.complete_sync(event.generation)) {
                 return;
             }
@@ -3141,6 +3282,7 @@ void Controller::process_ble_event(BleEvent event) {
             const std::int32_t result = ble_backend_->start_advertising();
             if (result == 0) {
                 ble_state_.complete_advertising(event.generation);
+                publish_profile(true, ble_fixture_profile::SelectionTransition::kStable);
                 ble_backend_->record_heap_checkpoint(
                     BleBackend::HeapCheckpoint::kAdvertising);
                 const ControlOperation owner =
@@ -3415,6 +3557,7 @@ bool Controller::process_wake_cycle_for_test() {
     (void)reconcile_ble_fallbacks(nullptr);
     drive_ble_explicit_release();
     retire_ble_route_if_unready();
+    drive_profile_selection();
     return true;
 }
 
@@ -3460,6 +3603,11 @@ void Controller::set_ble_grace_signal_hook_for_test(
 void Controller::set_ble_generation_for_test(
     ble_lifecycle::Generation generation) {
     ble_state_.set_generation_for_test(generation);
+}
+
+void Controller::drive_profile_selection_for_test() { drive_profile_selection(); }
+void Controller::set_stack_incarnation_for_test(std::uint32_t value) {
+    ble_stack_incarnation_.store(value, std::memory_order_release);
 }
 
 ControlOperation Controller::active_operation_for_test() const {
@@ -3546,7 +3694,8 @@ void Controller::task_loop() {
         // the queue and fallback atomics. A notification given before this
         // wait remains pending, closing the check-then-sleep race.
         const TickType_t wait_ticks =
-            usb_sof_watchdog_.armed
+            (usb_sof_watchdog_.armed || active_operation_.load(std::memory_order_acquire) ==
+                ControlOperation::kProfileSelection)
                 ? pdMS_TO_TICKS(kUsbSofWatchdogSampleMs)
                 : portMAX_DELAY;
         (void)ulTaskNotifyTake(pdTRUE, wait_ticks);
@@ -3567,6 +3716,7 @@ void Controller::task_loop() {
         (void)reconcile_ble_fallbacks(nullptr);
         drive_ble_explicit_release();
         retire_ble_route_if_unready();
+        drive_profile_selection();
     }
 }
 #endif

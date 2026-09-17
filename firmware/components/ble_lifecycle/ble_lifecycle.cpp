@@ -97,6 +97,39 @@ TransitionOutcome StateMachine::begin_disable() {
             .snapshot = snapshot()};
 }
 
+bool StateMachine::begin_hidden_restart() {
+    const auto current = snapshot();
+    if (current.desired != DesiredExposure::kHidden ||
+        current.observed != ObservedState::kIdle || !current.stack_ready ||
+        current.connected || current.advertising || current.recovery_required ||
+        current.generation == UINT32_MAX) return false;
+    advance_generation();
+    clear_error();
+    publish(DesiredExposure::kHidden, ObservedState::kDisabling,
+            false, false, false, false);
+    return true;
+}
+
+bool StateMachine::begin_hidden_initialization(Generation generation) {
+    const auto current = snapshot();
+    if (current.generation != generation || current.recovery_required ||
+        current.desired != DesiredExposure::kHidden ||
+        current.observed != ObservedState::kDisabling) return false;
+    publish(DesiredExposure::kHidden, ObservedState::kEnabling,
+            false, false, false, false);
+    return true;
+}
+
+bool StateMachine::complete_hidden_sync(Generation generation) {
+    const auto current = snapshot();
+    if (current.generation != generation || current.recovery_required ||
+        current.desired != DesiredExposure::kHidden ||
+        current.observed != ObservedState::kEnabling) return false;
+    publish(DesiredExposure::kHidden, ObservedState::kIdle,
+            true, false, false, false);
+    return true;
+}
+
 bool StateMachine::complete_sync(Generation generation) {
     const Snapshot current = snapshot();
     if (generation != current.generation ||

@@ -51,6 +51,9 @@ class StateMachine {
     StateMachine();
     TransitionOutcome begin_enable();
     TransitionOutcome begin_disable();
+    bool begin_hidden_restart();
+    bool begin_hidden_initialization(Generation generation);
+    bool complete_hidden_sync(Generation generation);
 
     bool complete_sync(Generation generation);
     bool complete_advertising(Generation generation);

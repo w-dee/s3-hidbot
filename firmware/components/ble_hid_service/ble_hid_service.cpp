@@ -155,6 +155,11 @@ bool Database::configure_profile(ble_fixture_profile::ProfileId id) {
     return true;
 }
 
+void Database::set_stack_incarnation(std::uint32_t incarnation) {
+    // Only before first registration or after proven complete host teardown.
+    if (!registered_) stack_incarnation_ = incarnation;
+}
+
 void Database::reset_after_stop() {
     registered_ = false;
     s_keyboard_value_handle = s_mouse_value_handle = 0;
@@ -311,6 +316,7 @@ bool Database::capture_control_point(std::uint16_t connection_handle,
         .connection_handle = connection_handle,
         .attribute_handle = s_control_point_value_handle,
         .suspended = suspended,
+        .stack_incarnation = stack_incarnation_,
     });
 }
 
@@ -338,6 +344,7 @@ int Database::access(std::uint16_t connection_handle,
                         std::memory_order_acquire),
                     .connection_handle = connection_handle,
                     .attribute_handle = attribute_handle,
+                    .stack_incarnation = s_database->stack_incarnation_,
                 });
             }
             return result;

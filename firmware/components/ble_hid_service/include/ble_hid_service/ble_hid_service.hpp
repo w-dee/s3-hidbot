@@ -99,6 +99,7 @@ class Database final : public hid_control_executor::BleDatabase {
   public:
     bool configure_profile(ble_fixture_profile::ProfileId id) override;
     void reset_after_stop() override;
+    void set_stack_incarnation(std::uint32_t incarnation) override;
     int register_database() override;
     int validate_registered_database() override;
     void bind_event_sink(hid_control_executor::BleEventSink *sink) override;
@@ -119,6 +120,7 @@ class Database final : public hid_control_executor::BleDatabase {
 
     const ble_fixture_profile::ProfileDefinition *profile_ = &kStrictProfile;
     bool registered_ = false;
+    std::uint32_t stack_incarnation_ = 0;
     hid_control_executor::BleEventSink *event_sink_ = nullptr;
     std::atomic<ble_lifecycle::Generation> generation_{0};
 };

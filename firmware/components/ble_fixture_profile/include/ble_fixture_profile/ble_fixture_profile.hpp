@@ -26,7 +26,7 @@ struct SelectionSnapshot {
     bool active_present = false;
     SelectionTransition transition = SelectionTransition::kStable;
 };
-enum class SelectionResult : std::uint8_t { kNoOp, kBusy };
+enum class SelectionResult : std::uint8_t { kNoOp, kAccepted, kBusy };
 struct SelectionOutcome {
     SelectionResult result = SelectionResult::kBusy;
     SelectionSnapshot snapshot{};
