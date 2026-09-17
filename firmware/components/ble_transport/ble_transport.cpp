@@ -13,6 +13,8 @@
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "host/ble_gap.h"
 #include "host/ble_esp_gap.h"
 #include "host/ble_hs.h"
@@ -570,6 +572,9 @@ Backend *Backend::instance_ = nullptr;
 std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
                                  hid_control_executor::BleDatabase *database,
                                  ble_lifecycle::Generation generation) {
+    if (!stop_transaction_.initialization_allowed()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (initialized_) {
         return 0;
     }
@@ -713,6 +718,18 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
         sink_ = nullptr;
         return result;
     }
+    if (timer_barrier_ == nullptr) {
+        const esp_timer_create_args_t barrier_args{
+            .callback = timer_barrier_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ble_stop_barrier",
+            .skip_unhandled_events = true,
+        };
+        result = esp_timer_create(&barrier_args, &timer_barrier_);
+        if (result != ESP_OK) return result;
+    }
+    host_exited_.store(false, std::memory_order_release);
     initialized_ = true;
     nimble_port_freertos_init(host_task);
     return 0;
@@ -725,7 +742,121 @@ void Backend::set_generation(ble_lifecycle::Generation generation) {
     }
 }
 
-void Backend::host_task(void *) { nimble_port_run(); }
+void Backend::host_task(void *) {
+    Backend *backend = instance_;
+    nimble_port_run();
+    // No NimBLE access follows this publication. Another task must call
+    // freertos_deinit: self-deletion inside that SDK function would skip its
+    // assignment clearing the SDK's saved task handle.
+    if (backend != nullptr) backend->host_exited_.store(true, std::memory_order_release);
+    vTaskSuspend(nullptr);
+    // Defensive: this task is never intentionally resumed.
+    vTaskDelete(nullptr);
+}
+
+std::uint64_t Backend::begin_stop() {
+    if (!stop_transaction_.initialization_allowed() ||
+        !initialized_ || instance_ != this || persistent_store_failure_observed() ||
+        current_connection_.load(std::memory_order_acquire) != ble_lifecycle::kNoConnection ||
+        ble_gap_adv_active() || ble_gap_conn_active()) return 0;
+    const auto id = stop_transaction_.begin();
+    if (id == 0) return 0;
+    stop_worker_id_ = id;
+    if (xTaskCreate(stop_task, "ble_stop", 4096, this, tskIDLE_PRIORITY + 1,
+                    nullptr) != pdPASS) {
+        (void)stop_transaction_.complete(id, ble_lifecycle::StopStatus::kTaskFailure);
+    }
+    return id;
+}
+
+ble_lifecycle::StopStatus Backend::poll_stop(std::uint64_t id) const {
+    return stop_transaction_.status(id);
+}
+
+void Backend::expire_stop(std::uint64_t id) {
+    (void)stop_transaction_.expire(id);
+}
+
+bool Backend::finish_stop(std::uint64_t id) {
+    // Only the serialized control owner consumes, resets adapter handles, and
+    // permits a later init. A late worker completion cannot undo expiry.
+    if (!stop_transaction_.consume(id)) return false;
+    initialized_ = false;
+    if (database_ != nullptr) database_->reset_after_stop();
+    instance_ = nullptr;
+    sink_ = nullptr;
+    database_ = nullptr;
+    original_store_read_ = nullptr;
+    original_store_write_ = nullptr;
+    original_store_delete_ = nullptr;
+    service_changed_value_handle_.store(0, std::memory_order_release);
+    gatt_schema_current_.store(false, std::memory_order_release);
+    identity_resolved_.store(false, std::memory_order_release);
+    return true;
+}
+
+struct Backend::StopOperations {
+    Backend &backend;
+    bool host_stop() { return nimble_port_stop() == ESP_OK; }
+    bool await_host_exit() {
+        const auto deadline = esp_timer_get_time() + 1'000'000;
+        while (!backend.host_exited_.load(std::memory_order_acquire)) {
+            if (esp_timer_get_time() >= deadline) return false;
+            vTaskDelay(1);
+        }
+        return true;
+    }
+    void delete_host_task() { nimble_port_freertos_deinit(); }
+    bool deinitialize() { return nimble_port_deinit() == ESP_OK; }
+    bool retire_timers() { return backend.retire_timers_after_stop(); }
+};
+
+void Backend::stop_task(void *context) {
+    auto &backend = *static_cast<Backend *>(context);
+    const auto id = backend.stop_worker_id_; // Immutable local owner from here.
+    StopOperations operations{backend};
+    const auto result = ble_lifecycle::run_stop_sequence(operations);
+    (void)backend.stop_transaction_.complete(id, result);
+    // No backend/context access after publication; a new cycle may begin.
+    vTaskDelete(nullptr);
+}
+
+void Backend::timer_barrier_callback(void *context) {
+    static_cast<Backend *>(context)->timer_barrier_passed_.store(
+        true, std::memory_order_release);
+}
+
+bool Backend::retire_timers_after_stop() {
+    // The host has exited and the controller is deinitialized. Retire both
+    // timer purposes before deleting their underlying handles.
+    cancel_timeout(LifecycleTimeoutPurpose::kSync);
+    cancel_timeout(LifecycleTimeoutPurpose::kDisconnect);
+    pairing_timer_id_.store(0, std::memory_order_release);
+    const auto remove = [](esp_timer_handle_t &timer) {
+        if (timer == nullptr) return true;
+        const auto stopped = esp_timer_stop(timer);
+        if (stopped != ESP_OK && stopped != ESP_ERR_INVALID_STATE) return false;
+        if (esp_timer_delete(timer) != ESP_OK) return false;
+        timer = nullptr;
+        return true;
+    };
+    bool removed = remove(timeout_timer_);
+    removed = remove(pairing_timer_) && removed;
+    for (auto &timer : route_release_timers_) removed = remove(timer) && removed;
+    if (!removed || timer_barrier_ == nullptr) return false;
+    // Pinned ESP-IDF deletes timers asynchronously in ESP_TIMER_TASK. A later
+    // timer on that same serialized dispatcher fences every preceding callback
+    // and deletion before their permanent callback contexts may be reused.
+    timer_barrier_passed_.store(false, std::memory_order_release);
+    if (esp_timer_start_once(timer_barrier_, 1) != ESP_OK) return false;
+    const auto deadline = esp_timer_get_time() + 1'000'000;
+    while (!timer_barrier_passed_.load(std::memory_order_acquire)) {
+        if (esp_timer_get_time() >= deadline) return false;
+        vTaskDelay(1);
+    }
+    return timeout_ownership_.active_purpose() == LifecycleTimeoutPurpose::kNone &&
+           route_release_grace_ownership_.all_idle();
+}
 
 void Backend::timeout_callback(void *context) {
     auto *backend = static_cast<Backend *>(context);
@@ -1011,7 +1142,8 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
 }
 
 std::int32_t Backend::start_advertising() {
-    if (!initialized_ || database_ == nullptr) {
+    if (!initialized_ || database_ == nullptr ||
+        !stop_transaction_.initialization_allowed()) {
         return ESP_ERR_INVALID_STATE;
     }
     const int database_result = database_->validate_registered_database();
@@ -1174,7 +1306,8 @@ void Backend::arm_pairing_timeout(ble_lifecycle::Generation generation,
 }
 
 void Backend::cancel_pairing_timeout() {
-    if (pairing_timer_ != nullptr && esp_timer_is_active(pairing_timer_)) {
+    if (stop_transaction_.initialization_allowed() &&
+        pairing_timer_ != nullptr && esp_timer_is_active(pairing_timer_)) {
         (void)esp_timer_stop(pairing_timer_);
     }
     pairing_timer_id_.store(0, std::memory_order_release);

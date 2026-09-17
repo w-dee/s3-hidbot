@@ -12,6 +12,7 @@
 #include "hid_route/hid_route.hpp"
 #include "hid_runtime/hid_runtime.hpp"
 #include "ble_lifecycle/ble_lifecycle.hpp"
+#include "ble_lifecycle/stop_transaction.hpp"
 #include "usb_lifecycle/usb_lifecycle.hpp"
 
 namespace hid_control_executor {
@@ -301,6 +302,14 @@ class BleBackend {
     virtual ~BleBackend() = default;
     virtual std::int32_t initialize(BleEventSink *sink, BleDatabase *database,
                                     ble_lifecycle::Generation generation) = 0;
+    // Stop is asynchronous and exact-owner scoped. No worker result alone
+    // permits reinitialization; the serialized owner must consume proven stop.
+    virtual std::uint64_t begin_stop() { return 0; }
+    virtual ble_lifecycle::StopStatus poll_stop(std::uint64_t) const {
+        return ble_lifecycle::StopStatus::kWrongOwner;
+    }
+    virtual void expire_stop(std::uint64_t) {}
+    virtual bool finish_stop(std::uint64_t) { return false; }
     virtual void set_generation(ble_lifecycle::Generation generation) = 0;
     virtual std::int32_t start_advertising() = 0;
     virtual std::int32_t stop_advertising() = 0;

@@ -23,6 +23,10 @@ class Backend final : public hid_control_executor::BleBackend {
     std::int32_t initialize(hid_control_executor::BleEventSink *sink,
                             hid_control_executor::BleDatabase *database,
                             ble_lifecycle::Generation generation) override;
+    std::uint64_t begin_stop() override;
+    ble_lifecycle::StopStatus poll_stop(std::uint64_t id) const override;
+    void expire_stop(std::uint64_t id) override;
+    bool finish_stop(std::uint64_t id) override;
     void set_generation(ble_lifecycle::Generation generation) override;
     std::int32_t start_advertising() override;
     std::int32_t stop_advertising() override;
@@ -96,6 +100,15 @@ class Backend final : public hid_control_executor::BleBackend {
     bool signal(hid_control_executor::BleEventKind kind,
                 std::uint16_t connection_handle, std::int32_t status);
     static void host_task(void *context);
+    static void stop_task(void *context);
+    static void timer_barrier_callback(void *context);
+    struct StopOperations;
+    bool retire_timers_after_stop();
+    ble_lifecycle::StopTransaction stop_transaction_{};
+    std::uint64_t stop_worker_id_ = 0;
+    std::atomic_bool host_exited_{false};
+    std::atomic_bool timer_barrier_passed_{false};
+    esp_timer_handle_t timer_barrier_ = nullptr;
     static void timeout_callback(void *context);
     static void pairing_timeout_callback(void *context);
     static void route_release_grace_callback(void *context);

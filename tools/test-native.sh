@@ -9,6 +9,7 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 "$repository_root/tools/test-usb-lifecycle.sh"
 "$repository_root/tools/test-ble-lifecycle.sh"
 "$repository_root/tools/test-ble-lifecycle-watchdog.sh"
+"$repository_root/tools/test-ble-stop-transaction.sh"
 "$repository_root/tools/test-ble-route-release-grace-ownership.sh"
 "$repository_root/tools/test-ble-fixture-profile.sh"
 "$repository_root/tools/test-ble-security.sh"

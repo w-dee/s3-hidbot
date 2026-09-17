@@ -185,6 +185,10 @@ class RouteReleaseGraceOwnership {
         }
     }
 
+    bool all_idle() const {
+        return available_slots_for_test() == kSlotCount;
+    }
+
     std::size_t available_slots_for_test() const {
         std::size_t available = 0;
         for (const Slot &slot : slots_) {

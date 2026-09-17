@@ -71,6 +71,14 @@ lifecycle validation, typed client methods, and artifact inclusion. These
 checks are software-only and perform no serial, USB, BLE, or other hardware
 access.
 
+The finite-profile restart foundation adds `tools/test-ble-stop-transaction.sh`
+to the native suite. It exercises the exact nonreused stop identity and the
+same stop/host-exit/task-delete/deinit/timer-retirement sequence consumed by the
+production worker. Failure cuts and deadline completion races cannot permit
+reinitialization. This is an internal prerequisite: the strict-only public
+catalog does not yet invoke restart, and the dedicated worker still needs the
+profile controller's deadline and physical engineering validation.
+
 ## Entrypoints
 
 `tools/test-rp-test-infra.sh` validates persistent rp-test bootstrap decisions,
