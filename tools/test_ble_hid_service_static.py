@@ -495,7 +495,13 @@ def main() -> int:
     assert "kBleMouseAllUp.data()" in release_submit.group(1)
     assert "vTaskDelay" not in release_submit.group(1)
     assert "arm_ble_route_release_grace(identity)" in executor
-    assert "ble_route_grace_due_.store(true" in executor
+    assert "ble_route_grace_authority_.find_armed(identity)" in executor
+    assert "ble_route_grace_authority_.claim(candidate)" in executor
+    assert "ble_route_grace_authority_.publish_due(claim)" in executor
+    assert "ble_route_grace_authority_.consume_due(" in executor
+    assert "BleRouteReleaseIdentity identity{}" in executor_header
+    assert "ble_route_grace_armed_" not in executor_header
+    assert "ble_route_grace_due_" not in executor_header
     assert "request_executor_wake();" in executor
     assert "route_release_timers_" in transport
     assert '"ble_route_release_0", "ble_route_release_1"' in transport

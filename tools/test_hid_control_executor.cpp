@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string_view>
 #include <utility>
 #include <functional>
 
@@ -4695,6 +4696,196 @@ void observe_exact_route_disconnect(ReadyBleRouteFixture &fixture) {
     assert(fixture.controller.process_one_for_test());
 }
 
+void reconnect_same_handle_and_begin_retirement(
+    ReadyBleRouteFixture &fixture) {
+    observe_exact_route_disconnect(fixture);
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(fixture.ble.event(hid_control_executor::BleEventKind::kConnect,
+                             fixture.connection));
+    assert(fixture.controller.process_one_for_test());
+    fixture.generation = fixture.controller.ble_snapshot().generation;
+    subscribe_composite(fixture.controller, fixture.database,
+                        fixture.generation, fixture.connection,
+                        hid_control_executor::BleSubscriptionReason::kRestore);
+    make_security_ready(fixture.ble);
+    fixture.ble.refresh_security(fixture.connection);
+    assert(fixture.controller.ble_link_ready());
+    assert(fixture.controller.activate_ble_route_internal().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    begin_explicit_ble_route_retirement(fixture);
+}
+
+ReadyBleRouteFixture *s_grace_race_fixture = nullptr;
+
+void replace_grace_retirement_with_same_handle(
+    hid_control_executor::Controller &controller) {
+    assert(s_grace_race_fixture != nullptr);
+    assert(&s_grace_race_fixture->controller == &controller);
+    reconnect_same_handle_and_begin_retirement(*s_grace_race_fixture);
+}
+
+void assert_maximally_equal_numeric_release_fields(
+    hid_control_executor::BleRouteReleaseIdentity old_identity,
+    hid_control_executor::BleRouteReleaseIdentity new_identity) {
+    assert(old_identity.connection_handle == new_identity.connection_handle);
+    assert(old_identity.present_roles == new_identity.present_roles);
+    assert(old_identity.required_input_subscriptions ==
+           new_identity.required_input_subscriptions);
+    assert(old_identity.report_handles.values ==
+           new_identity.report_handles.values);
+    assert(old_identity.authority_epoch != new_identity.authority_epoch ||
+           old_identity.route_generation != new_identity.route_generation ||
+           old_identity.profile_activation_epoch !=
+               new_identity.profile_activation_epoch ||
+           old_identity.ble_generation != new_identity.ble_generation ||
+           old_identity.release_epoch != new_identity.release_epoch);
+}
+
+void test_controller_grace_authority_closes_both_replacement_windows() {
+    using Phase =
+        hid_control_executor::Controller::BleGraceSignalPhase;
+    for (const Phase phase : {Phase::kAfterIdentityValidation,
+                              Phase::kAfterClaim}) {
+        ReadyBleRouteFixture fixture(137);
+        begin_explicit_ble_route_retirement(fixture);
+        const auto identity_a =
+            fixture.controller.ble_route_release_identity_for_test();
+        s_grace_race_fixture = &fixture;
+        fixture.controller.set_ble_grace_signal_hook_for_test(
+            phase, replace_grace_retirement_with_same_handle);
+
+        // T1/T2: A may pause after validation or after claiming its own slot.
+        // Exact physical completion then replaces it with B using the same
+        // connection and report handles. Resuming A cannot touch B's arm.
+        assert(!fixture.controller.signal_ble_route_release_grace(identity_a));
+        s_grace_race_fixture = nullptr;
+        const auto identity_b =
+            fixture.controller.ble_route_release_identity_for_test();
+        assert_maximally_equal_numeric_release_fields(identity_a, identity_b);
+        assert(fixture.ble.disconnect_calls == 0);
+
+        // T4/T5: an immutable A notification remains stale while B is armed,
+        // and does not clear or publish any part of B's exact state.
+        assert(!fixture.controller.signal_ble_route_release_grace(identity_a));
+        assert(fixture.ble.disconnect_calls == 0);
+
+        // T3: B keeps its full grace and only its own expiry advances the
+        // exact current retirement once.
+        assert(fixture.controller.signal_ble_route_release_grace(identity_b));
+        assert(!fixture.controller.signal_ble_route_release_grace(identity_b));
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.ble.disconnect_calls == 1);
+        assert(fixture.ble.last_connection == fixture.connection);
+        assert(!fixture.controller.signal_ble_route_release_grace(identity_a));
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.controller.ble_grace_available_slots_for_test() == 2);
+    }
+}
+
+void test_controller_grace_authority_repeated_cycles_reclaim_slots() {
+    ReadyBleRouteFixture fixture(138);
+    constexpr int kCycles = 32;
+    for (int cycle = 0; cycle < kCycles; ++cycle) {
+        begin_explicit_ble_route_retirement(fixture);
+        const auto identity =
+            fixture.controller.ble_route_release_identity_for_test();
+        assert(fixture.controller.signal_ble_route_release_grace(identity));
+        assert(!fixture.controller.signal_ble_route_release_grace(identity));
+        assert(fixture.controller.process_one_for_test());
+        assert(fixture.ble.disconnect_calls == cycle + 1);
+        observe_exact_route_disconnect(fixture);
+        assert(fixture.controller.ble_grace_available_slots_for_test() == 2);
+        if (cycle + 1 == kCycles) {
+            break;
+        }
+        assert(fixture.ble.event(
+            hid_control_executor::BleEventKind::kConnect,
+            fixture.connection));
+        assert(fixture.controller.process_one_for_test());
+        fixture.generation = fixture.controller.ble_snapshot().generation;
+        subscribe_composite(
+            fixture.controller, fixture.database, fixture.generation,
+            fixture.connection,
+            hid_control_executor::BleSubscriptionReason::kRestore);
+        make_security_ready(fixture.ble);
+        fixture.ble.refresh_security(fixture.connection);
+        assert(fixture.controller.activate_ble_route_internal().action_result ==
+               hid_runtime::RouteTransitionResult::kAccepted);
+    }
+    assert(fixture.runtime.state_machine().route_snapshot().active ==
+           hid_route::OutputRoute::kNone);
+    assert(fixture.controller.active_operation_for_test() ==
+           ControlOperation::kNone);
+}
+
+void test_controller_grace_queue_pressure_stays_identity_qualified() {
+    ReadyBleRouteFixture fixture(139);
+    begin_explicit_ble_route_retirement(fixture);
+    const auto identity_a =
+        fixture.controller.ble_route_release_identity_for_test();
+    for (std::size_t index = 0;
+         index < hid_control_executor::Controller::kActionQueueDepth;
+         ++index) {
+        assert(fixture.controller.signal_ble_event({
+            .kind = hid_control_executor::BleEventKind::kEncryptionChange,
+            .generation = fixture.generation - 1U,
+            .connection_handle = fixture.connection,
+        }));
+    }
+
+    // T6/T7: A's due publication survives a full normal queue as an exact
+    // slot. Its duplicate is rejected, and the independent wake is retained.
+    assert(fixture.controller.signal_ble_route_release_grace(identity_a));
+    assert(!fixture.controller.signal_ble_route_release_grace(identity_a));
+    assert(fixture.controller.executor_wake_pending_for_test());
+    hid_control_executor::Controller::Action discarded{};
+    for (std::size_t index = 0;
+         index < hid_control_executor::Controller::kActionQueueDepth;
+         ++index) {
+        assert(fixture.controller.dequeue_one_for_test(discarded));
+    }
+
+    // Exact physical completion cancels A's due slot. Its retained generic
+    // wake coalesces with the executor work that arms B, but has no generic
+    // due state that could advance B.
+    reconnect_same_handle_and_begin_retirement(fixture);
+    const auto identity_b =
+        fixture.controller.ble_route_release_identity_for_test();
+    assert_maximally_equal_numeric_release_fields(identity_a, identity_b);
+    assert(fixture.ble.disconnect_calls == 0);
+    assert(!fixture.controller.signal_ble_route_release_grace(identity_a));
+
+    assert(fixture.controller.signal_ble_route_release_grace(identity_b));
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.ble.disconnect_calls == 1);
+    observe_exact_route_disconnect(fixture);
+    assert(fixture.controller.ble_grace_available_slots_for_test() == 2);
+}
+
+void test_controller_grace_incarnation_exhaustion_fails_closed() {
+    ReadyBleRouteFixture fixture(140);
+    fixture.controller.set_ble_grace_next_incarnation_for_test(
+        UINT64_MAX >> 8U);
+    begin_explicit_ble_route_retirement(fixture);
+    const auto identity_a =
+        fixture.controller.ble_route_release_identity_for_test();
+    assert(fixture.controller.signal_ble_route_release_grace(identity_a));
+    assert(fixture.controller.process_one_for_test());
+    assert(fixture.ble.disconnect_calls == 1);
+    const int arm_calls = fixture.ble.arm_route_release_grace_calls;
+
+    // The maximum incarnation is used once and never wraps. The next
+    // retirement cannot publish a weaker/reused token, so it skips the grace
+    // timer and enters the existing fail-closed disconnect boundary.
+    reconnect_same_handle_and_begin_retirement(fixture);
+    assert(fixture.ble.arm_route_release_grace_calls == arm_calls);
+    assert(fixture.ble.disconnect_calls == 2);
+    assert(!fixture.controller.expire_ble_route_release_grace_for_test());
+    observe_exact_route_disconnect(fixture);
+    assert(fixture.controller.ble_grace_available_slots_for_test() == 2);
+}
+
 void test_u74c_normal_retirement_release_grace_and_cross_transport() {
     static_assert(hid_control_executor::kBleRouteReleaseGraceMs == 100);
     ReadyBleRouteFixture fixture(120);
@@ -6618,7 +6809,14 @@ void test_action_tagged_union_constructs_each_payload_without_identity_loss() {
     assert(grace.kind == Kind::kBleRouteReleaseGrace);
 }
 
-int main() {
+int main(int argc, char **argv) {
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--controller-grace-authority-only") {
+        test_controller_grace_authority_closes_both_replacement_windows();
+        test_controller_grace_authority_repeated_cycles_reclaim_slots();
+        test_controller_grace_incarnation_exhaustion_fails_closed();
+        return 0;
+    }
     test_action_tagged_union_constructs_each_payload_without_identity_loss();
     test_dle_last_order_admission_and_retirement();
     test_install_and_uninstall_are_task_owned_and_serialized();
@@ -6713,6 +6911,10 @@ int main() {
     test_ble_backend_failure_retires_and_never_replays_mouse();
     test_ble_not_ready_and_stale_results_terminalize_runtime_ticket();
     test_ble_disconnect_reconnect_kills_old_work_and_route();
+    test_controller_grace_authority_closes_both_replacement_windows();
+    test_controller_grace_authority_repeated_cycles_reclaim_slots();
+    test_controller_grace_queue_pressure_stays_identity_qualified();
+    test_controller_grace_incarnation_exhaustion_fails_closed();
     test_u74c_normal_retirement_release_grace_and_cross_transport();
     test_u74c_usb_none_ble_and_direct_switch_rejection();
     test_u74c_release_rejection_and_disconnect_failure_are_bounded();

@@ -610,6 +610,11 @@ class Controller final : public usb_lifecycle::Executor,
     };
     using BleEnqueueFailureHook = void (*)(Controller &controller);
     using ProcessAfterReconciliationHook = void (*)(Controller &controller);
+    enum class BleGraceSignalPhase : std::uint8_t {
+        kAfterIdentityValidation,
+        kAfterClaim,
+    };
+    using BleGraceSignalHook = void (*)(Controller &controller);
     bool process_one_for_test();
     bool process_wake_cycle_for_test();
     bool executor_wake_pending_for_test() const;
@@ -620,6 +625,8 @@ class Controller final : public usb_lifecycle::Executor,
         BleEnqueueFailurePhase phase, BleEnqueueFailureHook hook);
     void set_process_after_reconciliation_hook_for_test(
         ProcessAfterReconciliationHook hook);
+    void set_ble_grace_signal_hook_for_test(BleGraceSignalPhase phase,
+                                            BleGraceSignalHook hook);
     void set_ble_generation_for_test(ble_lifecycle::Generation generation);
     ControlOperation active_operation_for_test() const;
     bool reserve_operation_for_test(ControlOperation operation);
@@ -629,6 +636,8 @@ class Controller final : public usb_lifecycle::Executor,
     bool pairing_mailbox_zero_for_test() const;
     bool expire_ble_route_release_grace_for_test();
     BleRouteReleaseIdentity ble_route_release_identity_for_test() const;
+    std::size_t ble_grace_available_slots_for_test() const;
+    void set_ble_grace_next_incarnation_for_test(std::uint64_t value);
     bool reconcile_security_disconnect_absent_for_test(
         ble_lifecycle::Generation generation,
         std::uint16_t connection_handle);
@@ -641,6 +650,94 @@ class Controller final : public usb_lifecycle::Executor,
 #endif
 
   private:
+    // The timer dispatcher can retain one old producer while the serialized
+    // owner arms its replacement. Two fixed slots keep each arm, callback
+    // claim, due publication, cancellation, and consumption attached to the
+    // same complete retirement identity and non-reused incarnation.
+    class BleRouteGraceAuthority {
+      public:
+        static constexpr std::size_t kSlotCount = 2;
+
+        struct Claim {
+            std::size_t slot = kSlotCount;
+            std::uint64_t ownership = 0;
+            BleRouteReleaseIdentity identity{};
+
+            constexpr bool valid() const { return slot < kSlotCount; }
+        };
+
+        Claim arm(BleRouteReleaseIdentity identity);
+        Claim find_armed(BleRouteReleaseIdentity identity) const;
+        Claim claim(Claim candidate);
+        bool publish_due(Claim claim);
+        void cancel(Claim claim);
+        bool consume_due(Claim claim, BleRouteReleaseIdentity identity);
+        std::size_t available_slots_for_test() const;
+        void set_next_incarnation_for_test(std::uint64_t value) {
+            next_incarnation_.store(value, std::memory_order_release);
+        }
+        static bool identities_equal(BleRouteReleaseIdentity left,
+                                     BleRouteReleaseIdentity right);
+
+      private:
+        enum class State : std::uint8_t {
+            kIdle,
+            kArming,
+            kArmed,
+            kClaimed,
+            kCanceledClaimed,
+            kDue,
+        };
+
+        static constexpr std::uint64_t kStateMask = 0xffU;
+        static constexpr unsigned kStateBits = 8;
+        static constexpr std::uint64_t kMaxIncarnation =
+            UINT64_MAX >> kStateBits;
+
+        static constexpr std::uint64_t pack(std::uint64_t incarnation,
+                                            State state) {
+            return (incarnation << kStateBits) |
+                   static_cast<std::uint8_t>(state);
+        }
+        static constexpr State state_of(std::uint64_t ownership) {
+            return static_cast<State>(ownership & kStateMask);
+        }
+        static constexpr std::uint64_t with_state(std::uint64_t ownership,
+                                                  State state) {
+            return (ownership & ~kStateMask) |
+                   static_cast<std::uint8_t>(state);
+        }
+        std::uint64_t allocate_incarnation();
+
+        struct AtomicIdentity {
+            std::atomic<hid_runtime::AuthorityEpoch> authority_epoch{0};
+            std::atomic<hid_runtime::RouteGeneration> route_generation{0};
+            std::atomic<hid_runtime::ProfileActivationEpoch>
+                profile_activation_epoch{0};
+            std::atomic<ble_lifecycle::Generation> ble_generation{0};
+            std::atomic<std::uint16_t> connection_handle{
+                ble_lifecycle::kNoConnection};
+            std::atomic<hid_runtime::ReportMask> present_roles{0};
+            std::atomic<hid_runtime::ReportMask> required_subscriptions{0};
+            std::array<std::atomic<std::uint16_t>,
+                       hid_capability::kReportRoleCount>
+                report_handles{};
+            std::atomic<std::uint32_t> release_epoch{0};
+
+            void store(BleRouteReleaseIdentity identity);
+            BleRouteReleaseIdentity load() const;
+        };
+
+        struct Slot {
+            std::atomic<std::uint64_t> ownership{pack(0, State::kIdle)};
+            AtomicIdentity identity{};
+        };
+
+        std::array<Slot, kSlotCount> slots_{};
+        std::atomic<std::uint64_t> next_incarnation_{1};
+        std::atomic<std::size_t> next_slot_{0};
+    };
+
     void process(Action action);
     bool enqueue(Action action);
     void request_executor_wake();
@@ -812,8 +909,8 @@ class Controller final : public usb_lifecycle::Executor,
     BleRouteReleasePhase ble_route_release_phase_ =
         BleRouteReleasePhase::kNone;
     ControlOperation ble_route_release_owner_ = ControlOperation::kNone;
-    std::atomic_bool ble_route_grace_armed_{false};
-    std::atomic_bool ble_route_grace_due_{false};
+    BleRouteGraceAuthority ble_route_grace_authority_{};
+    BleRouteGraceAuthority::Claim ble_route_grace_claim_{};
     std::atomic_bool ble_route_disconnect_observed_{false};
 
 #ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
@@ -827,6 +924,9 @@ class Controller final : public usb_lifecycle::Executor,
     BleEnqueueFailurePhase ble_enqueue_failure_phase_ =
         BleEnqueueFailurePhase::kBeforeGenericFallback;
     ProcessAfterReconciliationHook process_after_reconciliation_hook_ = nullptr;
+    BleGraceSignalHook ble_grace_signal_hook_ = nullptr;
+    BleGraceSignalPhase ble_grace_signal_phase_ =
+        BleGraceSignalPhase::kAfterIdentityValidation;
     SofWatchdogBeforeFenceHook sof_watchdog_before_fence_hook_ = nullptr;
 #endif
 };

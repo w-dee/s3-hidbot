@@ -80,6 +80,219 @@ bool same_usb_link_watchdog_identity(
 
 }  // namespace
 
+bool Controller::BleRouteGraceAuthority::identities_equal(
+    BleRouteReleaseIdentity left, BleRouteReleaseIdentity right) {
+    return left.authority_epoch == right.authority_epoch &&
+           left.route_generation == right.route_generation &&
+           left.profile_activation_epoch == right.profile_activation_epoch &&
+           left.ble_generation == right.ble_generation &&
+           left.connection_handle == right.connection_handle &&
+           left.present_roles == right.present_roles &&
+           left.required_input_subscriptions ==
+               right.required_input_subscriptions &&
+           left.report_handles.values == right.report_handles.values &&
+           left.release_epoch == right.release_epoch;
+}
+
+void Controller::BleRouteGraceAuthority::AtomicIdentity::store(
+    BleRouteReleaseIdentity identity) {
+    authority_epoch.store(identity.authority_epoch, std::memory_order_relaxed);
+    route_generation.store(identity.route_generation,
+                           std::memory_order_relaxed);
+    profile_activation_epoch.store(identity.profile_activation_epoch,
+                                   std::memory_order_relaxed);
+    ble_generation.store(identity.ble_generation, std::memory_order_relaxed);
+    connection_handle.store(identity.connection_handle,
+                            std::memory_order_relaxed);
+    present_roles.store(identity.present_roles, std::memory_order_relaxed);
+    required_subscriptions.store(identity.required_input_subscriptions,
+                                 std::memory_order_relaxed);
+    for (std::size_t index = 0; index < report_handles.size(); ++index) {
+        report_handles[index].store(identity.report_handles.values[index],
+                                    std::memory_order_relaxed);
+    }
+    release_epoch.store(identity.release_epoch, std::memory_order_relaxed);
+}
+
+BleRouteReleaseIdentity
+Controller::BleRouteGraceAuthority::AtomicIdentity::load() const {
+    BleRouteReleaseIdentity identity{
+        .authority_epoch = authority_epoch.load(std::memory_order_relaxed),
+        .route_generation = route_generation.load(std::memory_order_relaxed),
+        .profile_activation_epoch =
+            profile_activation_epoch.load(std::memory_order_relaxed),
+        .ble_generation = ble_generation.load(std::memory_order_relaxed),
+        .connection_handle = connection_handle.load(std::memory_order_relaxed),
+        .present_roles = present_roles.load(std::memory_order_relaxed),
+        .required_input_subscriptions =
+            required_subscriptions.load(std::memory_order_relaxed),
+        .release_epoch = release_epoch.load(std::memory_order_relaxed),
+    };
+    for (std::size_t index = 0; index < report_handles.size(); ++index) {
+        identity.report_handles.values[index] =
+            report_handles[index].load(std::memory_order_relaxed);
+    }
+    return identity;
+}
+
+std::uint64_t Controller::BleRouteGraceAuthority::allocate_incarnation() {
+    std::uint64_t candidate =
+        next_incarnation_.load(std::memory_order_acquire);
+    while (candidate != 0 && candidate <= kMaxIncarnation) {
+        const std::uint64_t successor =
+            candidate == kMaxIncarnation ? 0 : candidate + 1;
+        if (next_incarnation_.compare_exchange_weak(
+                candidate, successor, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return candidate;
+        }
+    }
+    return 0;
+}
+
+Controller::BleRouteGraceAuthority::Claim
+Controller::BleRouteGraceAuthority::arm(BleRouteReleaseIdentity identity) {
+    const std::size_t first =
+        next_slot_.fetch_add(1, std::memory_order_relaxed) % kSlotCount;
+    for (std::size_t offset = 0; offset < kSlotCount; ++offset) {
+        const std::size_t index = (first + offset) % kSlotCount;
+        Slot &slot = slots_[index];
+        std::uint64_t observed =
+            slot.ownership.load(std::memory_order_acquire);
+        if (state_of(observed) != State::kIdle) {
+            continue;
+        }
+        const std::uint64_t incarnation = allocate_incarnation();
+        if (incarnation == 0) {
+            return {};
+        }
+        const std::uint64_t arming = pack(incarnation, State::kArming);
+        if (!slot.ownership.compare_exchange_strong(
+                observed, arming, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            continue;
+        }
+        slot.identity.store(identity);
+        const std::uint64_t armed = pack(incarnation, State::kArmed);
+        slot.ownership.store(armed, std::memory_order_release);
+        return {.slot = index, .ownership = armed, .identity = identity};
+    }
+    return {};
+}
+
+Controller::BleRouteGraceAuthority::Claim
+Controller::BleRouteGraceAuthority::find_armed(
+    BleRouteReleaseIdentity identity) const {
+    for (std::size_t index = 0; index < kSlotCount; ++index) {
+        const Slot &slot = slots_[index];
+        const std::uint64_t observed =
+            slot.ownership.load(std::memory_order_acquire);
+        if (state_of(observed) == State::kArmed &&
+            identities_equal(slot.identity.load(), identity)) {
+            return {.slot = index,
+                    .ownership = observed,
+                    .identity = identity};
+        }
+    }
+    return {};
+}
+
+Controller::BleRouteGraceAuthority::Claim
+Controller::BleRouteGraceAuthority::claim(Claim candidate) {
+    if (!candidate.valid() || state_of(candidate.ownership) != State::kArmed) {
+        return {};
+    }
+    Slot &slot = slots_[candidate.slot];
+    std::uint64_t expected = candidate.ownership;
+    const std::uint64_t claimed =
+        with_state(candidate.ownership, State::kClaimed);
+    if (!slot.ownership.compare_exchange_strong(
+            expected, claimed, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return {};
+    }
+    candidate.ownership = claimed;
+    return candidate;
+}
+
+bool Controller::BleRouteGraceAuthority::publish_due(Claim claim) {
+    if (!claim.valid() || state_of(claim.ownership) != State::kClaimed) {
+        return false;
+    }
+    Slot &slot = slots_[claim.slot];
+    std::uint64_t expected = claim.ownership;
+    if (slot.ownership.compare_exchange_strong(
+            expected, with_state(claim.ownership, State::kDue),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+    }
+    const std::uint64_t canceled =
+        with_state(claim.ownership, State::kCanceledClaimed);
+    if (expected == canceled) {
+        (void)slot.ownership.compare_exchange_strong(
+            expected, with_state(claim.ownership, State::kIdle),
+            std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    return false;
+}
+
+void Controller::BleRouteGraceAuthority::cancel(Claim claim) {
+    if (!claim.valid()) {
+        return;
+    }
+    Slot &slot = slots_[claim.slot];
+    for (;;) {
+        std::uint64_t observed =
+            slot.ownership.load(std::memory_order_acquire);
+        if ((observed & ~kStateMask) != (claim.ownership & ~kStateMask)) {
+            return;
+        }
+        State destination = State::kIdle;
+        switch (state_of(observed)) {
+            case State::kArmed:
+            case State::kDue:
+                break;
+            case State::kClaimed:
+                destination = State::kCanceledClaimed;
+                break;
+            default:
+                return;
+        }
+        if (slot.ownership.compare_exchange_weak(
+                observed, with_state(observed, destination),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+bool Controller::BleRouteGraceAuthority::consume_due(
+    Claim claim, BleRouteReleaseIdentity identity) {
+    if (!claim.valid() || !identities_equal(claim.identity, identity)) {
+        return false;
+    }
+    Slot &slot = slots_[claim.slot];
+    std::uint64_t expected = with_state(claim.ownership, State::kDue);
+    if (!identities_equal(slot.identity.load(), identity)) {
+        return false;
+    }
+    return slot.ownership.compare_exchange_strong(
+        expected, with_state(claim.ownership, State::kIdle),
+        std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+std::size_t
+Controller::BleRouteGraceAuthority::available_slots_for_test() const {
+    std::size_t available = 0;
+    for (const Slot &slot : slots_) {
+        if (state_of(slot.ownership.load(std::memory_order_acquire)) ==
+            State::kIdle) {
+            ++available;
+        }
+    }
+    return available;
+}
+
 bool Controller::initialize(hid_runtime::Runtime *runtime, Backend *backend,
                             BleBackend *ble_backend, BleDatabase *ble_database,
                             UsbLinkStallSink usb_link_stall_sink) {
@@ -464,20 +677,41 @@ bool Controller::signal_ble_event(BleEvent event) {
 
 bool Controller::signal_ble_route_release_grace(
     BleRouteReleaseIdentity identity) {
+    auto candidate = ble_route_grace_authority_.find_armed(identity);
+    if (!candidate.valid()) {
+        return false;
+    }
     if (!ble_route_release_identity_current(identity)) {
         return false;
     }
-    bool expected = true;
-    if (!ble_route_grace_armed_.compare_exchange_strong(
-            expected, false, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (ble_grace_signal_hook_ != nullptr &&
+        ble_grace_signal_phase_ ==
+            BleGraceSignalPhase::kAfterIdentityValidation) {
+        const auto hook = ble_grace_signal_hook_;
+        ble_grace_signal_hook_ = nullptr;
+        hook(*this);
+    }
+#endif
+    const auto claim = ble_route_grace_authority_.claim(candidate);
+    if (!claim.valid()) {
         return false;
     }
-    ble_route_grace_due_.store(true, std::memory_order_release);
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (ble_grace_signal_hook_ != nullptr &&
+        ble_grace_signal_phase_ == BleGraceSignalPhase::kAfterClaim) {
+        const auto hook = ble_grace_signal_hook_;
+        ble_grace_signal_hook_ = nullptr;
+        hook(*this);
+    }
+#endif
+    if (!ble_route_grace_authority_.publish_due(claim)) {
+        return false;
+    }
     const Action action = Action::empty(ActionKind::kBleRouteReleaseGrace);
     if (!enqueue(action)) {
-        // The due bit is authoritative and the independent task notification
-        // makes a full normal queue unable to strand retirement.
+        // The identity-owned due slot is authoritative and the independent
+        // task notification makes a full normal queue unable to strand it.
         request_executor_wake();
     }
     return true;
@@ -1192,8 +1426,12 @@ void Controller::note_ble_route_disconnect_result(
 
 void Controller::cancel_ble_route_release_grace(
     BleRouteReleaseIdentity identity) {
-    ble_route_grace_armed_.store(false, std::memory_order_release);
-    ble_route_grace_due_.store(false, std::memory_order_release);
+    if (ble_route_grace_claim_.valid() &&
+        BleRouteGraceAuthority::identities_equal(
+            ble_route_grace_claim_.identity, identity)) {
+        ble_route_grace_authority_.cancel(ble_route_grace_claim_);
+        ble_route_grace_claim_ = {};
+    }
     if (ble_backend_ != nullptr) {
         ble_backend_->cancel_ble_route_release_grace(identity);
     }
@@ -1245,17 +1483,20 @@ void Controller::drive_ble_route_retirement() {
         }
         submit_ble_safety_release(identity);
         ble_route_release_phase_ = BleRouteReleasePhase::kGrace;
-        ble_route_grace_due_.store(false, std::memory_order_release);
-        ble_route_grace_armed_.store(true, std::memory_order_release);
-        if (ble_backend_->arm_ble_route_release_grace(identity) != 0) {
-            ble_route_grace_armed_.store(false, std::memory_order_release);
+        ble_route_grace_claim_ = ble_route_grace_authority_.arm(identity);
+        if (!ble_route_grace_claim_.valid() ||
+            ble_backend_->arm_ble_route_release_grace(identity) != 0) {
+            ble_route_grace_authority_.cancel(ble_route_grace_claim_);
+            ble_route_grace_claim_ = {};
             start_ble_route_disconnect(identity);
         }
         return;
     }
     if (ble_route_release_phase_ == BleRouteReleasePhase::kGrace &&
         !ble_route_loss_pending(identity.ble_generation) &&
-        ble_route_grace_due_.exchange(false, std::memory_order_acq_rel)) {
+        ble_route_grace_authority_.consume_due(ble_route_grace_claim_,
+                                               identity)) {
+        ble_route_grace_claim_ = {};
         start_ble_route_disconnect(identity);
     }
 }
@@ -1717,8 +1958,8 @@ void Controller::process(Action action) {
         return;
     }
     if (action.kind == ActionKind::kBleRouteReleaseGrace) {
-        // The action is only a wake hint. The exact callback already claimed
-        // the retained timer owner and published the authoritative due bit.
+        // The action is only a wake hint. The exact callback published an
+        // identity-owned due slot that this owner consumes coherently.
         drive_ble_route_retirement();
         return;
     }
@@ -3050,6 +3291,12 @@ void Controller::set_process_after_reconciliation_hook_for_test(
     process_after_reconciliation_hook_ = hook;
 }
 
+void Controller::set_ble_grace_signal_hook_for_test(
+    BleGraceSignalPhase phase, BleGraceSignalHook hook) {
+    ble_grace_signal_phase_ = phase;
+    ble_grace_signal_hook_ = hook;
+}
+
 void Controller::set_ble_generation_for_test(
     ble_lifecycle::Generation generation) {
     ble_state_.set_generation_for_test(generation);
@@ -3091,6 +3338,15 @@ bool Controller::expire_ble_route_release_grace_for_test() {
 BleRouteReleaseIdentity
 Controller::ble_route_release_identity_for_test() const {
     return ble_route_release_;
+}
+
+std::size_t Controller::ble_grace_available_slots_for_test() const {
+    return ble_route_grace_authority_.available_slots_for_test();
+}
+
+void Controller::set_ble_grace_next_incarnation_for_test(
+    std::uint64_t value) {
+    ble_route_grace_authority_.set_next_incarnation_for_test(value);
 }
 
 bool Controller::reconcile_security_disconnect_absent_for_test(
