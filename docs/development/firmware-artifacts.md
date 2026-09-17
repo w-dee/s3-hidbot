@@ -61,11 +61,12 @@ SPIRAM, so a canonical artifact intentionally records `--flash_size 4MB`.
 The current partition table ends well below that address-space limit; unused
 flash is not consumed by placeholder partitions.
 
-`build_profile=freenove-fnk0085` identifies the validated FNK0085 fixture and
-its board-integration assumptions. It is not a claim that the physical fixture
-has only the firmware minimum: the fixture may provide 8 MiB flash and 8 MiB
-PSRAM. That additional capacity is intentionally unused by the current
-firmware, which does not thereby claim compatibility with arbitrary
+`build_profile=freenove-fnk0085` is the current legacy artifact identifier. It
+does not identify the physical fixture, which the owner has confirmed as
+FNK0099; changing this emitted contract belongs to the separate H-contract
+migration. A non-destructive query measured this fixture as 8 MiB flash with
+8 MiB embedded PSRAM. That additional capacity is intentionally unused by the
+current firmware, which does not thereby claim compatibility with arbitrary
 ESP32-S3 boards whose USB, UART, or GPIO topology has not been validated.
 
 An artifact built before this explicit policy, with the inherited 2 MiB
@@ -111,6 +112,10 @@ The output is a deterministic `.tar.gz` with one top-level directory named:
 ```text
 s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0085/
 ```
+
+This is the pre-H-contract legacy bundle name emitted by the current source.
+It remains literal for existing artifacts and must not be read as a physical
+FNK0085 identification. Future FNK0099 naming is not implemented here.
 
 The minimum payload is:
 
@@ -374,8 +379,9 @@ boot, or signed firmware authenticity.
 ## U6.4B2b/B2c safe flash and post-flash verification
 
 `hidbotctl flash-firmware ARTIFACT` is the explicit destructive programming
-entrypoint for a verified archive or extracted bundle. It accepts only the
-supported FNK0085 / ESP32-S3 / DIO / 4 MiB / 80 MHz provisioning plan produced
+entrypoint for a verified archive or extracted bundle. Until H-contract it
+accepts only the supported legacy-profile `freenove-fnk0085` / ESP32-S3 / DIO /
+4 MiB / 80 MHz provisioning plan produced
 by `stage_and_verify_firmware_bundle()` and the unchanged
 `plan_esptool_v4_args()` tuple. Staging and payload-integrity verification
 happen before any process or serial access, and the staged payloads are

@@ -1,6 +1,6 @@
 # s3-hidbot operator documentation
 
-This documentation is for someone operating an existing FNK0085 fixture or
+This documentation is for someone operating the FNK0099 fixture or
 automating one. It does not require ESP-IDF knowledge or a source checkout.
 
 Start with the [Linux-first quick start](quick-start.md). It explains the
@@ -33,10 +33,14 @@ both transports. Pairing is authenticated passkey entry with a 16-byte key.
 Firmware stores at most three verified bonds, never evicts one automatically,
 and exposes exact opaque-ID list/removal commands.
 
-Only the Freenove ESP32-S3 WROOM Board / FNK0085 with ESP32-S3-WROOM-1 has
-physical qualification evidence. Its validated board implementation has
-8 MiB flash and 8 MiB PSRAM; the canonical firmware needs at least 4 MiB flash
-and does not require external PSRAM. With the board
+Only the owner-confirmed Freenove FNK0099 ESP32-S3 WROOM Board Lite fixture has
+physical qualification evidence. A non-destructive query of this fixture
+detected 8 MiB flash and reported 8 MiB embedded PSRAM, corresponding to its
+N8R8 configuration. This does not assert the capacity of every FNK0099
+variant. Independently, the canonical firmware needs at least 4 MiB flash and
+does not require external PSRAM. See the maintained
+[fixture identity erratum](../development/hardware-profile-erratum.md) for the
+earlier FNK0085 label and historical artifact identifiers. With the board
 front-facing and its ESP32-S3 module at the top, the left USB-C under EN/RST is
 the CH343 programming/control port. The right USB-C under BOOT is native
 USB-OTG/HID. Provisioning and `verify-firmware` use only the left port.

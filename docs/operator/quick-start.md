@@ -9,9 +9,10 @@ procedures are not validated.
 
 ## Before starting
 
-You need a Freenove ESP32-S3 WROOM Board / FNK0085, a data-capable USB-C cable,
-Python 3.11 or newer, and access to the intended GitHub Actions run. No native
-USB/HID connection is required for provisioning or identity verification.
+You need the supported Freenove FNK0099 ESP32-S3 WROOM Board Lite fixture, a
+data-capable USB-C cable, Python 3.11 or newer, and access to the intended
+GitHub Actions run. No native USB/HID connection is required for provisioning
+or identity verification.
 
 With the board front-facing and the ESP32-S3 module at the top, use the **left
 USB-C below EN/RST**. It is the CH343 USB-UART port for programming and control.
@@ -46,6 +47,12 @@ and source revision supplied by `verify-artifact`.
 
 On Linux, verify each downloaded file from the directory containing its
 provided checksum:
+
+The commands below retain `freenove-fnk0085` because that is the literal
+profile and filename emitted by the current legacy artifact contract and used
+by published historical artifacts. It is not a statement that the physical
+fixture is FNK0085. The separately reviewed H-contract migration will change
+newly generated artifact names to `freenove-fnk0099`.
 
 ```bash
 sha256sum --check s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0085.tar.gz.sha256

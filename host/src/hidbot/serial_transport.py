@@ -32,7 +32,7 @@ SerialFactory = Callable[..., SerialLike]
 
 
 class PySerialTransport:
-    """Bounded byte transport with the measured FNK0085 line-state policy.
+    """Bounded byte transport with the measured FNK0099 line-state policy.
 
     The transport deliberately does not expose DTR/RTS setters.  Both lines
     are set to the measured safe idle state before the tty is opened and are

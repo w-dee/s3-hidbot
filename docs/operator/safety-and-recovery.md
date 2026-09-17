@@ -167,9 +167,11 @@ provide those approvals. This statement is not legal advice.
 
 ## Destructive provisioning policy
 
-`flash-firmware ARTIFACT` is destructive provisioning. It accepts only the
-supported verified FNK0085 plan and requires `s3-hidbot-host[flash]` with
-`esptool >=4.12,<5`.
+`flash-firmware ARTIFACT` is destructive provisioning. Until the separate
+H-contract migration, it accepts only the supported verified plan carrying the
+legacy literal profile `freenove-fnk0085`; that identifier does not identify
+the physical fixture as FNK0085. The command requires
+`s3-hidbot-host[flash]` with `esptool >=4.12,<5`.
 
 - Programming owns at most three identical attempts, each bounded to 300
   seconds.

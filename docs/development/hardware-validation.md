@@ -17,12 +17,23 @@ The validation vocabulary is deliberately narrow:
 
 ## Board and port roles
 
-The validated development fixture is the Freenove ESP32-S3 WROOM Board /
-FNK0085 with ESP32-S3-WROOM-1. The validated board implementation has 8 MiB
-flash and 8 MiB PSRAM. The canonical firmware targets a minimum 4 MiB flash
-and does not require external PSRAM; these minima do not qualify other boards.
-See the [official Freenove board material](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board)
-for the board's published resources.
+The validated development fixture is the Freenove FNK0099 ESP32-S3 WROOM
+Board Lite with an ESP32-S3-WROOM-1 module. A non-destructive query of this
+fixture detected 8 MiB flash and reported 8 MiB embedded PSRAM, corresponding
+to its N8R8 configuration. This is a measurement of the fixture, not a claim
+about every FNK0099 variant. The canonical firmware independently targets a
+minimum 4 MiB flash and does not require external PSRAM; these minima do not
+qualify other boards. The maintained
+[fixture identity erratum](hardware-profile-erratum.md) corrects the earlier
+FNK0085 label without rewriting historical evidence.
+
+See the [official FNK0099 documentation](https://docs.freenove.com/projects/fnk0099/en/latest/),
+[Freenove Lite resources](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board_Lite),
+[board photograph](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board_Lite/blob/main/Board.png),
+and [Lite pinout](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board_Lite/blob/main/ESP32S3_Lite_Pinout.png).
+The inspected Freenove pinout reverses the GPIO19/20 USB signal labels relative
+to Espressif's mapping. This project uses GPIO19 as USB D- and GPIO20 as USB D+
+and does not treat the Freenove pinout as a schematic.
 
 ```text
 Host PC
@@ -42,6 +53,11 @@ the control UART is usable.
 - Native USB-OTG is the TinyUSB Composite HID device path.
 - The fixture has produced the documented Composite HID and UART evidence in
   the matrix below.
+- Freenove documents the monochrome blue onboard LED on GPIO2 as active high:
+  `HIGH` is on and `LOW` is off. The existing firmware behavior matches this;
+  this documentation adds no LED behavior.
+- Freenove documents one onboard WS2812/NeoPixel on GPIO48. The project does
+  not currently use it as product functionality.
 
 ### Unresolved / do not infer
 
@@ -84,8 +100,8 @@ boards, operating systems, or future firmware.
 | F24 keyboard report path | `HARDWARE VALIDATED` | F24/HID usage `0x73` sentinel report path with Linux evdev machine-observed `KEY_F24` value `1` (DOWN) and value `0` (UP), explicit release recovery, and no claim that F24 is globally side-effect-free. |
 | Relative `REL_X` mouse report path | `HARDWARE VALIDATED` | Small positive relative movement observed once per accepted report; no claim about pointer acceleration or exact screen pixels. |
 | U5.4.3 raw `REL_X` physical smoke | `HARDWARE VALIDATED` | Linux evdev machine-observed `EV_REL/REL_X/+1` followed by `EV_SYN/SYN_REPORT` after one submitted report; the one-shot path completed with no retry, inverse movement, or reconnect/resend. |
-| BLE HID route and repaired Report Map | `HARDWARE VALIDATED` | FNK0085 with a Linux/BlueZ 5.72 host: exact repaired descriptor, F24 DOWN/UP, no repeat, stable route retirement, and bond-preserving reconnect. This is not a general Linux or HOGP-host claim. |
-| Authenticated bond lifecycle | `HARDWARE VALIDATED` | FNK0085 lab evidence covers authenticated pairing, 16-byte keys, exact opaque-ID removal, crash-safe persistent absence, stale host-record behavior, and exact slot reuse. |
+| BLE HID route and repaired Report Map | `HARDWARE VALIDATED` | FNK0099 fixture with a Linux/BlueZ 5.72 host: exact repaired descriptor, F24 DOWN/UP, no repeat, stable route retirement, and bond-preserving reconnect. This is not a general Linux or HOGP-host claim. |
+| Authenticated bond lifecycle | `HARDWARE VALIDATED` | FNK0099 same-fixture lab evidence covers authenticated pairing, 16-byte keys, exact opaque-ID removal, crash-safe persistent absence, stale host-record behavior, and exact slot reuse. |
 | Three-bond capacity / no eviction | `HARDWARE VALIDATED` | One Linux/BlueZ peer plus named lab Xperia, Lenovo, and Moto Android fixtures were used across the accepted sequence: three verified bonds, `store_full` with the set preserved, exact removal, slot reuse, reconnect, and reboot persistence. No blanket Android/device qualification is claimed. |
 | Mouse left button in HID Sequence Executor v1 | `HARDWARE VALIDATED` | The USB-only sequence checkpoint observed exactly one `BTN_LEFT` down/up pair after the F24 pair, with no extra input events and a final all-up cleanup. This does not qualify the other mouse buttons or arbitrary sequences. |
 | BLE HID Sequence Executor v1 | `HARDWARE VALIDATED` | `PASS_BLE_SEQUENCE_EXECUTOR_PHYSICAL_QUALIFICATION` on firmware `c2dcfcb14d555da2c8d5b472f91dd5d2824af3a0` and artifact cache key `f711094a91eedc7cd3a38dc3d5285ad90d0046926cc1d68602c71758da2e8db3`: one accepted execution of the exact seven-token F24/left-button workload produced the four expected BLE evdev transitions in order and no unexpected event. This closes BLE delivery only for the scoped Sequence Executor v1 workload on the documented fixture; it does not replace the USB-only checkpoint or qualify arbitrary sequences. |
@@ -320,11 +336,14 @@ admission gate opens. A suspend/resume or unmount/remount round trip cannot
 erase the cut; later reuse still requires a fresh explicit route selection.
 
 This result means `USB link activity lost`; it does not mean that firmware
-observed a physical cable removal, per-port VBUS loss, unmount, or suspend.
-The FNK0085 USB connectors share the board power rail, so true per-port VBUS
-discrimination is unavailable without hardware modification. The fallback
-publishes neither fake `mounted=false` nor fake `suspended=true`, and normal
-SOF/lifecycle recovery does not restore the old route.
+observed a physical cable removal, per-port VBUS loss, unmount, or suspend. On
+the tested FNK0099 fixture, while USB-UART continued powering the board,
+removing the native cable did not provide an independently observable
+native-port VBUS-loss condition usable by the product. This is
+`DIRECT_PHYSICAL_OBSERVATION_ON_FNK0099`, not a schematic or rail-connectivity
+claim. The fallback publishes neither fake `mounted=false` nor fake
+`suspended=true`, and normal SOF/lifecycle recovery does not restore the old
+route.
 
 The native USB logical link-loss physical checkpoint is now **HARDWARE
 VALIDATED** on the documented Freenove fixture. It qualifies logical USB
@@ -409,9 +428,12 @@ remote capsule runner aggregate = 5bed0c419b14c945b887fd911d734ea1a3f86a73af9dca
 remote capsule lifecycle = PASS / SUCCESS -> RESOLVED -> ACKNOWLEDGED
 ```
 
-Exact last SOF was not directly observable from the production artifact, the
-electrical per-port VBUS edge is not observable on the current FNK0085, and
-the old-session mismatch response was not directly observed in this run.
+Exact last SOF was not directly observable from the production artifact, no
+independently observable electrical native-port VBUS-loss condition was
+established on this tested FNK0099 fixture, and the old-session mismatch
+response was not directly observed in this run. This does not establish a
+direct-rail topology, backfeed behavior, dual-supply safety, or behavior of
+every FNK0099 revision.
 These are evidence limits, not qualification failures. Machine-local device,
 session, lock, boot-identity, and filesystem identifiers and raw UART output
 remain private.

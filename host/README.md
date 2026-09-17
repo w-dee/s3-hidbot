@@ -3,9 +3,11 @@
 `s3-hidbot-host` is the pure-Python client and `hidbotctl` CLI for the
 s3-hidbot UART control plane. It provides bounded transport, framing, protocol,
 session, artifact-verification, identity-comparison, and explicit HID primitive
-APIs for an FNK0085 fixture. It also provides an immutable low-level
-`SequenceBuilder` and typed sequence start/status methods; text, layout, and
-named-key translation remain outside the firmware protocol.
+APIs for the owner-confirmed FNK0099 fixture. Historical and current
+pre-H-contract artifacts still carry the literal `freenove-fnk0085` profile.
+It also provides an immutable low-level `SequenceBuilder` and typed sequence
+start/status methods; text, layout, and named-key translation remain outside
+the firmware protocol.
 
 Python 3.11 or newer is required.
 

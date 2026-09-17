@@ -12,11 +12,14 @@ macro-automation product.
 
 ## Supported fixture
 
-The physically qualified fixture is the **Freenove ESP32-S3 WROOM Board /
-FNK0085**, using its ESP32-S3-WROOM-1 module and board implementation with
-8 MiB flash and 8 MiB PSRAM.
-Evidence applies to that board and the documented scope only; it is not a
-claim about arbitrary ESP32-S3 boards.
+The physically qualified fixture is the **Freenove FNK0099 ESP32-S3 WROOM
+Board Lite**, using an ESP32-S3-WROOM-1 module. A non-destructive query of this
+fixture detected 8 MiB flash and the ESP32-S3 embedded-PSRAM feature reported
+8 MiB, corresponding to the FNK0099 N8R8 configuration. This measurement is
+specific to the fixture; it is not a claim about every FNK0099 variant or
+arbitrary ESP32-S3 boards. Earlier project material called this same fixture
+FNK0085; the maintained [fixture identity erratum](docs/development/hardware-profile-erratum.md)
+defines how that historical evidence is interpreted.
 
 The canonical firmware targets a minimum 4 MiB flash envelope and does not
 require external PSRAM. Those build minima do not qualify another board.
@@ -28,10 +31,14 @@ With the board viewed from the front and the ESP32-S3 module at the top:
 - the **right USB-C**, below **BOOT** and beside GPIO19/GPIO20, is the native
   USB-OTG connector for HID.
 
-The official [board photograph](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board/blob/main/Board.jpg)
-and [pinout](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board/blob/main/ESP32S3_Pinout.png)
-are the physical-reference evidence. Provisioning and identity verification
-need only the left CH343 connector; native USB is not required.
+The official [FNK0099 documentation](https://docs.freenove.com/projects/fnk0099/en/latest/),
+[board photograph](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board_Lite/blob/main/Board.png),
+and [Lite pinout](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board_Lite/blob/main/ESP32S3_Lite_Pinout.png)
+provide the physical reference. The Freenove pinout reverses the GPIO19/20 USB
+signal labels relative to Espressif's authoritative mapping; this project uses
+GPIO19 as USB D- and GPIO20 as USB D+ and does not treat that image as a
+schematic. Provisioning and identity verification need only the left CH343
+connector; native USB is not required.
 
 Keep the paths separate:
 
@@ -149,6 +156,7 @@ Contributors should use the development documentation instead:
 - [development runbook](docs/development/codex-runbook.md)
 - [validation entrypoints](docs/development/validation-entrypoints.md)
 - [hardware evidence and limits](docs/development/hardware-validation.md)
+- [physical fixture identity erratum](docs/development/hardware-profile-erratum.md)
 - [UART and HID protocol contract](docs/development/uart-control-plane.md)
 - [firmware artifact contract](docs/development/firmware-artifacts.md)
 
@@ -158,7 +166,7 @@ Contributors should use the development documentation instead:
   artifact verification, identity comparison, and bounded provisioning.
 - `NATIVE VALIDATED`: host, protocol, safety state machine, CLI and firmware
   build coverage.
-- `HARDWARE VALIDATED`: FNK0085 UART control, composite enumeration,
+- `HARDWARE VALIDATED`: FNK0099 UART control, composite enumeration,
   `release-all`, F24 keyboard sentinel, and one small relative mouse movement
   on Linux; scoped BLE HID, secure bond lifecycle, three-bond capacity,
   StoreFull/no-eviction behavior, and exact slot reuse on the documented lab

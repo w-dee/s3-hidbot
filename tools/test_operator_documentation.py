@@ -15,6 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 OPERATOR = ROOT / "docs/operator"
 CLI_SOURCE = ROOT / "host/src/hidbot/cli.py"
 README = ROOT / "README.md"
+HARDWARE_VALIDATION = ROOT / "docs/development/hardware-validation.md"
+HARDWARE_PROFILE_ERRATUM = ROOT / "docs/development/hardware-profile-erratum.md"
+UART_CONTROL_PLANE = ROOT / "docs/development/uart-control-plane.md"
+FIRMWARE_ARTIFACTS = ROOT / "docs/development/firmware-artifacts.md"
+HOST_README = ROOT / "host/README.md"
 RELEASE_NOTES = ROOT / "docs/development/release-notes-v0.1.0.md"
 RELEASE_NOTES_RENDERER = ROOT / "tools/render_release_notes.py"
 PUBLISHED_RELEASE_NOTES = ROOT / "docs/development/release-notes-v0.2.0.md"
@@ -124,6 +129,11 @@ def main() -> int:
     safety = documents["safety-and-recovery.md"]
     automation = documents["automation.md"]
     readme = README.read_text(encoding="utf-8")
+    hardware_validation = HARDWARE_VALIDATION.read_text(encoding="utf-8")
+    hardware_profile_erratum = HARDWARE_PROFILE_ERRATUM.read_text(encoding="utf-8")
+    uart_control_plane = UART_CONTROL_PLANE.read_text(encoding="utf-8")
+    firmware_artifacts = FIRMWARE_ARTIFACTS.read_text(encoding="utf-8")
+    host_readme = HOST_README.read_text(encoding="utf-8")
     release_notes = RELEASE_NOTES.read_text(encoding="utf-8")
     published_release_notes = PUBLISHED_RELEASE_NOTES.read_text(encoding="utf-8")
 
@@ -170,9 +180,85 @@ def main() -> int:
         _require(all_text, unknown, f"explicit unknown: {unknown}")
     _require(all_text, "**UNKNOWN**", "explicit hardware-unknown marker")
     _require(all_text, "Linux-first", "physical validation platform limit")
-    for marker in ("ESP32-S3-WROOM-1", "8 MiB flash", "8 MiB PSRAM", "minimum 4 MiB flash"):
-        _require(readme + all_text, marker, f"board/support scope {marker}")
+    fixture_text = readme + "\n" + all_text + "\n" + hardware_validation
+    for marker in (
+        "Freenove FNK0099 ESP32-S3 WROOM Board Lite",
+        "ESP32-S3-WROOM-1",
+        "non-destructive query",
+        "8 MiB flash",
+        "8 MiB embedded PSRAM",
+        "N8R8 configuration",
+        "minimum 4 MiB flash",
+    ):
+        _require(fixture_text, marker, f"corrected board/support scope {marker}")
     _require(readme + all_text, "does not require external PSRAM", "external PSRAM is optional")
+    _require(
+        hardware_validation,
+        "This is a measurement of the fixture, not a claim",
+        "measured fixture capacity scope",
+    )
+    _require(
+        hardware_validation,
+        "about every FNK0099 variant.",
+        "FNK0099 variant capacity limit",
+    )
+    _require(
+        hardware_validation,
+        "DIRECT_PHYSICAL_OBSERVATION_ON_FNK0099",
+        "observation-scoped VBUS provenance",
+    )
+    for limit in ("not a schematic", "backfeed behavior", "dual-supply safety"):
+        _require(hardware_validation, limit, f"VBUS evidence limit {limit!r}")
+    for marker in (
+        "monochrome blue onboard LED on GPIO2",
+        "`HIGH` is on and `LOW` is off",
+        "WS2812/NeoPixel on GPIO48",
+    ):
+        _require(hardware_validation, marker, f"FNK0099 LED fact {marker!r}")
+    for marker in (
+        "same physical fixture",
+        "does not qualify every FNK0099 unit or board revision",
+        "creates no qualification evidence for actual FNK0085 hardware",
+        "Frozen evidence objects",
+        "freenove-fnk0085",
+        "separate H-contract change",
+    ):
+        _require(hardware_profile_erratum, marker, f"fixture erratum scope {marker!r}")
+    _require(
+        quick_start,
+        "current legacy artifact contract",
+        "legacy artifact examples distinguished from physical fixture identity",
+    )
+    maintained_fixture_prose = "\n".join(
+        (
+            readme,
+            all_text,
+            hardware_validation,
+            uart_control_plane,
+            firmware_artifacts,
+            host_readme,
+        )
+    )
+    for wrong_claim in (
+        "physically qualified fixture is the **Freenove ESP32-S3 WROOM Board /\nFNK0085",
+        "Only the Freenove ESP32-S3 WROOM Board / FNK0085",
+        "need a Freenove ESP32-S3 WROOM Board / FNK0085",
+        "FNK0085 USB connectors share the board power rail",
+    ):
+        if wrong_claim in maintained_fixture_prose:
+            raise AssertionError(f"obsolete physical-fixture claim remains: {wrong_claim!r}")
+    for legacy_contract_doc in (quick_start, safety, uart_control_plane, firmware_artifacts):
+        normalized_legacy_contract_doc = " ".join(legacy_contract_doc.split())
+        _require(
+            normalized_legacy_contract_doc,
+            "freenove-fnk0085",
+            "preserved pre-H-contract profile literal",
+        )
+        _require(
+            normalized_legacy_contract_doc,
+            "physical fixture",
+            "legacy profile distinguished from physical fixture identity",
+        )
 
     _require(documents["README.md"], "Route v2", "current BLE route contract")
     _require(documents["README.md"], "never evicts", "three-bond no-eviction contract")

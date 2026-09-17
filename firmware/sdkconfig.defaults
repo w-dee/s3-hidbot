@@ -1,6 +1,6 @@
 CONFIG_IDF_TARGET="esp32s3"
-# The firmware targets a conservative 4 MiB flash minimum; the FNK0085
-# fixture's additional flash capacity is intentionally not required.
+# The firmware targets a conservative 4 MiB flash minimum; additional physical
+# fixture capacity is intentionally not required.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 # External PSRAM is deliberately optional hardware, not a firmware requirement.
 # CONFIG_SPIRAM is not set

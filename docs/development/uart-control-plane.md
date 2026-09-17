@@ -580,10 +580,12 @@ completed-request cache.
 
 Native USB HID lifecycle publication is a control-session safety boundary.
 Physical cable removal is not guaranteed to yield an immediate TinyUSB unmount
-on the FNK0085 because both USB connectors share one board power rail and the
-current hardware has no independent native-port VBUS observation. Per-port
-VBUS discrimination would require hardware modification and is not a firmware
-feature on this board.
+on the tested FNK0099 fixture. While USB-UART continued powering that fixture,
+removing the native cable did not provide an independently observable
+native-port VBUS-loss condition usable by the product. This direct physical
+observation does not establish VBUS-rail topology, backfeed behavior, or
+general dual-supply safety. No independent native-port VBUS detector is an
+established firmware feature on this fixture.
 
 TinyUSB suspend and unmount remain the authoritative primary paths. As a
 bounded safety fallback, the existing HID control executor observes a wrapping
@@ -681,6 +683,11 @@ The identity-v1 `system.info` result has exactly these fields:
   }
 }
 ```
+
+The `freenove-fnk0085` value above is the current pre-H-contract runtime and
+artifact identity literal. It does not identify the physical fixture as
+FNK0085. A separately reviewed H-contract migration will change the value for
+new FNK0099 builds while preserving exact identity comparison.
 
 `source_revision` is either JSON `null` for an unset build input or the full
 40-character lowercase hexadecimal `S3_HIDBOT_SOURCE_REVISION` value. It is
@@ -1136,8 +1143,8 @@ and `mouse-report` commands, each with command-local
 read-only `lease_ms` metadata. Closing the client only closes the injected
 transport and invalidates local session state; it sends no UART command.
 
-The current Freenove FNK0085 materials identify CH343 as the USB-UART bridge.
-Hardware characterization observed safe idle as DTR=true and RTS=true
+The current Freenove FNK0099 Lite materials identify CH343 as the USB-UART
+bridge. Hardware characterization observed safe idle as DTR=true and RTS=true
 on the tested board/host. DTR=false-to-true and a transition through both false
 could reset the application; an RTS-only transition had no observed effect.
 The exact circuit mapping was not inferred, and software cannot prove that an
@@ -1247,7 +1254,7 @@ submit all-up HID reports when safety state requires it, but the self-test does
 not intentionally inject a key, button, or movement.
 
 The characterization and this transport policy were established for the
-Freenove ESP32-S3 WROOM Board / FNK0085 CH343 path. The measured true/true
+Freenove FNK0099 ESP32-S3 WROOM Board Lite CH343 path. The measured true/true
 open/close sequence was repeated five times without reset, download boot, or
 native HID disconnect. It is a board/host policy, not an authentication
 mechanism; OS permissions and exclusive ownership are the local coordination
@@ -1549,6 +1556,7 @@ ordinary logs and verify byte integrity, count, and sequence while ignoring
 non-protocol text. That test must not send a HID report.
 
 The authority-epoch barrier and SOF fallback intentionally do not claim that a
-physical OTG cable removal was identified. Direct electrical discrimination of
-the native connector's VBUS is unavailable on the current FNK0085 hardware and
-would require a separately reviewed hardware modification.
+physical OTG cable removal was identified. The tested FNK0099 fixture did not
+provide an independently observable native-port VBUS-loss condition usable by
+the product while USB-UART continued powering it. That direct observation is
+not a schematic, direct-rail, backfeed, or general electrical-safety claim.
