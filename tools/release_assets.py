@@ -126,7 +126,11 @@ def validate_release_asset_directory(
         source_revision=source_revision,
     )
     try:
-        validate_wheel(directory / contract.host_wheel, contract.version)
+        validate_wheel(
+            directory / contract.host_wheel,
+            contract.version,
+            required_modules=contract.host_modules,
+        )
     except HostArtifactError as exc:
         raise ReleaseAssetError("host wheel failed canonical validation") from exc
     _validate_sdist(directory / contract.host_sdist, contract)

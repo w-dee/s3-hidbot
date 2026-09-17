@@ -12,12 +12,15 @@ import zipfile
 from pathlib import Path
 
 from host_artifact import (
+    BASELINE_REQUIRED_MODULES,
     REQUIRED_MODULES,
     HostArtifactError,
     checksum_basename,
     checksum_text,
     dist_info_name,
     read_distribution_version,
+    required_modules_for_source,
+    validate_wheel,
     validate_artifact_directory,
     wheel_basename,
 )
@@ -29,10 +32,12 @@ CHECKSUM_BASENAME = checksum_basename(FIXTURE_VERSION)
 DIST_INFO = dist_info_name(FIXTURE_VERSION)
 
 
-def _write_valid_artifact(directory: Path) -> Path:
+def _write_valid_artifact(
+    directory: Path, *, modules: frozenset[str] = REQUIRED_MODULES
+) -> Path:
     wheel = directory / WHEEL_BASENAME
     with zipfile.ZipFile(wheel, "w") as archive:
-        for module in REQUIRED_MODULES:
+        for module in modules:
             archive.writestr(module, "# fixture\n")
         archive.writestr(
             f"{DIST_INFO}/METADATA",
@@ -91,6 +96,37 @@ class HostArtifactTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         result = validate_artifact_directory(directory, FIXTURE_VERSION)
         self.assertEqual(result.wheel.name, WHEEL_BASENAME)
+
+    def test_selected_source_controls_only_its_added_module_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            historical_modules = required_modules_for_source(root)
+            self.assertEqual(historical_modules, BASELINE_REQUIRED_MODULES)
+            selected_module = root / "host/src/hidbot/legacy_recovery.py"
+            selected_module.parent.mkdir(parents=True)
+            selected_module.write_text("# selected source module\n", encoding="utf-8")
+            self.assertEqual(required_modules_for_source(root), REQUIRED_MODULES)
+
+    def test_same_historical_wheel_passes_only_historical_source_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            wheel = _write_valid_artifact(directory, modules=BASELINE_REQUIRED_MODULES)
+            validate_wheel(
+                wheel,
+                FIXTURE_VERSION,
+                required_modules=BASELINE_REQUIRED_MODULES,
+            )
+            with self.assertRaisesRegex(
+                HostArtifactError, "missing=.*hidbot/legacy_recovery.py"
+            ):
+                validate_wheel(wheel, FIXTURE_VERSION, required_modules=REQUIRED_MODULES)
+
+    def test_current_wheel_requires_selected_legacy_recovery_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            wheel = _write_valid_artifact(directory, modules=BASELINE_REQUIRED_MODULES)
+            with self.assertRaises(HostArtifactError):
+                validate_wheel(wheel, FIXTURE_VERSION)
 
     def test_checksum_mismatch(self) -> None:
         self.assert_rejected(lambda directory: (directory / WHEEL_BASENAME).write_bytes(b"changed"))

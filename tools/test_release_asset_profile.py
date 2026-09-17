@@ -7,10 +7,15 @@ import io
 import tarfile
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from release_assets import ReleaseAssetError, validate_release_firmware_archive
+from release_assets import (
+    ReleaseAssetError,
+    validate_release_asset_directory,
+    validate_release_firmware_archive,
+)
 from release_contract import ReleaseContract
 
 
@@ -66,6 +71,29 @@ class ReleaseAssetProfileTests(unittest.TestCase):
                         validate_release_firmware_archive(
                             archive, self.contract, source_revision=revision
                         )
+
+    def test_release_wheel_validation_uses_selected_source_module_contract(self) -> None:
+        selected_modules = frozenset({"hidbot/selected-source-module.py"})
+        contract = replace(self.contract, host_modules=selected_modules)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for name in contract.release_assets:
+                (directory / name).write_bytes(b"fixture")
+            with (
+                patch("release_assets._validate_checksum"),
+                patch(
+                    "release_assets.validate_release_firmware_archive",
+                    return_value=self.manifest,
+                ),
+                patch("release_assets.validate_wheel") as validate_wheel,
+                patch("release_assets._validate_sdist"),
+            ):
+                validate_release_asset_directory(directory, contract)
+            validate_wheel.assert_called_once_with(
+                directory / contract.host_wheel,
+                contract.version,
+                required_modules=selected_modules,
+            )
 
 
 if __name__ == "__main__":

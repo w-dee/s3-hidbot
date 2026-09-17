@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 
 DISTRIBUTION_NAME = "s3-hidbot-host"
 _VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
-REQUIRED_MODULES = frozenset(
+BASELINE_REQUIRED_MODULES = frozenset(
     {
         "hidbot/__init__.py",
         "hidbot/artifact.py",
@@ -22,13 +22,18 @@ REQUIRED_MODULES = frozenset(
         "hidbot/firmware_verification.py",
         "hidbot/flashing.py",
         "hidbot/framing.py",
-        "hidbot/legacy_recovery.py",
         "hidbot/protocol.py",
         "hidbot/provisioning.py",
         "hidbot/provisioning_workflow.py",
         "hidbot/sequence.py",
         "hidbot/serial_transport.py",
     }
+)
+SOURCE_SELECTED_MODULES = (
+    ("hidbot/legacy_recovery.py", Path("host/src/hidbot/legacy_recovery.py")),
+)
+REQUIRED_MODULES = frozenset(
+    BASELINE_REQUIRED_MODULES | {module for module, _ in SOURCE_SELECTED_MODULES}
 )
 _CHECKSUM = re.compile(r"^[0-9a-f]{64}  ([A-Za-z0-9][A-Za-z0-9_.-]*\.whl)\n$")
 _LINUX_HOME_ROOT = rb"/" + rb"home/"
@@ -49,6 +54,20 @@ class HostWheelArtifact:
     wheel: Path
     checksum: Path
     digest: str
+
+
+def required_modules_for_source(source_root: Path) -> frozenset[str]:
+    """Return the wheel module contract owned by one explicitly selected source tree."""
+
+    required = set(BASELINE_REQUIRED_MODULES)
+    root = source_root.resolve()
+    for module, relative in SOURCE_SELECTED_MODULES:
+        path = root / relative
+        if path.is_symlink():
+            raise HostArtifactError(f"selected source host module must not be a symlink: {module}")
+        if path.is_file():
+            required.add(module)
+    return frozenset(required)
 
 
 def sha256_file(path: Path) -> str:
@@ -104,7 +123,12 @@ def _metadata_value(metadata: str, field: str) -> str:
     raise HostArtifactError(f"wheel metadata is missing {field}")
 
 
-def validate_wheel(wheel: Path, distribution_version: str) -> None:
+def validate_wheel(
+    wheel: Path,
+    distribution_version: str,
+    *,
+    required_modules: frozenset[str] = REQUIRED_MODULES,
+) -> None:
     expected_basename = wheel_basename(distribution_version)
     dist_info = dist_info_name(distribution_version)
     if wheel.name != expected_basename:
@@ -138,9 +162,9 @@ def validate_wheel(wheel: Path, distribution_version: str) -> None:
         raise HostArtifactError("wheel is not a valid ZIP archive") from error
 
     package_modules = {name for name in payload if name.startswith("hidbot/")}
-    if package_modules != REQUIRED_MODULES:
-        missing = sorted(REQUIRED_MODULES.difference(package_modules))
-        unexpected = sorted(package_modules.difference(REQUIRED_MODULES))
+    if package_modules != required_modules:
+        missing = sorted(required_modules.difference(package_modules))
+        unexpected = sorted(package_modules.difference(required_modules))
         raise HostArtifactError(
             f"wheel runtime module set does not match; missing={missing}, unexpected={unexpected}"
         )

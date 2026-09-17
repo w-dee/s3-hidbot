@@ -10,6 +10,7 @@ from pathlib import Path
 
 from release_contract import (
     ReleaseContractError,
+    read_build_profile,
     read_release_contract,
     release_tag,
     resolve_annotated_tag_commit,
@@ -31,6 +32,7 @@ class ReleaseContractTests(unittest.TestCase):
             "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0099.tar.gz",
         )
         self.assertEqual(contract.build_profile, "freenove-fnk0099")
+        self.assertIn("hidbot/legacy_recovery.py", contract.host_modules)
         self.assertEqual(contract.host_wheel, "s3_hidbot_host-0.3.0-py3-none-any.whl")
         self.assertEqual(contract.host_sdist, "s3_hidbot_host-0.3.0.tar.gz")
         self.assertEqual(len(contract.distributable_assets), 6)
@@ -78,6 +80,7 @@ class ReleaseContractTests(unittest.TestCase):
             )
             historical = read_release_contract(root)
             self.assertEqual(historical.build_profile, "freenove-fnk0085")
+            self.assertNotIn("hidbot/legacy_recovery.py", historical.host_modules)
             self.assertEqual(
                 historical.firmware_archive,
                 "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0085.tar.gz",
@@ -91,6 +94,44 @@ class ReleaseContractTests(unittest.TestCase):
                 current.firmware_archive,
                 "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0099.tar.gz",
             )
+
+    def test_profile_parser_ignores_comments_and_unrelated_literals(self) -> None:
+        source = """
+namespace firmware_identity {
+// kBuildProfile = "freenove-fnk0099"
+/* inline constexpr std::string_view kBuildProfile = "also-wrong"; */
+inline constexpr const char* unrelated = "kBuildProfile = wrong-again";
+inline /* placement */ constexpr std::string_view
+    kBuildProfile /* active profile */ =
+        "freenove-fnk0085";
+}
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            header = self._write_identity_header(root, source)
+            self.assertEqual(read_build_profile(root), "freenove-fnk0085")
+            self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
+
+    def test_profile_parser_fails_closed_on_ambiguous_or_unsupported_authority(self) -> None:
+        cases = (
+            """
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";
+""",
+            'inline constexpr auto kBuildProfile = "freenove-fnk0099";\n',
+            """
+#if 0
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";
+#endif
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";
+""",
+        )
+        for source in cases:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self._write_identity_header(root, source)
+                with self.assertRaises(ReleaseContractError):
+                    read_build_profile(root)
 
     def test_tag_must_match_version_exactly(self) -> None:
         self.assertEqual(release_tag("0.1.0"), "v0.1.0")
@@ -139,6 +180,45 @@ class ReleaseContractTests(unittest.TestCase):
             text=True,
         )
         return result.stdout.strip()
+
+    @staticmethod
+    def _write_identity_header(root: Path, declaration: str) -> Path:
+        header = (
+            root
+            / "firmware/components/firmware_identity/include/firmware_identity/firmware_identity.hpp"
+        )
+        header.parent.mkdir(parents=True)
+        header.write_text(
+            "#pragma once\n#include <string_view>\n" + declaration,
+            encoding="utf-8",
+        )
+        return header
+
+    @staticmethod
+    def _compiled_profile(root: Path, header: Path) -> str:
+        source = root / "profile_oracle.cpp"
+        executable = root / "profile_oracle"
+        source.write_text(
+            '#include <iostream>\n#include "firmware_identity/firmware_identity.hpp"\n'
+            "int main() { std::cout << firmware_identity::kBuildProfile; }\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "c++",
+                "-std=c++20",
+                f"-I{header.parent.parent}",
+                str(source),
+                "-o",
+                str(executable),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return subprocess.run(
+            [str(executable)], check=True, capture_output=True, text=True
+        ).stdout
 
 
 if __name__ == "__main__":

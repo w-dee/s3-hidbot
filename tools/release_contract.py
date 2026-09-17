@@ -15,6 +15,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from host_artifact import HostArtifactError, REQUIRED_MODULES, required_modules_for_source
+
 
 PROJECT = "s3-hidbot"
 TARGET = "esp32s3"
@@ -22,11 +24,91 @@ DISTRIBUTION = "s3-hidbot-host"
 _RELEASE_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _SOURCE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _BUILD_PROFILE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
-_BUILD_PROFILE_DECLARATION = re.compile(r'kBuildProfile\s*=\s*"([^"]+)"')
 
 
 class ReleaseContractError(ValueError):
     """A requested release cannot be identified unambiguously."""
+
+
+@dataclass(frozen=True)
+class _CppToken:
+    kind: str
+    value: str
+
+
+def _cpp_tokens(text: str) -> tuple[_CppToken, ...]:
+    """Tokenize the deliberately narrow C++ subset used by the identity header."""
+
+    tokens: list[_CppToken] = []
+    cursor = 0
+    line_start = True
+    while cursor < len(text):
+        character = text[cursor]
+        if character.isspace():
+            if character in "\r\n":
+                line_start = True
+            cursor += 1
+            continue
+        if text.startswith("//", cursor):
+            newline = text.find("\n", cursor + 2)
+            cursor = len(text) if newline < 0 else newline
+            continue
+        if text.startswith("/*", cursor):
+            end = text.find("*/", cursor + 2)
+            if end < 0:
+                raise ReleaseContractError("firmware build profile authority has an unterminated comment")
+            line_start = line_start or "\n" in text[cursor : end + 2]
+            cursor = end + 2
+            continue
+        if character == "#" and line_start:
+            cursor += 1
+            while cursor < len(text) and text[cursor] in " \t":
+                cursor += 1
+            start = cursor
+            while cursor < len(text) and (text[cursor].isalnum() or text[cursor] == "_"):
+                cursor += 1
+            directive = text[start:cursor]
+            if directive not in {"include", "pragma"}:
+                raise ReleaseContractError(
+                    "firmware build profile authority uses unsupported conditional or macro syntax"
+                )
+            tokens.append(_CppToken("directive", directive))
+            line_start = False
+            continue
+        line_start = False
+        if character.isalpha() or character == "_":
+            start = cursor
+            cursor += 1
+            while cursor < len(text) and (text[cursor].isalnum() or text[cursor] == "_"):
+                cursor += 1
+            tokens.append(_CppToken("identifier", text[start:cursor]))
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            start = cursor + 1
+            cursor += 1
+            escaped = False
+            while cursor < len(text):
+                current = text[cursor]
+                if current in "\r\n":
+                    raise ReleaseContractError(
+                        "firmware build profile authority has an unsupported multiline literal"
+                    )
+                if not escaped and current == quote:
+                    break
+                if not escaped and current == "\\":
+                    escaped = True
+                else:
+                    escaped = False
+                cursor += 1
+            if cursor >= len(text):
+                raise ReleaseContractError("firmware build profile authority has an unterminated literal")
+            tokens.append(_CppToken("string" if quote == '"' else "character", text[start:cursor]))
+            cursor += 1
+            continue
+        tokens.append(_CppToken("symbol", character))
+        cursor += 1
+    return tuple(tokens)
 
 
 def validate_release_version(value: str) -> str:
@@ -54,10 +136,40 @@ def read_build_profile(source_root: Path) -> str:
         text = header.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ReleaseContractError("could not read firmware build profile authority") from exc
-    matches = _BUILD_PROFILE_DECLARATION.findall(text)
-    if len(matches) != 1 or _BUILD_PROFILE.fullmatch(matches[0]) is None:
+    tokens = _cpp_tokens(text)
+    declarations: list[str] = []
+    expected_prefix = (
+        _CppToken("identifier", "inline"),
+        _CppToken("identifier", "constexpr"),
+        _CppToken("identifier", "std"),
+        _CppToken("symbol", ":"),
+        _CppToken("symbol", ":"),
+        _CppToken("identifier", "string_view"),
+        _CppToken("identifier", "kBuildProfile"),
+        _CppToken("symbol", "="),
+    )
+    occurrences = [
+        index
+        for index, token in enumerate(tokens)
+        if token == _CppToken("identifier", "kBuildProfile")
+    ]
+    for index in occurrences:
+        start = index - 6
+        if (
+            start >= 0
+            and tokens[start : index + 2] == expected_prefix
+            and index + 3 < len(tokens)
+            and tokens[index + 2].kind == "string"
+            and tokens[index + 3] == _CppToken("symbol", ";")
+        ):
+            declarations.append(tokens[index + 2].value)
+    if (
+        len(occurrences) != 1
+        or len(declarations) != 1
+        or _BUILD_PROFILE.fullmatch(declarations[0]) is None
+    ):
         raise ReleaseContractError("firmware build profile authority is missing or invalid")
-    return matches[0]
+    return declarations[0]
 
 
 def release_tag(version: str) -> str:
@@ -73,12 +185,13 @@ def validate_release_tag(tag: str, version: str) -> str:
 
 @dataclass(frozen=True)
 class ReleaseContract:
-    """Names and metadata derived only from the two authoritative versions."""
+    """Names and package requirements derived from one selected source tree."""
 
     version: str
     firmware_version: str
     host_version: str
     build_profile: str
+    host_modules: frozenset[str] = REQUIRED_MODULES
 
     @property
     def tag(self) -> str:
@@ -128,11 +241,16 @@ def read_release_contract(source_root: Path) -> ReleaseContract:
             f"combined release requires matching firmware and host versions, got "
             f"{firmware_version} and {host_version}"
         )
+    try:
+        host_modules = required_modules_for_source(root)
+    except HostArtifactError as exc:
+        raise ReleaseContractError("could not read selected-source host module authority") from exc
     return ReleaseContract(
         version=firmware_version,
         firmware_version=firmware_version,
         host_version=host_version,
         build_profile=read_build_profile(root),
+        host_modules=host_modules,
     )
 
 
