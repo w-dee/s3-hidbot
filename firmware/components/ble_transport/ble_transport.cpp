@@ -34,6 +34,12 @@
 #include "store/config/ble_store_config.h"
 
 extern "C" void ble_store_config_init(void);
+// Pinned v5.5.4 host inspection boundary. foreach_handle requires the host
+// mutex and invokes no application callbacks. Never call a locking GAP API
+// from its callback. The SDK and this connection limit are verified at build.
+extern "C" void ble_hs_lock(void);
+extern "C" void ble_hs_unlock(void);
+extern "C" void ble_gap_conn_foreach_handle(ble_gap_conn_foreach_handle_fn *, void *);
 
 namespace ble_transport {
 namespace {
@@ -61,6 +67,7 @@ constexpr char kBondIdDomain[] = "s3-hidbot/bond-id/v1";
 // boundary therefore validates the exact v5.5.4 NVS representation against
 // the restored RAM store before trusting an absent security record.
 static_assert(ESP_IDF_VERSION == ESP_IDF_VERSION_VAL(5, 5, 4));
+static_assert(CONFIG_BT_NIMBLE_MAX_CONNECTIONS == 1);
 static_assert(ble_security::kBondCapacity == 3);
 static_assert(MYNEWT_VAL(BLE_STORE_CONFIG_PERSIST) == 1);
 static_assert(MYNEWT_VAL(BLE_STORE_MAX_BONDS) ==
@@ -1441,6 +1448,37 @@ std::int32_t Backend::start_advertising() {
 }
 
 std::int32_t Backend::stop_advertising() { return ble_gap_adv_stop(); }
+
+std::int32_t Backend::begin_hidden_exposure() {
+    const int stopped = ble_gap_adv_stop();
+    if (stopped != 0 && stopped != BLE_HS_EALREADY) return stopped;
+    std::uint16_t handle = ble_lifecycle::kNoConnection;
+    ble_hs_lock();
+    ble_gap_conn_foreach_handle([](std::uint16_t value, void *context) {
+        *static_cast<std::uint16_t *>(context) = value;
+        return 1;
+    }, &handle);
+    ble_hs_unlock();
+    if (handle == ble_lifecycle::kNoConnection) return 0;
+    // Advertising is stopped and max_connections is one, so this handle
+    // cannot be replaced by another connection before the call. The executor
+    // owns a bounded absence poll; do not re-arm an existing security timer.
+    const int result = ble_gap_terminate(handle, BLE_ERR_REM_USER_CONN_TERM);
+    return result == BLE_HS_EALREADY || result == BLE_HS_ENOTCONN ? 0 : result;
+}
+
+bool Backend::physical_exposure_hidden() const {
+    if (!ble_hs_is_enabled()) return false;
+    bool connected = false;
+    ble_hs_lock();
+    ble_gap_conn_foreach_handle([](std::uint16_t, void *context) {
+        *static_cast<bool *>(context) = true;
+        return 1;
+    }, &connected);
+    const bool advertising = ble_gap_adv_active() != 0;
+    ble_hs_unlock();
+    return !connected && !advertising;
+}
 
 std::int32_t Backend::disconnect(std::uint16_t connection_handle) {
     // Establish the typed watchdog before NimBLE can expose completion on

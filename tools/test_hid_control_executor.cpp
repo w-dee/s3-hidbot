@@ -124,9 +124,23 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         ++stop_calls;
         return stop_result;
     }
+    std::int32_t begin_hidden_exposure() override {
+        ++stop_calls;
+        if (stop_result != 0) return stop_result;
+        if (physical_connection != ble_lifecycle::kNoConnection)
+            return disconnect(physical_connection);
+        return 0;
+    }
+    bool physical_exposure_hidden() const override {
+        return physical_connection == ble_lifecycle::kNoConnection && !physical_advertising;
+    }
+    std::uint16_t physical_connection = ble_lifecycle::kNoConnection;
+    bool physical_advertising = false;
     std::int32_t disconnect(std::uint16_t connection_handle) override {
         ++disconnect_calls;
         last_connection = connection_handle;
+        if (disconnect_result == already_disconnected_result)
+            physical_connection = ble_lifecycle::kNoConnection;
         return disconnect_result;
     }
     bool security_teardown_already_disconnected(
@@ -376,6 +390,10 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
                 generation, connection,
                 kind == hid_control_executor::BleEventKind::kStorageFailure);
         }
+        if (kind == hid_control_executor::BleEventKind::kConnect && status == 0)
+            physical_connection = connection;
+        if (kind == hid_control_executor::BleEventKind::kDisconnect && physical_connection == connection)
+            physical_connection = ble_lifecycle::kNoConnection;
         return sink->signal_ble_event({.kind = kind,
                                       .generation = generation,
                                       .connection_handle = connection,
@@ -1940,6 +1958,96 @@ void test_ble_disable_expected_disconnect_and_retained_stack() {
     assert(ble.initialize_calls == 1);
     assert(database.register_calls == 1);
     assert(database.validate_calls == 2);
+}
+
+void test_hidden_exposure_waits_for_unadopted_physical_peer() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kSync));
+    assert(controller.process_one_for_test());
+    const auto old_generation = controller.ble_snapshot().generation;
+    // Host connection exists before its Connect reaches the serialized owner.
+    ble.physical_connection = 211;
+    assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.disconnect_calls == 1 && ble.last_connection == 211);
+    assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kDisabling);
+    assert(controller.active_operation_for_test() == ControlOperation::kBleDisable);
+    assert(!controller.ble_link_ready());
+    assert(controller.request_profile_select(ble_fixture_profile::ProfileId::kMouseMetadata).result == ble_fixture_profile::SelectionResult::kBusy);
+    // A late old-generation Connect cannot grant readiness or finish hide.
+    assert(ble.event_for_generation(hid_control_executor::BleEventKind::kConnect,old_generation,211));
+    assert(controller.process_one_for_test());
+    controller.drive_ble_disable_for_test();
+    assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kDisabling);
+    // Physical absence is sufficient even if Disconnect was already queued
+    // with retired generation. No second terminate, reset, or new request.
+    ble.physical_connection = ble_lifecycle::kNoConnection;
+    controller.drive_ble_disable_for_test();
+    assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kIdle);
+    assert(!controller.ble_snapshot().recovery_required);
+    assert(controller.active_operation_for_test() == ControlOperation::kNone);
+    assert(ble.disconnect_calls == 1);
+    assert(ble.event_for_generation(hid_control_executor::BleEventKind::kDisconnect,old_generation,211));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kIdle);
+    assert(ble.advertising_calls == 1);
+}
+
+void test_hidden_exposure_disconnect_needs_physical_absence() {
+    hid_runtime::Runtime runtime; FakeBackend usb; FakeBleBackend ble;
+    FakeBleDatabase database; hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime,&usb,&ble,&database));
+    assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kSync));
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect,213));
+    assert(controller.process_one_for_test());
+    assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect,213));
+    // The queued event alone is insufficient if host exposure still exists.
+    ble.physical_connection=214;
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kDisabling);
+    ble.physical_connection=ble_lifecycle::kNoConnection;
+    ble.physical_advertising=true;
+    controller.drive_ble_disable_for_test();
+    assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kDisabling);
+    ble.physical_advertising=false;
+    controller.drive_ble_disable_for_test();
+    assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kIdle);
+    assert(!controller.ble_snapshot().recovery_required);
+}
+
+void test_hidden_exposure_deadline_and_generation_fail_closed() {
+    for (const bool change_generation : {false,true}) {
+        hid_runtime::Runtime runtime; FakeBackend usb; FakeBleBackend ble;
+        FakeBleDatabase database; hid_control_executor::Controller controller;
+        assert(controller.initialize(&runtime,&usb,&ble,&database));
+        assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        assert(ble.event(hid_control_executor::BleEventKind::kSync));
+        assert(controller.process_one_for_test());
+        ble.physical_connection=212;
+        assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
+        assert(controller.process_one_for_test());
+        if (change_generation) controller.set_ble_generation_for_test(controller.ble_snapshot().generation+1);
+        else ble.now_us += 5'000'000;
+        controller.drive_ble_disable_for_test();
+        assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kFault);
+        assert(controller.ble_snapshot().recovery_required);
+        assert(controller.ble_snapshot().desired == ble_lifecycle::DesiredExposure::kHidden);
+        assert(controller.active_operation_for_test() == ControlOperation::kNone);
+        assert(ble.disconnect_calls==1);
+    }
 }
 
 void test_missing_live_database_fails_closed_before_advertising() {
@@ -7899,6 +8007,9 @@ int main(int argc, char **argv) {
     test_unmount_preempts_route_action_and_guard_releases_once();
     test_ble_lifecycle_is_shared_serialized_and_transport_independent();
     test_ble_disable_expected_disconnect_and_retained_stack();
+    test_hidden_exposure_waits_for_unadopted_physical_peer();
+    test_hidden_exposure_deadline_and_generation_fail_closed();
+    test_hidden_exposure_disconnect_needs_physical_absence();
     test_ble_disable_preserves_active_usb_route_and_reports();
     test_ble_disable_failure_preserves_active_usb_route();
     test_usb_route_release_serializes_ble_disable_without_ble_stage_a();

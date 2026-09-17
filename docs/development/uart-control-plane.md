@@ -1773,3 +1773,11 @@ and DIS `0x1f` / `0x21`, `0x23`, `0x25` (manufacturer, model, PnP).
 Metadata adds no HID producer role or subscription prerequisite. The existing
 quiescent, boot-scoped selection policy applies. Strict's services and map
 remain unchanged, and metadata disappears when another profile is selected.
+
+BLE hide completion also requires the pinned host to report both advertising
+stopped and no physical connection. A connection established while its callback
+is queued cannot be reported hidden-idle merely because advertising already
+stopped. The control owner initiates teardown once and bounds physical-absence
+observation to five seconds; missing progress or a changed lifecycle fails
+hidden with recovery required. No bond removal or automatic route restore is
+part of this cleanup.

@@ -33,6 +33,8 @@ class Backend final : public hid_control_executor::BleBackend {
     void set_generation(ble_lifecycle::Generation generation) override;
     std::int32_t start_advertising() override;
     std::int32_t stop_advertising() override;
+    std::int32_t begin_hidden_exposure() override;
+    bool physical_exposure_hidden() const override;
     std::int32_t disconnect(std::uint16_t connection_handle) override;
     bool security_teardown_already_disconnected(
         std::int32_t disconnect_result) const override;

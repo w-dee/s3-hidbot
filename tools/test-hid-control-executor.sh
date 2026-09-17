@@ -31,4 +31,5 @@ trap 'rm -f "$temporary_directory/test_hid_control_executor"; rmdir "$temporary_
   "$repository_root/firmware/components/secure_memory/secure_memory.cpp" \
   -o "$temporary_directory/test_hid_control_executor"
 "$temporary_directory/test_hid_control_executor"
+"${PYTHON_BIN:-python3}" "$repository_root/tools/test_ble_hidden_exposure.py"
 echo "PASS: HID control executor tests"

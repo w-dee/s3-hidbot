@@ -448,6 +448,29 @@ ble_fixture_profile::SelectionOutcome Controller::request_profile_select(
     return {.result = Result::kAccepted, .snapshot = profile_snapshot()};
 }
 
+void Controller::drive_ble_disable() {
+    constexpr auto owner = ControlOperation::kBleDisable;
+    if (active_operation_.load(std::memory_order_acquire) != owner) {
+        ble_disable_deadline_us_ = 0;
+        return;
+    }
+    if (ble_disable_deadline_us_ == 0) return;
+    const auto current = ble_state_.snapshot();
+    if (current.generation != ble_disable_generation_ || current.recovery_required ||
+        current.desired != ble_lifecycle::DesiredExposure::kHidden ||
+        current.observed != ble_lifecycle::ObservedState::kDisabling ||
+        ble_backend_->monotonic_time_us() >= ble_disable_deadline_us_) {
+        ble_disable_deadline_us_ = 0;
+        fail_ble(current.generation, ble_lifecycle::Operation::kDisable, -4, owner);
+        return;
+    }
+    if (!ble_backend_->physical_exposure_hidden()) return;
+    if (!ble_state_.complete_disable(ble_disable_generation_)) return;
+    ble_disable_deadline_us_ = 0;
+    ble_backend_->record_heap_checkpoint(BleBackend::HeapCheckpoint::kHiddenIdle);
+    release_operation(owner);
+}
+
 void Controller::drive_profile_selection() {
     constexpr auto operation = ControlOperation::kProfileSelection;
     if (active_operation_.load(std::memory_order_acquire) != operation ||
@@ -2433,27 +2456,16 @@ void Controller::process(Action action) {
                                           security.connection_handle);
         }
         ble_backend_->set_generation(current.generation);
-        if (current.advertising) {
-            const std::int32_t result = ble_backend_->stop_advertising();
-            if (result != 0) {
-                fail_ble(current.generation, ble_lifecycle::Operation::kDisable,
-                         result, operation);
-                return;
-            }
-        }
-        if (current.connected) {
-            const std::int32_t result =
-                ble_backend_->disconnect(ble_state_.connection_handle());
-            if (result != 0) {
-                fail_ble(current.generation, ble_lifecycle::Operation::kDisable,
-                         result, operation);
-            }
+        ble_disable_generation_ = current.generation;
+        ble_disable_deadline_us_ = ble_backend_->monotonic_time_us() + 5'000'000;
+        const auto result = ble_backend_->begin_hidden_exposure();
+        if (result != 0) {
+            ble_disable_deadline_us_ = 0;
+            fail_ble(current.generation, ble_lifecycle::Operation::kDisable,
+                     result, operation);
             return;
         }
-        ble_state_.complete_disable(current.generation);
-        ble_backend_->record_heap_checkpoint(
-            BleBackend::HeapCheckpoint::kHiddenIdle);
-        release_operation(operation);
+        drive_ble_disable();
         return;
     }
     if (action.kind == ActionKind::kRouteRelease) {
@@ -3257,10 +3269,9 @@ bool Controller::reconcile_ble_disconnect(BleEvent event, bool expected) {
                                   event.connection_handle);
     clear_ble_hid_peer();
     if (expected) {
-        ble_state_.complete_disable(event.generation);
-        ble_backend_->record_heap_checkpoint(
-            BleBackend::HeapCheckpoint::kHiddenIdle);
-        release_operation(ControlOperation::kBleDisable);
+        // A current Disconnect can wake completion, but the pinned host must
+        // also prove no unadopted peer or advertising remains.
+        drive_ble_disable();
         return true;
     }
     if (ble_backend_->persistent_store_failure_observed()) {
@@ -3603,6 +3614,7 @@ bool Controller::process_wake_cycle_for_test() {
     drive_ble_explicit_release();
     retire_ble_route_if_unready();
     drive_profile_selection();
+    drive_ble_disable();
     return true;
 }
 
@@ -3649,6 +3661,8 @@ void Controller::set_ble_generation_for_test(
     ble_lifecycle::Generation generation) {
     ble_state_.set_generation_for_test(generation);
 }
+
+void Controller::drive_ble_disable_for_test() { drive_ble_disable(); }
 
 void Controller::drive_profile_selection_for_test() { drive_profile_selection(); }
 void Controller::set_stack_incarnation_for_test(std::uint32_t value) {
@@ -3740,7 +3754,8 @@ void Controller::task_loop() {
         // wait remains pending, closing the check-then-sleep race.
         const TickType_t wait_ticks =
             (usb_sof_watchdog_.armed || active_operation_.load(std::memory_order_acquire) ==
-                ControlOperation::kProfileSelection)
+                ControlOperation::kProfileSelection ||
+             active_operation_.load(std::memory_order_acquire) == ControlOperation::kBleDisable)
                 ? pdMS_TO_TICKS(kUsbSofWatchdogSampleMs)
                 : portMAX_DELAY;
         (void)ulTaskNotifyTake(pdTRUE, wait_ticks);
@@ -3762,6 +3777,7 @@ void Controller::task_loop() {
         drive_ble_explicit_release();
         retire_ble_route_if_unready();
         drive_profile_selection();
+        drive_ble_disable();
     }
 }
 #endif

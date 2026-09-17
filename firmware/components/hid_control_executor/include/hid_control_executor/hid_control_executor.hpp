@@ -323,6 +323,12 @@ class BleBackend {
     virtual void set_generation(ble_lifecycle::Generation generation) = 0;
     virtual std::int32_t start_advertising() = 0;
     virtual std::int32_t stop_advertising() = 0;
+    // Stop advertising and initiate teardown of any physical peer, including
+    // one whose Connect has not yet reached the executor. Completion requires
+    // a separate physical-absence observation; neither API success nor a
+    // retired callback alone proves hidden exposure.
+    virtual std::int32_t begin_hidden_exposure() = 0;
+    virtual bool physical_exposure_hidden() const = 0;
     virtual std::int32_t disconnect(std::uint16_t connection_handle) = 0;
     // This classification is consumed only by the exact, executor-owned
     // security teardown path. Other disconnect callers retain their existing
@@ -660,6 +666,7 @@ class Controller final : public usb_lifecycle::Executor,
                                             BleGraceSignalHook hook);
     void set_ble_generation_for_test(ble_lifecycle::Generation generation);
     void drive_profile_selection_for_test();
+    void drive_ble_disable_for_test();
     void set_stack_incarnation_for_test(std::uint32_t value);
     ControlOperation active_operation_for_test() const;
     bool reserve_operation_for_test(ControlOperation operation);
@@ -773,6 +780,7 @@ class Controller final : public usb_lifecycle::Executor,
 
     void process(Action action);
     void drive_profile_selection();
+    void drive_ble_disable();
     const ble_fixture_profile::ProfileDefinition &selected_profile() const;
     void publish_profile(bool active, ble_fixture_profile::SelectionTransition transition);
     bool enqueue(Action action);
@@ -871,6 +879,8 @@ class Controller final : public usb_lifecycle::Executor,
     std::atomic<std::uint32_t> ble_stack_incarnation_{0};
     std::uint64_t profile_stop_id_ = 0;
     std::uint64_t profile_deadline_us_ = 0;
+    std::uint64_t ble_disable_deadline_us_ = 0;
+    ble_lifecycle::Generation ble_disable_generation_ = 0;
     // Protected by the short DLE admission critical section, never across HCI.
     void observe_dle_event(BleEvent event);
     bool claim_dle(BleEvent event);
