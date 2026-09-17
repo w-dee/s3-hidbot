@@ -467,6 +467,17 @@ void Controller::abort() {
     abort_generation(generation);
 }
 
+void Controller::abort_for_release() {
+    const std::uint32_t generation =
+        reserved_generation_.load(std::memory_order_acquire);
+    if (generation == 0) {
+        cancel_requested_.store(true, std::memory_order_release);
+        return;
+    }
+    release_owned_generation_.store(generation, std::memory_order_release);
+    abort_generation(generation);
+}
+
 void Controller::retire_owner(std::uint64_t local_owner_id) {
     if (local_owner_id == 0) return;
     while (true) {
@@ -597,6 +608,10 @@ void Controller::run(std::uint32_t generation) {
         (void)reserved_generation_.compare_exchange_strong(
             expected_generation, 0, std::memory_order_acq_rel,
             std::memory_order_acquire);
+        std::uint32_t expected_release_owner = generation;
+        (void)release_owned_generation_.compare_exchange_strong(
+            expected_release_owner, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
         return;
     }
     std::uint32_t accepted = encode_status(
@@ -607,13 +622,19 @@ void Controller::run(std::uint32_t generation) {
             accepted, running, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
         if (status_generation_.load(std::memory_order_acquire) == generation &&
-            decode_state(accepted) == State::kAborted) {
+            decode_state(accepted) == State::kAborted &&
+            release_owned_generation_.load(std::memory_order_acquire) !=
+                generation) {
             backend_->request_safety_release();
         }
         backend_->end_sequence(authority_);
         std::uint32_t expected_generation = generation;
         (void)reserved_generation_.compare_exchange_strong(
             expected_generation, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        std::uint32_t expected_release_owner = generation;
+        (void)release_owned_generation_.compare_exchange_strong(
+            expected_release_owner, 0, std::memory_order_acq_rel,
             std::memory_order_acquire);
         return;
     }
@@ -700,13 +721,19 @@ void Controller::run(std::uint32_t generation) {
     }
     const State published_state =
         decode_state(status_word_.load(std::memory_order_acquire));
-    if (published_state != State::kCompleted) {
+    if (published_state != State::kCompleted &&
+        release_owned_generation_.load(std::memory_order_acquire) !=
+            generation) {
         backend_->request_safety_release();
     }
     backend_->end_sequence(authority_);
     std::uint32_t expected_generation = generation;
     (void)reserved_generation_.compare_exchange_strong(
         expected_generation, 0, std::memory_order_acq_rel,
+        std::memory_order_acquire);
+    std::uint32_t expected_release_owner = generation;
+    (void)release_owned_generation_.compare_exchange_strong(
+        expected_release_owner, 0, std::memory_order_acq_rel,
         std::memory_order_acquire);
 }
 

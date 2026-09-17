@@ -1365,8 +1365,28 @@ Keyboard and Mouse outcomes. A successful result is exactly:
 
 `already_up` means the runtime knows that interface is all-up, not uncertain,
 and has no relevant queued or in-flight operation. `submitted` means the
-TinyUSB all-up report was accepted by `tud_hid_n_report`; it does not promise
-completion or host/OS processing. Cross-endpoint atomicity is not promised.
+selected transport's local stack accepted the all-up report. For USB this is
+`tud_hid_n_report`; for BLE it is `ble_gatts_notify_custom`. Neither outcome
+promises host polling, peer receipt, or OS processing. Cross-interface
+atomicity is not promised.
+
+On an explicitly selected, continuously healthy BLE route, this command is a
+route-preserving safety transaction. It publishes the producer barrier before
+the clean-state snapshot, waits for old claimed/submitting work, serializes any
+required Keyboard and Mouse neutral notifications through the BLE owner, and
+commits a fresh internal activation incarnation. The selected BLE route and
+route generation remain in place and become ready again only after that exact
+commit. Work admitted under the pre-release activation remains permanently
+stale.
+
+Route preservation requires the same connection, activation, report handles,
+required CCCDs, security, cache, lifecycle, and route authority to remain
+valid continuously. A callback-observed loss permanently vetoes preservation
+for that transaction even if readiness later recovers. Disconnect, CCCD or
+security loss, lifecycle fault, explicit route-none, session takeover, lease
+expiry, and authority exhaustion retain the existing fail-closed retirement
+behavior. Recovery or reconnect never reselects BLE automatically. The public
+command and result schema are unchanged.
 
 If either interface cannot be proven safe within the bounded operation window,
 the response is the existing error envelope with exactly
@@ -1432,8 +1452,11 @@ submits through the existing USB or BLE ticket owner and emits zero mouse
 motion, wheel, and pan deltas. Normal completion preserves held state. A
 second start and ordinary HID producers return `HID_BUSY` while the sequence
 owns production. `hid.release_all`, lease expiry, session takeover, lifecycle
-loss, and execution failure abort remaining work and use the existing safety
-release path.
+loss, and execution failure abort remaining work. An explicit public release
+owns the cleanup for its exact aborted Sequence generation, so a delayed
+Sequence callback cannot retire a successfully preserved BLE incarnation.
+Independent Sequence failure, lease expiry, takeover, and lifecycle loss keep
+their existing fail-closed safety path.
 
 Every public report waiter retains the exact fixed-slot ticket identity it
 published. Terminal results may be consumed only by that identity; a delayed

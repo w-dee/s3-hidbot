@@ -363,20 +363,37 @@ enum class ReleaseAllInterfaceState : std::uint8_t {
     kCanceled,
 };
 
+enum class BleReleaseAllAction : std::uint8_t {
+    kNotApplicable,
+    kWaitForOldWork,
+    kAlreadyUp,
+    kSubmitNeutral,
+};
+
 // Fixed-size, heap-free outcome bridge between the UART/control task and the
-// TinyUSB SOF executor. Interface outcomes are historical: kSubmitted means
-// tud_hid_n_report() accepted the all-up report, not that the host completed it.
+// selected transport owner. Interface outcomes are historical: kSubmitted
+// means the local USB or BLE stack accepted the all-up report, not that the
+// host or peer received it.
 struct ReleaseAllTicket {
     std::atomic<UsbGeneration> transport_generation{0};
     std::atomic<AuthorityEpoch> authority_epoch{0};
     std::atomic<RouteGeneration> route_generation{0};
     std::atomic<HidTransport> transport{HidTransport::kUsb};
+    std::atomic<std::uint32_t> release_epoch{0};
+    std::atomic<ProfileActivationEpoch> profile_activation_epoch{0};
+    std::atomic<std::uint16_t> connection_handle{kNoBleConnection};
+    std::atomic<ReportMask> present_roles{0};
+    std::atomic<ReportMask> required_input_subscriptions{0};
+    std::array<std::atomic<std::uint16_t>,
+               hid_capability::kReportRoleCount> report_handles{};
     std::atomic<ReleaseAllInterfaceState> keyboard{ReleaseAllInterfaceState::kUnresolved};
     std::atomic<ReleaseAllInterfaceState> mouse{ReleaseAllInterfaceState::kUnresolved};
     std::atomic_bool active{false};
     std::atomic_bool finalized{false};
     std::atomic_bool failed_before_finalization{false};
     std::atomic_bool canceled{false};
+    std::atomic_bool ble_continuity_lost{false};
+    std::atomic_bool success_committed{false};
 };
 
 struct ReleaseAllSnapshot {
@@ -384,12 +401,20 @@ struct ReleaseAllSnapshot {
     AuthorityEpoch authority_epoch = 0;
     RouteGeneration route_generation = 0;
     HidTransport transport = HidTransport::kUsb;
+    std::uint32_t release_epoch = 0;
+    ProfileActivationEpoch profile_activation_epoch = 0;
+    std::uint16_t connection_handle = kNoBleConnection;
+    ReportMask present_roles = 0;
+    ReportMask required_input_subscriptions = 0;
+    ReportHandles report_handles{};
     ReleaseAllInterfaceState keyboard = ReleaseAllInterfaceState::kUnresolved;
     ReleaseAllInterfaceState mouse = ReleaseAllInterfaceState::kUnresolved;
     bool active = false;
     bool finalized = false;
     bool failed_before_finalization = false;
     bool canceled = false;
+    bool ble_continuity_lost = false;
+    bool success_committed = false;
 };
 
 struct ReleaseAllResult {
@@ -530,6 +555,17 @@ class StateMachine {
     void begin_release_all();
     ReleaseAllSnapshot release_all_snapshot() const;
     void finalize_release_all();
+    BleReleaseAllAction prepare_ble_release_all_interface(
+        ReleaseAllSnapshot expected, Interface interface);
+    bool complete_ble_release_all_interface(ReleaseAllSnapshot expected,
+                                            Interface interface);
+    void fail_ble_release_all(ReleaseAllSnapshot expected,
+                              Interface uncertain_interface);
+    bool commit_ble_release_all(ReleaseAllSnapshot expected);
+    bool ble_release_all_route_continuity_matches(
+        BleRouteAuthoritySnapshot expected) const;
+    void note_ble_route_continuity_loss(
+        BleRouteAuthoritySnapshot expected);
     void cancel_queued(Interface interface);
 
     // TinyUSB-task USB executor and completion notifications.
@@ -687,6 +723,8 @@ class StateMachine {
     void cancel_keyboard_ticket(KeyboardReportTicketOutcome outcome);
     void cancel_mouse_ticket(MouseReportTicketOutcome outcome);
     bool known_all_up(Interface interface) const;
+    bool release_interface_work_pending(Interface interface) const;
+    bool release_ticket_matches(ReleaseAllSnapshot expected) const;
     void set_release_outcome(Interface interface, ReleaseAllInterfaceState outcome);
     void write_confirmed_keyboard(const std::uint8_t *report);
     std::array<std::uint8_t, 8> read_confirmed_keyboard() const;

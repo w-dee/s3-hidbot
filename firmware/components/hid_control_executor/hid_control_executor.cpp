@@ -12,6 +12,7 @@
 
 #include <cstring>
 #include <limits>
+#include <utility>
 
 #include "ble_fixture_profile/ble_fixture_profile.hpp"
 #include "secure_memory/secure_memory.hpp"
@@ -624,7 +625,14 @@ bool Controller::claim_dle(BleEvent event) {
 
 bool Controller::signal_ble_event(BleEvent event) {
     observe_dle_event(event);
+    const bool loses_current_route =
+        event_immediately_loses_ble_hid_readiness(event) &&
+        event_targets_current_ble_authority(event);
     mark_ble_route_loss(event);
+    if (runtime_ != nullptr && loses_current_route) {
+        runtime_->state_machine().note_ble_route_continuity_loss(
+            runtime_->state_machine().ble_route_authority_snapshot());
+    }
     const Action item = Action::with_ble_event(event);
     if (enqueue(item)) {
         return true;
@@ -638,6 +646,11 @@ bool Controller::signal_ble_event(BleEvent event) {
         hook(*this);
     }
 #endif
+    if (runtime_ != nullptr &&
+        event_targets_current_ble_authority(event)) {
+        runtime_->state_machine().note_ble_route_continuity_loss(
+            runtime_->state_machine().ble_route_authority_snapshot());
+    }
     mark_ble_event_overflow(event);
     if (event.kind == BleEventKind::kDisconnect && runtime_ != nullptr) {
         const auto release =
@@ -719,6 +732,10 @@ bool Controller::signal_ble_route_release_grace(
 
 void Controller::signal_ble_lifecycle_handoff_failure() {
     ble_lifecycle_handoff_failure_.store(true, std::memory_order_release);
+    if (runtime_ != nullptr) {
+        runtime_->state_machine().note_ble_route_continuity_loss(
+            runtime_->state_machine().ble_route_authority_snapshot());
+    }
     request_executor_wake();
 }
 
@@ -951,9 +968,11 @@ bool Controller::ble_route_ready() const {
     }
     const hid_runtime::StateMachine &state = runtime_->state_machine();
     const auto authority = state.ble_route_authority_snapshot();
+    const auto release = state.release_all_snapshot();
     const auto peer = ble_hid_peer_;
     const auto route = state.route_snapshot();
-    return ble_link_ready() && route.coherent && !route.invalidation_pending &&
+    return !release.active && ble_link_ready() && route.coherent &&
+           !route.invalidation_pending &&
            route.active == hid_route::OutputRoute::kBle &&
            route.desired == hid_route::OutputRoute::kBle &&
            route.transition == hid_route::Transition::kStable &&
@@ -1260,6 +1279,98 @@ BleHidSubmitResult Controller::submit_ble_mouse(
                              bounded.data(), bounded.size());
 }
 
+bool Controller::ble_explicit_release_ready(
+    hid_runtime::ReleaseAllSnapshot transaction,
+    BleHidInterface interface) const {
+    if (runtime_ == nullptr || !transaction.active ||
+        transaction.transport != hid_runtime::HidTransport::kBle ||
+        (interface != BleHidInterface::kKeyboard &&
+         interface != BleHidInterface::kMouse)) {
+        return false;
+    }
+    const auto role = interface == BleHidInterface::kKeyboard
+        ? hid_runtime::ReportRole::kKeyboardInput
+        : hid_runtime::ReportRole::kMouseInput;
+    const BleHidWorkIdentity identity{
+        .generation = transaction.transport_generation,
+        .profile_activation_epoch = transaction.profile_activation_epoch,
+        .connection_handle = transaction.connection_handle,
+        .characteristic_handle = transaction.report_handles.get(role),
+    };
+    const auto authority =
+        runtime_->state_machine().ble_route_authority_snapshot();
+    return ble_link_ready() &&
+           runtime_->state_machine().ble_release_all_route_continuity_matches(
+               authority) &&
+           ble_hid_interface_ready(identity, interface);
+}
+
+void Controller::drive_ble_explicit_release() {
+    if (runtime_ == nullptr || ble_database_ == nullptr) {
+        return;
+    }
+    hid_runtime::StateMachine &state = runtime_->state_machine();
+    auto transaction = state.release_all_snapshot();
+    if (!transaction.active ||
+        transaction.transport != hid_runtime::HidTransport::kBle ||
+        transaction.success_committed) {
+        return;
+    }
+    for (const auto &item : {
+             std::pair{hid_runtime::Interface::kKeyboard,
+                       BleHidInterface::kKeyboard},
+             std::pair{hid_runtime::Interface::kMouse,
+                       BleHidInterface::kMouse},
+         }) {
+        transaction = state.release_all_snapshot();
+        const auto action = state.prepare_ble_release_all_interface(
+            transaction, item.first);
+        if (action == hid_runtime::BleReleaseAllAction::kWaitForOldWork) {
+            return;
+        }
+        if (action == hid_runtime::BleReleaseAllAction::kNotApplicable) {
+            retire_ble_route_if_unready();
+            return;
+        }
+        if (action == hid_runtime::BleReleaseAllAction::kAlreadyUp) {
+            continue;
+        }
+        if (!ble_explicit_release_ready(transaction, item.second)) {
+            state.fail_ble_release_all(transaction, item.first);
+            retire_ble_route_if_unready();
+            return;
+        }
+        const auto role = item.second == BleHidInterface::kKeyboard
+            ? hid_runtime::ReportRole::kKeyboardInput
+            : hid_runtime::ReportRole::kMouseInput;
+        const std::uint8_t *neutral = item.second == BleHidInterface::kKeyboard
+            ? kBleKeyboardAllUp.data()
+            : kBleMouseAllUp.data();
+        const std::uint16_t length = item.second == BleHidInterface::kKeyboard
+            ? static_cast<std::uint16_t>(kBleKeyboardAllUp.size())
+            : static_cast<std::uint16_t>(kBleMouseAllUp.size());
+        const auto result = ble_database_->notify_custom(
+            transaction.connection_handle,
+            transaction.report_handles.get(role), neutral, length);
+        if (result != BleNotifyBackendResult::kStackAccepted ||
+            !ble_explicit_release_ready(transaction, item.second) ||
+            !state.complete_ble_release_all_interface(transaction,
+                                                      item.first)) {
+            state.fail_ble_release_all(transaction, item.first);
+            retire_ble_route_if_unready();
+            return;
+        }
+    }
+    transaction = state.release_all_snapshot();
+    if (!ble_explicit_release_ready(transaction,
+                                    BleHidInterface::kKeyboard) ||
+        !ble_explicit_release_ready(transaction,
+                                    BleHidInterface::kMouse) ||
+        !state.commit_ble_release_all(transaction)) {
+        retire_ble_route_if_unready();
+    }
+}
+
 void Controller::retire_ble_route_if_unready() {
     if (runtime_ == nullptr) {
         return;
@@ -1270,7 +1381,13 @@ void Controller::retire_ble_route_if_unready() {
         return;
     }
     if (authority.active) {
-        if (!ble_route_ready()) {
+        const auto transaction = state.release_all_snapshot();
+        const bool explicit_release_owns_route =
+            transaction.active &&
+            transaction.transport == hid_runtime::HidTransport::kBle &&
+            ble_link_ready() &&
+            state.ble_release_all_route_continuity_matches(authority);
+        if (!explicit_release_owns_route && !ble_route_ready()) {
             (void)state.retire_ble_route_if_matches(authority);
         }
     }
@@ -3254,6 +3371,7 @@ bool Controller::process_wake_cycle_for_test() {
     (void)reconcile_usb_runtime_fault();
     reconcile_usb_lifecycle_logs();
     (void)reconcile_ble_fallbacks(nullptr);
+    drive_ble_explicit_release();
     retire_ble_route_if_unready();
     return true;
 }
@@ -3405,6 +3523,7 @@ void Controller::task_loop() {
         (void)reconcile_usb_sof_watchdog(now_ms);
         reconcile_usb_lifecycle_logs();
         (void)reconcile_ble_fallbacks(nullptr);
+        drive_ble_explicit_release();
         retire_ble_route_if_unready();
     }
 }

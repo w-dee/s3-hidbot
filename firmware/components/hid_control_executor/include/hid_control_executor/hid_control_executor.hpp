@@ -791,6 +791,10 @@ class Controller final : public usb_lifecycle::Executor,
                                   BleHidInterface interface) const;
     bool ble_hid_interface_ready(BleHidWorkIdentity identity,
                                  BleHidInterface interface) const;
+    bool ble_explicit_release_ready(
+        hid_runtime::ReleaseAllSnapshot transaction,
+        BleHidInterface interface) const;
+    void drive_ble_explicit_release();
     BleHidSubmitResult submit_ble_report(
         BleHidWorkIdentity identity, BleHidInterface interface,
         const std::uint8_t *payload, std::uint16_t payload_length);

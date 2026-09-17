@@ -553,7 +553,7 @@ void request_hid_safety_release(void *) {
 }
 
 control_protocol::ReleaseAllResult release_all(void *) {
-    s_hid_sequence.abort();
+    s_hid_sequence.abort_for_release();
     const hid_runtime::ReleaseAllResult result = s_hid_runtime.release_all();
     const auto convert = [](hid_runtime::ReleaseAllInterfaceState state) {
         return state == hid_runtime::ReleaseAllInterfaceState::kSubmitted

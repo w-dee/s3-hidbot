@@ -57,7 +57,7 @@ intentionally injects a key, button, or movement.
 | `hidbotctl hid-route-set usb` | UART + route v2, or v1 fallback | Select an already mounted, safety-clear USB transport from stable none. |
 | `hidbotctl hid-route-set ble` | UART + `hid.output-route-v2` | Select an already connected, secured, composite-subscribed BLE peer from stable none. V1-only firmware is rejected locally. |
 | `hidbotctl self-test` | UART | Safe diagnostic sequence including `release-all`. |
-| `hidbotctl release-all` | UART | Explicit keyboard/mouse all-up recovery. |
+| `hidbotctl release-all` | UART | Explicit keyboard/mouse all-up recovery. A continuously healthy selected BLE route remains selected under a fresh internal incarnation; any readiness or authority loss retains fail-closed route retirement. |
 | `hidbotctl verify-firmware ARTIFACT` | Artifact + UART | Verify artifact first, then fresh hello and system info identity comparison. No flash or HID. |
 | `hidbotctl flash-firmware ARTIFACT` | Current FNK0099 artifact + UART + `[flash]` | Destructive verified provisioning. Native USB is not required. |
 | `hidbotctl flash-firmware --allow-legacy-v0-3-0-recovery ARCHIVE` | Exact published v0.3.0 archive + UART + `[flash]` | Explicit bounded recovery; extracted or repacked input is rejected. |

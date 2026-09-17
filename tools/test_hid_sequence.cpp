@@ -389,6 +389,36 @@ void admission_abort_and_authority_contract() {
     assert(!controller.status(32, &status));
 }
 
+void explicit_release_owns_only_its_sequence_abort_cleanup() {
+    Clock clock{};
+    Backend backend{};
+    backend.clock = &clock;
+    hid_sequence::Controller controller;
+    assert(controller.initialize(&backend, Clock::now, &clock));
+
+    assert(controller.start(33, "w200;kp4") ==
+           hid_sequence::AdmissionResult::kAccepted);
+    controller.abort_for_release();
+    controller.run_for_test();
+    hid_sequence::Status status{};
+    assert(controller.status(33, &status));
+    assert(status.state == hid_sequence::State::kAborted);
+    assert(status.code == hid_sequence::TerminalCode::kSequenceAborted);
+    assert(status.executed == 0);
+    assert(backend.safety_releases == 0);
+
+    // The release ownership is exact to generation 33. A later independent
+    // Sequence failure must still request the normal fail-closed cleanup.
+    backend.report_result = hid_sequence::ReportResult::kNotReady;
+    assert(controller.start(34, "kp4") ==
+           hid_sequence::AdmissionResult::kAccepted);
+    controller.run_for_test();
+    assert(controller.status(34, &status));
+    assert(status.state == hid_sequence::State::kFailed);
+    assert(status.code == hid_sequence::TerminalCode::kHidNotReady);
+    assert(backend.safety_releases == 1);
+}
+
 void execution_deadline_contract() {
     Clock clock{};
     Backend backend{};
@@ -718,6 +748,7 @@ int main() {
     local_delay_does_not_catch_up();
     state_and_failure_contract();
     admission_abort_and_authority_contract();
+    explicit_release_owns_only_its_sequence_abort_cleanup();
     execution_deadline_contract();
     revoked_report_cannot_complete();
     abort_and_release_before_ticket_creation_rejects_stale_work();

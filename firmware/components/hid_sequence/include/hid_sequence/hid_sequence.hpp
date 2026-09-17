@@ -143,6 +143,7 @@ class Controller {
                 std::int32_t sequence_id,
                 Status *status);
     void abort();
+    void abort_for_release();
     void retire_owner(std::uint64_t local_owner_id);
     bool active() const;
 
@@ -183,6 +184,7 @@ class Controller {
     std::atomic<std::uint32_t> reserved_generation_{0};
     std::atomic<std::uint32_t> runnable_generation_{0};
     std::atomic<std::uint32_t> canceled_generation_{0};
+    std::atomic<std::uint32_t> release_owned_generation_{0};
     std::atomic<std::uint32_t> status_owner_low_{0};
     std::atomic<std::uint32_t> status_owner_high_{0};
     std::atomic<std::uint32_t> status_generation_{0};
