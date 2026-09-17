@@ -137,6 +137,10 @@ def main() -> int:
     assert len(mouse_map) == 69
     assert hashlib.sha256(mouse_map).digest() == byte_array(profile, "kMouseReportMapSha256")
     assert mouse_map == byte_array(profile, "kStrictReportMap")[47:]
+    id7_map = byte_array(profile, "kMouseId7ReportMap")
+    assert id7_map == mouse_map[:7] + bytes([7]) + mouse_map[8:]
+    assert hashlib.sha256(id7_map).digest() == byte_array(profile, "kMouseId7ReportMapSha256")
+    assert hashlib.sha256(id7_map).hexdigest() == "7e06b773bb36dea83e1f0f76d9b49c46256d1a21d70183154ca4186e610ef628"
     keyboard_map = byte_array(profile, "kKeyboardReportMap")
     assert len(keyboard_map) == 47
     assert hashlib.sha256(keyboard_map).digest() == byte_array(profile, "kKeyboardReportMapSha256")

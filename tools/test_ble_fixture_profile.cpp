@@ -29,7 +29,18 @@ int main() {
     assert(subscriptions_ready(mouse_definition, report_bit(ReportRole::kMouseInput)));
     assert(!subscriptions_ready(mouse_definition, report_bit(ReportRole::kKeyboardInput)));
 
-    assert(kCatalog.size() == 3);
+    assert(kCatalog.size() == 4);
+    const auto &id7 = kStandaloneMouseJustWorksId7;
+    assert(find_profile("standalone_mouse_just_works_id7") == &id7);
+    assert(id7.reports.values[0].report_id == 7 && id7.reports.values[0].value_size == 5);
+    assert(id7.reports.values[0].report_reference == (std::array<std::uint8_t, 2>{7, 1}));
+    assert(id7.cache.schema_revision == 4 && id7.cache.schema_epoch_value[0] == 4);
+    assert(id7.bond_class == BondAssociationClass::kStandaloneMouseJustWorksId7);
+    assert(id7.bond_class != mouse_definition.bond_class && id7.identity_class == profile.identity_class);
+    assert(id7.layout.keyboard_value == 0 && id7.layout.mouse_value == 0x19);
+    assert(!id7.security.authenticated && id7.security.key_size == 16);
+    assert(id7.smp.io_capability == IoCapability::kNoInputNoOutput && !id7.smp.mitm);
+    assert(id7.supported_reports == report_bit(ReportRole::kMouseInput));
     const auto &keyboard_definition = kStandaloneKeyboard;
     assert(find_profile("standalone_keyboard") == &keyboard_definition);
     assert(keyboard_definition.report_map.size() == 47 && keyboard_definition.reports.size() == 1);

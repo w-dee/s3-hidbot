@@ -239,6 +239,18 @@ int main(){
  value=key_value(true);assert(ble_store_write(BLE_STORE_OBJ_TYPE_OUR_SEC,&value)==0);
  before=disk;retained.profile_=&ble_fixture_profile::kStandaloneKeyboard;
  assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL && disk==before);
+ // Identical Just Works security bits do not authorize mouse2/mouse7 reuse.
+ for(bool id7:{false,true}){
+  reset();Backend variation;variation.profile_=id7?&ble_fixture_profile::kStandaloneMouseJustWorksId7:&ble_fixture_profile::kStandaloneMouseJustWorks;
+  both(variation);assert(validate_complete_associations()==0);
+  assert(read_association(connected).record.bond_class==(id7?detail::BondClass::kStandaloneMouseJustWorksId7:detail::BondClass::kStandaloneMouseJustWorks));
+  assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==0 && !out.sec.authenticated);
+  before=disk;variation.profile_=id7?&ble_fixture_profile::kStandaloneMouseJustWorks:&ble_fixture_profile::kStandaloneMouseJustWorksId7;
+  out={}; // Fresh caller buffer: a rejected lookup must not supply key bytes.
+  assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL && out.sec.synthetic_ltk[0]==0);
+  value=key_value();assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL && disk==before);
+  assert(store_failures==0 && validate_complete_associations()==0);
+ }
  // No new record may exceed the three-record namespace bound.
  reset();AssociationStore store{raw_read};
  for(unsigned i=1;i<=3;++i){auto address=connected;address.val[0]=i;

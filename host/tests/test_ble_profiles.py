@@ -20,6 +20,7 @@ MOUSE = {"id": "standalone_mouse_just_works", "rev": 1, "schema": 2,
          "map": "c2fb165ffe3f84fc4160b013e15914dffbdecbc330c3c315051dc6922262e924",
          "bond": 1, "identity": 0}
 KEYBOARD = {"id": "standalone_keyboard", "rev": 1, "schema": 3, "map": "d56a8aa0efc3f4126a0aea1df4c6f6f1b5bc1d624a710159c34b1cdb02bc45ae", "bond": 2, "identity": 0}
+ID7 = {"id": "standalone_mouse_just_works_id7", "rev": 1, "schema": 4, "map": "7e06b773bb36dea83e1f0f76d9b49c46256d1a21d70183154ca4186e610ef628", "bond": 3, "identity": 0}
 STATUS = {"selected": "strict_composite", "active": None, "transition": "stable"}
 
 
@@ -38,6 +39,11 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(catalog[2].profile_id, BleProfileId.STANDALONE_KEYBOARD)
         self.assertEqual(catalog[2].bond_class, 2)
         self.assertIn(b'standalone_keyboard', build_ble_profile_select_frame(9, TOKEN, KEYBOARD["id"]))
+        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE, KEYBOARD, ID7]})
+        self.assertEqual(catalog[3].profile_id, BleProfileId.STANDALONE_MOUSE_JUST_WORKS_ID7)
+        self.assertEqual(catalog[3].bond_class, 3)
+        self.assertEqual(request_object(build_ble_profile_select_frame(10, TOKEN, ID7["id"]))["params"], {"profile": ID7["id"]})
+        self.assertEqual(validate_ble_profile_status({"selected": ID7["id"], "active": ID7["id"], "transition": "stable"}).active, BleProfileId.STANDALONE_MOUSE_JUST_WORKS_ID7)
         for item in ({**STATUS, "active": "strict_composite"},
                      {**STATUS, "transition": "initializing"},
                      {**STATUS, "transition": "fault"}):
@@ -45,7 +51,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_exact_finite_validation_rejects_unreviewed_values(self):
         for key, value in [("id", "custom"), ("rev", True), ("schema", 0),
-                           ("map", "a" * 63), ("bond", 3), ("identity", True),
+                           ("map", "a" * 63), ("bond", 4), ("identity", True),
                            ("upload", "bytes")]:
             with self.subTest(key=key), self.assertRaises(ProtocolError):
                 validate_ble_profile_list({"profiles": [{**PROFILE, key: value}]})

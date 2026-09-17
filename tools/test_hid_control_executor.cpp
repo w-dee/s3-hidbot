@@ -486,7 +486,8 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
     bool configure_profile(ble_fixture_profile::ProfileId id) override {
         if (id != profile_id || reset_pending) {
             handles = {.report_map_value = 5,
-                       .keyboard_value = id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks
+                       .keyboard_value = id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks &&
+                                         id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7
                            ? std::uint16_t{10} : std::uint16_t{0},
                        .mouse_value = id == ble_fixture_profile::ProfileId::kStandaloneKeyboard
                            ? std::uint16_t{0} : std::uint16_t{20}, .control_point_value = 30};
@@ -7566,7 +7567,7 @@ void test_profile_restart_failure_and_deadline_matrix() {
 
 hid_control_executor::Controller *finite_release_controller = nullptr;
 
-void test_cold_mouse_profile_capability_consumption() {
+void test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId selected) {
     using namespace ble_fixture_profile;
     using Event = hid_control_executor::BleEventKind;
     hid_runtime::Runtime runtime;
@@ -7575,7 +7576,7 @@ void test_cold_mouse_profile_capability_consumption() {
     FakeBleDatabase database;
     hid_control_executor::Controller controller;
     assert(controller.initialize(&runtime, &usb, &ble, &database));
-    assert(controller.request_profile_select(ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kAccepted);
+    assert(controller.request_profile_select(selected).result == SelectionResult::kAccepted);
     assert(controller.process_one_for_test());
     assert(ble.initialize_calls == 0 && ble.begin_stop_calls == 0);
     assert(controller.profile_snapshot().transition == SelectionTransition::kStable);
@@ -7706,7 +7707,8 @@ void test_cold_keyboard_profile_capability_consumption(bool secure_connections) 
     finite_release_controller = nullptr;
 }
 
-void test_single_role_cache_requires_map_and_fresh_write_without_migration(bool keyboard_only) {
+void test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId selected) {
+    const bool keyboard_only = selected == ble_fixture_profile::ProfileId::kStandaloneKeyboard;
     using namespace ble_fixture_profile;
     using Event = hid_control_executor::BleEventKind;
     using Reason = hid_control_executor::BleSubscriptionReason;
@@ -7720,7 +7722,7 @@ void test_single_role_cache_requires_map_and_fresh_write_without_migration(bool 
         if (scenario == 2) ble.gatt_schema_status_result.kind =
             hid_control_executor::GattSchemaStoreResultKind::kIncompatible;
         assert(controller.initialize(&runtime, &usb, &ble, &database));
-        assert(controller.request_profile_select(keyboard_only ? ProfileId::kStandaloneKeyboard : ProfileId::kStandaloneMouseJustWorks).result == SelectionResult::kAccepted);
+        assert(controller.request_profile_select(selected).result == SelectionResult::kAccepted);
         assert(controller.process_one_for_test());
         assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
         assert(controller.process_one_for_test());
@@ -7803,11 +7805,13 @@ int main(int argc, char **argv) {
     test_profile_restart_failure_and_deadline_matrix();
     test_hidden_reset_sync_and_new_stack_reset_budget();
     test_stale_reset_cannot_clear_current_peer();
-    test_cold_mouse_profile_capability_consumption();
+    test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks);
+    test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
     test_cold_keyboard_profile_capability_consumption(true);
     test_cold_keyboard_profile_capability_consumption(false);
-    test_single_role_cache_requires_map_and_fresh_write_without_migration(false);
-    test_single_role_cache_requires_map_and_fresh_write_without_migration(true);
+    test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks);
+    test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
+    test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneKeyboard);
     if (argc == 2 &&
         std::string_view(argv[1]) == "--controller-grace-authority-only") {
         test_controller_grace_authority_closes_both_replacement_windows();

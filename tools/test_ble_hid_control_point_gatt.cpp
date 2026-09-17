@@ -602,6 +602,28 @@ int main() {
                 hid_control_executor::BleNotifyBackendResult::kStackRejected,
             "mouse", "absent keyboard handle accepted");
     database.reset_after_stop();
+    require(database.configure_profile(ProfileId::kStandaloneMouseJustWorksId7), "mouse ID7", "selection failed");
+    require(database.register_database() == 0 && database.validate_registered_database() == 0,
+            "mouse ID7", "registered topology rejected");
+    require(database.hid_handles().keyboard_value == 0 && database.hid_handles().mouse_value == 0x19,
+            "mouse ID7", "wrong finite role handles");
+    require(find_characteristic(kHidServiceUuid, kReportUuid, 1) == nullptr,
+            "mouse ID7", "unexpected second input/CCCD");
+    const auto *id7_input = find_characteristic(kHidServiceUuid, kReportUuid);
+    require(id7_input->flags == (BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC |
+            BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC |
+            BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR) && id7_input->min_key_size == 16,
+            "mouse ID7", "wrong input access policy");
+    require_served_value(id7_input, kExpectedNeutralMouse, "mouse ID7 neutral");
+    require_served_value(find_descriptor(id7_input, kReportReferenceUuid),
+                         std::array<std::uint8_t, 2>{7, 1}, "mouse ID7 reference");
+    auto expected_id7_map = kExpectedMouseReportMap;
+    expected_id7_map[7] = 7; // Independent existing golden bytes; never read the profile definition.
+    require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid), expected_id7_map, "mouse ID7 map");
+    require_served_value(g_registered_services[0].characteristics, std::array<std::uint8_t, 1>{4}, "mouse ID7 epoch");
+    require(database.notify_custom(1, 0, kExpectedNeutralKeyboard.data(), 8) == hid_control_executor::BleNotifyBackendResult::kStackRejected,
+            "mouse ID7", "absent keyboard accepted");
+    database.reset_after_stop();
     require(database.configure_profile(ProfileId::kStandaloneKeyboard), "keyboard", "selection failed");
     require(database.register_database() == 0 && database.validate_registered_database() == 0,
             "keyboard", "registered topology rejected");

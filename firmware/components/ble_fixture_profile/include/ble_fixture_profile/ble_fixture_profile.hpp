@@ -13,11 +13,13 @@ enum class ProfileId : std::uint8_t {
     kStrictComposite = 0,
     kStandaloneMouseJustWorks = 1,
     kStandaloneKeyboard = 2,
+    kStandaloneMouseJustWorksId7 = 3,
 };
 
 // Profile identity and bond/cache interpretation are separate namespaces.
 enum class BondAssociationClass : std::uint8_t {
-    kStrictComposite = 0, kStandaloneMouseJustWorks = 1, kStandaloneKeyboard = 2
+    kStrictComposite = 0, kStandaloneMouseJustWorks = 1, kStandaloneKeyboard = 2,
+    kStandaloneMouseJustWorksId7 = 3
 };
 enum class LogicalIdentityClass : std::uint8_t { kSharedFixture = 0 };
 enum class SelectionTransition : std::uint8_t { kStable, kInitializing, kFault };
@@ -49,6 +51,7 @@ enum class GattLayoutId : std::uint8_t {
     kStrictRevision1 = 0,
     kMouseRevision2 = 1,
     kKeyboardRevision3 = 2,
+    kMouseId7Revision4 = 3,
 };
 
 enum class SmpPolicyId : std::uint8_t {
@@ -70,6 +73,7 @@ enum class CachePolicyId : std::uint8_t {
     kStrictRevision1 = 0,
     kMouseRevision2 = 1,
     kKeyboardRevision3 = 2,
+    kMouseId7Revision4 = 3,
 };
 
 using ReportRole = hid_capability::ReportRole;
@@ -384,8 +388,32 @@ inline constexpr ProfileDefinition kStandaloneKeyboard = [] {
     return profile;
 }();
 
-inline constexpr std::array<const ProfileDefinition *, 3> kCatalog{
-    &kStrictComposite, &kStandaloneMouseJustWorks, &kStandaloneKeyboard};
+// Finite Report ID variation: same input semantics, independent cache/bond authority.
+inline constexpr std::array<std::uint8_t, 69> kMouseId7ReportMap{0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x07,0x09,0x01,0xa1,0x00,0x05,0x09,0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,0x75,0x01,0x81,0x02,0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,0x05,0x0c,0x0a,0x38,0x02,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x01,0x81,0x06,0xc0,0xc0};
+inline constexpr std::array<std::uint8_t, 32> kMouseId7ReportMapSha256{0x7e,0x06,0xb7,0x73,0xbb,0x36,0xde,0xa8,0x3e,0x1f,0x0f,0x76,0xd9,0xb4,0x9c,0x46,0x25,0x6d,0x1a,0x21,0xd7,0x01,0x83,0x15,0x4c,0xa4,0x18,0x6e,0x61,0x0e,0xf6,0x28};
+inline constexpr std::array<ReportDefinition, 1> kMouseId7Reports{{
+    {.role = ReportRole::kMouseInput, .type = ReportType::kInput,
+     .report_id = 7, .value_size = 5, .report_reference = {7, 1},
+     .neutral_value = {kStrictNeutralMouse.data(), kStrictNeutralMouse.size()}},
+}};
+inline constexpr ProfileDefinition kStandaloneMouseJustWorksId7 = [] {
+    auto profile = kStandaloneMouseJustWorks;
+    profile.id = ProfileId::kStandaloneMouseJustWorksId7;
+    profile.name = "standalone_mouse_just_works_id7";
+    profile.bond_class = BondAssociationClass::kStandaloneMouseJustWorksId7;
+    profile.layout.id = GattLayoutId::kMouseId7Revision4;
+    profile.reports = {kMouseId7Reports.data(), kMouseId7Reports.size()};
+    profile.report_map = {kMouseId7ReportMap.data(), kMouseId7ReportMap.size()};
+    profile.report_map_sha256 = kMouseId7ReportMapSha256;
+    profile.cache.id = CachePolicyId::kMouseId7Revision4;
+    profile.cache.schema_revision = 4;
+    profile.cache.schema_epoch_value = {4};
+    return profile;
+}();
+
+inline constexpr std::array<const ProfileDefinition *, 4> kCatalog{
+    &kStrictComposite, &kStandaloneMouseJustWorks, &kStandaloneKeyboard,
+    &kStandaloneMouseJustWorksId7};
 
 // Internal reviewed definitions can precede public lifecycle enablement.
 constexpr const ProfileDefinition *find_definition(ProfileId id) {
@@ -393,6 +421,7 @@ constexpr const ProfileDefinition *find_definition(ProfileId id) {
         case ProfileId::kStrictComposite: return &kStrictComposite;
         case ProfileId::kStandaloneMouseJustWorks: return &kStandaloneMouseJustWorks;
         case ProfileId::kStandaloneKeyboard: return &kStandaloneKeyboard;
+        case ProfileId::kStandaloneMouseJustWorksId7: return &kStandaloneMouseJustWorksId7;
     }
     return nullptr;
 }
@@ -437,7 +466,7 @@ constexpr bool subscriptions_ready(const ProfileDefinition &profile,
 }
 
 static_assert(kStrictComposite.report_map.size() == 116);
-static_assert(kCatalog.size() == 3 &&
+static_assert(kCatalog.size() == 4 &&
               kCatalog[0]->id == ProfileId::kStrictComposite);
 static_assert(kStrictReports[0].report_id == 1 &&
               kStrictReports[0].value_size == 8);

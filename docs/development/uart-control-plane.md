@@ -1600,8 +1600,9 @@ not a schematic, direct-rail, backfeed, or general electrical-safety claim.
 `ble.fixture-profile-v1` adds `ble.profile.list`, `ble.profile.status`, and
 `ble.profile.select`. The catalog is finite; it accepts no descriptor, packet,
 GATT or arbitrary configuration upload. The public development catalog contains
-`strict_composite`, `standalone_mouse_just_works` and `standalone_keyboard`. Public availability does
-not imply physical qualification or completion of the remaining P0 profiles.
+`strict_composite`, `standalone_mouse_just_works`, `standalone_keyboard` and
+`standalone_mouse_just_works_id7`. Public availability does not imply physical
+qualification.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
 
 `ble.profile.list` and `ble.profile.status` accept no params (omitted or `{}`).
@@ -1689,3 +1690,12 @@ security, SC support and authenticated Legacy fallback. Only keyboard CCCD is
 required; mouse commands and mouse-bearing Sequences fail before admission.
 There is no LED Output Report. Its bond class is distinct from strict even when
 authentication bits match. Switching requires the same explicit bond preparation.
+
+`standalone_mouse_just_works_id7` is revision 1, schema 4, bond class 3 and
+shared identity class 0. Its independently hash-pinned 69-byte Report Map uses
+Input Report ID 7 and Report Reference `{7, 1}`. The five-byte mouse value,
+mouse-only topology, NoInputNoOutput/Just Works policy and mouse-only readiness
+match the ID 2 mouse profile. Report ID is descriptor/reference metadata and is
+not prefixed to the five-byte GATT value. The distinct schema and association
+require explicit bond preparation even between these two otherwise equivalent
+mouse profiles. No arbitrary descriptor or runtime Report ID selection exists.
