@@ -89,6 +89,7 @@ struct UsbExposureActionOutcome {
 using UsbExposureStatusProvider = UsbExposureStatus (*)(void *context);
 using UsbExposureActionProvider = UsbExposureActionOutcome (*)(void *context);
 
+using BleLedStatusProvider = ble_fixture_profile::LedStatus (*)(void *context);
 using BleProfileStatusProvider = ble_fixture_profile::SelectionSnapshot (*)(void *context);
 using BleProfileSelectProvider = ble_fixture_profile::SelectionOutcome (*)(
     void *context, ble_fixture_profile::ProfileId id);
@@ -379,6 +380,8 @@ struct Config {
     void *ble_enable_context;
     BleExposureActionProvider ble_disable_provider;
     void *ble_disable_context;
+    BleLedStatusProvider ble_led_status_provider;
+    void *ble_led_status_context;
     BleProfileStatusProvider ble_profile_status_provider;
     void *ble_profile_status_context;
     BleProfileSelectProvider ble_profile_select_provider;

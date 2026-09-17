@@ -141,6 +141,10 @@ def main() -> int:
     assert id7_map == mouse_map[:7] + bytes([7]) + mouse_map[8:]
     assert hashlib.sha256(id7_map).digest() == byte_array(profile, "kMouseId7ReportMapSha256")
     assert hashlib.sha256(id7_map).hexdigest() == "7e06b773bb36dea83e1f0f76d9b49c46256d1a21d70183154ca4186e610ef628"
+    leds_map = byte_array(profile, "kKeyboardLedsReportMap")
+    assert len(leds_map) == 69
+    assert hashlib.sha256(leds_map).digest() == byte_array(profile, "kKeyboardLedsReportMapSha256")
+    assert hashlib.sha256(leds_map).hexdigest() == "bc08d79cc45991446b3f46b37b23e6c82a86a3ad9450f1fe680e4e1134fd504d"
     keyboard_map = byte_array(profile, "kKeyboardReportMap")
     assert len(keyboard_map) == 47
     assert hashlib.sha256(keyboard_map).digest() == byte_array(profile, "kKeyboardReportMapSha256")
@@ -311,13 +315,14 @@ def main() -> int:
     assert service.count("BLE_UUID16_INIT(0x2a4d)") == 1
     assert service.count("BLE_UUID16_INIT(0x2908)") == 1
     assert service.count("BLE_GATT_CHR_F_NOTIFY") == 9
-    assert service.count("BLE_GATT_CHR_F_READ_AUTHEN") == 2
+    strict_characteristics = service.split("ble_gatt_chr_def s_characteristics[] = {", 1)[1].split("// Fixed storage", 1)[0]
+    assert strict_characteristics.count("BLE_GATT_CHR_F_READ_AUTHEN") == 2
     assert service.count("BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN") == 2
     assert service.count("BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR") == 3
     assert "BLE_GATT_CHR_F_WRITE_NO_RSP" in service
     for forbidden in ("0x2a4e", "0x2a22", "0x2a33", "0x180f", "0x180a", "0x2a50"):
         assert forbidden not in service.lower()
-    assert service.count("BLE_GATT_CHR_F_WRITE_AUTHEN") == 1
+    assert strict_characteristics.count("BLE_GATT_CHR_F_WRITE_AUTHEN") == 1
 
     assert "validate_registered_database() override" in header
     assert "virtual int validate_registered_database() = 0" in executor_header

@@ -21,6 +21,9 @@ from .framing import Framer, MachineFrame, MachineFrameIssue, TRANSPORT_SYNC
 from .protocol import (
     MAX_ID,
     BLE_FIXTURE_PROFILE_CAPABILITY,
+    BLE_LED_OBSERVATION_CAPABILITY,
+    BleLedStatus,
+    validate_ble_led_status,
     BleProfileId,
     BleFixtureProfile,
     BleProfileStatus,
@@ -464,6 +467,11 @@ class Client:
         with self._lock:
             self._require_capability_locked("ble.exposure-control-v1")
             return validate_ble_exposure_status(self._request_locked("ble.enable"))
+
+    def ble_led_status(self) -> BleLedStatus:
+        with self._lock:
+            self._require_capability_locked(BLE_LED_OBSERVATION_CAPABILITY)
+            return validate_ble_led_status(self._request_locked("ble.led.status"))
 
     def ble_profile_list(self) -> tuple[BleFixtureProfile, ...]:
         with self._lock:

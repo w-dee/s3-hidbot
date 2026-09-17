@@ -6,8 +6,8 @@
 
 namespace hid_capability {
 
-// Report roles are a finite internal vocabulary. LED output reserves the next
-// bounded role without enabling an output-report implementation in this slice.
+// Report roles are finite. LED Output is host-to-device observation and never
+// joins the input producer, subscription readiness, or all-up route masks.
 enum class ReportRole : std::uint8_t {
     kKeyboardInput = 0,
     kMouseInput = 1,

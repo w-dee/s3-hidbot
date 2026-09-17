@@ -287,6 +287,8 @@ class BleDatabase {
     virtual void bind_event_sink(BleEventSink *sink) = 0;
     virtual void set_generation(ble_lifecycle::Generation generation) = 0;
     virtual BleHidHandles hid_handles() const = 0;
+    virtual ble_fixture_profile::LedValue led_value(
+        ble_lifecycle::Generation, std::uint16_t) const { return {}; }
     virtual BleNotifyBackendResult notify_custom(
         std::uint16_t connection_handle, std::uint16_t characteristic_handle,
         const std::uint8_t *payload, std::uint16_t payload_length) = 0;
@@ -583,6 +585,7 @@ class Controller final : public usb_lifecycle::Executor,
     ExposureSnapshot snapshot() const;
     hid_runtime::RouteStatusSnapshot route_snapshot();
     ble_fixture_profile::SelectionSnapshot profile_snapshot() const;
+    ble_fixture_profile::LedStatus led_status() const;
     ble_fixture_profile::SelectionOutcome request_profile_select(
         ble_fixture_profile::ProfileId id);
     BleCommandOutcome request_ble_enable();

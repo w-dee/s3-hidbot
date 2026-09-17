@@ -25,9 +25,9 @@ constexpr std::size_t kMaxMetadataBytes = 32;
 constexpr std::size_t kMaxSequenceCodeBytes = 320;
 
 constexpr char kLegacyCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\",\"ble.fixture-profile-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\",\"ble.fixture-profile-v1\",\"ble.led-observation-v1\"]";
 constexpr char kIdentityCapabilityJson[] =
-    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\",\"ble.fixture-profile-v1\"]";
+    "[\"protocol.hello-v1\",\"system.ping-v1\",\"system.info-v1\",\"usb.status-v1\",\"usb.exposure-control-v1\",\"hid.lease-v1\",\"hid.release-all-v1\",\"hid.keyboard-report-v1\",\"hid.mouse-report-v1\",\"hid.sequence-v1\",\"firmware.identity-v1\",\"hid.output-route-v1\",\"hid.output-route-v2\",\"ble.exposure-control-v1\",\"ble.pairing-transaction-v1\",\"ble.bond-administration-v1\",\"ble.fixture-profile-v1\",\"ble.led-observation-v1\"]";
 struct ResponseSession {
     bool present;
     std::string_view token;
@@ -582,6 +582,19 @@ bool make_profile_status(control_session::ResponseFrame *frame,
         "\"session\":%s,\"ok\":true,\"result\":{\"selected\":\"%s\","
         "\"active\":%s,\"transition\":\"%s\"}}\n",
         static_cast<long>(id), session_field, selected->name, active_json, transition);
+}
+
+bool make_led_status(control_session::ResponseFrame *frame,
+                     ResponseSession session, std::int32_t id,
+                     ble_fixture_profile::LedStatus status) {
+    char session_field[kSessionFieldBytes]{};
+    if (!format_session_field(session_field, session) || status.leds > 31 ||
+        (!status.supported && status.valid) || (!status.valid && status.leds != 0)) return false;
+    return format_frame(frame,
+        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+        "\"session\":%s,\"ok\":true,\"result\":{\"supported\":%s,\"valid\":%s,\"leds\":%u}}\n",
+        static_cast<long>(id), session_field, status.supported ? "true" : "false",
+        status.valid ? "true" : "false", static_cast<unsigned>(status.leds));
 }
 
 bool make_profile_list(control_session::ResponseFrame *frame,
@@ -1264,7 +1277,7 @@ bool Protocol::initialize(const Config &config,
     if (config.output == nullptr || config.usb_status_provider == nullptr ||
         config.usb_exposure_status_provider == nullptr || config.usb_attach_provider == nullptr ||
         config.usb_detach_provider == nullptr || config.hid_route_status_provider == nullptr ||
-        config.ble_profile_status_provider == nullptr || config.ble_profile_select_provider == nullptr ||
+        config.ble_led_status_provider == nullptr || config.ble_profile_status_provider == nullptr || config.ble_profile_select_provider == nullptr ||
         config.ble_exposure_status_provider == nullptr || config.ble_enable_provider == nullptr ||
         config.ble_disable_provider == nullptr ||
         config.ble_pairing_status_provider == nullptr ||
@@ -1782,6 +1795,14 @@ void Protocol::handle_frame(std::string_view payload) {
                     return;
                 }
             }
+        }
+    } else if (command == "ble.led.status") {
+        if (!validate_no_params(params)) {
+            make_error(&response, current_session, true, id, "INVALID_PARAMS", "BLE LED query accepts no params");
+        } else {
+            semantically_valid = true;
+            completed = make_led_status(&response, current_session, id,
+                config_.ble_led_status_provider(config_.ble_led_status_context));
         }
     } else if (command == "ble.profile.list" || command == "ble.profile.status") {
         if (!validate_no_params(params)) {

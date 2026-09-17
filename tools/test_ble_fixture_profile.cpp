@@ -29,7 +29,17 @@ int main() {
     assert(subscriptions_ready(mouse_definition, report_bit(ReportRole::kMouseInput)));
     assert(!subscriptions_ready(mouse_definition, report_bit(ReportRole::kKeyboardInput)));
 
-    assert(kCatalog.size() == 4);
+    assert(kCatalog.size() == 5);
+    const auto &leds = kStandaloneKeyboardLeds;
+    assert(leds.reports.size() == 2 && leds.report_map.size() == 69);
+    assert(leds.cache.schema_revision == 5 && leds.cache.schema_epoch_value[0] == 5);
+    assert(leds.bond_class == BondAssociationClass::kStandaloneKeyboardLeds);
+    assert(leds.layout.led_output_value == 0x1d && leds.layout.hid_last_attribute == 0x1e);
+    assert(leds.supported_reports == report_bit(ReportRole::kKeyboardInput));
+    assert(leds.required_input_subscriptions == report_bit(ReportRole::kKeyboardInput));
+    assert(leds.reports.values[1].role == ReportRole::kLedOutput && leds.reports.values[1].type == ReportType::kOutput);
+    assert(leds.reports.values[1].report_reference == (std::array<std::uint8_t, 2>{1, 2}));
+    assert(leds.security.authenticated && leds.attributes.authenticated && leds.security.key_size == 16);
     const auto &id7 = kStandaloneMouseJustWorksId7;
     assert(find_profile("standalone_mouse_just_works_id7") == &id7);
     assert(id7.reports.values[0].report_id == 7 && id7.reports.values[0].value_size == 5);

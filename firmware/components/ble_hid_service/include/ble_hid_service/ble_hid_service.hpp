@@ -105,6 +105,8 @@ class Database final : public hid_control_executor::BleDatabase {
     void bind_event_sink(hid_control_executor::BleEventSink *sink) override;
     void set_generation(ble_lifecycle::Generation generation) override;
     hid_control_executor::BleHidHandles hid_handles() const override;
+    ble_fixture_profile::LedValue led_value(
+        ble_lifecycle::Generation generation, std::uint16_t connection_handle) const override;
     hid_control_executor::BleNotifyBackendResult notify_custom(
         std::uint16_t connection_handle, std::uint16_t characteristic_handle,
         const std::uint8_t *payload,
@@ -123,6 +125,9 @@ class Database final : public hid_control_executor::BleDatabase {
     std::uint32_t stack_incarnation_ = 0;
     hid_control_executor::BleEventSink *event_sink_ = nullptr;
     std::atomic<ble_lifecycle::Generation> generation_{0};
+    // One host writer. Packed scope and value cannot be sampled from different
+    // connections; teardown clears only after every host callback has stopped.
+    std::atomic<std::uint64_t> led_word_{0};
 };
 
 }  // namespace ble_hid_service

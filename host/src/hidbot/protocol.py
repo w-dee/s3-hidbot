@@ -23,7 +23,7 @@ MAX_TOKEN_LENGTH = 32
 MAX_JSON_DEPTH = 8
 MAX_OBJECT_MEMBERS = 16
 MAX_ARRAY_MEMBERS = 16
-MAX_CAPABILITIES = 17
+MAX_CAPABILITIES = 18
 MAX_STRING_BYTES = 256
 MAX_FIRMWARE_VERSION_BYTES = 31
 MAX_SOURCE_REVISION_BYTES = 40
@@ -33,6 +33,7 @@ MAX_USB_GENERATION = 0xFFFF_FFFF
 MAX_UINT32 = 0xFFFF_FFFF
 MAX_BLE_KEY_SIZE = 16
 BLE_PAIRING_TRANSACTION_CAPABILITY = "ble.pairing-transaction-v1"
+BLE_LED_OBSERVATION_CAPABILITY = "ble.led-observation-v1"
 BLE_FIXTURE_PROFILE_CAPABILITY = "ble.fixture-profile-v1"
 BLE_BOND_ADMINISTRATION_CAPABILITY = "ble.bond-administration-v1"
 MAX_BONDS = 3
@@ -71,6 +72,7 @@ OPTIONAL_CAPABILITIES = frozenset(
         BLE_PAIRING_TRANSACTION_CAPABILITY,
         BLE_BOND_ADMINISTRATION_CAPABILITY,
         BLE_FIXTURE_PROFILE_CAPABILITY,
+        BLE_LED_OBSERVATION_CAPABILITY,
     }
 )
 KNOWN_OPTIONAL_CAPABILITIES = OPTIONAL_CAPABILITIES
@@ -1478,6 +1480,7 @@ class BleProfileId(str, Enum):
     STRICT_COMPOSITE = "strict_composite"
     STANDALONE_MOUSE_JUST_WORKS = "standalone_mouse_just_works"
     STANDALONE_KEYBOARD = "standalone_keyboard"
+    STANDALONE_KEYBOARD_LEDS = "standalone_keyboard_leds"
     STANDALONE_MOUSE_JUST_WORKS_ID7 = "standalone_mouse_just_works_id7"
 
 
@@ -1524,7 +1527,7 @@ def validate_ble_profile_list(value: Any) -> tuple[BleFixtureProfile, ...]:
             raise ProtocolError("BLE profile schema is invalid")
         if not isinstance(item["map"], str) or APP_ELF_SHA256_PATTERN.fullmatch(item["map"]) is None:
             raise ProtocolError("BLE Report Map digest is invalid")
-        if type(item["bond"]) is not int or item["bond"] not in {0, 1, 2, 3}:
+        if type(item["bond"]) is not int or item["bond"] not in {0, 1, 2, 3, 4}:
             raise ProtocolError("BLE bond association class is invalid")
         if type(item["identity"]) is not int or item["identity"] != 0:
             raise ProtocolError("BLE logical identity class is invalid")
@@ -1555,3 +1558,22 @@ def build_ble_profile_select_frame(request_id: int, session: str,
     build_command_frame(request_id, session, "ble.profile.select")
     return _serialize_request({"v": PROTOCOL_VERSION, "id": request_id,
         "session": session, "cmd": "ble.profile.select", "params": {"profile": selected.value}})
+
+
+@dataclass(frozen=True)
+class BleLedStatus:
+    supported: bool
+    valid: bool
+    leds: int
+
+
+def validate_ble_led_status(value: Any) -> BleLedStatus:
+    if not isinstance(value, dict) or set(value) != {"supported", "valid", "leds"}:
+        raise ProtocolError("BLE LED status has unexpected fields")
+    if type(value["supported"]) is not bool or type(value["valid"]) is not bool:
+        raise ProtocolError("BLE LED status flags must be booleans")
+    if type(value["leds"]) is not int or not 0 <= value["leds"] <= 31:
+        raise ProtocolError("BLE LED value must be a five-bit mask")
+    if (value["valid"] and not value["supported"]) or (not value["valid"] and value["leds"] != 0):
+        raise ProtocolError("BLE LED status is inconsistent")
+    return BleLedStatus(**value)

@@ -70,10 +70,11 @@ def main() -> int:
             assert flag in body.group(1)
         assert ".min_key_size = kStrictProfile.attributes.key_size" in body.group(1)
     assert profile.count(".key_size = 16,") == 2
-    assert service.count(".att_flags = BLE_ATT_F_READ") == 2
-    # Two Report Reference descriptors and the public, read-only schema epoch
+    assert service.count(".att_flags = BLE_ATT_F_READ") == 3
+    # Keyboard Input, Mouse Input and LED Output Report Reference descriptors
+    # and the public, read-only schema epoch
     # characteristic intentionally have no encryption-key-size requirement.
-    assert service.count(".min_key_size = 0") == 3
+    assert service.count(".min_key_size = 0") == 4
     for exposed in ("ble.pairing.status", "ble.pairing.respond",
                     "ble.pairing-transaction-v1"):
         assert exposed in protocol

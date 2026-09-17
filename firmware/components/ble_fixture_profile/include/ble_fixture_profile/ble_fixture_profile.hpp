@@ -14,12 +14,13 @@ enum class ProfileId : std::uint8_t {
     kStandaloneMouseJustWorks = 1,
     kStandaloneKeyboard = 2,
     kStandaloneMouseJustWorksId7 = 3,
+    kStandaloneKeyboardLeds = 4,
 };
 
 // Profile identity and bond/cache interpretation are separate namespaces.
 enum class BondAssociationClass : std::uint8_t {
     kStrictComposite = 0, kStandaloneMouseJustWorks = 1, kStandaloneKeyboard = 2,
-    kStandaloneMouseJustWorksId7 = 3
+    kStandaloneMouseJustWorksId7 = 3, kStandaloneKeyboardLeds = 4
 };
 enum class LogicalIdentityClass : std::uint8_t { kSharedFixture = 0 };
 enum class SelectionTransition : std::uint8_t { kStable, kInitializing, kFault };
@@ -39,12 +40,14 @@ enum class TopologyId : std::uint8_t {
     kStrictComposite = 0,
     kMouseOnly = 1,
     kKeyboardOnly = 2,
+    kKeyboardWithLeds = 3,
 };
 
 enum class GattTemplateId : std::uint8_t {
     kStrictComposite = 0,
     kMouseOnly = 1,
     kKeyboardOnly = 2,
+    kKeyboardWithLeds = 3,
 };
 
 enum class GattLayoutId : std::uint8_t {
@@ -52,6 +55,7 @@ enum class GattLayoutId : std::uint8_t {
     kMouseRevision2 = 1,
     kKeyboardRevision3 = 2,
     kMouseId7Revision4 = 3,
+    kKeyboardLedsRevision5 = 4,
 };
 
 enum class SmpPolicyId : std::uint8_t {
@@ -74,12 +78,14 @@ enum class CachePolicyId : std::uint8_t {
     kMouseRevision2 = 1,
     kKeyboardRevision3 = 2,
     kMouseId7Revision4 = 3,
+    kKeyboardLedsRevision5 = 4,
 };
 
 using ReportRole = hid_capability::ReportRole;
 
 enum class ReportType : std::uint8_t {
     kInput = 1,
+    kOutput = 2,
 };
 
 template <typename T>
@@ -181,6 +187,7 @@ struct GattLayout {
     std::uint16_t keyboard_value;
     std::uint16_t mouse_value;
     std::uint16_t hid_last_attribute;
+    std::uint16_t led_output_value = 0;
 };
 
 inline constexpr std::array<std::uint8_t, 4> kStrictHidInformation{
@@ -231,6 +238,7 @@ struct ProfileDefinition {
     GattTemplateId gatt_template;
     GattLayout layout;
     View<ReportDefinition> reports;
+    // Input producer/route roles only; Output reports never join release/readiness.
     ReportMask supported_reports;
     ReportMask required_input_subscriptions;
     ByteView report_map;
@@ -411,9 +419,41 @@ inline constexpr ProfileDefinition kStandaloneMouseJustWorksId7 = [] {
     return profile;
 }();
 
-inline constexpr std::array<const ProfileDefinition *, 4> kCatalog{
+// Keyboard Input ID1 plus five standard host LED Output bits, ID1/type2.
+inline constexpr std::array<std::uint8_t, 69> kKeyboardLedsReportMap{0x05,0x01,0x09,0x06,0xa1,0x01,0x85,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,0x81,0x01,0x95,0x06,0x75,0x08,0x15,0x00,0x26,0xff,0x00,0x19,0x00,0x2a,0xff,0x00,0x81,0x00,0x95,0x05,0x75,0x01,0x05,0x08,0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x91,0x02,0x95,0x01,0x75,0x03,0x91,0x01,0xc0};
+inline constexpr std::array<std::uint8_t, 32> kKeyboardLedsReportMapSha256{0xbc,0x08,0xd7,0x9c,0xc4,0x59,0x91,0x44,0x6b,0x3f,0x46,0xb3,0x7b,0x23,0xe6,0xc8,0x2a,0x86,0xa3,0xad,0x94,0x50,0xf1,0xfe,0x68,0x0e,0x4e,0x11,0x34,0xfd,0x50,0x4d};
+inline constexpr std::array<std::uint8_t, 1> kNeutralLeds{};
+inline constexpr std::array<ReportDefinition, 2> kKeyboardLedsReports{{
+    kKeyboardReports[0],
+    {.role = ReportRole::kLedOutput, .type = ReportType::kOutput,
+     .report_id = 1, .value_size = 1, .report_reference = {1, 2},
+     .neutral_value = {kNeutralLeds.data(), kNeutralLeds.size()}},
+}};
+inline constexpr ProfileDefinition kStandaloneKeyboardLeds = [] {
+    auto profile = kStandaloneKeyboard;
+    profile.id = ProfileId::kStandaloneKeyboardLeds;
+    profile.name = "standalone_keyboard_leds";
+    profile.bond_class = BondAssociationClass::kStandaloneKeyboardLeds;
+    profile.topology = TopologyId::kKeyboardWithLeds;
+    profile.gatt_template = GattTemplateId::kKeyboardWithLeds;
+    profile.layout.id = GattLayoutId::kKeyboardLedsRevision5;
+    profile.layout.led_output_value = 0x001d;
+    profile.layout.hid_last_attribute = 0x001e;
+    profile.reports = {kKeyboardLedsReports.data(), kKeyboardLedsReports.size()};
+    profile.report_map = {kKeyboardLedsReportMap.data(), kKeyboardLedsReportMap.size()};
+    profile.report_map_sha256 = kKeyboardLedsReportMapSha256;
+    profile.cache.id = CachePolicyId::kKeyboardLedsRevision5;
+    profile.cache.schema_revision = 5;
+    profile.cache.schema_epoch_value = {5};
+    return profile;
+}();
+
+struct LedValue { bool valid = false; std::uint8_t leds = 0; };
+struct LedStatus { bool supported = false; bool valid = false; std::uint8_t leds = 0; };
+
+inline constexpr std::array<const ProfileDefinition *, 5> kCatalog{
     &kStrictComposite, &kStandaloneMouseJustWorks, &kStandaloneKeyboard,
-    &kStandaloneMouseJustWorksId7};
+    &kStandaloneMouseJustWorksId7, &kStandaloneKeyboardLeds};
 
 // Internal reviewed definitions can precede public lifecycle enablement.
 constexpr const ProfileDefinition *find_definition(ProfileId id) {
@@ -421,6 +461,7 @@ constexpr const ProfileDefinition *find_definition(ProfileId id) {
         case ProfileId::kStrictComposite: return &kStrictComposite;
         case ProfileId::kStandaloneMouseJustWorks: return &kStandaloneMouseJustWorks;
         case ProfileId::kStandaloneKeyboard: return &kStandaloneKeyboard;
+        case ProfileId::kStandaloneKeyboardLeds: return &kStandaloneKeyboardLeds;
         case ProfileId::kStandaloneMouseJustWorksId7: return &kStandaloneMouseJustWorksId7;
     }
     return nullptr;
@@ -466,7 +507,7 @@ constexpr bool subscriptions_ready(const ProfileDefinition &profile,
 }
 
 static_assert(kStrictComposite.report_map.size() == 116);
-static_assert(kCatalog.size() == 4 &&
+static_assert(kCatalog.size() == 5 &&
               kCatalog[0]->id == ProfileId::kStrictComposite);
 static_assert(kStrictReports[0].report_id == 1 &&
               kStrictReports[0].value_size == 8);

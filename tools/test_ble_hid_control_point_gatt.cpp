@@ -65,6 +65,8 @@ const ble_gatt_svc_def *g_registered_services = nullptr;
 int g_count_calls = 0;
 int g_add_calls = 0;
 bool g_topology_mode = false;
+void (*g_flatten_hook)() = nullptr;
+ble_hid_service::Database *g_led_database = nullptr;
 std::vector<std::uint8_t> g_appended_bytes;
 
 bool uuid16_equals(const ble_uuid_t *uuid, std::uint16_t value) {
@@ -424,6 +426,7 @@ extern "C" int ble_hs_mbuf_to_flat(const os_mbuf *mbuf, void *flat,
                              ? mbuf->test_flatten_length
                              : copy_length;
     }
+    if (g_flatten_hook) g_flatten_hook();
     return OS_MBUF_PKTLEN(mbuf) > maximum_length ? BLE_HS_EMSGSIZE : 0;
 }
 
@@ -646,6 +649,58 @@ int main() {
     require(database.notify_custom(1, 0, kExpectedNeutralMouse.data(), 5) == hid_control_executor::BleNotifyBackendResult::kStackRejected,
             "keyboard", "absent mouse accepted");
     database.reset_after_stop();
+    require(database.configure_profile(ProfileId::kStandaloneKeyboardLeds), "LED", "selection failed");
+    require(database.register_database() == 0 && database.validate_registered_database() == 0, "LED", "topology rejected");
+    require(database.hid_handles().keyboard_value == 0x19 && database.hid_handles().mouse_value == 0, "LED", "input roles changed");
+    const auto *led = find_characteristic(kHidServiceUuid, kReportUuid, 1);
+    require(led != nullptr && *led->val_handle == 0x1d && find_characteristic(kHidServiceUuid, kReportUuid, 2) == nullptr, "LED", "output handle/count wrong");
+    require(led->flags == (BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_AUTHEN | BLE_GATT_CHR_F_WRITE |
+            BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_AUTHEN) && led->min_key_size == 16, "LED", "output policy/CCCD wrong");
+    require_served_value(find_descriptor(led, kReportReferenceUuid), std::array<std::uint8_t, 2>{1, 2}, "LED reference");
+    constexpr std::array<std::uint8_t, 69> expected_led_map{0x05,0x01,0x09,0x06,0xa1,0x01,0x85,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,0x81,0x01,0x95,0x06,0x75,0x08,0x15,0x00,0x26,0xff,0x00,0x19,0x00,0x2a,0xff,0x00,0x81,0x00,0x95,0x05,0x75,0x01,0x05,0x08,0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x91,0x02,0x95,0x01,0x75,0x03,0x91,0x01,0xc0};
+    require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid), expected_led_map, "LED map");
+    require_served_value(g_registered_services[0].characteristics, std::array<std::uint8_t, 1>{5}, "LED epoch");
+    require_served_value(led, std::array<std::uint8_t, 1>{0}, "LED initial read");
+    const std::uint8_t led_zero = 0;
+    require(database.notify_custom(kDistinctiveConnectionHandle, 0x1d, &led_zero, 1) == hid_control_executor::BleNotifyBackendResult::kStackRejected, "LED", "Output accepted input notification");
+    require(!database.led_value(kDistinctiveGeneration, kDistinctiveConnectionHandle).valid, "LED", "read fabricated write");
+    const auto write_led = [&](MbufFixture &bytes, std::uint8_t op = BLE_GATT_ACCESS_OP_WRITE_CHR,
+                               std::uint16_t handle = 0x1d, std::uint16_t connection = kDistinctiveConnectionHandle) {
+        ble_gatt_access_ctxt context{}; context.op = op; context.om = &bytes.first; context.chr = led;
+        return led->access_cb(connection, handle, &context, led->arg);
+    };
+    for (const auto value : {0, 1, 2, 4, 8, 16, 31, 255}) {
+        auto bytes = MbufFixture(static_cast<std::uint8_t>(value));
+        require(write_led(bytes) == 0, "LED", "valid write rejected");
+        const auto observed = database.led_value(kDistinctiveGeneration, kDistinctiveConnectionHandle);
+        require(observed.valid && observed.leds == (value & 31), "LED", "write not observed/padding leaked");
+        require_served_value(led, std::array<std::uint8_t, 1>{static_cast<std::uint8_t>(value & 31)}, "LED readback");
+    }
+    auto chained = MbufFixture::zero_length_head_then_byte(21);
+    require(write_led(chained) == 0, "LED", "valid chained write rejected");
+    auto empty = MbufFixture::empty(); auto two = MbufFixture::two_bytes(1,2);
+    require(write_led(empty) == BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN && write_led(two) == BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN, "LED", "invalid size accepted");
+    auto bad = MbufFixture(3); bad.first.test_flatten_status = BLE_HS_EINVAL;
+    require(write_led(bad) != 0, "LED", "flatten failure accepted");
+    bad.first.test_flatten_status = 0; bad.first.test_override_flatten_length = true; bad.first.test_flatten_length = 0;
+    require(write_led(bad) != 0, "LED", "flatten length mismatch accepted");
+    auto valid = MbufFixture(3);
+    require(write_led(valid, BLE_GATT_ACCESS_OP_WRITE_DSC) == BLE_ATT_ERR_WRITE_NOT_PERMITTED, "LED", "wrong operation accepted");
+    require(write_led(valid, BLE_GATT_ACCESS_OP_WRITE_CHR, 0x19) != 0, "LED", "input handle accepted");
+    require(write_led(valid, BLE_GATT_ACCESS_OP_WRITE_CHR, 0x1d, ble_lifecycle::kNoConnection) != 0, "LED", "absent connection accepted");
+    require(database.led_value(kDistinctiveGeneration, kDistinctiveConnectionHandle).leds == 21, "LED", "rejection changed state");
+    require(!database.led_value(kDistinctiveGeneration, kDistinctiveConnectionHandle + 1).valid, "LED", "other handle adopted state");
+    g_led_database = &database;
+    g_flatten_hook = +[] { g_led_database->set_generation(kDistinctiveGeneration + 1); };
+    require(write_led(valid) == 0, "LED", "admitted old write failed unexpectedly");
+    g_flatten_hook = nullptr;
+    require(!database.led_value(kDistinctiveGeneration + 1, kDistinctiveConnectionHandle).valid, "LED", "late write adopted new generation");
+    require_served_value(led, std::array<std::uint8_t, 1>{0}, "LED new generation initial read");
+    require(write_led(valid) == 0 && database.led_value(kDistinctiveGeneration + 1, kDistinctiveConnectionHandle).leds == 3, "LED", "new generation write failed");
+    *led->val_handle = 0;
+    require(database.validate_registered_database() != 0, "LED", "missing output handle accepted");
+    database.reset_after_stop();
+    require(!database.led_value(kDistinctiveGeneration + 1, kDistinctiveConnectionHandle).valid, "LED", "teardown retained value");
     require(database.configure_profile(ProfileId::kStrictComposite),
             "strict restore", "strict selection failed");
     require(database.register_database() == 0, "strict restore", "registration failed");

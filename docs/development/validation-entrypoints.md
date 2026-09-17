@@ -78,8 +78,9 @@ production worker. Failure cuts and deadline completion races cannot permit
 reinitialization. Executor tests additionally run hidden strict/mouse/strict
 transitions, stale queued callbacks/actions, stop and synchronization deadline
 edges, partial failures, and mouse-only route readiness/unsupported keyboard
-admission. The public catalog remains strict-only until bond/cache association
-is integrated. Physical restart and heap engineering validation remain pending.
+admission. Subsequent finite-profile tests cover public keyboard, mouse ID 7,
+and keyboard LED Output definitions with separate bond/cache associations.
+Software checks do not establish physical qualification.
 
 ## Entrypoints
 
@@ -488,3 +489,13 @@ Those are separate gates documented in
   qualification machinery, safety boundaries, and evidence schema.
 - [`uart-control-plane.md`](uart-control-plane.md) — protocol/runtime
   contract.
+
+The finite keyboard LED Output profile extends the actual GATT suite with an
+independent descriptor/reference/topology golden, authenticated read/write
+flags, exact one-byte and chained-mbuf handling, padding, connection-generation
+isolation and late-write retirement. Executor tests keep Output state separate
+from input route readiness/release and invalidate observation across retirement.
+The actual NVS/store adapter rejects plain-keyboard/LED-keyboard bond reuse.
+Host and control-protocol tests cover `ble.led-observation-v1`, exact typed
+status, capability gating, CLI observation, cached retry and the five-profile
+catalog at the maximum request ID. None of these tests touches physical LEDs.

@@ -272,6 +272,7 @@ def _parser() -> argparse.ArgumentParser:
         ("ble-enable", "explicitly initialize/reuse BLE and advertise"),
         ("ble-disable", "hide BLE while retaining the initialized stack"),
         ("ble-profile-list", "list finite BLE fixture profiles"),
+        ("ble-led-status", "observe the current BLE keyboard LED Output value"),
         ("ble-profile-status", "show selected and active BLE fixture profiles"),
         ("ble-profile-select", "select a finite BLE fixture profile while quiescent"),
         ("ble-pairing-status", "show the current BLE pairing transaction"),
@@ -435,6 +436,8 @@ def _result_value(command: str, result: object) -> object:
         return value
     if command == "ble-pairing-respond":
         assert isinstance(result, BlePairingRespondResult)
+        return asdict(result)
+    if command == "ble-led-status":
         return asdict(result)
     if command == "ble-profile-list":
         return {"profiles": [asdict(profile) for profile in result]}
@@ -801,6 +804,8 @@ def main(
                 result = client.ble_exposure_status()
             elif args.command == "ble-enable":
                 result = client.ble_enable()
+            elif args.command == "ble-led-status":
+                result = client.ble_led_status()
             elif args.command == "ble-profile-list":
                 result = client.ble_profile_list()
             elif args.command == "ble-profile-status":

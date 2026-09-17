@@ -282,6 +282,8 @@ struct ExposureSource {
 };
 
 struct ProfileSource {
+    ble_fixture_profile::LedStatus led{};
+    static ble_fixture_profile::LedStatus get_led(void *context) { return static_cast<ProfileSource *>(context)->led; }
     ble_fixture_profile::SelectionSnapshot snapshot{};
     ble_fixture_profile::SelectionResult result = ble_fixture_profile::SelectionResult::kNoOp;
     int selections = 0;
@@ -671,6 +673,8 @@ struct LeaseFixture {
             .ble_enable_context = &ble,
             .ble_disable_provider = BleSource::disable,
             .ble_disable_context = &ble,
+            .ble_led_status_provider = ProfileSource::get_led,
+            .ble_led_status_context = &profile,
             .ble_profile_status_provider = ProfileSource::get,
             .ble_profile_status_context = &profile,
             .ble_profile_select_provider = ProfileSource::select,
@@ -806,6 +810,8 @@ struct Fixture {
             .ble_enable_context = &ble,
             .ble_disable_provider = BleSource::disable,
             .ble_disable_context = &ble,
+            .ble_led_status_provider = ProfileSource::get_led,
+            .ble_led_status_context = &profile,
             .ble_profile_status_provider = ProfileSource::get,
             .ble_profile_status_context = &profile,
             .ble_profile_select_provider = ProfileSource::select,
@@ -1787,7 +1793,7 @@ void test_hid_route_schema_frozen_retry_and_errors() {
     const std::string session = extract_string(hello, "session");
     assert(count_occurrences(hello, "\"hid.output-route-v1\"") == 1);
     assert(count_occurrences(hello, "\"hid.output-route-v2\"") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 16);
+    assert(count_occurrences(hello, "-v1\"") == 17);
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
 
     fixture.payload(request(2, session, "hid.route.status"));
@@ -1973,7 +1979,7 @@ void test_ble_exposure_schema_frozen_retry_and_authority_isolation() {
     const std::string session = extract_string(hello, "session");
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
     assert(count_occurrences(hello, "ble.exposure-control-v1") == 1);
-    assert(count_occurrences(hello, "-v1\"") == 16);
+    assert(count_occurrences(hello, "-v1\"") == 17);
 
     fixture.payload(request(2, session, "ble.exposure.status"));
     const std::string cold = fixture.sink.last();
@@ -2041,7 +2047,7 @@ void test_ble_pairing_status_exact_schema() {
     assert(count_occurrences(hello, "ble.pairing-transaction-v1") == 1);
     assert(hello.find("ble.pairing-control-v1") == std::string::npos);
     assert(hello.find("ble.bond-store-v1") == std::string::npos);
-    assert(count_occurrences(hello, "-v1\"") == 16);
+    assert(count_occurrences(hello, "-v1\"") == 17);
 
     fixture.payload(request(2, session, "ble.pairing.status"));
     require_contains(
@@ -2774,6 +2780,9 @@ void test_finite_profile_api_and_retry() {
     require_contains(fixture.sink.last(), "\"id\":\"standalone_mouse_just_works_id7\",\"rev\":1,\"schema\":4");
     require_contains(fixture.sink.last(), "7e06b773bb36dea83e1f0f76d9b49c46256d1a21d70183154ca4186e610ef628");
     require_contains(fixture.sink.last(), "\"bond\":3,\"identity\":0");
+    require_contains(fixture.sink.last(), "\"id\":\"standalone_keyboard_leds\",\"rev\":1,\"schema\":5");
+    require_contains(fixture.sink.last(), "bc08d79cc45991446b3f46b37b23e6c82a86a3ad9450f1fe680e4e1134fd504d");
+    require_contains(fixture.sink.last(), "\"bond\":4,\"identity\":0");
     assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
     fixture.payload(request(3, session, "ble.profile.status"));
     require_contains(fixture.sink.last(), "\"selected\":\"strict_composite\",\"active\":null,\"transition\":\"stable\"");
@@ -2813,7 +2822,32 @@ void test_finite_profile_api_and_retry() {
     require_contains(fixture.sink.last(), "\"pong\":true");
 }
 
+void test_led_observation_exact_api() {
+    Fixture fixture(0, true);
+    fixture.payload(hello_request(1, kNonceA));
+    require_contains(fixture.sink.last(), "ble.led-observation-v1");
+    const auto session = extract_string(fixture.sink.last(), "session");
+    fixture.payload(request(2, session, "ble.led.status"));
+    require_contains(fixture.sink.last(), "\"result\":{\"supported\":false,\"valid\":false,\"leds\":0}");
+    fixture.profile.led = {.supported = true, .valid = true, .leds = 31};
+    const auto query = request(3, session, "ble.led.status", "{}");
+    fixture.payload(query);
+    const auto observed = fixture.sink.last();
+    require_contains(observed, "\"result\":{\"supported\":true,\"valid\":true,\"leds\":31}");
+    fixture.profile.led = {.supported = true};
+    fixture.payload(query);
+    assert(fixture.sink.last() == observed); // Exact retry remains the original observation.
+    fixture.payload(request(4, session, "ble.led.status"));
+    require_contains(fixture.sink.last(), "\"supported\":true,\"valid\":false,\"leds\":0");
+    fixture.payload(request(5, session, "ble.led.status", "{\"leds\":3}"));
+    require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
+    fixture.payload(request(INT32_MAX, session, "ble.profile.list"));
+    require_contains(fixture.sink.last(), "standalone_keyboard_leds");
+    assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
+}
+
 int main() {
+    test_led_observation_exact_api();
     test_finite_profile_api_and_retry();
     cJSON_Hooks hooks{tracked_cjson_malloc, tracked_cjson_free};
     cJSON_InitHooks(&hooks);

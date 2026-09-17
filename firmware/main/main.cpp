@@ -312,6 +312,8 @@ control_protocol::BleExposureStatus make_ble_exposure_status(
     };
 }
 
+ble_fixture_profile::LedStatus ble_led_status(void *) { return s_usb_exposure.led_status(); }
+
 ble_fixture_profile::SelectionSnapshot ble_profile_status(void *) {
     return s_usb_exposure.profile_snapshot();
 }
@@ -1048,6 +1050,8 @@ extern "C" void app_main() {
         .ble_enable_context = nullptr,
         .ble_disable_provider = ble_disable,
         .ble_disable_context = nullptr,
+        .ble_led_status_provider = ble_led_status,
+        .ble_led_status_context = nullptr,
         .ble_profile_status_provider = ble_profile_status,
         .ble_profile_status_context = nullptr,
         .ble_profile_select_provider = ble_profile_select,

@@ -372,6 +372,32 @@ ble_fixture_profile::SelectionSnapshot Controller::profile_snapshot() const {
             .transition = transition};
 }
 
+ble_fixture_profile::LedStatus Controller::led_status() const {
+    const auto publication = profile_word_.load(std::memory_order_acquire);
+    const auto *profile = ble_fixture_profile::find_definition(
+        static_cast<ble_fixture_profile::ProfileId>(publication & 0xffU));
+    ble_fixture_profile::LedStatus result{
+        .supported = profile != nullptr && ble_fixture_profile::find_report(
+            *profile, ble_fixture_profile::ReportRole::kLedOutput) != nullptr};
+    const auto lifecycle = ble_state_.snapshot();
+    const auto handle = ble_state_.connection_handle();
+    if (!result.supported || ble_database_ == nullptr ||
+        (publication & 0x100U) == 0 || (publication >> 9) != 0 ||
+        !lifecycle.stack_ready || !lifecycle.connected || lifecycle.recovery_required ||
+        lifecycle.desired != ble_lifecycle::DesiredExposure::kExposed ||
+        lifecycle.observed != ble_lifecycle::ObservedState::kConnected) return result;
+    const auto value = ble_database_->led_value(lifecycle.generation, handle);
+    const auto after = ble_state_.snapshot();
+    if (publication != profile_word_.load(std::memory_order_acquire) ||
+        lifecycle.generation != after.generation || !after.connected || after.recovery_required ||
+        after.desired != ble_lifecycle::DesiredExposure::kExposed ||
+        after.observed != ble_lifecycle::ObservedState::kConnected ||
+        handle != ble_state_.connection_handle()) return result;
+    result.valid = value.valid;
+    result.leds = value.valid ? value.leds : 0;
+    return result;
+}
+
 ble_fixture_profile::SelectionOutcome Controller::request_profile_select(
     ble_fixture_profile::ProfileId id) {
     // The wire parser additionally restricts requests to the public catalog.

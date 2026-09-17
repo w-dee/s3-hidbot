@@ -19,6 +19,8 @@ enum class AccessTarget : std::uint8_t {
     kMouseReport,
     kKeyboardReference,
     kMouseReference,
+    kLedReport,
+    kLedReference,
 };
 
 // Project-owned internal UUIDs.  Canonical service UUID:
@@ -41,6 +43,7 @@ ble_uuid16_t s_report_reference = BLE_UUID16_INIT(0x2908);
 
 std::uint16_t s_keyboard_value_handle = 0;
 std::uint16_t s_mouse_value_handle = 0;
+std::uint16_t s_led_value_handle = 0;
 std::uint16_t s_schema_epoch_value_handle = 0;
 std::uint16_t s_information_value_handle = 0;
 std::uint16_t s_report_map_value_handle = 0;
@@ -85,6 +88,25 @@ ble_gatt_dsc_def s_mouse_descriptors[] = {
     {},
 };
 
+ble_gatt_dsc_def s_led_descriptors[] = {
+    {.uuid = &s_report_reference.u,
+     .att_flags = BLE_ATT_F_READ,
+     .min_key_size = 0,
+     .access_cb = Database::access,
+     .arg = target(AccessTarget::kLedReference)},
+    {},
+};
+ble_gatt_chr_def s_led_characteristic = {
+    .uuid = &s_report.u,
+    .access_cb = Database::access,
+    .arg = target(AccessTarget::kLedReport),
+    .descriptors = s_led_descriptors,
+    .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_AUTHEN |
+             BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_AUTHEN,
+    .min_key_size = 16,
+    .val_handle = &s_led_value_handle,
+};
+
 ble_gatt_chr_def s_characteristics[] = {
     {.uuid = &s_hid_information.u,
      .access_cb = Database::access,
@@ -125,7 +147,7 @@ ble_gatt_chr_def s_characteristics[] = {
 
 // Fixed storage for reviewed single-input templates. No public descriptor
 // input is accepted, and this storage is rewritten only after a proven stop.
-ble_gatt_chr_def s_single_input_characteristics[5]{};
+ble_gatt_chr_def s_single_input_characteristics[6]{};
 
 ble_gatt_svc_def s_services[] = {
     {.type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -162,6 +184,8 @@ void Database::set_stack_incarnation(std::uint32_t incarnation) {
 
 void Database::reset_after_stop() {
     registered_ = false;
+    led_word_.store(0, std::memory_order_release);
+    s_led_value_handle = 0;
     s_keyboard_value_handle = s_mouse_value_handle = 0;
     s_schema_epoch_value_handle = s_information_value_handle = 0;
     s_report_map_value_handle = s_control_point_value_handle = 0;
@@ -177,7 +201,8 @@ int Database::register_database() {
     registered_ = true; // Even a partial registration requires proven teardown.
     s_services[1].characteristics = s_characteristics;
     if (profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly ||
-        profile_->gatt_template == ble_fixture_profile::GattTemplateId::kKeyboardOnly) {
+        profile_->gatt_template == ble_fixture_profile::GattTemplateId::kKeyboardOnly ||
+        profile_->gatt_template == ble_fixture_profile::GattTemplateId::kKeyboardWithLeds) {
         const bool mouse_only = profile_->gatt_template == ble_fixture_profile::GattTemplateId::kMouseOnly;
         s_single_input_characteristics[0] = s_characteristics[0];
         s_single_input_characteristics[1] = s_characteristics[1];
@@ -193,6 +218,9 @@ int Database::register_database() {
         }
         s_single_input_characteristics[2].min_key_size = profile_->attributes.key_size;
         s_single_input_characteristics[3].min_key_size = profile_->attributes.key_size;
+        s_single_input_characteristics[4] = profile_->gatt_template ==
+            ble_fixture_profile::GattTemplateId::kKeyboardWithLeds ? s_led_characteristic : ble_gatt_chr_def{};
+        s_single_input_characteristics[5] = {};
         s_services[1].characteristics = s_single_input_characteristics;
     }
     int result = ble_gatts_count_cfg(s_services);
@@ -261,7 +289,8 @@ int Database::validate_registered_database() {
         s_report_map_value_handle != layout.report_map_value ||
         s_control_point_value_handle != layout.control_point_value ||
         s_keyboard_value_handle != layout.keyboard_value ||
-        s_mouse_value_handle != layout.mouse_value) {
+        s_mouse_value_handle != layout.mouse_value ||
+        s_led_value_handle != layout.led_output_value) {
         return BLE_HS_ENOENT;
     }
     return 0;
@@ -282,6 +311,16 @@ hid_control_executor::BleHidHandles Database::hid_handles() const {
         .mouse_value = s_mouse_value_handle,
         .control_point_value = s_control_point_value_handle,
     };
+}
+
+ble_fixture_profile::LedValue Database::led_value(
+    ble_lifecycle::Generation generation, std::uint16_t connection_handle) const {
+    const auto word = led_word_.load(std::memory_order_acquire);
+    const auto scope = (static_cast<std::uint64_t>(generation) << 32) |
+                       (static_cast<std::uint64_t>(connection_handle) << 8);
+    if (generation == 0 || connection_handle == ble_lifecycle::kNoConnection ||
+        (word & ~std::uint64_t{0x3f}) != scope || (word & 0x20U) == 0) return {};
+    return {.valid = true, .leds = static_cast<std::uint8_t>(word & 0x1fU)};
 }
 
 hid_control_executor::BleNotifyBackendResult Database::notify_custom(
@@ -373,6 +412,34 @@ int Database::access(std::uint16_t connection_handle,
                 *s_database->profile_, ble_fixture_profile::ReportRole::kMouseInput);
             return report != nullptr ? append(context->om, report->report_reference)
                                      : BLE_ATT_ERR_UNLIKELY;
+        }
+        case AccessTarget::kLedReference: {
+            const auto *report = ble_fixture_profile::find_report(
+                *s_database->profile_, ble_fixture_profile::ReportRole::kLedOutput);
+            return report != nullptr && context->op == BLE_GATT_ACCESS_OP_READ_DSC
+                ? append(context->om, report->report_reference) : BLE_ATT_ERR_READ_NOT_PERMITTED;
+        }
+        case AccessTarget::kLedReport: {
+            const auto generation = s_database->generation_.load(std::memory_order_acquire);
+            if (s_database->profile_->layout.led_output_value == 0 ||
+                attribute_handle != s_led_value_handle || generation == 0 ||
+                connection_handle == ble_lifecycle::kNoConnection) return BLE_ATT_ERR_UNLIKELY;
+            if (context->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+                const auto current = s_database->led_value(generation, connection_handle);
+                return append(context->om, std::array<std::uint8_t, 1>{current.leds});
+            }
+            if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+            if (context->om == nullptr || OS_MBUF_PKTLEN(context->om) != 1)
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            std::uint8_t value = 0;
+            std::uint16_t length = 0;
+            if (ble_hs_mbuf_to_flat(context->om, &value, sizeof(value), &length) != 0 || length != 1)
+                return BLE_ATT_ERR_UNLIKELY;
+            // Bits5..7 are constant padding in the immutable descriptor.
+            const auto word = (static_cast<std::uint64_t>(generation) << 32) |
+                (static_cast<std::uint64_t>(connection_handle) << 8) | 0x20U | (value & 0x1fU);
+            s_database->led_word_.store(word, std::memory_order_release);
+            return 0;
         }
         case AccessTarget::kControlPoint: {
             if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR ||

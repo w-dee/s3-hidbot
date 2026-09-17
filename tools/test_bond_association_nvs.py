@@ -224,10 +224,10 @@ int main(){
  assert(!host_locked);
  // Keyboard uses authenticated policy but its own association, including
  // authenticated Legacy fallback; authentication bits alone never reuse strict.
- for(bool sc:{false,true}){
-  reset();Backend keyboard;keyboard.profile_=&ble_fixture_profile::kStandaloneKeyboard;
+ for(const auto *definition:{&ble_fixture_profile::kStandaloneKeyboard,&ble_fixture_profile::kStandaloneKeyboardLeds})for(bool sc:{false,true}){
+  reset();Backend keyboard;keyboard.profile_=definition;
   both(keyboard,true,sc);assert(validate_complete_associations()==0);
-  assert(read_association(connected).record.bond_class==detail::BondClass::kStandaloneKeyboard);
+  assert(read_association(connected).record.bond_class==definition->bond_class);
   before=disk;keyboard.profile_=&ble_fixture_profile::kStrictComposite;
   assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL && disk==before);
   assert(keyboard.read_security_raw(true,key.sec,raw)==0 && raw.authenticated);
@@ -250,6 +250,14 @@ int main(){
   assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL && out.sec.synthetic_ltk[0]==0);
   value=key_value();assert(ble_store_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value)==BLE_HS_ESTORE_FAIL && disk==before);
   assert(store_failures==0 && validate_complete_associations()==0);
+ }
+ // Identical keyboard authentication does not migrate LED/plain schemas.
+ for(bool leds:{false,true}){
+  reset();Backend keyboard;keyboard.profile_=leds?&ble_fixture_profile::kStandaloneKeyboardLeds:&ble_fixture_profile::kStandaloneKeyboard;
+  both(keyboard,true,true);before=disk;
+  keyboard.profile_=leds?&ble_fixture_profile::kStandaloneKeyboard:&ble_fixture_profile::kStandaloneKeyboardLeds;
+  assert(ble_store_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&key,&out)==BLE_HS_ESTORE_FAIL && disk==before);
+  assert(validate_complete_associations()==0 && store_failures==0);
  }
  // No new record may exceed the three-record namespace bound.
  reset();AssociationStore store{raw_read};

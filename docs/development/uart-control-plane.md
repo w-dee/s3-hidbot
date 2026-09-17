@@ -1601,7 +1601,8 @@ not a schematic, direct-rail, backfeed, or general electrical-safety claim.
 `ble.profile.select`. The catalog is finite; it accepts no descriptor, packet,
 GATT or arbitrary configuration upload. The public development catalog contains
 `strict_composite`, `standalone_mouse_just_works`, `standalone_keyboard` and
-`standalone_mouse_just_works_id7`. Public availability does not imply physical
+`standalone_mouse_just_works_id7` and `standalone_keyboard_leds`. Public
+availability does not imply physical
 qualification.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
 
@@ -1648,10 +1649,10 @@ constitute a hardware qualification.
 The Python APIs are `Client.ble_profile_list()`, `ble_profile_status()` and
 `ble_profile_select(BleProfileId.STANDALONE_MOUSE_JUST_WORKS)`. CLI counterparts
 are `ble-profile-list`, `ble-profile-status`, and `ble-profile-select PROFILE_ID`.
-They require the advertised capability. The host permits up to 17 capabilities
+They require the advertised capability. The host permits up to 18 capabilities
 only in the hello capability array; other generic arrays retain their 16-item
 bound and the machine response frame remains 1024 bytes. Older host versions
-with a 16-capability limit must be updated for this development firmware.
+with a 16- or 17-capability limit must be updated for this development firmware.
 
 The internal shared-store association uses bounded `hid_assoc` U32 records,
 keyed by the existing exact peer identity. Format 1 has explicit pending and
@@ -1699,3 +1700,45 @@ match the ID 2 mouse profile. Report ID is descriptor/reference metadata and is
 not prefixed to the five-byte GATT value. The distinct schema and association
 require explicit bond preparation even between these two otherwise equivalent
 mouse profiles. No arbitrary descriptor or runtime Report ID selection exists.
+
+`standalone_keyboard_leds` is revision 1, schema 5, bond class 4 and shared
+identity class 0. It adds a one-byte LED Output Report ID 1 (Report Reference
+`{1, 2}`) to the keyboard-only input semantics and authenticated security policy.
+Its separately hash-pinned 69-byte Report Map defines Num Lock, Caps Lock,
+Scroll Lock, Compose and Kana as bits 0 through 4. Bits 5 through 7 are constant
+padding and are ignored on writes. The Output characteristic supports Read,
+Write and Write Without Response with authenticated 16-byte access, has no
+CCCD, and does not participate in input readiness, Sequence capability or
+`hid.release_all`. The board's physical LEDs are not driven. Moving between
+plain and LED keyboard profiles requires explicit bond preparation.
+
+### BLE LED observation
+
+`ble.led-observation-v1` adds the read-only `ble.led.status` command. It accepts
+no params (omitted or `{}`) and returns exactly:
+
+```json
+{"supported":true,"valid":true,"leds":21}
+```
+
+`supported` describes whether the selected finite profile has the LED Output
+Report. `valid` means an Output write has been observed for the current exposed
+connection under the stable active LED profile. `leds` is an integer from 0 to
+31. Before any write, while hidden/disconnected, during a profile transition,
+or under an unsupported profile, `valid` is false and `leds` is zero. An
+unsupported profile also has `supported:false`. GATT reads before the first
+write of a connection return zero without fabricating an observed write.
+
+State is RAM-only and scoped to the BLE generation and connection handle;
+retired connections and full stack restart cannot supply the next connection's
+value. This is an observation of the last accepted host Output value, not proof
+of a current OS lock state or a physical LED state. Input route selection and
+input CCCD readiness are not prerequisites for host Output writes. Each new
+query samples current observation; an exact request retry returns its cached
+original response under the usual protocol rules. The typed host method is
+`Client.ble_led_status()` and the CLI command is `hidbotctl ble-led-status`.
+Peers without the capability fail locally before sending the command.
+
+The hello capability-array bound is 18; unrelated JSON arrays retain their
+existing bound of 16. The complete five-profile catalog remains within the
+1023-byte logical machine-frame limit, including a maximum request ID.
