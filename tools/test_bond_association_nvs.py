@@ -57,10 +57,35 @@ int raw_write(int type,const ble_store_value*value){
  }
  return raw_fail==3?77:0;
 }
+using ble_store_delete_fn=int(int,const ble_store_key*);
+int raw_delete(int,const ble_store_key*){return 0;}
+struct StoreConfig {ble_store_read_fn*store_read_cb;ble_store_write_fn*store_write_cb;ble_store_delete_fn*store_delete_cb;};
+StoreConfig ble_hs_cfg{};
+namespace hid_control_executor {enum class BleEventKind {kSync,kTimeout};}
+struct Sink {void signal_ble_lifecycle_handoff_failure(){assert(false);}};
+struct Uuid {int u=0;};Uuid s_gatt_service_uuid,s_service_changed_uuid;
+int ble_hs_util_ensure_addr(int){return 0;}
+int ble_hs_id_infer_auto(int,uint8_t*){return 0;}
+int ble_gatts_find_chr(int*,int*,void*,uint16_t*handle){*handle=4;return 0;}
 struct Backend {
  static Backend* instance_;
  ble_store_read_fn*original_store_read_=raw_read;
  ble_store_write_fn*original_store_write_=raw_write;
+ ble_store_delete_fn*original_store_delete_=raw_delete;
+ uint8_t own_address_type_=0;
+ std::atomic<uint16_t> service_changed_value_handle_{0};
+ Sink sink;Sink*sink_=&sink;
+ hid_control_executor::BleEventKind last_event=hid_control_executor::BleEventKind::kTimeout;
+ enum class LifecycleTimeoutPurpose {kSync};
+ void cancel_timeout(LifecycleTimeoutPurpose){}
+ bool signal(hid_control_executor::BleEventKind kind,uint16_t,int status){
+  last_event=kind;if(kind==hid_control_executor::BleEventKind::kSync){
+   assert(status==0 && ble_hs_cfg.store_read_cb==store_read && ble_hs_cfg.store_write_cb==store_write && ble_hs_cfg.store_delete_cb==store_delete);
+  }return true;
+ }
+ int restore_store_callbacks();
+ static void on_sync();
+ static int store_delete(int,const ble_store_key*){return 0;}
  const ble_fixture_profile::ProfileDefinition* profile_=&ble_fixture_profile::kStandaloneMouseJustWorks;
  detail::AssociationCreation association_creation_{};
  uint64_t active_host_connection_=1;
@@ -81,15 +106,15 @@ struct Backend {
 };
 Backend* Backend::instance_=nullptr;
 int ble_store_read(int type,const ble_store_key*key,ble_store_value*value){
- HostLock lock;return Backend::store_read(type,key,value);
+ HostLock lock;return ble_hs_cfg.store_read_cb(type,key,value);
 }
 int ble_store_write(int type,const ble_store_value*value){
- HostLock lock;return Backend::store_write(type,value);
+ HostLock lock;return ble_hs_cfg.store_write_cb(type,value);
 }
 '''
 
 POST = r'''
-void reset(){assert(handles.empty()&&live_iterators==0);disk.clear();ram.clear();calls=0;cut=-1;after=false;raw_reads=raw_writes=store_failures=raw_fail=0;}
+void reset(){ble_hs_cfg={Backend::store_read,Backend::store_write,Backend::store_delete};assert(handles.empty()&&live_iterators==0);disk.clear();ram.clear();calls=0;cut=-1;after=false;raw_reads=raw_writes=store_failures=raw_fail=0;}
 ble_store_value key_value(bool authenticated=false){ble_store_value result{};
  result.sec.peer_addr=connected;result.sec.ltk_present=1;result.sec.authenticated=authenticated;
  result.sec.sc=1;result.sec.key_size=16;result.sec.synthetic_ltk[0]=42;return result;}
@@ -100,6 +125,19 @@ void both(Backend&b){Backend::instance_=&b;auto value=key_value();
  assert(read_association(connected).record.state==detail::AssociationState::kComplete);}
 int main(){
  using S=detail::AssociationState;
+ // Reproduce pinned startup/privacy resetting configuration after application
+ // initialization. Actual on_sync must restore before publishing readiness.
+ for(int cycle=0;cycle<3;++cycle){
+  reset();Backend startup;Backend::instance_=&startup;
+  ble_hs_cfg={raw_read,raw_write,raw_delete};Backend::on_sync();
+  assert(startup.last_event==hid_control_executor::BleEventKind::kSync);
+  both(startup);ble_store_key_sec key{};key.peer_addr=connected;ble_store_value_sec out{};
+  assert(startup.read_security_raw(true,key,out)==0 && out.synthetic_ltk[0]==42);
+ }
+ reset();Backend unexpected;Backend::instance_=&unexpected;
+ ble_hs_cfg.store_write_cb=+[](int,const ble_store_value*){return 9;};Backend::on_sync();
+ assert(unexpected.last_event==hid_control_executor::BleEventKind::kTimeout && unexpected.service_changed_value_handle_==0);
+
  reset();Backend b;both(b);assert(validate_complete_associations()==0);
  auto complete=disk;auto retained_ram=ram;
  ble_store_key key{};key.sec.peer_addr=connected;ble_store_value out{};
@@ -207,7 +245,8 @@ def main():
         'detail::AssociationRead read_association(', 'int validate_association_namespace(',
         'int read_inventory_security(', 'struct AssociationStore {', 'int validate_complete_associations(',
         'int Backend::read_security_raw(', 'bool Backend::compatible_association(',
-        'int Backend::store_read(', 'int Backend::store_write(')
+        'int Backend::store_read(', 'int Backend::store_write(',
+        'int Backend::restore_store_callbacks(', 'void Backend::on_sync(')
     extracted = '\n'.join(body(source, s) + (';' if s.startswith('struct') else '') for s in signatures)
     with tempfile.TemporaryDirectory(prefix='bond-association-nvs-') as directory:
         path = Path(directory)

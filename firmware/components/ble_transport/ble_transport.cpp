@@ -1160,6 +1160,22 @@ bool Backend::signal(hid_control_executor::BleEventKind kind,
                                });
 }
 
+int Backend::restore_store_callbacks() {
+    // With STATIC_TO_DYNAMIC the pinned SDK's startup privacy initialization
+    // calls ble_store_config_init again and overwrites these callbacks. Rebind
+    // after startup, before Sync can authorize advertising or key lookup.
+    if (original_store_read_ == nullptr || original_store_write_ == nullptr ||
+        original_store_delete_ == nullptr ||
+        (ble_hs_cfg.store_read_cb != original_store_read_ && ble_hs_cfg.store_read_cb != store_read) ||
+        (ble_hs_cfg.store_write_cb != original_store_write_ && ble_hs_cfg.store_write_cb != store_write) ||
+        (ble_hs_cfg.store_delete_cb != original_store_delete_ && ble_hs_cfg.store_delete_cb != store_delete))
+        return BLE_HS_EINVAL;
+    ble_hs_cfg.store_read_cb = store_read;
+    ble_hs_cfg.store_write_cb = store_write;
+    ble_hs_cfg.store_delete_cb = store_delete;
+    return 0;
+}
+
 void Backend::on_sync() {
     if (instance_ == nullptr) {
         return;
@@ -1168,6 +1184,7 @@ void Backend::on_sync() {
     if (result == 0) {
         result = ble_hs_id_infer_auto(0, &instance_->own_address_type_);
     }
+    if (result == 0) result = instance_->restore_store_callbacks();
     std::uint16_t service_changed_handle = 0;
     if (result == 0) {
         result = ble_gatts_find_chr(

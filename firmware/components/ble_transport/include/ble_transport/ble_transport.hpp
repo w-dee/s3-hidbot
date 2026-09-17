@@ -123,6 +123,7 @@ class Backend final : public hid_control_executor::BleBackend {
                                std::int32_t status,
                                bool persistent_store_unhealthy,
                                std::uint16_t connection_handle);
+    int restore_store_callbacks();
     int read_security_raw(bool our, const ble_store_key_sec &key, ble_store_value_sec &value) const;
     bool compatible_association(const ble_addr_t &identity) const;
     detail::AssociationCreation association_creation_{};
