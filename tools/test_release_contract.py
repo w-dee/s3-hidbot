@@ -261,6 +261,25 @@ using namespace example;
                 self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
                 self._assert_authority_rejected(root)
 
+    def test_profile_parser_rejects_digit_separator_scope_bypass(self) -> None:
+        source = '''
+namespace firmware_identity {
+inline constexpr auto a = 1'2; inline constexpr std::string_view kBuildProfile = "freenove-fnk0085"; namespace example { inline constexpr auto b = 3'4;
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";
+inline constexpr auto c = 5'6; } inline constexpr auto d = 7'8;
+}
+'''
+        for body in (
+            source,
+            'namespace firmware_identity {\ninline constexpr char example = \'a\';\n'
+            'inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";\n}\n',
+        ):
+            with self.subTest(source=body), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                header = self._write_identity_header(root, body)
+                self.assertEqual(self._compiled_profile(root, header), "freenove-fnk0085")
+                self._assert_authority_rejected(root)
+
     def _assert_authority_rejected(self, root: Path) -> None:
         (root / "firmware/version.txt").write_text("0.3.0\n", encoding="utf-8")
         (root / "host").mkdir()

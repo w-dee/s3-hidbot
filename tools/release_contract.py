@@ -90,6 +90,10 @@ def _cpp_tokens(text: str) -> tuple[_CppToken, ...]:
             cursor = end
             line_start = False
             continue
+        if character == "'":
+            raise ReleaseContractError(
+                "firmware build profile authority uses unsupported character or numeric literal syntax"
+            )
         if not character.isascii() or character in {"%", "\\"}:
             raise ReleaseContractError("firmware build profile authority uses unsupported token syntax")
         line_start = False
@@ -100,7 +104,7 @@ def _cpp_tokens(text: str) -> tuple[_CppToken, ...]:
                 cursor += 1
             tokens.append(_CppToken("identifier", text[start:cursor]))
             continue
-        if character in {'"', "'"}:
+        if character == '"':
             quote = character
             start = cursor + 1
             cursor += 1
@@ -120,7 +124,7 @@ def _cpp_tokens(text: str) -> tuple[_CppToken, ...]:
                 cursor += 1
             if cursor >= len(text):
                 raise ReleaseContractError("firmware build profile authority has an unterminated literal")
-            tokens.append(_CppToken("string" if quote == '"' else "character", text[start:cursor]))
+            tokens.append(_CppToken("string", text[start:cursor]))
             cursor += 1
             continue
         tokens.append(_CppToken("symbol", character))
