@@ -297,6 +297,11 @@ def _parser() -> argparse.ArgumentParser:
         hidden_help: Collection[str] = ()
         if name == "flash-firmware":
             hidden_help = {"--baud", "--timeout", "--attempts"}
+            command.add_argument(
+                "--allow-legacy-v0-3-0-recovery",
+                action="store_true",
+                help="allow only the exact frozen published v0.3.0 recovery archive",
+            )
         elif name == "verify-artifact":
             hidden_help = {"--port", "--baud", "--timeout", "--attempts"}
         _add_global_options(
@@ -736,7 +741,10 @@ def main(
             return 0
         if args.command == "flash-firmware":
             port = resolve_port(args.port, environ)
-            with stage_and_verify_firmware_bundle(args.artifact) as bundle:
+            with stage_and_verify_firmware_bundle(
+                args.artifact,
+                allow_legacy_v0_3_0_recovery=args.allow_legacy_v0_3_0_recovery,
+            ) as bundle:
                 result = provisioning_workflow_runner(
                     bundle,
                     port,

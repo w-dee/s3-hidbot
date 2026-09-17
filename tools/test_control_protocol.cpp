@@ -1168,7 +1168,7 @@ void test_identity_hello_and_info_shapes() {
                      "\"firmware\":{\"version\":\"0.1.0-dev\",\"source_revision\":null,");
     require_contains(null_revision_info,
                      "\"app_elf_sha256\":\"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\"");
-    require_contains(null_revision_info, "\"build_profile\":\"freenove-fnk0085\"}");
+    require_contains(null_revision_info, "\"build_profile\":\"freenove-fnk0099\"}");
     assert(null_revision_info.size() <= kMaxLogicalMachineFrameBytes);
 
     constexpr char kFullRevision[] =

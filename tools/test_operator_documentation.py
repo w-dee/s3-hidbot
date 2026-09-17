@@ -221,14 +221,52 @@ def main() -> int:
         "creates no qualification evidence for actual FNK0085 hardware",
         "Frozen evidence objects",
         "freenove-fnk0085",
-        "separate H-contract change",
+        "Forward source now emits `freenove-fnk0099`",
+        "the two profile values are not aliases",
     ):
         _require(hardware_profile_erratum, marker, f"fixture erratum scope {marker!r}")
-    _require(
-        quick_start,
-        "current legacy artifact contract",
-        "legacy artifact examples distinguished from physical fixture identity",
-    )
+    for document, markers in (
+        (
+            quick_start,
+            (
+                "freenove-fnk0099.tar.gz.sha256",
+                "Published historical artifacts retain their literal old names",
+            ),
+        ),
+        (
+            safety,
+            (
+                "--allow-legacy-v0-3-0-recovery",
+                "fixed outer and internal hashes",
+                "runtime verification still requires its literal",
+            ),
+        ),
+        (
+            firmware_artifacts,
+            (
+                "build_profile=freenove-fnk0099",
+                "s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0099/",
+                "Read-only inspection",
+                "Ordinary old-profile artifacts are rejected",
+            ),
+        ),
+        (
+            uart_control_plane,
+            (
+                '"build_profile": "freenove-fnk0099"',
+                "does not alias `freenove-fnk0085` to `freenove-fnk0099`",
+            ),
+        ),
+        (
+            host_readme,
+            (
+                "--allow-legacy-v0-3-0-recovery",
+                "does not authorize an extracted",
+            ),
+        ),
+    ):
+        for marker in markers:
+            _require(document, marker, f"forward/legacy contract {marker!r}")
     maintained_fixture_prose = "\n".join(
         (
             readme,
@@ -247,18 +285,14 @@ def main() -> int:
     ):
         if wrong_claim in maintained_fixture_prose:
             raise AssertionError(f"obsolete physical-fixture claim remains: {wrong_claim!r}")
-    for legacy_contract_doc in (quick_start, safety, uart_control_plane, firmware_artifacts):
-        normalized_legacy_contract_doc = " ".join(legacy_contract_doc.split())
-        _require(
-            normalized_legacy_contract_doc,
-            "freenove-fnk0085",
-            "preserved pre-H-contract profile literal",
-        )
-        _require(
-            normalized_legacy_contract_doc,
-            "physical fixture",
-            "legacy profile distinguished from physical fixture identity",
-        )
+    for obsolete in (
+        "current pre-H-contract runtime",
+        "current legacy artifact identifier",
+        "Future FNK0099 naming is not implemented",
+        "Until H-contract it accepts",
+    ):
+        if obsolete in maintained_fixture_prose:
+            raise AssertionError(f"obsolete pre-H-contract statement remains: {obsolete!r}")
 
     _require(documents["README.md"], "Route v2", "current BLE route contract")
     _require(documents["README.md"], "never evicts", "three-bond no-eviction contract")

@@ -65,6 +65,43 @@ def _validate_sdist(path: Path, contract: ReleaseContract) -> None:
         raise ReleaseAssetError("host sdist metadata does not match the release contract")
 
 
+def validate_release_firmware_archive(
+    firmware: Path,
+    contract: ReleaseContract,
+    *,
+    source_revision: str | None = None,
+) -> dict:
+    """Bind archive basename, bundle root, and manifest to selected source."""
+
+    if firmware.name != contract.firmware_archive:
+        raise ReleaseAssetError("firmware archive filename does not match release contract")
+    try:
+        manifest = verify_bundle_archive(firmware)
+    except ArtifactError as exc:
+        raise ReleaseAssetError("firmware archive failed official verification") from exc
+    firmware_data = manifest["firmware"]
+    if firmware_data["version"] != contract.version:
+        raise ReleaseAssetError("firmware archive version does not match release contract")
+    if firmware_data["build_profile"] != contract.build_profile:
+        raise ReleaseAssetError("firmware archive profile does not match selected source")
+    expected_root = contract.firmware_archive.removesuffix(".tar.gz")
+    try:
+        with tarfile.open(firmware, "r:gz") as archive:
+            roots = {
+                PurePosixPath(member.name).parts[0]
+                for member in archive.getmembers()
+                if member.name
+            }
+    except tarfile.TarError as exc:
+        raise ReleaseAssetError("firmware archive root could not be inspected") from exc
+    if roots != {expected_root}:
+        raise ReleaseAssetError("firmware bundle root does not match selected source profile")
+    revision = validate_source_revision(firmware_data["source_revision"])
+    if source_revision is not None and revision != validate_source_revision(source_revision):
+        raise ReleaseAssetError("firmware archive source revision does not match expected commit")
+    return manifest
+
+
 def validate_release_asset_directory(
     directory: Path,
     contract: ReleaseContract,
@@ -83,16 +120,11 @@ def validate_release_asset_directory(
     for primary in contract.distributable_assets[::2] + contract.legal_assets[::2]:
         _validate_checksum(directory, primary)
     firmware = directory / contract.firmware_archive
-    try:
-        manifest = verify_bundle_archive(firmware)
-    except ArtifactError as exc:
-        raise ReleaseAssetError("firmware archive failed official verification") from exc
-    firmware_data = manifest["firmware"]
-    if firmware_data["version"] != contract.version:
-        raise ReleaseAssetError("firmware archive version does not match release contract")
-    revision = validate_source_revision(firmware_data["source_revision"])
-    if source_revision is not None and revision != validate_source_revision(source_revision):
-        raise ReleaseAssetError("firmware archive source revision does not match expected commit")
+    manifest = validate_release_firmware_archive(
+        firmware,
+        contract,
+        source_revision=source_revision,
+    )
     try:
         validate_wheel(directory / contract.host_wheel, contract.version)
     except HostArtifactError as exc:

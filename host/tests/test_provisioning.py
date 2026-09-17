@@ -5,6 +5,8 @@ import os
 import shutil
 import tempfile
 import unittest
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -17,11 +19,14 @@ from hidbot.artifact import (
 )
 from hidbot.provisioning import (
     FlashPlan,
+    InspectedFirmwareBundle,
     ProvisioningPolicyError,
     SupportedProvisioningPlan,
     plan_esptool_v4_args,
+    stage_and_inspect_firmware_bundle,
     stage_and_verify_firmware_bundle,
 )
+from hidbot.legacy_recovery import HistoricalReleaseAuthority, matches_historical_release
 import hidbot.provisioning as provisioning
 
 
@@ -57,8 +62,14 @@ def _plan() -> dict[str, object]:
     }
 
 
-def _make_bundle(root: Path) -> Path:
-    bundle = root / "s3-hidbot-firmware-0.1.0-dev-esp32s3-freenove-fnk0085"
+def _make_bundle(
+    root: Path,
+    *,
+    profile: str = "freenove-fnk0099",
+    version: str = "0.1.0-dev",
+    source_revision: str = "a" * 40,
+) -> Path:
+    bundle = root / f"s3-hidbot-firmware-{version}-esp32s3-{profile}"
     payloads = {
         "application.bin": b"application image\n",
         "application.elf": b"exact linked elf\n",
@@ -95,11 +106,11 @@ def _make_bundle(root: Path) -> Path:
         "artifact_manifest_version": 1,
         "project": "s3-hidbot",
         "firmware": {
-            "version": "0.1.0-dev",
+            "version": version,
             "protocol_version": 1,
-            "source_revision": "a" * 40,
+            "source_revision": source_revision,
             "target": "esp32s3",
-            "build_profile": "freenove-fnk0085",
+            "build_profile": profile,
             "idf_version": "v5.5.4",
         },
         "runtime_identity": {"app_elf_sha256": files["application.elf"]["sha256"]},
@@ -179,6 +190,39 @@ class _TrackedTemporaryDirectory:
 
 
 class ProvisioningTests(unittest.TestCase):
+    def test_read_only_inspection_accepts_old_profile_without_flash_authority(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="s3-hidbot-provision-test-") as temporary:
+            source = _make_bundle(
+                Path(temporary) / "source",
+                profile="freenove-fnk0085",
+            )
+            with stage_and_inspect_firmware_bundle(source) as bundle:
+                self.assertIsInstance(bundle, InspectedFirmwareBundle)
+                self.assertEqual(bundle.artifact_identity.build_profile, "freenove-fnk0085")
+                self.assertFalse(hasattr(bundle, "provisioning_plan"))
+                bundle.verify_staged_payloads_unchanged()
+            with self.assertRaises(ProvisioningPolicyError):
+                with stage_and_verify_firmware_bundle(source):
+                    pass
+
+    def test_read_only_inspection_does_not_grant_or_apply_flash_policy(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="s3-hidbot-provision-test-") as temporary:
+            source = _make_bundle(Path(temporary) / "source")
+            plan_path = source / "flasher_args.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["app"]["encrypted"] = "true"
+            write_deterministic_json(plan_path, plan)
+            _refresh(source)
+            with stage_and_inspect_firmware_bundle(source) as bundle:
+                application = next(
+                    image for image in bundle.flash_plan.images if image.role == "application_bin"
+                )
+                self.assertTrue(application.encrypted)
+                self.assertFalse(hasattr(bundle, "provisioning_plan"))
+            with self.assertRaises(ProvisioningPolicyError):
+                with stage_and_verify_firmware_bundle(source):
+                    pass
+
     def test_directory_is_private_snapshot_and_lifetime_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory(prefix="s3-hidbot-provision-test-") as temporary:
             root = Path(temporary)
@@ -357,6 +401,150 @@ class ProvisioningTests(unittest.TestCase):
                 with self.assertRaises(ProvisioningPolicyError):
                     with stage_and_verify_firmware_bundle(source):
                         pass
+
+    def test_historical_release_match_binds_outer_and_inner_authority(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="s3-hidbot-provision-test-") as temporary:
+            root = Path(temporary)
+            source = _make_bundle(
+                root / "source",
+                profile="freenove-fnk0085",
+                version="0.3.0",
+                source_revision="e" * 40,
+            )
+            archive = root / "legacy.tar.gz"
+            create_deterministic_tar_gz(source, archive, 0)
+            manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+            authority = HistoricalReleaseAuthority(
+                archive_name=archive.name,
+                archive_sha256=sha256_file(archive),
+                firmware_version="0.3.0",
+                source_revision="e" * 40,
+                manifest_sha256=sha256_file(source / "manifest.json"),
+                application_elf_sha256=manifest["files"]["application.elf"]["sha256"],
+                application_bin_sha256=manifest["files"]["application.bin"]["sha256"],
+                build_profile="freenove-fnk0085",
+            )
+            self.assertTrue(
+                matches_historical_release(
+                    authority,
+                    archive_name=archive.name,
+                    archive_snapshot=archive,
+                    staged_root=source,
+                    manifest=manifest,
+                )
+            )
+            mutations = {
+                "filename": {"archive_name": "renamed.tar.gz"},
+                "outer": {"archive_sha256": "0" * 64},
+                "source": {"source_revision": "f" * 40},
+                "manifest": {"manifest_sha256": "1" * 64},
+                "elf": {"application_elf_sha256": "2" * 64},
+                "bin": {"application_bin_sha256": "3" * 64},
+            }
+            for name, changes in mutations.items():
+                with self.subTest(name=name):
+                    altered = replace(authority, **changes)
+                    self.assertFalse(
+                        matches_historical_release(
+                            altered,
+                            archive_name=archive.name,
+                            archive_snapshot=archive,
+                            staged_root=source,
+                            manifest=manifest,
+                        )
+                    )
+
+            altered_archive = root / "altered.tar.gz"
+            altered_archive.write_bytes(archive.read_bytes() + b"altered")
+            self.assertFalse(
+                matches_historical_release(
+                    authority,
+                    archive_name=archive.name,
+                    archive_snapshot=altered_archive,
+                    staged_root=source,
+                    manifest=manifest,
+                )
+            )
+            repacked = root / "repacked.tar.gz"
+            create_deterministic_tar_gz(source, repacked, 1)
+            self.assertFalse(
+                matches_historical_release(
+                    authority,
+                    archive_name=archive.name,
+                    archive_snapshot=repacked,
+                    staged_root=source,
+                    manifest=manifest,
+                )
+            )
+            for name, mutate in (
+                (
+                    "artifact-source",
+                    lambda value: value["firmware"].update(source_revision="f" * 40),
+                ),
+                (
+                    "artifact-elf",
+                    lambda value: value["runtime_identity"].update(
+                        app_elf_sha256="4" * 64
+                    ),
+                ),
+                (
+                    "artifact-bin",
+                    lambda value: value["files"]["application.bin"].update(
+                        sha256="5" * 64
+                    ),
+                ),
+            ):
+                with self.subTest(name=name):
+                    changed_manifest = deepcopy(manifest)
+                    mutate(changed_manifest)
+                    self.assertFalse(
+                        matches_historical_release(
+                            authority,
+                            archive_name=archive.name,
+                            archive_snapshot=archive,
+                            staged_root=source,
+                            manifest=changed_manifest,
+                        )
+                    )
+
+    def test_legacy_recovery_requires_flag_archive_and_exact_recognition(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="s3-hidbot-provision-test-") as temporary:
+            root = Path(temporary)
+            source = _make_bundle(root / "source", profile="freenove-fnk0085")
+            archive = root / "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0085.tar.gz"
+            create_deterministic_tar_gz(source, archive, 0)
+
+            with self.assertRaises(ProvisioningPolicyError):
+                with stage_and_verify_firmware_bundle(archive):
+                    pass
+            with mock.patch.object(provisioning, "matches_legacy_v0_3_0", return_value=False):
+                with self.assertRaises(ProvisioningPolicyError):
+                    with stage_and_verify_firmware_bundle(
+                        archive, allow_legacy_v0_3_0_recovery=True
+                    ):
+                        pass
+            with mock.patch.object(provisioning, "matches_legacy_v0_3_0", return_value=True):
+                with stage_and_verify_firmware_bundle(
+                    archive, allow_legacy_v0_3_0_recovery=True
+                ) as bundle:
+                    self.assertEqual(bundle.authority, "legacy-v0.3.0")
+                    self.assertEqual(bundle.provisioning_plan.build_profile, "freenove-fnk0085")
+                with self.assertRaises(ProvisioningPolicyError):
+                    with stage_and_verify_firmware_bundle(
+                        source, allow_legacy_v0_3_0_recovery=True
+                    ):
+                        pass
+
+    def test_legacy_flag_does_not_change_current_artifact_semantics(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="s3-hidbot-provision-test-") as temporary:
+            source = _make_bundle(Path(temporary) / "source")
+            with mock.patch.object(provisioning, "matches_legacy_v0_3_0") as legacy:
+                with stage_and_verify_firmware_bundle(
+                    source, allow_legacy_v0_3_0_recovery=True
+                ) as bundle:
+                    self.assertEqual(bundle.authority, "current")
+                    self.assertEqual(bundle.provisioning_plan.build_profile, "freenove-fnk0099")
+                legacy.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ ARTIFACT = ArtifactFirmwareIdentity(
     version="0.1.0-dev",
     source_revision="a" * 40,
     app_elf_sha256="b" * 64,
-    build_profile="freenove-fnk0085",
+    build_profile="freenove-fnk0099",
     idf_version="v5.5.4",
 )
 
@@ -33,7 +33,7 @@ def identity(*, source_revision: str | None = "a" * 40) -> FirmwareIdentity:
         version="0.1.0-dev",
         source_revision=source_revision,
         app_elf_sha256="b" * 64,
-        build_profile="freenove-fnk0085",
+        build_profile="freenove-fnk0099",
     )
 
 
@@ -71,6 +71,30 @@ class FirmwareVerificationTests(unittest.TestCase):
         self.assertEqual(result.classification, FirmwareVerificationClassification.MATCH)
         self.assertEqual(result.mismatches, ())
         self.assertIsNone(result.unavailable_reason)
+
+    def test_old_and_new_profiles_match_only_the_same_literal(self) -> None:
+        old_artifact = replace(ARTIFACT, build_profile="freenove-fnk0085")
+        old_runtime = system_info(
+            firmware=replace(identity(), build_profile="freenove-fnk0085")
+        )
+        new_runtime = system_info()
+        self.assertTrue(
+            compare_firmware_identity(
+                old_artifact, (FIRMWARE_IDENTITY_CAPABILITY,), old_runtime
+            ).match
+        )
+        for artifact, runtime in (
+            (old_artifact, new_runtime),
+            (ARTIFACT, old_runtime),
+        ):
+            with self.subTest(artifact=artifact.build_profile):
+                result = compare_firmware_identity(
+                    artifact, (FIRMWARE_IDENTITY_CAPABILITY,), runtime
+                )
+                self.assertEqual(
+                    result.mismatches,
+                    (FirmwareIdentityMismatch.BUILD_PROFILE_MISMATCH,),
+                )
 
     def test_each_field_mismatch_has_one_fixed_code(self) -> None:
         cases = (

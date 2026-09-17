@@ -14,6 +14,9 @@
 4. `release-all` and `self-test` are safety actions, not arbitrary HID
    injection; `self-test` includes `release-all`.
 5. Destructive provisioning requires explicit provisioning authorization.
+   Normal authority accepts the current `freenove-fnk0099` plan. Historical
+   v0.3.0 recovery additionally requires the exact archive and the explicit
+   `--allow-legacy-v0-3-0-recovery` option; never infer or broaden it.
 6. `keyboard-report` and `mouse-report` require explicit human authorization
    and command-local `--unsafe-hid`.
 7. Never infer host-OS consumption from `submitted`.

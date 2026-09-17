@@ -22,6 +22,7 @@ REQUIRED_MODULES = frozenset(
         "hidbot/firmware_verification.py",
         "hidbot/flashing.py",
         "hidbot/framing.py",
+        "hidbot/legacy_recovery.py",
         "hidbot/protocol.py",
         "hidbot/provisioning.py",
         "hidbot/provisioning_workflow.py",

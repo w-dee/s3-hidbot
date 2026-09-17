@@ -679,15 +679,14 @@ The identity-v1 `system.info` result has exactly these fields:
     "version": "0.2.0",
     "source_revision": null,
     "app_elf_sha256": "<64 lowercase hex>",
-    "build_profile": "freenove-fnk0085"
+    "build_profile": "freenove-fnk0099"
   }
 }
 ```
 
-The `freenove-fnk0085` value above is the current pre-H-contract runtime and
-artifact identity literal. It does not identify the physical fixture as
-FNK0085. A separately reviewed H-contract migration will change the value for
-new FNK0099 builds while preserving exact identity comparison.
+The value above is the current forward runtime and artifact identity literal.
+Historical firmware continues to report its original literal profile, and
+comparison does not alias `freenove-fnk0085` to `freenove-fnk0099`.
 
 `source_revision` is either JSON `null` for an unset build input or the full
 40-character lowercase hexadecimal `S3_HIDBOT_SOURCE_REVISION` value. It is

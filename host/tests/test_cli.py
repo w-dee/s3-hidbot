@@ -417,7 +417,7 @@ class CliTests(unittest.TestCase):
             version="0.1.0-dev",
             source_revision="a" * 40,
             app_elf_sha256="b" * 64,
-            build_profile="freenove-fnk0085",
+            build_profile="freenove-fnk0099",
             idf_version="v5.5.4",
         )
         bundle = SimpleNamespace(artifact_identity=identity)
@@ -445,7 +445,7 @@ class CliTests(unittest.TestCase):
                         version="0.1.0-dev",
                         source_revision="a" * 40,
                         app_elf_sha256="b" * 64,
-                        build_profile="freenove-fnk0085",
+                        build_profile="freenove-fnk0099",
                     ),
                 )
                 comparison = FirmwareVerificationResult(
@@ -468,7 +468,12 @@ class CliTests(unittest.TestCase):
 
         output = io.StringIO()
         errors = io.StringIO()
-        with patch("hidbot.cli.stage_and_verify_firmware_bundle", return_value=contextlib.nullcontext(bundle)):
+        @contextlib.contextmanager
+        def stage(artifact: str, **kwargs: object):
+            calls.append(("stage", artifact, kwargs))
+            yield bundle
+
+        with patch("hidbot.cli.stage_and_verify_firmware_bundle", side_effect=stage):
             code = main(
                 argv,
                 environ={} if env is None else env,
@@ -494,7 +499,7 @@ class CliTests(unittest.TestCase):
                 version="0.1.0-dev",
                 source_revision="a" * 40,
                 app_elf_sha256="b" * 64,
-                build_profile="freenove-fnk0085",
+                build_profile="freenove-fnk0099",
             ),
         )
         comparison: FirmwareVerificationResult | None = None
@@ -1080,6 +1085,24 @@ class CliTests(unittest.TestCase):
         flash_call = next(call for call in calls if call[0] == "flash")
         self.assertEqual(flash_call[2], "env-port")
         self.assertTrue(flash_call[3]["json_mode"])
+        stage_call = next(call for call in calls if call[0] == "stage")
+        self.assertEqual(stage_call[2], {"allow_legacy_v0_3_0_recovery": False})
+
+    def test_flash_legacy_recovery_flag_is_forwarded_as_explicit_opt_in(self) -> None:
+        code, _, errors, calls = self.run_flash_cli(
+            [
+                "--port",
+                "flash-port",
+                "flash-firmware",
+                "--allow-legacy-v0-3-0-recovery",
+                "legacy.tar.gz",
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        stage_call = next(call for call in calls if call[0] == "stage")
+        self.assertEqual(stage_call[1], "legacy.tar.gz")
+        self.assertEqual(stage_call[2], {"allow_legacy_v0_3_0_recovery": True})
 
     def test_flash_firmware_normal_output_and_explicit_programming_options_are_rejected(self) -> None:
         code, output, errors, calls = self.run_flash_cli(
@@ -1257,7 +1280,7 @@ class CliTests(unittest.TestCase):
                 "protocol_version": 1,
                 "version": "0.1.0-dev",
                 "source_revision": "a" * 40,
-                "build_profile": "freenove-fnk0085",
+                "build_profile": "freenove-fnk0099",
                 "idf_version": "v5.5.4",
             },
             "runtime_identity": {"app_elf_sha256": "b" * 64},
@@ -1274,7 +1297,7 @@ class CliTests(unittest.TestCase):
                 "version": "0.1.0-dev",
                 "source_revision": "a" * 40,
                 "app_elf_sha256": "b" * 64,
-                "build_profile": "freenove-fnk0085",
+                "build_profile": "freenove-fnk0099",
             },
         }
         for key, item in overrides.items():
@@ -1548,7 +1571,11 @@ class CliTests(unittest.TestCase):
                 calls.append(("factory", args, kwargs))
                 transport = FakeTransport(calls)
                 self.configure_identity_transport(
-                    transport, self.identity_info(app_elf_sha256=elf_sha256)
+                    transport,
+                    self.identity_info(
+                        app_elf_sha256=elf_sha256,
+                        build_profile="freenove-fnk0085",
+                    ),
                 )
                 return transport
 
@@ -1602,11 +1629,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             output,
             '{"artifact":{"app_elf_sha256":"' + "b" * 64
-            + '","build_profile":"freenove-fnk0085","idf_version":"v5.5.4","project":"s3-hidbot","protocol_version":1,"source_revision":"'
+            + '","build_profile":"freenove-fnk0099","idf_version":"v5.5.4","project":"s3-hidbot","protocol_version":1,"source_revision":"'
             + "a" * 40
             + '","target":"esp32s3","version":"0.1.0-dev"},"classification":"MATCH","device":{"app_elf_sha256":"'
             + "b" * 64
-            + '","build_profile":"freenove-fnk0085","idf_version":"v5.5.4","project":"s3-hidbot","protocol_version":1,"source_revision":"'
+            + '","build_profile":"freenove-fnk0099","idf_version":"v5.5.4","project":"s3-hidbot","protocol_version":1,"source_revision":"'
             + "a" * 40
             + '","target":"esp32s3","version":"0.1.0-dev"},"match":true,"mismatches":[],"ok":true,"unavailable_reason":null}\n',
         )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Callable
 
@@ -129,7 +129,7 @@ class ProvisioningWorkflowTests(unittest.TestCase):
             version="0.1.0-dev",
             source_revision="a" * 40,
             app_elf_sha256="b" * 64,
-            build_profile="freenove-fnk0085",
+            build_profile="freenove-fnk0099",
             idf_version="v5.5.4",
         )
         self.bundle = SimpleNamespace(artifact_identity=self.identity)
@@ -139,7 +139,7 @@ class ProvisioningWorkflowTests(unittest.TestCase):
             "version": "0.1.0-dev",
             "source_revision": "a" * 40,
             "app_elf_sha256": "b" * 64,
-            "build_profile": "freenove-fnk0085",
+            "build_profile": "freenove-fnk0099",
         }
         value: dict[str, object] = {
             "project": "s3-hidbot",
@@ -211,6 +211,30 @@ class ProvisioningWorkflowTests(unittest.TestCase):
         self.assertTrue(clients[0].closed)
         self.assertEqual(self.last_client_parameters, [(1.0, 2)])
 
+    def test_legacy_post_flash_requires_literal_historical_profile(self) -> None:
+        self.bundle = SimpleNamespace(
+            artifact_identity=replace(self.identity, build_profile="freenove-fnk0085")
+        )
+        historical_info = self.info()
+        historical_info["firmware"]["build_profile"] = "freenove-fnk0085"
+        matching, flashes, _ = self.run_workflow(
+            [self.ready_transport()], [ClientPlan(info_value=historical_info)]
+        )
+        self.assertEqual(
+            matching.verification.classification,
+            VerificationPhaseClassification.MATCH,
+        )
+        self.assertEqual(len(flashes), 1)
+
+        corrected_runtime, flashes, _ = self.run_workflow(
+            [self.ready_transport()], [ClientPlan(info_value=self.info())]
+        )
+        self.assertEqual(
+            corrected_runtime.verification.classification,
+            VerificationPhaseClassification.MISMATCH,
+        )
+        self.assertEqual(len(flashes), 1)
+
     def test_first_open_failure_reconnects_without_reflash(self) -> None:
         failed = FakeTransport(open_error=TransportError("not ready"), clock=self.clock)
         ready = self.ready_transport()
@@ -255,7 +279,7 @@ class ProvisioningWorkflowTests(unittest.TestCase):
                 "version": "0.1.0-dev",
                 "source_revision": None,
                 "app_elf_sha256": "b" * 64,
-                "build_profile": "freenove-fnk0085",
+                "build_profile": "freenove-fnk0099",
             },
         }
         unavailable, flashes, _ = self.run_workflow(

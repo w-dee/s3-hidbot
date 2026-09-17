@@ -27,12 +27,11 @@ unchanged. In those objects, `FNK0085` and `freenove-fnk0085` are historical
 literals. They must not be rewritten or interpreted as proof that an FNK0085
 camera board was used.
 
-The current pre-H-contract firmware, artifact, archive, release, and
-provisioning contracts also still emit or require `freenove-fnk0085`. That is
-a known legacy identifier. New artifacts will move to `freenove-fnk0099` in a
-separate H-contract change that preserves exact runtime/artifact identity
-comparison and historical verification. This erratum does not implement or
-simulate that migration.
+At the time this erratum was introduced, the pre-H-contract firmware,
+artifact, archive, release, and provisioning contracts still emitted or
+required `freenove-fnk0085`. Forward source now emits `freenove-fnk0099`, while
+historical artifacts retain the old literal. Runtime/artifact comparison
+remains exact; the two profile values are not aliases.
 
 ## Fixture memory and product envelope
 

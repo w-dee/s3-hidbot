@@ -240,7 +240,7 @@ jobs:
                           "version": "1.2.3",
                           "source_revision": "a" * 40,
                           "app_elf_sha256": "b" * 64,
-                          "build_profile": "freenove-fnk0085",
+                          "build_profile": "freenove-fnk0099",
                       },
                   }
 
@@ -256,7 +256,7 @@ jobs:
               version="1.2.3",
               source_revision="a" * 40,
               app_elf_sha256="b" * 64,
-              build_profile="freenove-fnk0085",
+              build_profile="freenove-fnk0099",
               idf_version="v5.5.4",
           )
           clock = Clock()

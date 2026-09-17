@@ -8,7 +8,8 @@ the later value.
 
 `flash-firmware` intentionally ignores `S3_HIDBOT_BAUD` and rejects explicit
 `--baud`, `--timeout`, and `--attempts`; its programming and post-flash policy
-is fixed. `verify-artifact` remains parse-compatible with generic options but
+is fixed. Its only artifact-policy option is the narrowly named
+`--allow-legacy-v0-3-0-recovery`. `verify-artifact` remains parse-compatible with generic options but
 does not resolve a serial port or use them.
 
 ## Command taxonomy
@@ -58,7 +59,8 @@ intentionally injects a key, button, or movement.
 | `hidbotctl self-test` | UART | Safe diagnostic sequence including `release-all`. |
 | `hidbotctl release-all` | UART | Explicit keyboard/mouse all-up recovery. |
 | `hidbotctl verify-firmware ARTIFACT` | Artifact + UART | Verify artifact first, then fresh hello and system info identity comparison. No flash or HID. |
-| `hidbotctl flash-firmware ARTIFACT` | Artifact + UART + `[flash]` | Destructive verified provisioning. Native USB is not required. |
+| `hidbotctl flash-firmware ARTIFACT` | Current FNK0099 artifact + UART + `[flash]` | Destructive verified provisioning. Native USB is not required. |
+| `hidbotctl flash-firmware --allow-legacy-v0-3-0-recovery ARCHIVE` | Exact published v0.3.0 archive + UART + `[flash]` | Explicit bounded recovery; extracted or repacked input is rejected. |
 | `hidbotctl keyboard-report --unsafe-hid --modifiers N [--key USAGE ...]` | UART + approved native HID topology | One unsafe keyboard report. |
 | `hidbotctl mouse-report --unsafe-hid --buttons N --x N --y N --wheel N --pan N` | UART + approved native HID topology | One unsafe mouse report. |
 
@@ -139,6 +141,13 @@ application ELF SHA-256, build profile, and IDF version.
 hello and `system.info`. It compares those exact identity fields. It does not
 flash, access native USB, query USB status, or send HID. Exit 0 is `MATCH`; exit
 7 is `MISMATCH` or `IDENTITY_UNAVAILABLE`.
+
+Artifact verification is structural and preserves historical profile strings;
+it does not grant flash authority. Normal flash authorization requires
+`freenove-fnk0099`. The legacy recovery option recognizes only the fixed
+published v0.3.0 outer archive and still requires its historical
+`freenove-fnk0085` runtime identity after programming. Old and new profiles
+are compared literally and are never aliases.
 
 In JSON, `ok:true` with `match:false` means the comparison completed but did
 not match. Automation must inspect process exit status, `match`, and

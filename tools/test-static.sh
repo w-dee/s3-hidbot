@@ -28,6 +28,7 @@ python_bin=${PYTHON_BIN:-python3}
 "$python_bin" "$repository_root/tools/test_host_artifact.py"
 "$python_bin" "$repository_root/tools/test_nonhardware_ci_static.py"
 "$python_bin" "$repository_root/tools/test_release_contract.py"
+"$python_bin" "$repository_root/tools/test_release_asset_profile.py"
 "$python_bin" "$repository_root/tools/test_release_firmware_equality.py"
 "$python_bin" "$repository_root/tools/test_release_workflows.py"
 "$python_bin" "$repository_root/tools/test_post_flash_provisioning_static.py"

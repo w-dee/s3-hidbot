@@ -167,11 +167,18 @@ provide those approvals. This statement is not legal advice.
 
 ## Destructive provisioning policy
 
-`flash-firmware ARTIFACT` is destructive provisioning. Until the separate
-H-contract migration, it accepts only the supported verified plan carrying the
-legacy literal profile `freenove-fnk0085`; that identifier does not identify
-the physical fixture as FNK0085. The command requires
+`flash-firmware ARTIFACT` is destructive provisioning. Normally it accepts
+only the supported verified plan carrying `freenove-fnk0099`. The command requires
 `s3-hidbot-host[flash]` with `esptool >=4.12,<5`.
+
+The explicit `--allow-legacy-v0-3-0-recovery` option authorizes only the exact
+published v0.3.0 archive
+`s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0085.tar.gz`, identified by its
+fixed outer and internal hashes. It does not authorize extracted directories,
+repacks, other FNK0085 artifacts, or any old/new profile alias. Without the
+option, that historical artifact is rejected for provisioning. After an
+authorized recovery flash, runtime verification still requires its literal
+`freenove-fnk0085` identity.
 
 - Programming owns at most three identical attempts, each bounded to 300
   seconds.

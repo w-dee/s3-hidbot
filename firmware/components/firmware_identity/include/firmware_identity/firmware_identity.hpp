@@ -13,7 +13,7 @@ inline constexpr std::size_t kAppElfSha256HexChars = 64;
 inline constexpr std::size_t kVersionMaxBytes = 31;
 inline constexpr std::size_t kSourceRevisionChars = 40;
 inline constexpr std::size_t kBuildProfileMaxBytes = 31;
-inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";
+inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";
 
 struct SourceRevisionInput {
     bool present = false;

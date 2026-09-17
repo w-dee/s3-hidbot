@@ -15,12 +15,15 @@ fi
 
 source_revision=${S3_HIDBOT_ARTIFACT_TEST_REVISION:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}
 source_date_epoch=${S3_HIDBOT_ARTIFACT_TEST_EPOCH:-0}
+contract=$("$python_bin" "$repository_root/tools/release_contract.py" --source-root "$repository_root")
+artifact_name=$("$python_bin" -c 'import json,sys; print(json.load(sys.stdin)["firmware_archive"])' <<<"$contract")
 for artifact in a b; do
+    mkdir "$temporary_directory/$artifact"
     "$python_bin" "$repository_root/tools/build_firmware_artifact.py" \
-        --output "$temporary_directory/firmware-$artifact.tar.gz" \
+        --output "$temporary_directory/$artifact/$artifact_name" \
         --source-root "$repository_root" \
         --source-revision "$source_revision" \
         --source-date-epoch "$source_date_epoch"
 done
-cmp "$temporary_directory/firmware-a.tar.gz" "$temporary_directory/firmware-b.tar.gz"
+cmp "$temporary_directory/a/$artifact_name" "$temporary_directory/b/$artifact_name"
 echo "PASS: two isolated firmware artifact builds are byte-identical"

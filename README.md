@@ -87,8 +87,11 @@ automatic eviction. The UART host can list opaque firmware bond IDs and remove
 one exact disconnected bond while BLE is hidden; that removal does not alter a
 host OS pairing database or an independent USB route.
 
-`flash-firmware` is destructive provisioning. It programs only a verified,
-supported plan and returns success only after an exact runtime identity match.
+`flash-firmware` is destructive provisioning. It normally programs only a
+verified `freenove-fnk0099` plan and returns success only after an exact runtime
+identity match. The explicit `--allow-legacy-v0-3-0-recovery` option is limited
+to the exact frozen published v0.3.0 archive; it is not a general legacy or
+profile-override mechanism.
 
 ## Distribution status
 

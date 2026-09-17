@@ -1,4 +1,4 @@
-"""Non-destructive firmware staging and supported-device flash planning.
+"""Non-destructive firmware inspection and supported-device flash planning.
 
 This module deliberately stops before any serial or subprocess operation.  It
 creates one private snapshot, verifies that snapshot with the canonical
@@ -29,9 +29,10 @@ from .firmware_verification import (
     ArtifactFirmwareIdentity,
     artifact_identity_from_verified_manifest,
 )
+from .legacy_recovery import LEGACY_V0_3_0, matches_legacy_v0_3_0
 
 
-SUPPORTED_PROFILE = "freenove-fnk0085"
+SUPPORTED_PROFILE = "freenove-fnk0099"
 SUPPORTED_TARGET = "esp32s3"
 SUPPORTED_FLASH_MODE = "dio"
 SUPPORTED_FLASH_SIZE = "4MB"
@@ -82,7 +83,7 @@ class FlashPlan:
 
 @dataclass(frozen=True, slots=True)
 class SupportedProvisioningPlan:
-    """Plan that passed the explicit FNK0085 execution policy."""
+    """Plan that passed an explicit current or bounded-legacy policy."""
 
     build_profile: str
     target: str
@@ -100,20 +101,20 @@ def _freeze_json(value: Any) -> Any:
 
 
 @dataclass(frozen=True, slots=True)
-class VerifiedFirmwareBundle:
-    """Verified values whose paths are valid only inside the context.
+class InspectedFirmwareBundle:
+    """Structurally verified values whose paths exist only in the context.
 
     The private staging directory is removed by
-    :func:`stage_and_verify_firmware_bundle` on every exit path.  The public
-    manifest is recursively immutable and is not the execution interface;
-    downstream code should consume ``provisioning_plan``.
+    :func:`stage_and_inspect_firmware_bundle` on every exit path. This model
+    carries no destructive provisioning authority.
     """
 
     staged_root: Path
     manifest: Mapping[str, Any]
     artifact_identity: ArtifactFirmwareIdentity
     flash_plan: FlashPlan
-    provisioning_plan: SupportedProvisioningPlan
+    source_archive_name: str | None
+    _archive_snapshot: Path | None = field(repr=False, compare=False)
     _manifest_value: Mapping[str, Any] = field(repr=False, compare=False)
 
     def verify_staged_payloads_unchanged(self) -> None:
@@ -122,6 +123,46 @@ class VerifiedFirmwareBundle:
         current = verify_bundle_directory(self.staged_root)
         if current != self._manifest_value:
             raise ArtifactError("verified staged artifact changed before execution")
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedFirmwareBundle:
+    """Inspected bundle carrying explicit destructive provisioning authority."""
+
+    inspection: InspectedFirmwareBundle
+    provisioning_plan: SupportedProvisioningPlan
+    authority: str
+
+    @property
+    def staged_root(self) -> Path:
+        return self.inspection.staged_root
+
+    @property
+    def manifest(self) -> Mapping[str, Any]:
+        return self.inspection.manifest
+
+    @property
+    def artifact_identity(self) -> ArtifactFirmwareIdentity:
+        return self.inspection.artifact_identity
+
+    @property
+    def flash_plan(self) -> FlashPlan:
+        return self.inspection.flash_plan
+
+    def verify_staged_payloads_unchanged(self) -> None:
+        """Revalidate payloads and any exact historical outer authority."""
+
+        self.inspection.verify_staged_payloads_unchanged()
+        if self.authority == "legacy-v0.3.0":
+            archive_snapshot = self.inspection._archive_snapshot
+            archive_name = self.inspection.source_archive_name
+            if archive_snapshot is None or archive_name is None or not matches_legacy_v0_3_0(
+                archive_name=archive_name,
+                archive_snapshot=archive_snapshot,
+                staged_root=self.staged_root,
+                manifest=self.inspection._manifest_value,
+            ):
+                raise ProvisioningPolicyError("legacy v0.3.0 recovery authority changed")
 
 
 def _source_stat(path: Path, description: str) -> os.stat_result:
@@ -230,10 +271,10 @@ def _flash_plan_from_normalized(
         value = image["encrypted"]
         if type(value) is bool:
             encrypted = value
-        elif type(value) is str and value == "false":
-            encrypted = False
+        elif type(value) is str and value in {"true", "false"}:
+            encrypted = value == "true"
         else:
-            raise ProvisioningPolicyError("B2 supports only explicitly unencrypted images")
+            raise ProvisioningPolicyError("flash image encryption value is not canonical")
         images.append(
             FlashImage(
                 role=role,
@@ -280,9 +321,11 @@ def _supported_plan(
     staged_root: Path,
     manifest: Mapping[str, Any],
     normalized: Mapping[str, Any],
+    *,
+    expected_profile: str = SUPPORTED_PROFILE,
 ) -> tuple[FlashPlan, SupportedProvisioningPlan]:
     firmware = manifest["firmware"]
-    if firmware["build_profile"] != SUPPORTED_PROFILE:
+    if firmware["build_profile"] != expected_profile:
         raise ProvisioningPolicyError("artifact profile is not supported for this fixture")
     if firmware["target"] != SUPPORTED_TARGET or normalized["chip"] != SUPPORTED_TARGET:
         raise ProvisioningPolicyError("artifact target is not supported for this fixture")
@@ -306,7 +349,7 @@ def _supported_plan(
             raise ProvisioningPolicyError("encrypted images are not supported by B2")
     sdkconfig_path = _memory_profile(staged_root, manifest)
     approved = SupportedProvisioningPlan(
-        build_profile=SUPPORTED_PROFILE,
+        build_profile=expected_profile,
         target=SUPPORTED_TARGET,
         flash_plan=plan,
         sdkconfig_path=sdkconfig_path,
@@ -316,10 +359,10 @@ def _supported_plan(
 
 
 @contextmanager
-def stage_and_verify_firmware_bundle(
+def stage_and_inspect_firmware_bundle(
     artifact: str | os.PathLike[str] | Path,
-) -> Iterator[VerifiedFirmwareBundle]:
-    """Snapshot, verify, and policy-check an artifact for B2 execution.
+) -> Iterator[InspectedFirmwareBundle]:
+    """Snapshot and structurally verify an artifact without flash authority.
 
     The yielded bundle owns a private staging directory for the duration of
     the context.  No serial port, esptool import, subprocess, or hardware
@@ -334,25 +377,85 @@ def stage_and_verify_firmware_bundle(
             snapshot = root / "input.tar.gz"
             _copy_regular_snapshot(source, snapshot, "artifact archive")
             staged_root = _extract_archive_to(snapshot, root / "archive")
+            source_archive_name: str | None = source.name
+            archive_snapshot: Path | None = snapshot
         elif stat.S_ISDIR(source_stat.st_mode):
             staged_root = root / "bundle"
             _copy_directory_snapshot(source, staged_root)
+            source_archive_name = None
+            archive_snapshot = None
         else:
             raise ArtifactError("artifact path must be a directory or archive")
         manifest, normalized = _verify_bundle_directory_with_plan(staged_root)
-        flash_plan, provisioning_plan = _supported_plan(staged_root, manifest, normalized)
+        flash_plan = _flash_plan_from_normalized(staged_root, normalized)
         identity = artifact_identity_from_verified_manifest(manifest)
         frozen_manifest = _freeze_json(manifest)
         assert isinstance(frozen_manifest, Mapping)
-        bundle = VerifiedFirmwareBundle(
+        bundle = InspectedFirmwareBundle(
             staged_root=staged_root,
             manifest=frozen_manifest,
             artifact_identity=identity,
             flash_plan=flash_plan,
-            provisioning_plan=provisioning_plan,
+            source_archive_name=source_archive_name,
+            _archive_snapshot=archive_snapshot,
             _manifest_value=manifest,
         )
         yield bundle
+
+
+def _authorize_provisioning(
+    inspection: InspectedFirmwareBundle,
+    *,
+    allow_legacy_v0_3_0_recovery: bool,
+) -> VerifiedFirmwareBundle:
+    manifest = inspection._manifest_value
+    normalized_manifest, normalized = _verify_bundle_directory_with_plan(inspection.staged_root)
+    if normalized_manifest != manifest:
+        raise ArtifactError("verified staged artifact changed before authorization")
+    profile = manifest["firmware"]["build_profile"]
+    if profile == SUPPORTED_PROFILE:
+        _, plan = _supported_plan(inspection.staged_root, manifest, normalized)
+        return VerifiedFirmwareBundle(inspection, plan, "current")
+    if not allow_legacy_v0_3_0_recovery:
+        raise ProvisioningPolicyError("artifact profile is not supported for normal provisioning")
+    archive_snapshot = inspection._archive_snapshot
+    archive_name = inspection.source_archive_name
+    if (
+        profile != LEGACY_V0_3_0.build_profile
+        or archive_snapshot is None
+        or archive_name is None
+        or not matches_legacy_v0_3_0(
+            archive_name=archive_name,
+            archive_snapshot=archive_snapshot,
+            staged_root=inspection.staged_root,
+            manifest=manifest,
+        )
+    ):
+        raise ProvisioningPolicyError(
+            "legacy recovery requires the exact published v0.3.0 archive"
+        )
+    _, plan = _supported_plan(
+        inspection.staged_root,
+        manifest,
+        normalized,
+        expected_profile=LEGACY_V0_3_0.build_profile,
+    )
+    return VerifiedFirmwareBundle(inspection, plan, "legacy-v0.3.0")
+
+
+@contextmanager
+def stage_and_verify_firmware_bundle(
+    artifact: str | os.PathLike[str] | Path,
+    *,
+    allow_legacy_v0_3_0_recovery: bool = False,
+) -> Iterator[VerifiedFirmwareBundle]:
+    """Inspect and explicitly authorize an artifact for destructive flashing."""
+
+    with stage_and_inspect_firmware_bundle(artifact) as inspection:
+        yield _authorize_provisioning(
+            inspection,
+            allow_legacy_v0_3_0_recovery=allow_legacy_v0_3_0_recovery,
+        )
 
 
 def plan_esptool_v4_args(

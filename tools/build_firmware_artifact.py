@@ -39,6 +39,7 @@ from firmware_artifact import (
 )
 from firmware_resource_gate import ResourceGateError, measure_and_enforce
 from prepare_production_sdk import verify as verify_production_sdk
+from release_contract import ReleaseContractError, read_build_profile
 
 
 _TOOL_VERSION_CANDIDATE = re.compile(
@@ -69,14 +70,6 @@ def _copy_regular(source: Path, destination: Path) -> None:
         raise ArtifactError(f"build output is not a regular file: {source.name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
-
-
-def _profile_from_source(source_root: Path) -> str:
-    header = source_root / "firmware/components/firmware_identity/include/firmware_identity/firmware_identity.hpp"
-    match = re.search(r'kBuildProfile\s*=\s*"([^"]+)"', header.read_text(encoding="utf-8"))
-    if match is None:
-        raise ArtifactError("firmware build profile constant is missing")
-    return validate_profile(match.group(1))
 
 
 def _protocol_version_from_source(source_root: Path) -> int:
@@ -115,11 +108,17 @@ def build(args: argparse.Namespace) -> Path:
     source_revision = validate_source_revision(args.source_revision)
     source_date_epoch = validate_source_date_epoch(args.source_date_epoch)
     version = validate_version((firmware_root / "version.txt").read_text(encoding="utf-8").strip())
-    profile = _profile_from_source(source_root)
+    try:
+        profile = validate_profile(read_build_profile(source_root))
+    except ReleaseContractError as exc:
+        raise ArtifactError(str(exc)) from exc
     protocol_version = _protocol_version_from_source(source_root)
     output = args.output.resolve()
     if output.exists():
         raise ArtifactError("refusing to overwrite an existing artifact")
+    expected_name = f"{PROJECT}-firmware-{version}-{TARGET}-{profile}.tar.gz"
+    if output.name != expected_name:
+        raise ArtifactError(f"artifact output filename must be {expected_name}")
 
     idf_path = os.environ.get("IDF_PATH", "")
     idf_py = shutil.which("idf.py")

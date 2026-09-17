@@ -405,7 +405,7 @@ class Client:
                 "version": "0.1.0",
                 "source_revision": "a" * 40,
                 "app_elf_sha256": "b" * 64,
-                "build_profile": "freenove-fnk0085",
+                "build_profile": "freenove-fnk0099",
             },
         }
 
@@ -420,7 +420,7 @@ identity = ArtifactFirmwareIdentity(
     version="0.1.0",
     source_revision="a" * 40,
     app_elf_sha256="b" * 64,
-    build_profile="freenove-fnk0085",
+    build_profile="freenove-fnk0099",
     idf_version="v5.5.4",
 )
 clock = Clock()

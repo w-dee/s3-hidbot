@@ -18,10 +18,11 @@ from pathlib import Path
 
 PROJECT = "s3-hidbot"
 TARGET = "esp32s3"
-PROFILE = "freenove-fnk0085"
 DISTRIBUTION = "s3-hidbot-host"
 _RELEASE_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _SOURCE_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_BUILD_PROFILE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+_BUILD_PROFILE_DECLARATION = re.compile(r'kBuildProfile\s*=\s*"([^"]+)"')
 
 
 class ReleaseContractError(ValueError):
@@ -42,6 +43,23 @@ def validate_source_revision(value: str) -> str:
     return value
 
 
+def read_build_profile(source_root: Path) -> str:
+    """Read the exact compiled profile from the explicitly selected source."""
+
+    header = (
+        source_root.resolve()
+        / "firmware/components/firmware_identity/include/firmware_identity/firmware_identity.hpp"
+    )
+    try:
+        text = header.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ReleaseContractError("could not read firmware build profile authority") from exc
+    matches = _BUILD_PROFILE_DECLARATION.findall(text)
+    if len(matches) != 1 or _BUILD_PROFILE.fullmatch(matches[0]) is None:
+        raise ReleaseContractError("firmware build profile authority is missing or invalid")
+    return matches[0]
+
+
 def release_tag(version: str) -> str:
     return f"v{validate_release_version(version)}"
 
@@ -60,6 +78,7 @@ class ReleaseContract:
     version: str
     firmware_version: str
     host_version: str
+    build_profile: str
 
     @property
     def tag(self) -> str:
@@ -67,7 +86,7 @@ class ReleaseContract:
 
     @property
     def firmware_archive(self) -> str:
-        return f"{PROJECT}-firmware-{self.version}-{TARGET}-{PROFILE}.tar.gz"
+        return f"{PROJECT}-firmware-{self.version}-{TARGET}-{self.build_profile}.tar.gz"
 
     @property
     def host_wheel(self) -> str:
@@ -113,6 +132,7 @@ def read_release_contract(source_root: Path) -> ReleaseContract:
         version=firmware_version,
         firmware_version=firmware_version,
         host_version=host_version,
+        build_profile=read_build_profile(root),
     )
 
 
@@ -175,6 +195,7 @@ def main() -> int:
             "version": contract.version,
             "tag": contract.tag,
             "firmware_archive": contract.firmware_archive,
+            "build_profile": contract.build_profile,
             "host_wheel": contract.host_wheel,
             "host_sdist": contract.host_sdist,
             "release_assets": list(contract.release_assets),

@@ -47,11 +47,11 @@ def derive_source_identity(
 
 
 def _default_bundle_loader(path: Path) -> AbstractContextManager[Any]:
-    # This is the repository's authoritative artifact verifier and policy
-    # checker. Import lazily so pure harness tests need no host dependencies.
-    from hidbot.provisioning import stage_and_verify_firmware_bundle
+    # This is the repository's authoritative read-only artifact inspection.
+    # Import lazily so pure harness tests need no host dependencies.
+    from hidbot.provisioning import stage_and_inspect_firmware_bundle
 
-    return stage_and_verify_firmware_bundle(path)
+    return stage_and_inspect_firmware_bundle(path)
 
 
 def _sha256_file(path: Path) -> str:
@@ -243,6 +243,11 @@ def _source_revision(value: Mapping[str, Any]) -> Any:
     return firmware.get("source_revision") if isinstance(firmware, Mapping) else None
 
 
+def _build_profile(value: Mapping[str, Any]) -> Any:
+    firmware = value.get("firmware")
+    return firmware.get("build_profile") if isinstance(firmware, Mapping) else None
+
+
 def compare_artifact_identity(
     left: Mapping[str, Any], right: Mapping[str, Any]
 ) -> dict[str, bool]:
@@ -266,6 +271,12 @@ def compare_artifact_identity(
         and all(character in "0123456789abcdef" for character in left_source)
         and left_source == _source_revision(right)
     )
+    left_profile = _build_profile(left)
+    profile = (
+        isinstance(left_profile, str)
+        and bool(left_profile)
+        and left_profile == _build_profile(right)
+    )
     left_runtime = left.get("runtime_elf_sha256")
     runtime = (
         _valid_hash(left_runtime)
@@ -284,7 +295,10 @@ def compare_artifact_identity(
         "archive_byte_identity": archive,
         "flash_payload_identity": payloads,
         "source_sha_identity": source,
+        "build_profile_identity": profile,
         "runtime_elf_identity": runtime,
         "flash_semantics_identity": flash,
-        "physical_qualification_carry_forward": payloads and source and runtime and flash,
+        "physical_qualification_carry_forward": (
+            payloads and source and profile and runtime and flash
+        ),
     }

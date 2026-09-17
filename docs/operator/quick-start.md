@@ -48,14 +48,11 @@ and source revision supplied by `verify-artifact`.
 On Linux, verify each downloaded file from the directory containing its
 provided checksum:
 
-The commands below retain `freenove-fnk0085` because that is the literal
-profile and filename emitted by the current legacy artifact contract and used
-by published historical artifacts. It is not a statement that the physical
-fixture is FNK0085. The separately reviewed H-contract migration will change
-newly generated artifact names to `freenove-fnk0099`.
+Current artifacts use the corrected forward profile `freenove-fnk0099`.
+Published historical artifacts retain their literal old names and profiles.
 
 ```bash
-sha256sum --check s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0085.tar.gz.sha256
+sha256sum --check s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0099.tar.gz.sha256
 sha256sum --check s3_hidbot_host-<version>-py3-none-any.whl.sha256
 ```
 
@@ -101,7 +98,7 @@ permissions; native USB-OTG is not a substitute for this port.
 
 ```bash
 hidbotctl --json verify-artifact \
-  ./s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0085.tar.gz
+  ./s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0099.tar.gz
 ```
 
 Require exit 0 and `classification:"VALID"`. Record the returned version,
@@ -115,7 +112,7 @@ to program the verified supported plan:
 
 ```bash
 hidbotctl --json flash-firmware \
-  ./s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0085.tar.gz
+  ./s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0099.tar.gz
 ```
 
 Success requires all of the following: exit 0,
@@ -131,7 +128,7 @@ An optional later comparison uses the same artifact:
 
 ```bash
 hidbotctl --json verify-firmware \
-  ./s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0085.tar.gz
+  ./s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0099.tar.gz
 ```
 
 Require exit 0 and `match:true`. Save the command's JSON, exit status, package

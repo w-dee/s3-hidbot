@@ -464,7 +464,7 @@ class ProtocolTests(unittest.TestCase):
                     "version": "0.1.0-dev",
                     "source_revision": None,
                     "app_elf_sha256": "a" * 64,
-                    "build_profile": "freenove-fnk0085",
+                    "build_profile": "freenove-fnk0099",
                 },
             },
             capabilities=tuple(REQUIRED_CAPABILITIES) + ("firmware.identity-v1",),
@@ -495,7 +495,7 @@ class ProtocolTests(unittest.TestCase):
             "version": "0.1.0-dev",
             "source_revision": None,
             "app_elf_sha256": "a" * 64,
-            "build_profile": "freenove-fnk0085",
+            "build_profile": "freenove-fnk0099",
         }
         base = {
             "project": "s3-hidbot",
@@ -559,7 +559,7 @@ class ProtocolTests(unittest.TestCase):
                     "version": "1.2.3+build.7",
                     "source_revision": "b" * 40,
                     "app_elf_sha256": "c" * 64,
-                    "build_profile": "freenove-fnk0085",
+                    "build_profile": "freenove-fnk0099",
                 },
             },
         )

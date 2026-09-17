@@ -3,8 +3,9 @@
 `s3-hidbot-host` is the pure-Python client and `hidbotctl` CLI for the
 s3-hidbot UART control plane. It provides bounded transport, framing, protocol,
 session, artifact-verification, identity-comparison, and explicit HID primitive
-APIs for the owner-confirmed FNK0099 fixture. Historical and current
-pre-H-contract artifacts still carry the literal `freenove-fnk0085` profile.
+APIs for the owner-confirmed FNK0099 fixture. Current artifacts carry the
+literal `freenove-fnk0099` profile; historical artifacts retain their exact
+profile values, including `freenove-fnk0085`.
 It also provides an immutable low-level `SequenceBuilder` and typed sequence
 start/status methods; text, layout, and named-key translation remain outside
 the firmware protocol.
@@ -107,11 +108,19 @@ protocol, firmware version, source revision, ELF SHA-256, build profile, and
 IDF version. It never flashes or sends HID. Exit 0 is `MATCH`; exit 7 is
 `MISMATCH` or `IDENTITY_UNAVAILABLE`.
 
-`hidbotctl flash-firmware ARTIFACT` is destructive. It accepts only the
-verified supported policy, owns up to three identical programming attempts, and
-never erases, changes baud, or mutates the plan. After programming succeeds it
-never automatically reflashes because verification failed; exit 0 means both
-programming and exact runtime identity `MATCH` succeeded. See
+`hidbotctl flash-firmware ARTIFACT` is destructive. It normally accepts only
+the verified `freenove-fnk0099` policy, owns up to three identical programming
+attempts, and never erases, changes baud, or mutates the plan. After
+programming succeeds it never automatically reflashes because verification
+failed; exit 0 means both programming and exact runtime identity `MATCH`
+succeeded.
+
+`--allow-legacy-v0-3-0-recovery` is an archive-only exception for the exact
+frozen published v0.3.0 FNK0085-labelled archive. Canonical filename, outer
+SHA-256, manifest, source revision, application ELF, and application BIN must
+all match its registry entry. The option does not authorize an extracted
+directory, repack, other old artifact, or profile alias. It does not alter an
+ordinary accepted FNK0099 plan. See
 [safety and recovery](../docs/operator/safety-and-recovery.md).
 
 ## JSON and unsafe HID

@@ -61,12 +61,12 @@ SPIRAM, so a canonical artifact intentionally records `--flash_size 4MB`.
 The current partition table ends well below that address-space limit; unused
 flash is not consumed by placeholder partitions.
 
-`build_profile=freenove-fnk0085` is the current legacy artifact identifier. It
-does not identify the physical fixture, which the owner has confirmed as
-FNK0099; changing this emitted contract belongs to the separate H-contract
-migration. A non-destructive query measured this fixture as 8 MiB flash with
-8 MiB embedded PSRAM. That additional capacity is intentionally unused by the
-current firmware, which does not thereby claim compatibility with arbitrary
+`build_profile=freenove-fnk0099` is the current forward artifact and runtime
+identifier. Historical artifacts retain their literal profile values and no
+old/new alias is applied. A non-destructive query measured the physical
+fixture as 8 MiB flash with 8 MiB embedded PSRAM. That additional capacity is
+intentionally unused by the current firmware, which does not thereby claim
+compatibility with arbitrary
 ESP32-S3 boards whose USB, UART, or GPIO topology has not been validated.
 
 An artifact built before this explicit policy, with the inherited 2 MiB
@@ -110,12 +110,13 @@ build is added.
 The output is a deterministic `.tar.gz` with one top-level directory named:
 
 ```text
-s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0085/
+s3-hidbot-firmware-<version>-esp32s3-freenove-fnk0099/
 ```
 
-This is the pre-H-contract legacy bundle name emitted by the current source.
-It remains literal for existing artifacts and must not be read as a physical
-FNK0085 identification. Future FNK0099 naming is not implemented here.
+The source-derived profile must agree across the compiled runtime identity,
+manifest, bundle root, outer archive basename, and adjacent checksum sidecar.
+Release preparation rejects an outer/inner profile mismatch. Historical source
+trees continue deriving their historical names from their own identity header.
 
 The minimum payload is:
 
@@ -379,15 +380,26 @@ boot, or signed firmware authenticity.
 ## U6.4B2b/B2c safe flash and post-flash verification
 
 `hidbotctl flash-firmware ARTIFACT` is the explicit destructive programming
-entrypoint for a verified archive or extracted bundle. Until H-contract it
-accepts only the supported legacy-profile `freenove-fnk0085` / ESP32-S3 / DIO /
-4 MiB / 80 MHz provisioning plan produced
-by `stage_and_verify_firmware_bundle()` and the unchanged
+entrypoint. Read-only inspection first creates a private, structurally verified
+bundle without provisioning authority. The destructive path separately
+authorizes the supported `freenove-fnk0099` / ESP32-S3 / DIO / 4 MiB / 80 MHz
+plan through `stage_and_verify_firmware_bundle()` and the unchanged
 `plan_esptool_v4_args()` tuple. Staging and payload-integrity verification
 happen before any process or serial access, and the staged payloads are
 reverified immediately before each attempt. There is no confirmation prompt or
 public dry-run/plan option; the command itself is the explicit programming
 intent.
+
+Ordinary old-profile artifacts are rejected by normal provisioning even though
+they remain structurally verifiable. The explicit
+`--allow-legacy-v0-3-0-recovery` option accepts only the exact published
+`s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0085.tar.gz` bytes. Recognition
+requires its fixed filename, outer SHA-256, manifest SHA-256, source revision,
+profile, version, application ELF SHA-256, and application BIN SHA-256. An
+extracted directory, repack, other syntactically valid FNK0085 artifact, or
+byte-different archive is rejected. The flag does not change normal FNK0099
+semantics. After a legacy flash, runtime comparison still expects the old
+literal `freenove-fnk0085` profile embedded in that historical firmware.
 
 The host package keeps esptool optional (`s3-hidbot-host[flash]`, constrained to
 `>=4.12,<5`); the base package imports and runs without it. The executor invokes

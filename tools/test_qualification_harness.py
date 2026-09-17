@@ -13,6 +13,7 @@ import unittest
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from qualification_harness import (
     BondSnapshot,
@@ -40,7 +41,7 @@ from qualification_harness import (
     validate_route_sequence,
     validate_usb_exposure,
 )
-from qualification_harness.artifact import parse_partition_geometry
+from qualification_harness.artifact import _default_bundle_loader, parse_partition_geometry
 from qualification_harness.core import PollTimeout, StepResult
 from qualification_harness.input import EV_KEY, EV_REL, EV_SYN, KEY_F24, REL_X, SYN_REPORT
 
@@ -129,6 +130,23 @@ class SessionTests(unittest.TestCase):
 
 
 class SourceArtifactTests(unittest.TestCase):
+    def test_default_loader_uses_read_only_inspection_not_flash_authorization(self) -> None:
+        @contextmanager
+        def sentinel():
+            yield SimpleNamespace()
+
+        with patch(
+            "hidbot.provisioning.stage_and_inspect_firmware_bundle",
+            return_value=sentinel(),
+        ) as inspect, patch(
+            "hidbot.provisioning.stage_and_verify_firmware_bundle",
+            side_effect=AssertionError("qualification requested flash authority"),
+        ) as authorize:
+            with _default_bundle_loader(Path("historical.tar.gz")):
+                pass
+        inspect.assert_called_once_with(Path("historical.tar.gz"))
+        authorize.assert_not_called()
+
     def test_source_identity_is_runtime_derived(self) -> None:
         def identity(revision: str) -> dict[str, object]:
             def run(args: list[str], _root: Path) -> str:
@@ -181,7 +199,7 @@ class SourceArtifactTests(unittest.TestCase):
                     "artifact_manifest_version": 1, "project": "s3-hidbot",
                     "firmware": {"version": "0.1.0", "protocol_version": 1,
                                  "source_revision": "a" * 40, "target": "esp32s3",
-                                 "build_profile": "freenove-fnk0085", "idf_version": "v5.5.4"},
+                                 "build_profile": "freenove-fnk0099", "idf_version": "v5.5.4"},
                     "runtime_identity": {"app_elf_sha256": hashes["application_elf"]},
                     "files": files,
                 },
@@ -204,7 +222,11 @@ class SourceArtifactTests(unittest.TestCase):
             "archive_sha256": "a" * 64, "payloads": {"license": "provenance-a"},
             "flash_payloads": {"application_bin": "b" * 64, "bootloader_bin": "e" * 64,
                                "partition_table_bin": "f" * 64},
-            "firmware": {"source_revision": "c" * 40}, "runtime_elf_sha256": "d" * 64,
+            "firmware": {
+                "source_revision": "c" * 40,
+                "build_profile": "freenove-fnk0099",
+            },
+            "runtime_elf_sha256": "d" * 64,
             "flash": {"chip": "esp32s3", "before": "default_reset", "after": "hard_reset",
                       "stub": True, "mode": "dio", "size": "4MB", "frequency": "80m",
                       "images": [
@@ -222,6 +244,41 @@ class SourceArtifactTests(unittest.TestCase):
         self.assertTrue(comparison["physical_qualification_carry_forward"])
         other["flash_payloads"]["application_bin"] = "different"
         self.assertFalse(compare_artifact_identity(base, other)["physical_qualification_carry_forward"])
+
+    def test_carry_forward_rejects_hardware_profile_change(self) -> None:
+        base = {
+            "archive_sha256": "a" * 64,
+            "flash_payloads": {
+                "application_bin": "b" * 64,
+                "bootloader_bin": "c" * 64,
+                "partition_table_bin": "d" * 64,
+            },
+            "firmware": {
+                "source_revision": "e" * 40,
+                "build_profile": "freenove-fnk0085",
+            },
+            "runtime_elf_sha256": "f" * 64,
+            "flash": {
+                "chip": "esp32s3",
+                "before": "default_reset",
+                "after": "hard_reset",
+                "stub": True,
+                "mode": "dio",
+                "size": "4MB",
+                "frequency": "80m",
+                "images": [
+                    {"role": "bootloader_bin", "offset": 0, "encrypted": False},
+                    {"role": "partition_table_bin", "offset": 0x8000, "encrypted": False},
+                    {"role": "application_bin", "offset": 0x10000, "encrypted": False},
+                ],
+            },
+            "partitions": [{"label": "app"}],
+        }
+        current = json.loads(json.dumps(base))
+        current["firmware"]["build_profile"] = "freenove-fnk0099"
+        comparison = compare_artifact_identity(base, current)
+        self.assertFalse(comparison["build_profile_identity"])
+        self.assertFalse(comparison["physical_qualification_carry_forward"])
 
     def test_incomplete_artifact_identity_fails_closed(self) -> None:
         self.assertFalse(

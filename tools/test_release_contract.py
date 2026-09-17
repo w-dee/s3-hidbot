@@ -28,8 +28,9 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertEqual(contract.tag, "v0.3.0")
         self.assertEqual(
             contract.firmware_archive,
-            "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0085.tar.gz",
+            "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0099.tar.gz",
         )
+        self.assertEqual(contract.build_profile, "freenove-fnk0099")
         self.assertEqual(contract.host_wheel, "s3_hidbot_host-0.3.0-py3-none-any.whl")
         self.assertEqual(contract.host_sdist, "s3_hidbot_host-0.3.0.tar.gz")
         self.assertEqual(len(contract.distributable_assets), 6)
@@ -44,6 +45,12 @@ class ReleaseContractTests(unittest.TestCase):
             root = Path(temporary)
             (root / "firmware").mkdir()
             (root / "host").mkdir()
+            identity = root / "firmware/components/firmware_identity/include/firmware_identity"
+            identity.mkdir(parents=True)
+            (identity / "firmware_identity.hpp").write_text(
+                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";\n',
+                encoding="utf-8",
+            )
             (root / "firmware" / "version.txt").write_text("0.1.0\n", encoding="utf-8")
             (root / "host" / "pyproject.toml").write_text(
                 "[project]\nname = 's3-hidbot-host'\nversion = '0.1.1'\n",
@@ -51,6 +58,39 @@ class ReleaseContractTests(unittest.TestCase):
             )
             with self.assertRaises(ReleaseContractError):
                 read_release_contract(root)
+
+    def test_archive_profile_is_derived_from_selected_source_not_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "firmware").mkdir()
+            (root / "host").mkdir()
+            identity = root / "firmware/components/firmware_identity/include/firmware_identity"
+            identity.mkdir(parents=True)
+            (root / "firmware/version.txt").write_text("0.3.0\n", encoding="utf-8")
+            (root / "host/pyproject.toml").write_text(
+                "[project]\nname = 's3-hidbot-host'\nversion = '0.3.0'\n",
+                encoding="utf-8",
+            )
+            header = identity / "firmware_identity.hpp"
+            header.write_text(
+                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0085";\n',
+                encoding="utf-8",
+            )
+            historical = read_release_contract(root)
+            self.assertEqual(historical.build_profile, "freenove-fnk0085")
+            self.assertEqual(
+                historical.firmware_archive,
+                "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0085.tar.gz",
+            )
+            header.write_text(
+                'inline constexpr std::string_view kBuildProfile = "freenove-fnk0099";\n',
+                encoding="utf-8",
+            )
+            current = read_release_contract(root)
+            self.assertEqual(
+                current.firmware_archive,
+                "s3-hidbot-firmware-0.3.0-esp32s3-freenove-fnk0099.tar.gz",
+            )
 
     def test_tag_must_match_version_exactly(self) -> None:
         self.assertEqual(release_tag("0.1.0"), "v0.1.0")
