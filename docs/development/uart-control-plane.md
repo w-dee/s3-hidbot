@@ -1817,12 +1817,27 @@ pinned public VHCI callback-registration API installs a forwarding ingress
 proxy. The proxy records a successful peripheral Connection Complete handle
 before invoking NimBLE admission, then forwards the event unchanged. If
 stopping advertising makes host admission reject that handle, a
-default-host-queue resolver sends one exact
-standard HCI Disconnect command and retains establishment authority until the
-matching Disconnect Complete arrives. A registered connection transfers to the
-normal GAP/list authority. Hidden-idle therefore also requires no unresolved
-HCI establishment. The control owner bounds physical-absence observation to
-five seconds; missing progress or changed lifecycle fails hidden with recovery
+default-host-queue resolver sends an exact standard HCI Disconnect command.
+Command success keeps establishment authority: Disconnect Complete carries no
+product lifetime identity, so it only wakes a new exact probe. Only the pinned
+host-domain Unknown Connection Identifier result proves that the controller no
+longer owns the probed handle and permits resolution of the unchanged exact
+establishment. A later Connection Complete replaces a probed establishment
+with a fresh monotonic identity even when the numeric handle is reused.
+The pinned controller returns successful Disconnect Command Status only after
+marking the connection terminating; a repeat while that state remains returns
+Command Disallowed and therefore fails closed. After removal, the same exact
+probe returns host-domain Unknown Connection Identifier. Re-probing is thus
+driven by a completion wake and never treats command acceptance as absence.
+
+The VHCI callback takes a counted lease immediately before inspecting or
+queueing the project NPL resolver event. Stop closes new leases before it
+enqueues the host stop operation and drains every admitted lease before event
+deinitialization; a bounded drain failure leaves the event allocated and fails
+stop closed. A registered connection transfers to the normal GAP/list
+authority. Hidden-idle therefore also requires no unresolved HCI
+establishment. The control owner bounds physical-absence observation to five
+seconds; missing progress or changed lifecycle fails hidden with recovery
 required. No SDK source modification, bond removal, or automatic route restore
 is part of this cleanup.
 

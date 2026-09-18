@@ -129,6 +129,9 @@ constexpr std::int32_t kLifecycleTimeoutError = -3;
 constexpr std::uint16_t kConnectionIntervalMin = 12;  // 15 ms.
 constexpr std::uint16_t kConnectionIntervalMax = 24;  // 30 ms.
 constexpr std::uint16_t kSupervisionTimeout = 400;    // 4 s.
+constexpr std::uint32_t kHciEventUsersClosing = UINT32_C(1) << 31;
+constexpr std::uint32_t kHciEventUsersMask = kHciEventUsersClosing - 1U;
+constexpr std::int64_t kHciEventUsersDrainTimeoutUs = 1'000'000;
 constexpr char kLogTag[] = "ble_transport";
 
 bool allocate_hci_establishment_id(std::atomic<std::uint64_t> *next,
@@ -1054,7 +1057,13 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     hidden_exposure_barrier_initialized_ = true;
     ble_npl_event_init(&hci_establishment_event_,
                        hci_establishment_callback, this);
-    hci_establishment_event_initialized_ = true;
+    hci_establishment_event_initialized_.store(true, std::memory_order_release);
+    if (!open_hci_event_users()) {
+        ble_npl_event_deinit(&hci_establishment_event_);
+        hci_establishment_event_initialized_.store(false,
+                                                   std::memory_order_release);
+        return ESP_ERR_INVALID_STATE;
+    }
     retire_hci_establishment();
     hci_ingress_enabled_.store(true, std::memory_order_release);
     host_exited_.store(false, std::memory_order_release);
@@ -1099,8 +1108,27 @@ std::uint64_t Backend::begin_stop() {
         current_connection_.load(std::memory_order_acquire) != ble_lifecycle::kNoConnection ||
         hci_establishment_id_.load(std::memory_order_acquire) != 0 ||
         ble_gap_adv_active() || ble_gap_conn_active()) return 0;
+    // Fence new controller ingress before the decisive precondition recheck.
+    // An observer already in progress sees the epoch change at its post-publish
+    // check and retires its own temporary authority.
+    hci_ingress_enabled_.store(false, std::memory_order_release);
+    hci_ingress_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (current_connection_.load(std::memory_order_acquire) !=
+            ble_lifecycle::kNoConnection ||
+        hci_establishment_id_.load(std::memory_order_acquire) != 0 ||
+        ble_gap_adv_active() || ble_gap_conn_active()) {
+        hci_ingress_enabled_.store(true, std::memory_order_release);
+        return 0;
+    }
     const auto id = stop_transaction_.begin();
-    if (id == 0) return 0;
+    if (id == 0) {
+        hci_ingress_enabled_.store(true, std::memory_order_release);
+        return 0;
+    }
+    // Close callback-side NPL event leases before the host stop event is
+    // enqueued. Any earlier queued resolver therefore drains ahead of stop;
+    // no later callback can queue behind it.
+    close_hci_event_users();
     stop_worker_id_ = id;
     if (xTaskCreate(stop_task, "ble_stop", 4096, this, tskIDLE_PRIORITY + 1,
                     nullptr) != pdPASS) {
@@ -1154,13 +1182,10 @@ struct Backend::StopOperations {
     void delete_host_task() { nimble_port_freertos_deinit(); }
     bool deinitialize() {
         backend.retire_hci_establishment();
+        if (!backend.deinitialize_hci_event()) return false;
         if (backend.hidden_exposure_barrier_initialized_) {
             ble_npl_event_deinit(&backend.hidden_exposure_barrier_);
             backend.hidden_exposure_barrier_initialized_ = false;
-        }
-        if (backend.hci_establishment_event_initialized_) {
-            ble_npl_event_deinit(&backend.hci_establishment_event_);
-            backend.hci_establishment_event_initialized_ = false;
         }
         return nimble_port_deinit() == ESP_OK;
     }
@@ -1348,7 +1373,11 @@ void Backend::on_sync() {
 void Backend::on_reset(int reason) {
     if (instance_ != nullptr) {
         instance_->retire_hci_establishment();
-        instance_->hci_ingress_enabled_.store(true, std::memory_order_release);
+        if ((instance_->hci_event_users_.load(std::memory_order_acquire) &
+             kHciEventUsersClosing) == 0U) {
+            instance_->hci_ingress_enabled_.store(true,
+                                                  std::memory_order_release);
+        }
         instance_->association_creation_.retire();
         instance_->active_host_connection_ = 0;
         instance_->host_connection_handle_ = ble_lifecycle::kNoConnection;
@@ -1711,21 +1740,12 @@ bool Backend::observe_hci_ingress(const std::uint8_t *event) {
             ingress_epoch) return false;
     if (event[0] == BLE_HCI_EVCODE_DISCONN_CMP && event[1] == 4 &&
         event[2] == BLE_ERR_SUCCESS) {
-        std::uint16_t connection_handle = 0;
-        std::memcpy(&connection_handle, event + 3, sizeof(connection_handle));
-        connection_handle = le16toh(connection_handle);
+        // Disconnect Complete has only a numeric controller handle, so it
+        // cannot identify an establishment lifetime after handle reuse. It is
+        // only a wake-up: a fresh exact Disconnect probe must prove absence.
         const auto establishment_id = backend->hci_establishment_id_.load(
             std::memory_order_acquire);
-        if (establishment_id != 0 && establishment_id != UINT64_MAX &&
-            backend->hci_establishment_disconnect_owner_.load(
-                std::memory_order_acquire) == establishment_id &&
-            backend->hci_establishment_stack_.load(
-                std::memory_order_acquire) == backend->stack_incarnation_ &&
-            backend->hci_establishment_handle_.load(
-                std::memory_order_acquire) == connection_handle) {
-            backend->resolve_hci_establishment(establishment_id);
-        }
-        return false;
+        return establishment_id != 0 && establishment_id != UINT64_MAX;
     }
     if (event[0] != BLE_HCI_EVCODE_LE_META || event[1] < 1) {
         return false;
@@ -1762,10 +1782,17 @@ bool Backend::observe_hci_ingress(const std::uint8_t *event) {
                 backend->generation_.load(std::memory_order_acquire) &&
             backend->hci_establishment_handle_.load(
                 std::memory_order_acquire) == connection_handle;
-        if (!duplicate && backend->sink_ != nullptr) {
-            backend->sink_->signal_ble_lifecycle_handoff_failure();
+        const bool replacing_probed_establishment =
+            current_id != UINT64_MAX &&
+            backend->hci_establishment_disconnect_owner_.load(
+                std::memory_order_acquire) == current_id;
+        if (duplicate && !replacing_probed_establishment) return true;
+        if (!replacing_probed_establishment) {
+            if (backend->sink_ != nullptr) {
+                backend->sink_->signal_ble_lifecycle_handoff_failure();
+            }
+            return false;
         }
-        return duplicate;
     }
     std::uint64_t establishment_id = 0;
     if (!allocate_hci_establishment_id(
@@ -1775,9 +1802,9 @@ bool Backend::observe_hci_ingress(const std::uint8_t *event) {
         }
         return false;
     }
-    std::uint64_t empty = 0;
+    std::uint64_t expected_id = current_id;
     if (!backend->hci_establishment_id_.compare_exchange_strong(
-            empty, UINT64_MAX, std::memory_order_acq_rel,
+            expected_id, UINT64_MAX, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
         if (backend->sink_ != nullptr) {
             backend->sink_->signal_ble_lifecycle_handoff_failure();
@@ -1815,19 +1842,87 @@ bool Backend::observe_hci_ingress(const std::uint8_t *event) {
 
 void Backend::queue_hci_establishment_resolution() {
     Backend *backend = instance_;
-    if (backend == nullptr ||
-        !backend->hci_ingress_enabled_.load(std::memory_order_acquire) ||
-        !backend->hci_establishment_event_initialized_ ||
-        ble_npl_event_is_queued(&backend->hci_establishment_event_)) {
-        return;
+    if (backend == nullptr || !backend->acquire_hci_event_user()) return;
+    if (backend->hci_ingress_enabled_.load(std::memory_order_acquire) &&
+        backend->hci_establishment_event_initialized_.load(
+            std::memory_order_acquire) &&
+        !ble_npl_event_is_queued(&backend->hci_establishment_event_)) {
+        ble_npl_eventq_put(nimble_port_get_dflt_eventq(),
+                           &backend->hci_establishment_event_);
     }
-    ble_npl_eventq_put(nimble_port_get_dflt_eventq(),
-                       &backend->hci_establishment_event_);
+    backend->release_hci_event_user();
 }
 
 void Backend::hci_establishment_callback(struct ble_npl_event *event) {
     auto *backend = static_cast<Backend *>(ble_npl_event_get_arg(event));
     if (backend != nullptr) backend->process_hci_establishment();
+}
+
+bool Backend::acquire_hci_event_user() {
+    std::uint32_t observed = hci_event_users_.load(std::memory_order_acquire);
+    while ((observed & kHciEventUsersClosing) == 0U) {
+        if ((observed & kHciEventUsersMask) == kHciEventUsersMask) return false;
+        if (hci_event_users_.compare_exchange_weak(
+                observed, observed + 1U, std::memory_order_acq_rel,
+                std::memory_order_acquire)) return true;
+    }
+    return false;
+}
+
+void Backend::release_hci_event_user() {
+    std::uint32_t observed = hci_event_users_.load(std::memory_order_acquire);
+    while ((observed & kHciEventUsersMask) != 0U) {
+        if (hci_event_users_.compare_exchange_weak(
+                observed, observed - 1U, std::memory_order_release,
+                std::memory_order_acquire)) return;
+    }
+    if (sink_ != nullptr) sink_->signal_ble_lifecycle_handoff_failure();
+}
+
+void Backend::close_hci_event_users() {
+    hci_event_users_.fetch_or(kHciEventUsersClosing,
+                              std::memory_order_acq_rel);
+}
+
+bool Backend::await_hci_event_users() {
+    const auto deadline = esp_timer_get_time() + kHciEventUsersDrainTimeoutUs;
+    while ((hci_event_users_.load(std::memory_order_acquire) &
+            kHciEventUsersMask) != 0U) {
+        if (esp_timer_get_time() >= deadline) return false;
+        vTaskDelay(1);
+    }
+    return true;
+}
+
+bool Backend::deinitialize_hci_event() {
+    if (!await_hci_event_users()) return false;
+    if (hci_establishment_event_initialized_.load(std::memory_order_acquire)) {
+        ble_npl_event_deinit(&hci_establishment_event_);
+        hci_establishment_event_initialized_.store(false,
+                                                   std::memory_order_release);
+    }
+    return true;
+}
+
+bool Backend::open_hci_event_users() {
+    std::uint32_t expected = kHciEventUsersClosing;
+    return hci_event_users_.compare_exchange_strong(
+        expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+bool Backend::owns_hci_establishment(
+    std::uint64_t establishment_id, std::uint32_t stack_incarnation,
+    ble_lifecycle::Generation generation,
+    std::uint16_t connection_handle) const {
+    return establishment_id != 0 && establishment_id != UINT64_MAX &&
+           hci_establishment_id_.load(std::memory_order_acquire) ==
+               establishment_id &&
+           hci_establishment_stack_.load(std::memory_order_acquire) ==
+               stack_incarnation &&
+           hci_establishment_generation_.load(std::memory_order_acquire) ==
+               generation &&
+           hci_establishment_handle_.load(std::memory_order_acquire) ==
+               connection_handle;
 }
 
 void Backend::resolve_hci_establishment(std::uint64_t establishment_id) {
@@ -1856,15 +1951,19 @@ void Backend::process_hci_establishment() {
     const auto establishment_id = hci_establishment_id_.load(
         std::memory_order_acquire);
     if (establishment_id == 0 || establishment_id == UINT64_MAX) return;
-    if (hci_establishment_stack_.load(std::memory_order_acquire) !=
-            stack_incarnation_ ||
-        hci_establishment_generation_.load(std::memory_order_acquire) !=
-            generation_.load(std::memory_order_acquire)) {
+    const auto establishment_stack = hci_establishment_stack_.load(
+        std::memory_order_acquire);
+    const auto establishment_generation = hci_establishment_generation_.load(
+        std::memory_order_acquire);
+    const auto handle = hci_establishment_handle_.load(
+        std::memory_order_acquire);
+    if (establishment_stack != stack_incarnation_ ||
+        establishment_generation != generation_.load(std::memory_order_acquire) ||
+        !owns_hci_establishment(establishment_id, establishment_stack,
+                                establishment_generation, handle)) {
         if (sink_ != nullptr) sink_->signal_ble_lifecycle_handoff_failure();
         return;
     }
-    const auto handle = hci_establishment_handle_.load(
-        std::memory_order_acquire);
     std::pair<std::uint16_t, bool> registered{handle, false};
     ble_hs_lock();
     ble_gap_conn_foreach_handle([](std::uint16_t value, void *context) {
@@ -1880,18 +1979,26 @@ void Backend::process_hci_establishment() {
         }
         return;
     }
-    std::uint64_t unclaimed = 0;
+    std::uint64_t probe_owner = 0;
     if (!hci_establishment_disconnect_owner_.compare_exchange_strong(
-            unclaimed, establishment_id, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        if (unclaimed != establishment_id && sink_ != nullptr) {
+            probe_owner, establishment_id, std::memory_order_acq_rel,
+            std::memory_order_acquire) && probe_owner != establishment_id) {
+        if (sink_ != nullptr) {
             sink_->signal_ble_lifecycle_handoff_failure();
         }
         return;
     }
     const int result = disconnect_controller_handle(handle);
     if (result == BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID)) {
-        resolve_hci_establishment(establishment_id);
+        // The synchronous command result proves current controller absence.
+        // Recheck the complete exact owner after the command so a Connection
+        // Complete racing the probe cannot be erased by its predecessor.
+        if (owns_hci_establishment(establishment_id, establishment_stack,
+                                   establishment_generation, handle) &&
+            hci_establishment_disconnect_owner_.load(
+                std::memory_order_acquire) == establishment_id) {
+            resolve_hci_establishment(establishment_id);
+        }
         return;
     }
     if (result != 0 ||

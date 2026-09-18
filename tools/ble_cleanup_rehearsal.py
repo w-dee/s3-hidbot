@@ -228,6 +228,14 @@ class Event:
         self.seconds, self.microseconds, self.event_type, self.code, self.value = raw
 
 
+class PendingEvidenceError(OSError):
+    """Terminal observer error carrying complete records decoded before it."""
+
+    def __init__(self, error: OSError, events: list[Event]) -> None:
+        super().__init__(error.errno, error.strerror)
+        self.events = events
+
+
 class Observer:
     def __init__(self, path: Path, role: str) -> None:
         self.path = path
@@ -260,7 +268,10 @@ class Observer:
         """Return every complete pending record or fail on terminal evidence."""
         events: list[Event] = []
         while self.pending:
-            decoded = self._decode_pending()
+            try:
+                decoded = self._decode_pending()
+            except OSError as exc:
+                raise PendingEvidenceError(exc, events) from exc
             events.extend(decoded)
             if decoded:
                 continue
@@ -360,6 +371,8 @@ class ExactObservers:
         deadline = time.monotonic() + duration
         relevant = 0
         unexpected = 0
+        retired = [False] * len(self.observers)
+        retirement_error: OSError | None = None
 
         def aggregate(observer: Observer, events: list[Event]) -> None:
             nonlocal relevant, unexpected
@@ -399,6 +412,7 @@ class ExactObservers:
                 try:
                     aggregate(observer, observer.finish_pending())
                 except OSError as exc:
+                    aggregate(observer, getattr(exc, "events", []))
                     # Continue adjudicating the other observer so already
                     # complete evidence is never blanked by the first error.
                     if pending_error is None:
@@ -421,27 +435,90 @@ class ExactObservers:
                 held_buttons=max(len(self.held_buttons), held_buttons or 0),
             )
 
-        while time.monotonic() < deadline:
-            for observer in self.observers:
+        while time.monotonic() < deadline and not all(retired):
+            for index, observer in enumerate(self.observers):
+                if retired[index]:
+                    continue
                 try:
                     events = observer.read(min(0.02, max(0.0, deadline - time.monotonic())))
                 except OSError as exc:
+                    if (retirement and
+                            phase is BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED and
+                            exc.errno in {errno.ENODEV, errno.ENXIO, errno.ENOENT}):
+                        # Retirement is per exact observer. Keep collecting the
+                        # other observer until it also retires or the bounded
+                        # observation window closes; its fd may still own
+                        # queued input that has not reached Python's buffer.
+                        retired[index] = True
+                        if retirement_error is None:
+                            retirement_error = exc
+                        continue
                     return terminal(exc)
                 aggregate(observer, events)
+
+        # Close the deadline edge explicitly. A different observer may have
+        # become readable while the preceding fd consumed the final blocking
+        # slice. Each live fd gets a bounded nonblocking drain before pending
+        # buffers or held-state queries can authorize aggregate success.
+        final_error: OSError | None = None
+        for index, observer in enumerate(self.observers):
+            if retired[index]:
+                continue
+            for _ in range(64):
+                try:
+                    events = observer.read(0)
+                except OSError as exc:
+                    if (retirement and
+                            phase is BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED and
+                            exc.errno in {errno.ENODEV, errno.ENXIO, errno.ENOENT}):
+                        retired[index] = True
+                        if retirement_error is None:
+                            retirement_error = exc
+                    elif final_error is None:
+                        final_error = exc
+                    break
+                aggregate(observer, events)
+                if not events:
+                    break
+            else:
+                if final_error is None:
+                    final_error = OSError(errno.EIO, "observer final drain exceeded bound")
+        if final_error is not None:
+            return terminal(final_error)
         pending_error = finish_pending()
         if pending_error is not None:
             return terminal(pending_error)
         keys = len(self.held_keys)
         buttons = len(self.held_buttons)
         for index, observer in enumerate(self.observers):
+            if retired[index]:
+                continue
             try:
                 held = observer.held_count()
             except OSError as exc:
+                if (retirement and
+                        phase is BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED and
+                        exc.errno in {errno.ENODEV, errno.ENXIO, errno.ENOENT}):
+                    retired[index] = True
+                    if retirement_error is None:
+                        retirement_error = exc
+                    continue
                 return terminal(exc, held_keys=keys, held_buttons=buttons)
             if index == 0:
                 keys = max(keys, held)
             else:
                 buttons = max(buttons, held)
+        if retirement_error is not None:
+            return classify_observer_error(
+                retirement_error,
+                phase=phase,
+                exact_device=True,
+                retirement_requested=retirement,
+                relevant_events=relevant,
+                unexpected_events=unexpected,
+                held_keys=keys,
+                held_buttons=buttons,
+            )
         return observation_complete(
             relevant_events=relevant,
             unexpected_events=unexpected,

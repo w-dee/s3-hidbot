@@ -122,6 +122,16 @@ class Backend final : public hid_control_executor::BleBackend {
     static void timer_barrier_callback(void *context);
     static void hidden_exposure_barrier_callback(struct ble_npl_event *event);
     static void hci_establishment_callback(struct ble_npl_event *event);
+    bool acquire_hci_event_user();
+    void release_hci_event_user();
+    void close_hci_event_users();
+    bool await_hci_event_users();
+    bool open_hci_event_users();
+    bool deinitialize_hci_event();
+    bool owns_hci_establishment(std::uint64_t establishment_id,
+                                std::uint32_t stack_incarnation,
+                                ble_lifecycle::Generation generation,
+                                std::uint16_t connection_handle) const;
     void terminate_hidden_connection(std::uint16_t connection_handle);
     void resolve_hci_establishment(std::uint64_t establishment_id);
     void retire_hci_establishment();
@@ -136,7 +146,10 @@ class Backend final : public hid_control_executor::BleBackend {
     struct ble_npl_event hidden_exposure_barrier_{};
     bool hidden_exposure_barrier_initialized_ = false;
     struct ble_npl_event hci_establishment_event_{};
-    bool hci_establishment_event_initialized_ = false;
+    std::atomic_bool hci_establishment_event_initialized_{false};
+    // The high bit closes event access before stop. Low bits are exact
+    // callback-side leases whose drain precedes NPL event deinitialization.
+    std::atomic<std::uint32_t> hci_event_users_{UINT32_C(1) << 31};
     std::atomic<std::uint64_t> hci_establishment_id_{0};
     std::atomic<std::uint64_t> next_hci_establishment_id_{1};
     std::atomic<std::uint64_t> hci_establishment_disconnect_owner_{0};

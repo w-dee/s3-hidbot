@@ -8,13 +8,33 @@ from test_bond_delete_nvs import ROOT, body
 
 SOURCE = (ROOT / "firmware/components/ble_transport/ble_transport.cpp").read_text()
 
+BEGIN_STOP = body(SOURCE, "std::uint64_t Backend::begin_stop")
+assert BEGIN_STOP.index("hci_ingress_enabled_.store(false") < BEGIN_STOP.index(
+    "close_hci_event_users()"
+) < BEGIN_STOP.index("xTaskCreate(")
+STOP_DEINIT = SOURCE[SOURCE.index("struct Backend::StopOperations"):
+                     SOURCE.index("void Backend::stop_task")]
+assert "if (!backend.deinitialize_hci_event()) return false;" in STOP_DEINIT
+DISCONNECT_INGRESS = SOURCE[
+    SOURCE.index("if (event[0] == BLE_HCI_EVCODE_DISCONN_CMP"):
+    SOURCE.index("if (event[0] != BLE_HCI_EVCODE_LE_META")
+]
+assert "resolve_hci_establishment" not in DISCONNECT_INGRESS
+RESET = body(SOURCE, "void Backend::on_reset")
+assert "kHciEventUsersClosing" in RESET
+assert RESET.index("retire_hci_establishment()") < RESET.index(
+    "hci_ingress_enabled_.store(true"
+)
+
 PRE = r'''
 #include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <endian.h>
+#include <functional>
 #include <iostream>
+#include <thread>
 #include <utility>
 #define BLE_HCI_EVCODE_DISCONN_CMP 0x05
 #define BLE_HCI_EVCODE_LE_META 0x3e
@@ -42,6 +62,15 @@ int real_registration_result = 0;
 int original_recv = 0;
 int replacement_recv = 0;
 int original_send = 0;
+int queue_puts = 0;
+int queue_checks = 0;
+bool event_alive = true;
+std::function<void()> queue_put_hook;
+std::function<void()> command_hook;
+std::function<void()> delay_hook;
+int64_t fake_time_us = 0;
+int64_t esp_timer_get_time() { return fake_time_us += 100'000; }
+void vTaskDelay(int) { if (delay_hook) delay_hook(); }
 extern "C" esp_err_t __real_esp_vhci_host_register_callback(
     const esp_vhci_host_callback_t *callback) {
  if (real_registration_result == 0) registered_vhci = callback;
@@ -89,11 +118,22 @@ struct ble_npl_event {
 };
 struct ble_npl_eventq {} queue;
 void *ble_npl_event_get_arg(ble_npl_event *event) { return event->arg; }
-bool ble_npl_event_is_queued(ble_npl_event *event) { return event->queued; }
+bool ble_npl_event_is_queued(ble_npl_event *event) {
+ ++queue_checks;
+ assert(event_alive);
+ return event->queued;
+}
 ble_npl_eventq *nimble_port_get_dflt_eventq() { return &queue; }
 void ble_npl_eventq_put(ble_npl_eventq *, ble_npl_event *event) {
+ if (queue_put_hook) queue_put_hook();
+ assert(event_alive);
  assert(!event->queued);
+ ++queue_puts;
  event->queued = true;
+}
+void ble_npl_event_deinit(ble_npl_event *) {
+ assert(event_alive);
+ event_alive = false;
 }
 void run(ble_npl_event &event) {
  assert(event.queued);
@@ -121,6 +161,7 @@ int ble_hs_hci_cmd_tx(uint16_t, const void *value, uint8_t, void *, uint8_t) {
  auto *command = static_cast<const ble_hci_lc_disconnect_cp *>(value);
  ++raw_disconnects;
  last_raw_handle = le16toh(command->conn_handle);
+ if (command_hook) command_hook();
  return raw_result;
 }
 namespace ble_lifecycle {
@@ -134,6 +175,9 @@ struct BleEventSink {
 };
 }
 namespace ble_transport {
+constexpr uint32_t kHciEventUsersClosing = UINT32_C(1) << 31;
+constexpr uint32_t kHciEventUsersMask = kHciEventUsersClosing - 1U;
+constexpr int64_t kHciEventUsersDrainTimeoutUs = 1'000'000;
 bool allocate_hci_establishment_id(std::atomic<uint64_t> *, uint64_t *);
 int disconnect_controller_handle(uint16_t);
 class Backend {
@@ -143,6 +187,14 @@ public:
  static bool observe_hci_ingress(const uint8_t *);
  static void queue_hci_establishment_resolution();
  static void hci_establishment_callback(ble_npl_event *);
+ bool acquire_hci_event_user();
+ void release_hci_event_user();
+ void close_hci_event_users();
+ bool await_hci_event_users();
+ bool deinitialize_hci_event();
+ bool open_hci_event_users();
+ bool owns_hci_establishment(uint64_t, uint32_t,
+                             ble_lifecycle::Generation, uint16_t) const;
  void resolve_hci_establishment(uint64_t);
  void retire_hci_establishment();
  void process_hci_establishment();
@@ -155,7 +207,8 @@ public:
  std::atomic<ble_lifecycle::Generation> generation_{11};
  hid_control_executor::BleEventSink *sink_ = nullptr;
  ble_npl_event hci_establishment_event_{};
- bool hci_establishment_event_initialized_ = true;
+ std::atomic_bool hci_establishment_event_initialized_{true};
+ std::atomic<uint32_t> hci_event_users_{0};
  std::atomic<uint64_t> hci_establishment_id_{0};
  std::atomic<uint64_t> next_hci_establishment_id_{1};
  std::atomic<uint64_t> hci_establishment_disconnect_owner_{0};
@@ -222,53 +275,79 @@ int main() {
  assert(raw_disconnects == 1 && last_raw_handle == 55);
  assert(backend.hci_establishment_disconnect_owner_.load() == first_id);
 
+ // A Disconnect Complete is only a resolver wake. Even a matching handle
+ // cannot resolve the exact establishment without a fresh absence probe.
  uint8_t wrong_disconnect[] = {4, BLE_HCI_EVCODE_DISCONN_CMP, 4,
                                BLE_ERR_SUCCESS, 54, 0, 19};
  expect_ignored(wrong_disconnect, sizeof(wrong_disconnect));
  assert(backend.hci_establishment_id_.load() == first_id);
+ assert(backend.hci_establishment_event_.queued);
+ run(backend.hci_establishment_event_);
+ assert(backend.hci_establishment_id_.load() == first_id);
  uint8_t disconnected[] = {4, BLE_HCI_EVCODE_DISCONN_CMP, 4,
                            BLE_ERR_SUCCESS, 55, 0, 19};
- expect_ignored(disconnected, sizeof(disconnected));
- assert(backend.physical_exposure_hidden());
 
- // Reuse the controller handle, but never the establishment identity. A stale
- // completion from A cannot retire B before B owns a controller disconnect.
+ // A new Connection Complete after A owns a raw probe creates a new exact B
+ // identity even when the controller reuses handle 55.
  assert(registered_vhci->notify_host_recv(legacy, sizeof(legacy)) == 23);
  const uint64_t second_id = backend.hci_establishment_id_.load();
  assert(second_id != first_id);
+ assert(backend.hci_establishment_disconnect_owner_.load() == 0);
+
+ // A stale completion from A cannot clear B, either before or after B owns a
+ // successful Disconnect probe. It only wakes the exact probe resolver.
  expect_ignored(disconnected, sizeof(disconnected));
  assert(backend.hci_establishment_id_.load() == second_id);
  run(backend.hci_establishment_event_);
- assert(raw_disconnects == 2);
+ assert(backend.hci_establishment_id_.load() == second_id);
+ assert(backend.hci_establishment_disconnect_owner_.load() == second_id);
  expect_ignored(disconnected, sizeof(disconnected));
+ assert(backend.hci_establishment_id_.load() == second_id);
+ run(backend.hci_establishment_event_);
+ assert(backend.hci_establishment_id_.load() == second_id);
+
+ // Even B's real completion is only a wake. A subsequent exact converted
+ // Unknown Connection ID proves current controller absence and resolves B.
+ raw_result = BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID);
+ expect_ignored(disconnected, sizeof(disconnected));
+ run(backend.hci_establishment_event_);
  assert(backend.physical_exposure_hidden());
 
- // NimBLE returns host-domain errors. Only converted Unknown Connection ID
- // proves the exact controller handle is absent.
+ // Immediate converted absence closes the exact token. Raw 2 and unrelated
+ // host errors remain faults and keep authority live.
  raw_result = BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID);
  assert(registered_vhci->notify_host_recv(legacy, sizeof(legacy)) == 23);
  run(backend.hci_establishment_event_);
  assert(backend.physical_exposure_hidden());
+ raw_result = BLE_ERR_UNK_CONN_ID;
+ assert(registered_vhci->notify_host_recv(legacy, sizeof(legacy)) == 23);
+ run(backend.hci_establishment_event_);
+ assert(!backend.physical_exposure_hidden());
+ backend.retire_hci_establishment();
+ backend.hci_ingress_enabled_.store(true);
  raw_result = 7;
  assert(registered_vhci->notify_host_recv(legacy, sizeof(legacy)) == 23);
  run(backend.hci_establishment_event_);
  assert(!backend.physical_exposure_hidden());
- assert(sink.faults == 1);
+ backend.retire_hci_establishment();
+ backend.hci_ingress_enabled_.store(true);
+
+ // Replacement during a synchronous absence probe cannot be erased by the
+ // predecessor's command result; the complete exact tuple is rechecked.
+ uint64_t replacement_id = 0;
+ command_hook = [&]() {
+  assert(Backend::observe_hci_ingress(legacy + 1));
+  replacement_id = backend.hci_establishment_id_.load();
+  command_hook = nullptr;
+ };
+ raw_result = BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID);
+ assert(registered_vhci->notify_host_recv(legacy, sizeof(legacy)) == 23);
+ run(backend.hci_establishment_event_);
+ assert(replacement_id != 0);
+ assert(backend.hci_establishment_id_.load() == replacement_id);
  backend.retire_hci_establishment();
  backend.hci_ingress_enabled_.store(true);
  raw_result = 0;
-
- // Reset/stop retirement removes all former authority, while the monotonic
- // allocator gives the next stack incarnation a distinct identity.
- backend.stack_incarnation_ = 8;
- assert(registered_vhci->notify_host_recv(legacy, sizeof(legacy)) == 23);
- const uint64_t third_id = backend.hci_establishment_id_.load();
- assert(third_id != first_id && third_id != second_id);
- expect_ignored(disconnected, sizeof(disconnected));
- assert(backend.hci_establishment_id_.load() == third_id);
- run(backend.hci_establishment_event_);
- expect_ignored(disconnected, sizeof(disconnected));
- assert(backend.physical_exposure_hidden());
 
  // A host-registered exact handle transfers teardown to the normal GAP path.
  peer = 56;
@@ -316,6 +395,73 @@ int main() {
  expect_ignored(unrelated, sizeof(unrelated));
  assert(backend.hci_establishment_id_.load() == 0);
 
+ // Queue-use leases make the check/use interval indivisible from event
+ // lifetime. Stop closes admission while the callback owns one exact user;
+ // deinit is legal only after that user releases.
+ backend.hci_ingress_enabled_.store(true);
+ backend.hci_establishment_event_.queued = false;
+ const int puts_before_lease_seam = queue_puts;
+ queue_put_hook = [&]() {
+  assert((backend.hci_event_users_.load() &
+          ble_transport::kHciEventUsersMask) == 1);
+  backend.close_hci_event_users();
+  assert(!backend.acquire_hci_event_user());
+  assert(event_alive);
+  queue_put_hook = nullptr;
+ };
+ Backend::queue_hci_establishment_resolution();
+ assert(queue_puts == puts_before_lease_seam + 1);
+ assert(backend.hci_event_users_.load() ==
+        ble_transport::kHciEventUsersClosing);
+ event_alive = false; // Models deinit only after the admitted user drained.
+
+ // New init cannot open while users remain. Several callback leases are
+ // counted exactly and a callback that decides not to queue still releases.
+ event_alive = true;
+ assert(backend.open_hci_event_users());
+ assert(backend.acquire_hci_event_user());
+ assert(backend.acquire_hci_event_user());
+ backend.close_hci_event_users();
+ assert(!backend.open_hci_event_users());
+ backend.release_hci_event_user();
+ assert(!backend.open_hci_event_users());
+ backend.release_hci_event_user();
+ assert(backend.open_hci_event_users());
+ backend.hci_ingress_enabled_.store(false);
+ const int checks_before_skip = queue_checks;
+ Backend::queue_hci_establishment_resolution();
+ assert(queue_checks == checks_before_skip);
+
+ // Normal stop context waits for all admitted users. Timeout leaves the
+ // event alive and the user counted; it never licenses forced deinit.
+ backend.close_hci_event_users();
+ assert(backend.open_hci_event_users());
+ assert(backend.acquire_hci_event_user());
+ backend.close_hci_event_users();
+ delay_hook = [&]() {
+  backend.release_hci_event_user();
+  delay_hook = nullptr;
+ };
+ assert(backend.await_hci_event_users());
+ assert(backend.open_hci_event_users());
+ assert(backend.acquire_hci_event_user());
+ backend.close_hci_event_users();
+ fake_time_us = 0;
+ assert(!backend.await_hci_event_users());
+ assert((backend.hci_event_users_.load() &
+         ble_transport::kHciEventUsersMask) == 1);
+ assert(event_alive);
+ assert(!backend.deinitialize_hci_event());
+ assert(event_alive);
+ backend.release_hci_event_user();
+ assert(backend.deinitialize_hci_event());
+ assert(!event_alive);
+ assert(backend.hci_event_users_.load() ==
+        ble_transport::kHciEventUsersClosing);
+ backend.close_hci_event_users();
+ Backend::queue_hci_establishment_resolution();
+ assert(queue_checks == checks_before_skip);
+
  backend.retire_hci_establishment();
  real_registration_result = -77;
  assert(__wrap_esp_vhci_host_register_callback(&replacement) == -77);
@@ -340,6 +486,13 @@ for signature in (
     "bool Backend::observe_hci_ingress",
     "void Backend::queue_hci_establishment_resolution",
     "void Backend::hci_establishment_callback",
+    "bool Backend::acquire_hci_event_user",
+    "void Backend::release_hci_event_user",
+    "void Backend::close_hci_event_users",
+    "bool Backend::await_hci_event_users",
+    "bool Backend::deinitialize_hci_event",
+    "bool Backend::open_hci_event_users",
+    "bool Backend::owns_hci_establishment",
     "void Backend::resolve_hci_establishment",
     "void Backend::retire_hci_establishment",
     "void Backend::process_hci_establishment",
