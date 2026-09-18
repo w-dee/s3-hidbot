@@ -947,6 +947,9 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
         result = esp_timer_create(&barrier_args, &timer_barrier_);
         if (result != ESP_OK) return result;
     }
+    ble_npl_event_init(&hidden_exposure_barrier_,
+                       hidden_exposure_barrier_callback, this);
+    hidden_exposure_barrier_initialized_ = true;
     host_exited_.store(false, std::memory_order_release);
     initialized_ = true;
     nimble_port_freertos_init(host_task);
@@ -1021,6 +1024,10 @@ bool Backend::finish_stop(std::uint64_t id) {
     service_changed_value_handle_.store(0, std::memory_order_release);
     gatt_schema_current_.store(false, std::memory_order_release);
     identity_resolved_.store(false, std::memory_order_release);
+    hidden_exposure_requested_.store(false, std::memory_order_release);
+    hidden_exposure_barrier_passed_.store(false, std::memory_order_release);
+    hidden_exposure_termination_claimed_.store(false,
+                                               std::memory_order_release);
     return true;
 }
 
@@ -1036,7 +1043,13 @@ struct Backend::StopOperations {
         return true;
     }
     void delete_host_task() { nimble_port_freertos_deinit(); }
-    bool deinitialize() { return nimble_port_deinit() == ESP_OK; }
+    bool deinitialize() {
+        if (backend.hidden_exposure_barrier_initialized_) {
+            ble_npl_event_deinit(&backend.hidden_exposure_barrier_);
+            backend.hidden_exposure_barrier_initialized_ = false;
+        }
+        return nimble_port_deinit() == ESP_OK;
+    }
     bool retire_timers() { return backend.retire_timers_after_stop(); }
 };
 
@@ -1275,6 +1288,13 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 // run inside it and must consume this host-owned snapshot.
                 backend->host_identity_valid_ = peer_identity(event->connect.conn_handle,
                     backend->host_connection_identity_) && valid_identity(backend->host_connection_identity_);
+                // A hide request can race after the controller has accepted
+                // Connection Complete but before NimBLE inserts the peer.
+                // Claim the exact callback handle once; the host-queue
+                // barrier below prevents hidden-idle publication until this
+                // callback and its direct teardown request have completed.
+                backend->terminate_hidden_connection(
+                    event->connect.conn_handle);
             }
             (void)backend->signal(
                 event->connect.status == 0
@@ -1424,6 +1444,10 @@ std::int32_t Backend::start_advertising() {
     if (database_result != 0) {
         return database_result;
     }
+    hidden_exposure_requested_.store(false, std::memory_order_release);
+    hidden_exposure_barrier_passed_.store(false, std::memory_order_release);
+    hidden_exposure_termination_claimed_.store(false,
+                                               std::memory_order_release);
     ble_hs_adv_fields fields{};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.uuids16 = &s_hid_service_uuid;
@@ -1450,8 +1474,15 @@ std::int32_t Backend::start_advertising() {
 std::int32_t Backend::stop_advertising() { return ble_gap_adv_stop(); }
 
 std::int32_t Backend::begin_hidden_exposure() {
+    hidden_exposure_termination_claimed_.store(false,
+                                               std::memory_order_release);
+    hidden_exposure_barrier_passed_.store(false, std::memory_order_release);
+    hidden_exposure_requested_.store(true, std::memory_order_release);
     const int stopped = ble_gap_adv_stop();
-    if (stopped != 0 && stopped != BLE_HS_EALREADY) return stopped;
+    if (stopped != 0 && stopped != BLE_HS_EALREADY) {
+        hidden_exposure_requested_.store(false, std::memory_order_release);
+        return stopped;
+    }
     std::uint16_t handle = ble_lifecycle::kNoConnection;
     ble_hs_lock();
     ble_gap_conn_foreach_handle([](std::uint16_t value, void *context) {
@@ -1459,16 +1490,42 @@ std::int32_t Backend::begin_hidden_exposure() {
         return 1;
     }, &handle);
     ble_hs_unlock();
-    if (handle == ble_lifecycle::kNoConnection) return 0;
-    // Advertising is stopped and max_connections is one, so this handle
-    // cannot be replaced by another connection before the call. The executor
-    // owns a bounded absence poll; do not re-arm an existing security timer.
-    const int result = ble_gap_terminate(handle, BLE_ERR_REM_USER_CONN_TERM);
-    return result == BLE_HS_EALREADY || result == BLE_HS_ENOTCONN ? 0 : result;
+    if (handle != ble_lifecycle::kNoConnection) {
+        bool unclaimed = false;
+        if (hidden_exposure_termination_claimed_.compare_exchange_strong(
+                unclaimed, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            // Advertising is stopped and max_connections is one, so this
+            // handle cannot be replaced before the exact teardown call.
+            const int result =
+                ble_gap_terminate(handle, BLE_ERR_REM_USER_CONN_TERM);
+            if (result != 0 && result != BLE_HS_EALREADY &&
+                result != BLE_HS_ENOTCONN) {
+                hidden_exposure_requested_.store(false,
+                                                 std::memory_order_release);
+                return result;
+            }
+        }
+    }
+    if (!hidden_exposure_barrier_initialized_ ||
+        ble_npl_event_is_queued(&hidden_exposure_barrier_)) {
+        hidden_exposure_requested_.store(false, std::memory_order_release);
+        return ESP_ERR_INVALID_STATE;
+    }
+    // This event runs on the same default queue as the HCI Connection
+    // Complete handler. If hide interrupted that handler before connection
+    // insertion, its GAP callback and exact teardown claim finish first.
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(),
+                       &hidden_exposure_barrier_);
+    return 0;
 }
 
 bool Backend::physical_exposure_hidden() const {
-    if (!ble_hs_is_enabled()) return false;
+    if (!ble_hs_is_enabled() ||
+        !hidden_exposure_requested_.load(std::memory_order_acquire) ||
+        !hidden_exposure_barrier_passed_.load(std::memory_order_acquire)) {
+        return false;
+    }
     bool connected = false;
     ble_hs_lock();
     ble_gap_conn_foreach_handle([](std::uint16_t, void *context) {
@@ -1478,6 +1535,31 @@ bool Backend::physical_exposure_hidden() const {
     const bool advertising = ble_gap_adv_active() != 0;
     ble_hs_unlock();
     return !connected && !advertising;
+}
+
+void Backend::hidden_exposure_barrier_callback(struct ble_npl_event *event) {
+    auto *backend = static_cast<Backend *>(ble_npl_event_get_arg(event));
+    if (backend != nullptr && backend->hidden_exposure_requested_.load(
+                                  std::memory_order_acquire)) {
+        backend->hidden_exposure_barrier_passed_.store(
+            true, std::memory_order_release);
+    }
+}
+
+void Backend::terminate_hidden_connection(std::uint16_t connection_handle) {
+    if (!hidden_exposure_requested_.load(std::memory_order_acquire)) {
+        return;
+    }
+    bool unclaimed = false;
+    if (!hidden_exposure_termination_claimed_.compare_exchange_strong(
+            unclaimed, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    // GAP callbacks are outside the host mutex. The single-connection build
+    // makes this callback handle exact until the request is issued. Physical
+    // absence and the bounded executor deadline remain final authority.
+    (void)ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
 std::int32_t Backend::disconnect(std::uint16_t connection_handle) {

@@ -12,6 +12,7 @@
 #include "hid_control_executor/hid_control_executor.hpp"
 #include "esp_timer.h"
 #include "host/ble_store.h"
+#include "nimble/nimble_npl.h"
 
 struct ble_gap_event;
 
@@ -108,6 +109,8 @@ class Backend final : public hid_control_executor::BleBackend {
     static void host_task(void *context);
     static void stop_task(void *context);
     static void timer_barrier_callback(void *context);
+    static void hidden_exposure_barrier_callback(struct ble_npl_event *event);
+    void terminate_hidden_connection(std::uint16_t connection_handle);
     struct StopOperations;
     bool retire_timers_after_stop();
     ble_lifecycle::StopTransaction stop_transaction_{};
@@ -115,6 +118,11 @@ class Backend final : public hid_control_executor::BleBackend {
     std::atomic_bool host_exited_{false};
     std::atomic_bool timer_barrier_passed_{false};
     esp_timer_handle_t timer_barrier_ = nullptr;
+    struct ble_npl_event hidden_exposure_barrier_{};
+    bool hidden_exposure_barrier_initialized_ = false;
+    std::atomic_bool hidden_exposure_requested_{false};
+    std::atomic_bool hidden_exposure_barrier_passed_{false};
+    std::atomic_bool hidden_exposure_termination_claimed_{false};
     static void timeout_callback(void *context);
     static void pairing_timeout_callback(void *context);
     static void route_release_grace_callback(void *context);

@@ -334,6 +334,10 @@ class ExactObservers:
                         phase=phase,
                         exact_device=True,
                         retirement_requested=retirement,
+                        relevant_events=relevant,
+                        unexpected_events=unexpected,
+                        held_keys=len(self.held_keys),
+                        held_buttons=len(self.held_buttons),
                     )
                 for event in events:
                     if event.event_type == EV_SYN:
@@ -364,16 +368,31 @@ class ExactObservers:
                             self.held_buttons.discard(event.code)
                     else:
                         unexpected += 1
-        try:
-            keys, buttons = (observer.held_count() for observer in self.observers)
-        except OSError as exc:
-            return classify_observer_error(exc, phase=phase, exact_device=True,
-                                           retirement_requested=retirement)
+        keys = len(self.held_keys)
+        buttons = len(self.held_buttons)
+        for index, observer in enumerate(self.observers):
+            try:
+                held = observer.held_count()
+            except OSError as exc:
+                return classify_observer_error(
+                    exc,
+                    phase=phase,
+                    exact_device=True,
+                    retirement_requested=retirement,
+                    relevant_events=relevant,
+                    unexpected_events=unexpected,
+                    held_keys=keys,
+                    held_buttons=buttons,
+                )
+            if index == 0:
+                keys = max(keys, held)
+            else:
+                buttons = max(buttons, held)
         return observation_complete(
             relevant_events=relevant,
             unexpected_events=unexpected,
-            held_keys=max(keys, len(self.held_keys)),
-            held_buttons=max(buttons, len(self.held_buttons)),
+            held_keys=keys,
+            held_buttons=buttons,
         )
 
     def close(self) -> None:

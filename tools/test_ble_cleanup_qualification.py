@@ -332,6 +332,109 @@ class BleCleanupQualificationTests(unittest.TestCase):
 
 
 class PhysicalRunnerAdapterTests(unittest.TestCase):
+    @staticmethod
+    def event(event_type: int, code: int, value: int) -> rehearsal.Event:
+        return rehearsal.Event((0, 0, event_type, code, value))
+
+    def observer_outcome(
+        self,
+        keyboard_reads,
+        mouse_reads,
+        *,
+        phase=BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED,
+        retirement=True,
+        keyboard_held=0,
+        mouse_held=0,
+    ):
+        keyboard = mock.Mock(role="keyboard", held_count=mock.Mock(return_value=keyboard_held))
+        keyboard.read.side_effect = keyboard_reads
+        mouse = mock.Mock(role="mouse", held_count=mock.Mock(return_value=mouse_held))
+        mouse.read.side_effect = mouse_reads
+        return rehearsal.ExactObservers(keyboard, mouse).collect(
+            1, phase=phase, retirement=retirement
+        )
+
+    def test_retirement_preserves_unexpected_keyboard_evidence(self) -> None:
+        unexpected = self.event(rehearsal.EV_KEY, 30, 1)
+        outcome = self.observer_outcome(
+            [[unexpected], OSError(errno.ENODEV, "gone")], [[], []]
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.EXPECTED_DEVICE_RETIRED)
+        self.assertEqual(outcome.unexpected_events, 1)
+        fixture = CleanupFixture()
+        fixture.retirement = outcome
+        with self.assertRaisesRegex(QualificationError, "unexpected held input"):
+            fixture.run()
+
+    def test_retirement_preserves_held_f24_evidence(self) -> None:
+        down = self.event(rehearsal.EV_KEY, rehearsal.KEY_F24, 1)
+        outcome = self.observer_outcome(
+            [[down], OSError(errno.ENODEV, "gone")], [[], []]
+        )
+        self.assertEqual(outcome.relevant_events, 1)
+        self.assertEqual(outcome.held_keys, 1)
+        fixture = CleanupFixture()
+        fixture.retirement = outcome
+        with self.assertRaisesRegex(QualificationError, "unexpected held input"):
+            fixture.run()
+
+    def test_clean_retirement_keeps_zero_evidence(self) -> None:
+        outcome = self.observer_outcome(
+            [OSError(errno.ENODEV, "gone")], [[]]
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.EXPECTED_DEVICE_RETIRED)
+        self.assertEqual(
+            (outcome.relevant_events, outcome.unexpected_events,
+             outcome.held_keys, outcome.held_buttons),
+            (0, 0, 0, 0),
+        )
+
+    def test_retirement_preserves_unexpected_mouse_evidence(self) -> None:
+        movement = self.event(rehearsal.EV_REL, rehearsal.REL_X, 1)
+        outcome = self.observer_outcome(
+            [[], []], [[movement], OSError(errno.ENODEV, "gone")]
+        )
+        self.assertEqual(outcome.unexpected_events, 1)
+
+    def test_final_held_query_failure_preserves_prior_evidence(self) -> None:
+        unexpected = self.event(rehearsal.EV_KEY, 30, 1)
+        keyboard = mock.Mock(role="keyboard")
+        keyboard.read.return_value = [unexpected]
+        keyboard.held_count.return_value = 1
+        mouse = mock.Mock(role="mouse")
+        mouse.read.return_value = []
+        mouse.held_count.side_effect = OSError(errno.ENODEV, "gone")
+        observer = rehearsal.ExactObservers(keyboard, mouse)
+        with mock.patch.object(
+            rehearsal.time, "monotonic", side_effect=[0, 0, 0, 0, 2]
+        ):
+            outcome = observer.collect(
+                1,
+                phase=BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED,
+                retirement=True,
+            )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.EXPECTED_DEVICE_RETIRED)
+        self.assertEqual(outcome.unexpected_events, 1)
+        self.assertEqual(outcome.held_keys, 1)
+
+    def test_observer_io_error_preserves_prior_evidence(self) -> None:
+        down = self.event(rehearsal.EV_KEY, rehearsal.KEY_F24, 1)
+        outcome = self.observer_outcome(
+            [[down], OSError(errno.EIO, "io")], [[], []]
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
+        self.assertEqual((outcome.relevant_events, outcome.held_keys), (1, 1))
+
+    def test_pre_retirement_loss_preserves_prior_evidence(self) -> None:
+        unexpected = self.event(rehearsal.EV_KEY, 30, 1)
+        outcome = self.observer_outcome(
+            [[unexpected], OSError(errno.ENODEV, "gone")], [[], []],
+            phase=BleCleanupPhase.PRE_RETIREMENT_CLEANUP,
+            retirement=False,
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.UNEXPECTED_DEVICE_LOSS)
+        self.assertEqual(outcome.unexpected_events, 1)
+
     def test_all_up_queries_preexisting_kernel_key_state(self) -> None:
         observer = rehearsal.Observer(Path("/unused"), "keyboard")
         observer.fd = 123

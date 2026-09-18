@@ -115,6 +115,9 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
             return validation_result;
         }
         if (advertising_result == 0) {
+            hidden_exposure_requested = false;
+            hidden_exposure_barrier_passed = false;
+            hidden_exposure_termination_claimed = false;
             ++advertising_calls;
             if (advertising_hook != nullptr) { advertising_hook(*this); }
         }
@@ -127,15 +130,26 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     std::int32_t begin_hidden_exposure() override {
         ++stop_calls;
         if (stop_result != 0) return stop_result;
-        if (physical_connection != ble_lifecycle::kNoConnection)
+        hidden_exposure_requested = true;
+        hidden_exposure_barrier_passed = auto_hidden_exposure_barrier;
+        hidden_exposure_termination_claimed = false;
+        if (physical_connection != ble_lifecycle::kNoConnection) {
+            hidden_exposure_termination_claimed = true;
             return disconnect(physical_connection);
+        }
         return 0;
     }
     bool physical_exposure_hidden() const override {
-        return physical_connection == ble_lifecycle::kNoConnection && !physical_advertising;
+        return hidden_exposure_requested && hidden_exposure_barrier_passed &&
+               physical_connection == ble_lifecycle::kNoConnection &&
+               !physical_advertising;
     }
     std::uint16_t physical_connection = ble_lifecycle::kNoConnection;
     bool physical_advertising = false;
+    bool hidden_exposure_requested = false;
+    bool hidden_exposure_barrier_passed = false;
+    bool hidden_exposure_termination_claimed = false;
+    bool auto_hidden_exposure_barrier = true;
     std::int32_t disconnect(std::uint16_t connection_handle) override {
         ++disconnect_calls;
         last_connection = connection_handle;
@@ -390,8 +404,14 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
                 generation, connection,
                 kind == hid_control_executor::BleEventKind::kStorageFailure);
         }
-        if (kind == hid_control_executor::BleEventKind::kConnect && status == 0)
+        if (kind == hid_control_executor::BleEventKind::kConnect && status == 0) {
             physical_connection = connection;
+            if (hidden_exposure_requested &&
+                !hidden_exposure_termination_claimed) {
+                hidden_exposure_termination_claimed = true;
+                (void)disconnect(connection);
+            }
+        }
         if (kind == hid_control_executor::BleEventKind::kDisconnect && physical_connection == connection)
             physical_connection = ble_lifecycle::kNoConnection;
         return sink->signal_ble_event({.kind = kind,
@@ -2000,6 +2020,50 @@ void test_hidden_exposure_waits_for_unadopted_physical_peer() {
     assert(ble.advertising_calls == 1);
 }
 
+void test_hidden_exposure_fences_connection_complete_before_insertion() {
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(hid_control_executor::BleEventKind::kSync));
+    assert(controller.process_one_for_test());
+
+    // The controller has accepted Connection Complete but the NimBLE host has
+    // not inserted the connection or invoked the application callback yet.
+    ble.auto_hidden_exposure_barrier = false;
+    assert(controller.request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kDisabling);
+    assert(ble.disconnect_calls == 0);
+
+    // Registration and the callback occur before the queued host barrier.
+    // The callback owns one exact teardown request and the late Connect cannot
+    // be adopted by the hidden lifecycle generation.
+    assert(ble.event(hid_control_executor::BleEventKind::kConnect, 215));
+    assert(ble.disconnect_calls == 1 && ble.last_connection == 215);
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kDisabling);
+    ble.hidden_exposure_barrier_passed = true;
+    controller.drive_ble_disable_for_test();
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kDisabling);
+
+    assert(ble.event(hid_control_executor::BleEventKind::kDisconnect, 215));
+    assert(controller.process_one_for_test());
+    controller.drive_ble_disable_for_test();
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kIdle);
+    assert(ble.disconnect_calls == 1);
+}
+
 void test_hidden_exposure_disconnect_needs_physical_absence() {
     hid_runtime::Runtime runtime; FakeBackend usb; FakeBleBackend ble;
     FakeBleDatabase database; hid_control_executor::Controller controller;
@@ -2028,7 +2092,7 @@ void test_hidden_exposure_disconnect_needs_physical_absence() {
 }
 
 void test_hidden_exposure_deadline_and_generation_fail_closed() {
-    for (const bool change_generation : {false,true}) {
+    for (const int scenario : {0, 1, 2}) {
         hid_runtime::Runtime runtime; FakeBackend usb; FakeBleBackend ble;
         FakeBleDatabase database; hid_control_executor::Controller controller;
         assert(controller.initialize(&runtime,&usb,&ble,&database));
@@ -2036,17 +2100,23 @@ void test_hidden_exposure_deadline_and_generation_fail_closed() {
         assert(controller.process_one_for_test());
         assert(ble.event(hid_control_executor::BleEventKind::kSync));
         assert(controller.process_one_for_test());
-        ble.physical_connection=212;
+        if (scenario == 2) {
+            // Connection Complete acceptance never reaches registration or
+            // the host-queue barrier. Zero enumerated peers is insufficient.
+            ble.auto_hidden_exposure_barrier = false;
+        } else {
+            ble.physical_connection=212;
+        }
         assert(controller.request_ble_disable().action_result == ble_lifecycle::TransitionResult::kAccepted);
         assert(controller.process_one_for_test());
-        if (change_generation) controller.set_ble_generation_for_test(controller.ble_snapshot().generation+1);
+        if (scenario == 1) controller.set_ble_generation_for_test(controller.ble_snapshot().generation+1);
         else ble.now_us += 5'000'000;
         controller.drive_ble_disable_for_test();
         assert(controller.ble_snapshot().observed == ble_lifecycle::ObservedState::kFault);
         assert(controller.ble_snapshot().recovery_required);
         assert(controller.ble_snapshot().desired == ble_lifecycle::DesiredExposure::kHidden);
         assert(controller.active_operation_for_test() == ControlOperation::kNone);
-        assert(ble.disconnect_calls==1);
+        assert(ble.disconnect_calls == (scenario == 2 ? 0 : 1));
     }
 }
 
@@ -7535,6 +7605,12 @@ void test_profile_restart_hidden_and_exact_incarnation() {
     controller.process_for_test(Action::with_ble_event({.kind = Event::kSync,
         .generation = controller.ble_snapshot().generation, .stack_incarnation = 0}));
     assert(!controller.profile_snapshot().active_present);
+    const auto orphan_terminations = ble.orphan_terminate_calls;
+    controller.process_for_test(Action::with_ble_event({.kind = Event::kConnect,
+        .generation = controller.ble_snapshot().generation,
+        .connection_handle = 0x77, .stack_incarnation = 0}));
+    assert(!controller.ble_snapshot().connected);
+    assert(ble.orphan_terminate_calls == orphan_terminations);
     assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
     assert(controller.profile_snapshot().active_present);
     assert(controller.profile_snapshot().selected == ProfileId::kStandaloneMouseJustWorks);
@@ -8008,6 +8084,7 @@ int main(int argc, char **argv) {
     test_ble_lifecycle_is_shared_serialized_and_transport_independent();
     test_ble_disable_expected_disconnect_and_retained_stack();
     test_hidden_exposure_waits_for_unadopted_physical_peer();
+    test_hidden_exposure_fences_connection_complete_before_insertion();
     test_hidden_exposure_deadline_and_generation_fail_closed();
     test_hidden_exposure_disconnect_needs_physical_absence();
     test_ble_disable_preserves_active_usb_route_and_reports();

@@ -56,6 +56,10 @@ def classify_observer_error(
     phase: BleCleanupPhase,
     exact_device: bool,
     retirement_requested: bool,
+    relevant_events: int = 0,
+    unexpected_events: int = 0,
+    held_keys: int = 0,
+    held_buttons: int = 0,
 ) -> ObserverOutcome:
     """Classify one exact observer failure without broadly suppressing OSError."""
 
@@ -68,7 +72,15 @@ def classify_observer_error(
         status = ObserverTerminalStatus.UNEXPECTED_DEVICE_LOSS
     else:
         status = ObserverTerminalStatus.OBSERVER_IO_ERROR
-    return ObserverOutcome(status, exact_device, error_name=error_name)
+    return ObserverOutcome(
+        status,
+        exact_device,
+        error_name=error_name,
+        relevant_events=relevant_events,
+        unexpected_events=unexpected_events,
+        held_keys=held_keys,
+        held_buttons=held_buttons,
+    )
 
 
 def observation_complete(
