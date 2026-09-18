@@ -85,6 +85,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("idf.py flash", self.build)
         self.assertNotIn("--hardware", self.build)
 
+    def test_release_static_guards_install_selected_source_host_dependencies(self) -> None:
+        static_step = self.build.split(
+            "      - name: Enforce release version authority and static guards\n", 1
+        )[1].split("      - name: Build and compare two independent firmware archives\n", 1)[0]
+        install = "python3 -m pip install --disable-pip-version-check --no-input ./host"
+        self.assertIn(install, static_step)
+        self.assertLess(static_step.index(install), static_step.index("./tools/test-static.sh"))
+
     def test_dispatch_inputs_and_checkout_selector_are_fail_closed(self) -> None:
         self.assertIn("expected_commit:", self.build)
         self.assertRegex(
