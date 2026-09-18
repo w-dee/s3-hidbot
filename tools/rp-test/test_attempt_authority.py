@@ -74,6 +74,9 @@ class AuthorityTests(unittest.TestCase):
             if not path.exists(): path.write_bytes(c.encode(data)); path.chmod(0o400)
         return value
 
+    def activate(self):
+        return self.service.activate(self.handle, self.uid)
+
     def seal(self,value): return self.service.seal(self.handle,self.uid,c.digest(value))
 
     def no_commit(self): self.assertFalse((self.attempt/'commit.json').exists())
@@ -157,6 +160,7 @@ print(spec.origin)
         with self.assertRaises(c.EvidenceError): self.service.load(self.handle,self.uid)
 
     def test_request_authority(self):
+        self.activate()
         env=self.service.load(self.handle,self.uid)['request']; env=copy.deepcopy(env)
         env['attempt_authority_sha256']='f'*64
         with self.assertRaises(c.EvidenceError): a.capture_request(env)
@@ -236,7 +240,7 @@ print(spec.origin)
     def test_failure_never_upgrades(self):
         class Failed:
             def operate(self,req,**kwargs): return fixture(req,status='FAILED')
-        self.service.producer_override=Failed(); prepared=self.prepare()
+        self.activate(); self.service.producer_override=Failed(); prepared=self.prepare()
         self.service.producer_override=FixtureProducer()
         self.assertEqual(self.service.prepare(self.handle,self.uid),prepared)
         self.assertEqual(self.seal(prepared)['code'],'EVIDENCE_FINALIZATION_FAILED')
@@ -302,7 +306,7 @@ print(spec.origin)
         self.no_commit()
 
     def test_q8_and_coordinator_real_boundary(self):
-        events=[]; env=self.service.load(self.handle,self.uid)['request']
+        events=[]; self.activate(); env=self.service.load(self.handle,self.uid)['request']
         class Session:
             def __init__(self,req): self.req=req
             def start(self): events.append('start'); return self
@@ -311,6 +315,7 @@ print(spec.origin)
         self.assertEqual(events,['start','pair','stop']); self.assertEqual(value['counts'],COUNTS)
         def rpc(operation,handle,payload=None):
             if operation=='load': return self.service.load(handle,self.uid)
+            if operation=='activate': return self.service.activate(handle,self.uid)
             if operation=='record': return self.service.record(handle,self.uid,**payload)
             if operation=='prepare': return self.service.prepare(handle,self.uid)
             if operation=='seal': return self.service.seal(handle,self.uid,payload)
@@ -322,6 +327,59 @@ print(spec.origin)
         source=(HERE.parent/'qualification_campaign'/'q8_host_security.py').read_text()
         self.assertIn('capture_pair(package_request()',source)
         self.assertNotIn('S3_EVIDENCE_PACKAGE',source)
+
+    def test_empty_evidence_set_is_finalized_test_failure(self):
+        prepared = self.prepare('FAIL')
+        evidence = prepared['files']['evidence.json']
+        self.assertEqual(evidence, {'handle': self.handle, 'required': False,
+                                   'status': 'FINALIZED', 'receipt': None, 'error': None})
+        commit = self.seal(prepared)
+        self.assertEqual((commit['test'], commit['evidence'], commit['code']),
+                         ('FAIL', 'FINALIZED', 'TEST_FAILED'))
+
+    def test_q8_evidence_activation_is_immutable_and_required(self):
+        request = self.activate()
+        self.assertEqual(request, self.service.load(self.handle, self.uid)['request'])
+        self.assertEqual(self.activate(), request)
+        prepared = self.prepare('FAIL')
+        self.assertTrue(prepared['files']['evidence.json']['required'])
+
+    def test_required_finalized_evidence_and_test_failure_is_test_failed(self):
+        self.activate()
+        prepared = self.prepare('FAIL')
+        self.assertEqual(prepared['files']['evidence.json']['status'], 'FINALIZED')
+        self.assertTrue(prepared['files']['evidence.json']['required'])
+        self.assertEqual(self.seal(prepared)['code'], 'TEST_FAILED')
+
+    def test_required_evidence_failure_overrides_test_pass(self):
+        class Failed:
+            def operate(self, req, **kwargs): return fixture(req, status='FAILED')
+        self.activate(); self.service.producer_override = Failed()
+        prepared = self.prepare('PASS')
+        self.assertEqual(self.seal(prepared)['code'], 'EVIDENCE_FINALIZATION_FAILED')
+
+    def test_required_evidence_and_test_failure_preserves_both(self):
+        class Failed:
+            def operate(self, req, **kwargs): return fixture(req, status='FAILED')
+        self.activate(); self.service.producer_override = Failed()
+        prepared = self.prepare('FAIL')
+        commit = self.seal(prepared)
+        self.assertEqual((commit['test'], commit['evidence'], commit['code']),
+                         ('FAIL', 'FAILED', 'EVIDENCE_FINALIZATION_FAILED'))
+
+    def test_capture_without_activation_is_rejected(self):
+        envelope = self.service.load(self.handle, self.uid)['request']
+        with self.assertRaisesRegex(c.EvidenceError, 'EVIDENCE_NOT_REQUIRED'):
+            self.service.capture(envelope, self.uid, capture=True)
+
+    def test_official_pass_cannot_omit_q8_evidence_activation(self):
+        run = p.new_id()
+        response = self.service.begin(self.runtime_id, run, 'OFFICIAL_FNK0099_V0_4_0',
+                                      self.uid, 2)
+        handle = response['handle']
+        self.service.record(handle, self.uid, 'PASS', {'phases': 'synthetic'})
+        with self.assertRaisesRegex(c.EvidenceError, 'OFFICIAL_EVIDENCE_NOT_ACTIVATED'):
+            self.service.prepare(handle, self.uid)
 
     def test_q8_stops_on_pair_failure(self):
         events=[]

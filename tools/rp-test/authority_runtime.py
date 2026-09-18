@@ -1,4 +1,4 @@
-"""Protected source runtime and immutable v3 authority vocabulary (no site startup)."""
+"""Protected source runtime and immutable v4 authority vocabulary (no site startup)."""
 from __future__ import annotations
 import hashlib
 import importlib.abc
@@ -10,8 +10,8 @@ import stat
 import sys
 import evidence_contract as c
 
-INSTALL = Path('/usr/local/lib/s3-hidbot-authority-v3')
-STATE = Path('/var/lib/s3-hidbot-authority-v3')
+INSTALL = Path('/usr/local/lib/s3-hidbot-authority-v4')
+STATE = Path('/var/lib/s3-hidbot-authority-v4')
 ENGINE = ('authority_service.py', 'authority_runtime.py', 'runtime_launcher.py',
           'evidence_contract.py', 'privileged_evidence.py')
 PRODUCT = dict(commit='8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad',

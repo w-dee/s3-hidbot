@@ -2,14 +2,17 @@
 """Future official coordinator. Preparing a bundle never starts qualification."""
 from __future__ import annotations
 import argparse
+from datetime import datetime, timezone
 import os
 from pathlib import Path
+import secrets
 import subprocess
 import sys
 import time
 
 import evidence_contract as c
-from evidence_pipeline import create_package, finalize_terminal_package, sha, verify_attempt, phase_command
+from evidence_pipeline import (create_package, finalize_terminal_package, sha,
+                               verify_attempt, phase_command, preflight_command)
 
 EXPECTED_ARCHIVE = 'db7c9afec9ba2a6ec210ebffc030ac61542079d7e4a29db5d026d3c542e3ece9'
 EXPECTED_COMMIT = '8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad'
@@ -26,19 +29,40 @@ def finish(package, passed, details, **test_seams):
                                      details=details, **test_seams)
 
 
+def normalized_preflight(artifact, base):
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + secrets.token_hex(6)
+    output = base / ('preflight-' + stamp + '.json')
+    proc = subprocess.run(preflight_command('official_preflight.py', '--official-preflight',
+                          '--artifact', artifact, '--evidence', output),
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        result = c.decode(output.read_bytes())
+    except (OSError, c.EvidenceError):
+        result = {'result': 'MISSING'}
+    c.need(proc.returncode == 0 and result.get('result') == 'PASS'
+           and result.get('reset_count') == 1
+           and result.get('post_reset', {}).get('profile') == 'strict_composite',
+           'OFFICIAL_PREFLIGHT_FAILED')
+    return result
+
+
 def run(artifact, base):
     c.need(sha(artifact) == EXPECTED_ARCHIVE, 'ARTIFACT_AUTHORITY_INVALID')
+    preflight = normalized_preflight(artifact, base)
     package = create_package('OFFICIAL_FNK0099_V0_4_0', kind='Q8_HCI', max_seconds=60)
     # Phase outputs are ordinary metadata outside the sealed package. The immutable
     # test journal embeds their full JSON content; root raw is never in this tree.
     outputs = base / (package['run_id'] + '-phase-output'); outputs.mkdir(mode=0o700)
-    details = {'source_commit': EXPECTED_COMMIT, 'archive_sha256': EXPECTED_ARCHIVE, 'phases': []}
+    details = {'source_commit': EXPECTED_COMMIT, 'archive_sha256': EXPECTED_ARCHIVE,
+               'preflight': preflight,
+               'phases': [{'name': name, 'status': 'NOT EXECUTED'} for name, _ in PHASES]}
     print('QUALIFICATION_ATTEMPT_START=' + package['run_id'], flush=True)
     env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'S3_ATTEMPT_AUTHORITY_SHA256': package['attempt_authority_sha256']}
     passed = False
     try:
-        for name, script in PHASES:
+        for index, (name, script) in enumerate(PHASES):
             verify_attempt(package)
+            details['phases'][index]['status'] = 'RUNNING'
             out = outputs / (name + '.json')
             proc = subprocess.run(phase_command(package, script, 'official', artifact, out),
                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -46,7 +70,8 @@ def run(artifact, base):
                 result = c.decode(out.read_bytes())
             except (OSError, c.EvidenceError):
                 result = {'result': 'MISSING'}
-            details['phases'].append({'name': name, 'returncode': proc.returncode, 'result': result})
+            details['phases'][index].update(returncode=proc.returncode, result=result,
+                                            status='PASS' if proc.returncode == 0 and result.get('result') == 'PASS' else 'FAIL')
             if proc.returncode != 0 or result.get('result') != 'PASS':
                 break
         else:

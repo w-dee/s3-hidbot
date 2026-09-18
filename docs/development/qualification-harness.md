@@ -31,6 +31,11 @@ The implementation is intentionally split into small components:
   are the maintained future official coordinator and Q8 integration. Their
   bundle preparation freezes the remaining audited phase snapshot, plan and
   exact boundary source. Preparing a bundle does not authorize qualification.
+- `tools/qualification_campaign/official_preflight.py` is the protected
+  nonqualification start gate. It verifies the running identity, performs one
+  controlled application reset even from an already-strict state, reacquires a
+  fresh session, and requires the strict boot default plus route, HID, BLE, USB,
+  bond and host safety postconditions before an attempt package can be created.
 - `tools/qualification_runner.py` is a thin preflight entrypoint. Later U7.6D
   scenario orchestration should compose the modules rather than grow this
   entrypoint into a single campaign script.

@@ -29,24 +29,28 @@ def main():
         p.rpc=rpc; a.STATE=fixture.state; sys._s3_runtime=(fixture.runtime_id,fixture.snapshot['runtime'])
         try:
             codes=[]
-            for outcome,mode in ((True,'normal'),(False,'normal'),(True,'bad')):
+            for outcome,mode in ((True,'normal'),(False,'normal'),(True,'bad'),(False,'empty')):
                 handle=p.create_package(a.CLASSIFICATION,max_seconds=2)
-                env=p.package_request(handle)
-                class Session:
-                    def __init__(self,request): self.request=request
-                    def start(self):
-                        stream.write(c.encode({'operation':'capture-'+mode,'handle':handle,'payload':self.request}))
-                        ready=c.decode(stream.readline()); c.need(ready['request']==self.request['request'],'READY_INVALID')
-                        return self
-                    def stop(self):
-                        stream.write(c.encode({'command':'STOP'}))
-                        return c.receipt(c.decode(stream.readline()),self.request['request'])
-                try: q8_capture.capture_pair(env,lambda:None,_session=Session)
-                except c.EvidenceError: c.need(mode=='bad','CAPTURE_FAILED')
+                if mode != 'empty':
+                    env=p.package_request(handle)
+                    class Session:
+                        def __init__(self,request): self.request=request
+                        def start(self):
+                            stream.write(c.encode({'operation':'capture-'+mode,'handle':handle,'payload':self.request}))
+                            ready=c.decode(stream.readline()); c.need(ready['request']==self.request['request'],'READY_INVALID')
+                            return self
+                        def stop(self):
+                            stream.write(c.encode({'command':'STOP'}))
+                            return c.receipt(c.decode(stream.readline()),self.request['request'])
+                    try: q8_capture.capture_pair(env,lambda:None,_session=Session)
+                    except c.EvidenceError: c.need(mode=='bad','CAPTURE_FAILED')
                 raw=fixture.state/'captures'/handle['run_id']/handle['capture_id']/'raw-hci'
                 final=fixture.state/'attempts'/handle['run_id']/'package'/'index.json'
-                for operation in (lambda:raw.read_bytes(),lambda:raw.chmod(0o644),
-                                  lambda:(fixture.root/'q8_capture.py').write_text('bad'),
+                for operation in ((lambda:raw.read_bytes(),lambda:raw.chmod(0o644)) if mode != 'empty' else ()):
+                    try: operation()
+                    except PermissionError: pass
+                    else: raise AssertionError('ordinary user changed protected authority')
+                for operation in (lambda:(fixture.root/'q8_capture.py').write_text('bad'),
                                   lambda:(fixture.root/'injected.pyc').write_bytes(b'bad')):
                     try: operation()
                     except PermissionError: pass
@@ -58,7 +62,7 @@ def main():
                     except PermissionError: pass
                     else: raise AssertionError('ordinary user accessed private sealed package')
                 codes.append(commit['code'])
-            c.need(codes==['SUCCESS','TEST_FAILED','EVIDENCE_FINALIZATION_FAILED'],'OUTCOME_INVALID')
+            c.need(codes==['SUCCESS','TEST_FAILED','EVIDENCE_FINALIZATION_FAILED','TEST_FAILED'],'OUTCOME_INVALID')
             stream.write(c.encode({'done':codes})); os._exit(0)
         except BaseException:
             import traceback
@@ -74,6 +78,7 @@ def main():
             if operation=='begin':
                 result=service.begin(payload['runtime_id'],handle['run_id'],payload['classification'],65534,payload['max_seconds'])
             elif operation=='load': result=service.load(handle,65534)
+            elif operation=='activate': result=service.activate(handle,65534)
             elif operation.startswith('capture-'):
                 req=payload['request']
                 service.producer_override=h.Producer(fixture.state/'captures',req['helper'],

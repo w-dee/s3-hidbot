@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed-root v3 attempt journal, capture and bounded metadata sealer."""
+"""Fixed-root v4 attempt journal, optional capture set and metadata sealer."""
 from __future__ import annotations
 import contextlib
 import fcntl
@@ -17,7 +17,7 @@ import types
 
 # Executed with -I -S: bootstrap only protected source, never local bytecode.
 def bootstrap(name):
-    path = Path('/usr/local/lib/s3-hidbot-authority-v3') / (name + '.py')
+    path = Path('/usr/local/lib/s3-hidbot-authority-v4') / (name + '.py')
     for parent in (path, *path.parents):
         s = parent.lstat()
         if s.st_uid != 0 or s.st_mode & 0o022 or stat.S_ISLNK(s.st_mode):
@@ -198,8 +198,20 @@ class Authority:
         with self.locked(expected['run_id']) as d:
             _, req = self.load_locked(d, expected, uid)
             c.need(envelope == req, 'AUTHORITY_CONFLICT')
+            activation = optional(d, 'evidence-required.json', self.owner)
+            c.need(activation == {'handle': expected, 'request': req}, 'EVIDENCE_NOT_REQUIRED')
             return c.receipt(self.producer(req['request']).operate(req['request'], capture=capture,
                 ready=ready, control=control), req['request'])
+
+    def activate(self, expected, uid):
+        with self.locked(expected['run_id']) as d:
+            _, req = self.load_locked(d, expected, uid)
+            c.need(optional(d, 'test.json', self.owner) is None
+                   and optional(d, 'evidence.json', self.owner) is None,
+                   'EVIDENCE_ACTIVATION_TOO_LATE')
+            write(d, 'evidence-required.json', {'handle': expected, 'request': req}, self.owner)
+            self.cut('evidence_required')
+            return req
 
     def record(self, expected, uid, outcome, details):
         c.need(outcome in ('PASS', 'FAIL'), 'TEST_OUTCOME_INVALID')
@@ -216,11 +228,24 @@ class Authority:
             c.need(test['handle'] == expected, 'AUTHORITY_CONFLICT')
             evidence = optional(d, 'evidence.json', self.owner)
             if evidence is None:
-                try:
-                    receipt = c.receipt(self.producer(req['request']).operate(req['request']), req['request'])
-                    evidence = {'handle': expected, 'status': receipt['status'], 'receipt': receipt, 'error': receipt['error']}
-                except (c.EvidenceError, OSError, subprocess.SubprocessError):
-                    evidence = {'handle': expected, 'status': 'FAILED', 'receipt': None, 'error': 'CAPTURE_VERIFY_FAILED'}
+                activation = optional(d, 'evidence-required.json', self.owner)
+                if activation is not None:
+                    c.need(activation == {'handle': expected, 'request': req}, 'AUTHORITY_CONFLICT')
+                required = activation is not None
+                c.need(not (snapshot['classification'] == 'OFFICIAL_FNK0099_V0_4_0'
+                           and test['outcome'] == 'PASS' and not required),
+                       'OFFICIAL_EVIDENCE_NOT_ACTIVATED')
+                if not required:
+                    evidence = {'handle': expected, 'required': False, 'status': 'FINALIZED',
+                                'receipt': None, 'error': None}
+                else:
+                    try:
+                        receipt = c.receipt(self.producer(req['request']).operate(req['request']), req['request'])
+                        evidence = {'handle': expected, 'required': True, 'status': receipt['status'],
+                                    'receipt': receipt, 'error': receipt['error']}
+                    except (c.EvidenceError, OSError, subprocess.SubprocessError):
+                        evidence = {'handle': expected, 'required': True, 'status': 'FAILED',
+                                    'receipt': None, 'error': 'CAPTURE_VERIFY_FAILED'}
                 write(d, 'evidence.json', evidence, self.owner)
             c.need(evidence['handle'] == expected, 'AUTHORITY_CONFLICT')
             if evidence['receipt'] is not None: c.receipt(evidence['receipt'], req['request'])
@@ -262,7 +287,11 @@ class Authority:
             c.need(files['test.json'] == read(d, 'test.json', self.owner) and
                    files['evidence.json'] == read(d, 'evidence.json', self.owner), 'AUTHORITY_CONFLICT')
             evidence = files['evidence.json']
-            if evidence['status'] == 'FINALIZED':
+            activation = optional(d, 'evidence-required.json', self.owner)
+            if activation is not None:
+                c.need(activation == {'handle': expected, 'request': req}, 'AUTHORITY_CONFLICT')
+            c.need(evidence['required'] == (activation is not None), 'EVIDENCE_PLAN_CHANGED')
+            if evidence['status'] == 'FINALIZED' and evidence['receipt'] is not None:
                 current = self.producer(req['request']).operate(req['request'])
                 c.need(c.receipt(current, req['request']) == evidence['receipt'], 'EVIDENCE_CHANGED')
             prior = optional(d, 'commit.json', self.owner)
@@ -317,6 +346,8 @@ def main():
             c.need(payload is None,'PAYLOAD_INVALID'); result=service.resume(run,uid)
         elif operation == 'load':
             c.need(payload is None, 'PAYLOAD_INVALID'); result = service.load(expected, uid)
+        elif operation == 'activate':
+            c.need(payload is None, 'PAYLOAD_INVALID'); result = service.activate(expected, uid)
         elif operation in ('capture', 'verify'):
             c.need(payload['handle'] == expected, 'AUTHORITY_CONFLICT')
             def control(process):

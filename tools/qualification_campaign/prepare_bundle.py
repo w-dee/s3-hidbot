@@ -9,23 +9,27 @@ sys.path.insert(0,str(HERE.parent / 'rp-test'))
 import evidence_contract as c
 import authority_runtime as a
 
+EXPECTED_BASE_PLAN = 'd18126b4a3418bbb0db24b280faebcca0f854cf9e9d92460d155fdd0e0469f44'
+ADDENDUM = HERE / 'qualification-plan-v4-addendum.md'
+
 
 def prepare(source, destination, plan):
     c.need(not destination.exists(), 'DESTINATION_EXISTS')
+    c.need(a.sha(plan.read_bytes()) == EXPECTED_BASE_PLAN, 'BASE_PLAN_AUTHORITY_INVALID')
     shutil.copytree(source,destination,ignore=shutil.ignore_patterns('__pycache__','*.pyc','*.pyo',
         'FROZEN.json','BUNDLE.json','RUNNER_DIGEST','TOOLSHA256SUMS'))
-    for name in ('official_campaign.py','q8_host_security.py','q8_capture.py'):
+    for name in ('official_campaign.py','official_preflight.py','q8_host_security.py','q8_capture.py'):
         shutil.copyfile(HERE / name, destination / name)
     for name in ('evidence_pipeline.py','evidence_rehearsal.py','evidence_resume.py',*a.ENGINE):
         shutil.copyfile(HERE.parent / 'rp-test' / name,destination / name)
-    shutil.copyfile(plan,destination / 'qualification-plan.md')
+    (destination / 'qualification-plan.md').write_bytes(plan.read_bytes() + ADDENDUM.read_bytes())
     (destination / 'runtime_probe.py').write_text(
         "import json, q8_capture, hidbot.client, hidbot.serial_transport, dbus, gi\n"
         "print(json.dumps({m.__name__: {'file': m.__file__, 'loader': type(m.__loader__).__name__} for m in (q8_capture,hidbot.client,hidbot.serial_transport,dbus,gi)}))\n")
     engine = {name:a.sha((HERE.parent / 'rp-test' / name).read_bytes()) for name in a.ENGINE}
     frozen = {'schema':3, 'product':a.PRODUCT, 'engine':engine,
               'coordinator':a.sha((destination / 'official_campaign.py').read_bytes()),
-              'plan':a.sha(plan.read_bytes())}
+              'plan':a.sha((destination / 'qualification-plan.md').read_bytes())}
     (destination / 'FROZEN.json').write_bytes(c.encode(frozen))
     rows = a.membership(destination)
     manifest = {'schema':3,'files':rows,'engine':engine,'product':a.PRODUCT,

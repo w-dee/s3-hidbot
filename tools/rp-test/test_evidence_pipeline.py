@@ -98,7 +98,7 @@ class ContractTests(unittest.TestCase):
     def test_exact_invocation(self):
         argv = p.command('capture', HANDLE)
         self.assertEqual(argv[:7], ['/usr/bin/sudo','-n','/usr/bin/python3','-I','-S','-B',
-                                   '/usr/local/lib/s3-hidbot-authority-v3/authority_service.py'])
+                                   '/usr/local/lib/s3-hidbot-authority-v4/authority_service.py'])
         self.assertEqual(argv[7:], ['capture', REQ['run_id']])
         self.assertEqual(h.ENV, {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'})
 

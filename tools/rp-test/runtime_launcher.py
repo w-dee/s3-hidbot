@@ -8,7 +8,7 @@ import types
 
 
 def bootstrap(name):
-    path = Path('/usr/local/lib/s3-hidbot-authority-v3') / (name + '.py')
+    path = Path('/usr/local/lib/s3-hidbot-authority-v4') / (name + '.py')
     for parent in (path, *path.parents):
         s = parent.lstat()
         if s.st_uid != 0 or s.st_mode & 0o022 or stat.S_ISLNK(s.st_mode):
@@ -36,7 +36,7 @@ def main():
         p.verify_attempt(handle)
         sys._s3_attempt = handle
     else:
-        c.need(entry in ('official_campaign.py', 'evidence_rehearsal.py', 'runtime_probe.py', 'evidence_resume.py'), 'ATTEMPT_REQUIRED')
+        c.need(entry in ('official_campaign.py', 'official_preflight.py', 'evidence_rehearsal.py', 'runtime_probe.py', 'evidence_resume.py'), 'ATTEMPT_REQUIRED')
     c.need(entry in manifest['files'] and '/' not in entry and entry.endswith('.py'), 'ENTRY_INVALID')
     path = root / entry; data = a.source(path)
     c.need(a.sha(data) == manifest['files'][entry], 'EXECUTED_SOURCE_CHANGED')

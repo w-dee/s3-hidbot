@@ -1,4 +1,4 @@
-"""Ordinary coordinator: immutable v3 handle, root metadata RPC, no raw access."""
+"""Ordinary coordinator: immutable v4 handle, root metadata RPC, no raw access."""
 from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
@@ -23,7 +23,7 @@ def new_id(): return datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-'
 
 def command(operation, handle):
     a.handle(handle)
-    c.need(operation in ('begin','resume','load','capture','verify','record','prepare','seal'), 'OPERATION_INVALID')
+    c.need(operation in ('begin','resume','load','activate','capture','verify','record','prepare','seal'), 'OPERATION_INVALID')
     return ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-S', '-B',
             str(a.INSTALL / 'authority_service.py'), operation, handle['run_id']]
 
@@ -68,7 +68,17 @@ def create_package(classification, *, kind='REHEARSAL_HCI', max_seconds=30):
 def package_request(handle=None):
     if handle is None:
         c.need(hasattr(sys, '_s3_attempt'), 'ATTEMPT_REQUIRED'); handle = sys._s3_attempt
-    return verify_attempt(handle)['request']
+    expected = verify_attempt(handle)['request']
+    activated = rpc('activate', handle)
+    c.need(activated == expected, 'AUTHORITY_CONFLICT')
+    return activated
+
+
+def preflight_command(script, *args):
+    runtime_id, manifest = runtime_context()
+    c.need(script in manifest['files'] and '/' not in script and script.endswith('.py'), 'ENTRY_INVALID')
+    return ['/usr/bin/python3', '-I', '-S', '-B', str(a.INSTALL / 'runtime_launcher.py'),
+            runtime_id, script, '-', *map(str, args)]
 
 
 def verify_capture(envelope):

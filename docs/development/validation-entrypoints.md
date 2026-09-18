@@ -93,8 +93,10 @@ container-oriented artifact static guards. It performs no device, BlueZ,
 network or privileged operations.
 The same entrypoint covers the root-owned HCI evidence contract with injected
 filesystem/process boundaries: stopped-writer ordering, stable hash/stat,
-opaque 0600 raw packaging, PASS/TEST_FAILED terminal packages,
-EVIDENCE_FINALIZATION_FAILED behavior, receipt mismatch, and idempotence. Those
+opaque 0600 raw packaging, finalized empty evidence sets for pre-Q8 failures,
+Q8 activation, PASS/TEST_FAILED terminal packages,
+EVIDENCE_FINALIZATION_FAILED behavior, receipt mismatch, reset-normalized
+official preflight, and idempotence. Those
 tests do not invoke sudo; the separately authorized rp-test rehearsal is the
 real privilege-boundary check.
 Actual appliance bootstrap/cache/doctor commands are separate host-administration

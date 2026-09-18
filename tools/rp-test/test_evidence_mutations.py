@@ -9,6 +9,12 @@ import unittest
 
 HERE=Path(__file__).resolve().parent
 MUTANTS=[
+ ('mandatory-reset','official_preflight.py',"    reset_once()\n    events.append(\"controlled_application_reset\")","    None\n    events.append(\"controlled_application_reset\")",'test_official_preflight.OfficialPreflightTests.test_p1_stale_host_security_profile_resets_to_strict'),
+ ('post-reset-profile-authority','official_preflight.py',"require(final[\"profile\"] == STRICT_PROFILE, \"POST_RESET_PROFILE_NOT_STRICT\")","require(initial[\"profile\"] == STRICT_PROFILE or final[\"profile\"] == STRICT_PROFILE, \"POST_RESET_PROFILE_NOT_STRICT\")",'test_official_preflight.OfficialPreflightTests.test_p5_wrong_post_reset_profile_prohibits_start'),
+ ('wrong-boot-profile','official_preflight.py',"require(final[\"profile\"] == STRICT_PROFILE, \"POST_RESET_PROFILE_NOT_STRICT\")","require(True, \"POST_RESET_PROFILE_NOT_STRICT\")",'test_official_preflight.OfficialPreflightTests.test_p5_wrong_post_reset_profile_prohibits_start'),
+ ('empty-evidence-finalized','authority_service.py',"evidence = {'handle': expected, 'required': False, 'status': 'FINALIZED',","evidence = {'handle': expected, 'required': False, 'status': 'FAILED',",'test_attempt_authority.AuthorityTests.test_empty_evidence_set_is_finalized_test_failure'),
+ ('not-executed-q8-evidence','authority_service.py',"required = activation is not None","required = True",'test_attempt_authority.AuthorityTests.test_empty_evidence_set_is_finalized_test_failure'),
+ ('official-pass-requires-q8','authority_service.py',"c.need(not (snapshot['classification'] == 'OFFICIAL_FNK0099_V0_4_0'","c.need(not (False and snapshot['classification'] == 'OFFICIAL_FNK0099_V0_4_0'",'test_attempt_authority.AuthorityTests.test_official_pass_cannot_omit_q8_evidence_activation'),
  ('root-confinement','evidence_contract.py',"need(matches(RUN, value), 'RUN_ID_INVALID')","need(True, 'RUN_ID_INVALID')",'test_evidence_pipeline.ContractTests.test_namespace_grammar'),
  ('object-pinning','evidence_contract.py',"need(object_identity(entry) == object_identity(current), 'RAW_NAME_CHANGED')","need(True, 'RAW_NAME_CHANGED')",'test_evidence_pipeline.ProducerTests.test_directory_entry_must_match_held_fd'),
  ('commit-order','authority_service.py',"self.cut('before_validation')","write(d, 'commit.json', {'state':'COMMITTED'}, self.owner); self.cut('before_validation')",'test_attempt_authority.AuthorityTests.test_commit_last'),
@@ -40,7 +46,9 @@ class MutationTests(unittest.TestCase):
                 for source in HERE.glob('*.py'): shutil.copyfile(source,rp/source.name)
                 shutil.copytree(HERE.parent/'qualification_campaign',root/'qualification_campaign',
                                 ignore=shutil.ignore_patterns('__pycache__'))
-                path=rp/file; source=path.read_text()
+                path=rp/file
+                if not path.exists(): path=root/'qualification_campaign'/file
+                source=path.read_text()
                 for old,new in zip(before if isinstance(before,list) else [before], after if isinstance(after,list) else [after]):
                     self.assertIn(old,source); source=source.replace(old,new,1)
                 path.write_text(source)

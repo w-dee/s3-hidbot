@@ -1,10 +1,12 @@
-# Qualification evidence authority, version 3
+# Qualification evidence authority, version 4
 
 This boundary changes qualification tooling, with product commit
 `8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad` unchanged. The physical fixture is
-owner-confirmed FNK0099. The previous official FAIL, forensic index, interrupted
-manifest, v1/v2 rehearsals, v2 installation and raw captures are historical and
+owner-confirmed FNK0099. Previous official FAILs, forensic indexes, interrupted
+manifests, v1/v2/v3 rehearsals, v2/v3 installations and raw captures are historical and
 must not be edited or normalized. A rehearsal is never qualification.
+Version 4 uses a separate fixed namespace so installing it cannot replace the
+engine used by either consumed v3 attempt.
 
 ## Authority chain
 
@@ -18,7 +20,8 @@ identity here; root ownership and fixed invocation provide provenance, not a
 claim that an untrusted self-described hash is authenticated.
 
 `prepare_bundle.py` copies the retained reviewed phase source, overlays the
-maintained boundary and copies the unchanged qualification plan. BUNDLE.json
+maintained boundary and appends the reviewed v4 amendment to the exact frozen
+v3 base qualification plan. BUNDLE.json
 lists **every file**, its digest, the product, coordinator, plan, FROZEN and five
 privileged engine module identities. The runtime ID is the SHA-256 of the exact
 canonical BUNDLE.json bytes. FROZEN.json is an ordinary measured member, never
@@ -29,9 +32,9 @@ No generated runtime is committed in the source repository.
 An explicit administrator preparation runs `install_authority_runtime.py
 --bundle BUNDLE`. It writes fixed destinations only:
 
-- `/usr/local/lib/s3-hidbot-authority-v3`: protected engine modules and per-digest
+- `/usr/local/lib/s3-hidbot-authority-v4`: protected engine modules and per-digest
   runtimes, files 0444, runtime directories 0555;
-- `/var/lib/s3-hidbot-authority-v3`: root-owned state; `attempts` and `captures`
+- `/var/lib/s3-hidbot-authority-v4`: root-owned state; `attempts` and `captures`
   0700, `staging` 0755 with per-run ordinary-user 0700 directories;
 - protected `roots.json`: the state/capture directory device and inode identities.
 
@@ -46,7 +49,7 @@ The previous v2 installer remains historical tooling, not the future entrypoint.
 The only future entrypoint is:
 
 ```text
-/usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v3/runtime_launcher.py RUNTIME_ID ENTRY CONTEXT [ARGS...]
+/usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v4/runtime_launcher.py RUNTIME_ID ENTRY CONTEXT [ARGS...]
 ```
 
 The launcher verifies complete runtime membership, bytes, ownership and modes.
@@ -60,8 +63,8 @@ trusted system dependencies. Python version and executable SHA-256 are in the
 snapshot. System administrator changes remain outside the ordinary-user threat
 model; no claim is made to measure every OS shared library or defeat root.
 
-CONTEXT is `-` only for coordinator, rehearsal, metadata resume and read-only
-runtime probe. Each phase instead receives the original handle as JSON argv;
+CONTEXT is `-` only for coordinator, reset-normalized preflight, rehearsal,
+metadata resume and read-only runtime probe. Each phase instead receives the original handle as JSON argv;
 the launcher loads and validates that original root journal before executing.
 The snapshot contains product commit/tree/archive/BIN/ELF and host tree, exact
 runtime manifest, coordinator/plan/helper/contract identities, schema, storage
@@ -77,10 +80,12 @@ an authority source.
 The ordinary boundary invokes the absolute command, with controlled environment:
 
 ```text
-/usr/bin/sudo -n /usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v3/authority_service.py OP RUN_ID
+/usr/bin/sudo -n /usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v4/authority_service.py OP RUN_ID
 ```
 
-Operations are begin, resume, load, capture, verify, record, prepare and seal.
+Operations are begin, resume, load, activate, capture, verify, record, prepare
+and seal. `activate` writes the immutable Q8 evidence requirement before a
+capture can start and is rejected after terminal test/evidence recording.
 No arbitrary path, writer executable, ownership target, source code, receipt,
 installation or raw file operation is accepted. The root service derives the
 caller UID from sudo and checks it against the immutable snapshot. Test-only
@@ -104,8 +109,9 @@ identity, bytes and writer state. Capture IDs are never recaptured.
 
 The root attempt flock serializes each operation around the **original** handle.
 `record` persists the test result before evidence finalization. PASS/FAIL and
-all details are immutable. `prepare` directly reverifies the root producer and
-persists evidence; an evidence failure cannot upgrade. It constructs exact
+all details are immutable. `prepare` seals a FINALIZED empty evidence set when
+no object was activated. When Q8 was activated, it directly reverifies the root
+producer and persists its exact receipt; an evidence failure cannot upgrade. It constructs exact
 expected authority, request, test, evidence, PREPARED manifest and index bytes.
 The ordinary coordinator writes these metadata mirrors into the fixed stage.
 Raw data never enters that tree or an ordinary recursive hash.
@@ -139,17 +145,19 @@ never resumes or reruns hardware phases. If no test result exists, it fails
 closed for manual investigation. All incomplete/failed records are retained.
 No automatic purge exists.
 
-SUCCESS requires test PASS plus FINALIZED evidence. TEST_FAILED retains test
-FAIL with valid evidence. EVIDENCE_FINALIZATION_FAILED retains abnormal or
-unverifiable evidence. Q8 pairing criteria and all official phase criteria
+SUCCESS requires test PASS plus FINALIZED required evidence. TEST_FAILED retains
+test FAIL with either a valid finalized object or a finalized empty set.
+EVIDENCE_FINALIZATION_FAILED is reserved for an activated object that is
+abnormal or unverifiable. Q8 pairing criteria and all official phase criteria
 remain unchanged. A future official attempt requires separate owner instruction;
 this repair campaign uses only passive NOT_QUALIFICATION capture.
 
 ## Validation
 
-`test-rp-test-infra.sh` includes real writer/FD races, v3 snapshot/stage/final-byte
-regressions, exception and actual process-exit crash cuts, Q8/coordinator
-integration and 17 assertion-killed semantic mutants. Root/nobody integration
+`test-rp-test-infra.sh` includes real writer/FD races, v4 snapshot/stage/final-byte
+regressions, exception and actual process-exit crash cuts, reset-normalized
+preflight, the full early/late failure packaging matrix, Q8/coordinator
+integration and assertion-killed semantic mutants. Root/nobody integration
 in `evidence_root_integration.py` uses synthetic writers, no devices and no
 installation; it separately proves raw/runtime/final-package permissions and
 all three terminal codes. Installed-runtime probes test source loader identity
