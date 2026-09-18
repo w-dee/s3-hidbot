@@ -7,10 +7,12 @@
 #include <array>
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 #include "ble_fixture_profile/ble_fixture_profile.hpp"
 #include "ble_hid_service/ble_hid_service.hpp"
 #include "esp_err.h"
+#include "esp_bt.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
@@ -24,6 +26,7 @@
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
 #include "mbedtls/md.h"
+#include "nimble/hci_common.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs.h"
@@ -40,6 +43,62 @@ extern "C" void ble_store_config_init(void);
 extern "C" void ble_hs_lock(void);
 extern "C" void ble_hs_unlock(void);
 extern "C" void ble_gap_conn_foreach_handle(ble_gap_conn_foreach_handle_fn *, void *);
+// Exact pinned v5.5.4 internal command boundary. The public GAP termination
+// API refuses a controller-established handle that host admission rejected.
+// This sends the standard HCI Disconnect command without modifying the SDK.
+extern "C" int ble_hs_hci_cmd_tx(std::uint16_t opcode, const void *command,
+                                  std::uint8_t command_length, void *response,
+                                  std::uint8_t response_length);
+extern "C" esp_err_t __real_esp_vhci_host_register_callback(
+    const esp_vhci_host_callback_t *callback);
+
+namespace {
+using VhciSendAvailable = void (*)(void);
+using VhciReceive = int (*)(std::uint8_t *, std::uint16_t);
+constexpr std::uint8_t kHciUartH4Event = 0x04;
+std::atomic<VhciSendAvailable> s_vhci_send_available{nullptr};
+std::atomic<VhciReceive> s_vhci_receive{nullptr};
+static_assert(std::atomic<VhciSendAvailable>::is_always_lock_free);
+static_assert(std::atomic<VhciReceive>::is_always_lock_free);
+
+void vhci_send_available_proxy() {
+    const auto callback = s_vhci_send_available.load(std::memory_order_acquire);
+    if (callback != nullptr) callback();
+}
+
+int vhci_receive_proxy(std::uint8_t *data, std::uint16_t length) {
+    const bool complete_event = data != nullptr && length >= 3U &&
+        data[0] == kHciUartH4Event &&
+        length >= static_cast<std::uint16_t>(data[2]) + 3U;
+    const bool establishment = complete_event &&
+        ble_transport::Backend::observe_hci_ingress(data + 1);
+    const auto callback = s_vhci_receive.load(std::memory_order_acquire);
+    const int result = callback == nullptr ? ESP_ERR_INVALID_STATE
+                                           : callback(data, length);
+    if (establishment) {
+        ble_transport::Backend::queue_hci_establishment_resolution();
+    }
+    return result;
+}
+
+const esp_vhci_host_callback_t s_vhci_proxy{
+    .notify_host_send_available = vhci_send_available_proxy,
+    .notify_host_recv = vhci_receive_proxy,
+};
+}  // namespace
+
+extern "C" esp_err_t __wrap_esp_vhci_host_register_callback(
+    const esp_vhci_host_callback_t *callback) {
+    if (callback == nullptr || callback->notify_host_send_available == nullptr ||
+        callback->notify_host_recv == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_vhci_send_available.store(callback->notify_host_send_available,
+                                std::memory_order_release);
+    s_vhci_receive.store(callback->notify_host_recv,
+                         std::memory_order_release);
+    return __real_esp_vhci_host_register_callback(&s_vhci_proxy);
+}
 
 namespace ble_transport {
 namespace {
@@ -52,7 +111,29 @@ constexpr std::int32_t kLifecycleTimeoutError = -3;
 constexpr std::uint16_t kConnectionIntervalMin = 12;  // 15 ms.
 constexpr std::uint16_t kConnectionIntervalMax = 24;  // 30 ms.
 constexpr std::uint16_t kSupervisionTimeout = 400;    // 4 s.
+constexpr std::uint64_t kHciEstablishmentPresent = UINT64_C(1) << 48;
 constexpr char kLogTag[] = "ble_transport";
+
+std::uint64_t hci_establishment_token(std::uint32_t stack_incarnation,
+                                      std::uint16_t connection_handle) {
+    return kHciEstablishmentPresent |
+           (static_cast<std::uint64_t>(stack_incarnation) << 16) |
+           connection_handle;
+}
+
+std::uint16_t hci_establishment_handle(std::uint64_t token) {
+    return static_cast<std::uint16_t>(token & UINT16_MAX);
+}
+
+int disconnect_controller_handle(std::uint16_t connection_handle) {
+    const ble_hci_lc_disconnect_cp command{
+        .conn_handle = htole16(connection_handle),
+        .reason = BLE_ERR_REM_USER_CONN_TERM,
+    };
+    return ble_hs_hci_cmd_tx(
+        BLE_HCI_OP(BLE_HCI_OGF_LINK_CTRL, BLE_HCI_OCF_DISCONNECT_CMD),
+        &command, sizeof(command), nullptr, 0);
+}
 constexpr std::array<const char *,
                      detail::RouteReleaseGraceOwnership::kSlotCount>
     kRouteReleaseTimerNames{"ble_route_release_0", "ble_route_release_1"};
@@ -950,6 +1031,12 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     ble_npl_event_init(&hidden_exposure_barrier_,
                        hidden_exposure_barrier_callback, this);
     hidden_exposure_barrier_initialized_ = true;
+    ble_npl_event_init(&hci_establishment_event_,
+                       hci_establishment_callback, this);
+    hci_establishment_event_initialized_ = true;
+    hci_establishment_.store(0, std::memory_order_release);
+    hci_establishment_teardown_claimed_.store(false,
+                                              std::memory_order_release);
     host_exited_.store(false, std::memory_order_release);
     initialized_ = true;
     nimble_port_freertos_init(host_task);
@@ -1028,6 +1115,9 @@ bool Backend::finish_stop(std::uint64_t id) {
     hidden_exposure_barrier_passed_.store(false, std::memory_order_release);
     hidden_exposure_termination_claimed_.store(false,
                                                std::memory_order_release);
+    hci_establishment_.store(0, std::memory_order_release);
+    hci_establishment_teardown_claimed_.store(false,
+                                              std::memory_order_release);
     return true;
 }
 
@@ -1047,6 +1137,10 @@ struct Backend::StopOperations {
         if (backend.hidden_exposure_barrier_initialized_) {
             ble_npl_event_deinit(&backend.hidden_exposure_barrier_);
             backend.hidden_exposure_barrier_initialized_ = false;
+        }
+        if (backend.hci_establishment_event_initialized_) {
+            ble_npl_event_deinit(&backend.hci_establishment_event_);
+            backend.hci_establishment_event_initialized_ = false;
         }
         return nimble_port_deinit() == ESP_OK;
     }
@@ -1280,6 +1374,8 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
+                backend->resolve_hci_establishment(
+                    event->connect.conn_handle);
                 backend->association_creation_.retire();
                 backend->active_host_connection_ = backend->host_connection_incarnation_ == UINT64_MAX
                     ? 0 : ++backend->host_connection_incarnation_;
@@ -1303,6 +1399,8 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 event->connect.conn_handle, event->connect.status);
             break;
         case BLE_GAP_EVENT_DISCONNECT:
+            backend->resolve_hci_establishment(
+                event->disconnect.conn.conn_handle);
             backend->association_creation_.retire();
             backend->active_host_connection_ = 0;
             backend->host_connection_handle_ = ble_lifecycle::kNoConnection;
@@ -1564,7 +1662,8 @@ bool Backend::physical_exposure_hidden() const {
     }, &connected);
     const bool advertising = ble_gap_adv_active() != 0;
     ble_hs_unlock();
-    return !connected && !advertising;
+    return !connected && !advertising &&
+           hci_establishment_.load(std::memory_order_acquire) == 0;
 }
 
 void Backend::hidden_exposure_barrier_callback(struct ble_npl_event *event) {
@@ -1573,6 +1672,109 @@ void Backend::hidden_exposure_barrier_callback(struct ble_npl_event *event) {
                                   std::memory_order_acquire)) {
         backend->hidden_exposure_barrier_passed_.store(
             true, std::memory_order_release);
+    }
+}
+
+bool Backend::observe_hci_ingress(const std::uint8_t *event) {
+    Backend *backend = instance_;
+    if (backend == nullptr || event == nullptr) return false;
+    if (event[0] == BLE_HCI_EVCODE_DISCONN_CMP && event[1] >= 4 &&
+        event[2] == BLE_ERR_SUCCESS) {
+        std::uint16_t connection_handle = 0;
+        std::memcpy(&connection_handle, event + 3, sizeof(connection_handle));
+        backend->resolve_hci_establishment(le16toh(connection_handle));
+        return false;
+    }
+    if (event[0] != BLE_HCI_EVCODE_LE_META || event[1] < 5 ||
+        (event[2] != BLE_HCI_LE_SUBEV_CONN_COMPLETE &&
+         event[2] != BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE &&
+         event[2] != BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE_V2) ||
+        event[3] != BLE_ERR_SUCCESS ||
+        event[6] != BLE_HCI_LE_CONN_COMPLETE_ROLE_SLAVE) {
+        return false;
+    }
+    std::uint16_t connection_handle = 0;
+    std::memcpy(&connection_handle, event + 4, sizeof(connection_handle));
+    connection_handle = le16toh(connection_handle);
+    const auto token = hci_establishment_token(
+        backend->stack_incarnation_, connection_handle);
+    std::uint64_t expected = 0;
+    if (backend->hci_establishment_.compare_exchange_strong(
+            expected, token, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        backend->hci_establishment_teardown_claimed_.store(
+            false, std::memory_order_release);
+        return true;
+    }
+    if (expected != token && backend->sink_ != nullptr) {
+        backend->sink_->signal_ble_lifecycle_handoff_failure();
+    }
+    return expected == token;
+}
+
+void Backend::queue_hci_establishment_resolution() {
+    Backend *backend = instance_;
+    if (backend == nullptr ||
+        !backend->hci_establishment_event_initialized_ ||
+        ble_npl_event_is_queued(&backend->hci_establishment_event_)) {
+        return;
+    }
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(),
+                       &backend->hci_establishment_event_);
+}
+
+void Backend::hci_establishment_callback(struct ble_npl_event *event) {
+    auto *backend = static_cast<Backend *>(ble_npl_event_get_arg(event));
+    if (backend != nullptr) backend->process_hci_establishment();
+}
+
+void Backend::resolve_hci_establishment(
+    std::uint16_t connection_handle) {
+    std::uint64_t token = hci_establishment_.load(std::memory_order_acquire);
+    while (token != 0 && hci_establishment_handle(token) == connection_handle &&
+           !hci_establishment_.compare_exchange_weak(
+               token, 0, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+    if (token != 0 && hci_establishment_handle(token) == connection_handle) {
+        hci_establishment_teardown_claimed_.store(false,
+                                                  std::memory_order_release);
+    }
+}
+
+void Backend::process_hci_establishment() {
+    const auto token = hci_establishment_.load(std::memory_order_acquire);
+    if (token == 0) return;
+    const auto handle = hci_establishment_handle(token);
+    std::pair<std::uint16_t, bool> registered{handle, false};
+    ble_hs_lock();
+    ble_gap_conn_foreach_handle([](std::uint16_t value, void *context) {
+        auto *result = static_cast<std::pair<std::uint16_t, bool> *>(context);
+        if (value == result->first) result->second = true;
+        return result->second ? 1 : 0;
+    }, &registered);
+    ble_hs_unlock();
+    if (registered.second) {
+        resolve_hci_establishment(handle);
+        if (hidden_exposure_requested_.load(std::memory_order_acquire)) {
+            terminate_hidden_connection(handle);
+        }
+        return;
+    }
+    bool unclaimed = false;
+    if (!hci_establishment_teardown_claimed_.compare_exchange_strong(
+            unclaimed, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    const int result = disconnect_controller_handle(handle);
+    if (result == BLE_ERR_UNK_CONN_ID) {
+        resolve_hci_establishment(handle);
+        return;
+    }
+    if (result != 0 ||
+        !hidden_exposure_requested_.load(std::memory_order_acquire)) {
+        if (sink_ != nullptr) sink_->signal_ble_lifecycle_handoff_failure();
     }
 }
 

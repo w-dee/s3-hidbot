@@ -34,6 +34,13 @@ S3_HIDBOT_REQUIRE_TINYUSB_SOURCE=1 \
 config_env="$repository_root/firmware/build/config.env"
 test -f "$config_env"
 grep -Fq '"IDF_TARGET": "esp32s3"' "$config_env"
+nm_tool=$(command -v xtensa-esp32s3-elf-nm || command -v xtensa-esp-elf-nm)
+elf="$repository_root/firmware/build/s3_hidbot_passive_usb_hid.elf"
+"$nm_tool" "$elf" | grep -Eq \
+    '^[[:xdigit:]]+[[:space:]]+T[[:space:]]+__wrap_esp_vhci_host_register_callback$'
+"$nm_tool" "$elf" | grep -Eq \
+    '^[[:xdigit:]]+[[:space:]]+T[[:space:]]+esp_vhci_host_register_callback$'
+echo "PASS: materialized VHCI ingress wrapper"
 "${PYTHON_BIN:-python3}" "$repository_root/tools/validate_ble_security_sdkconfig.py" \
     "$repository_root/firmware/sdkconfig"
 if git -C "$repository_root" ls-files --error-unmatch \

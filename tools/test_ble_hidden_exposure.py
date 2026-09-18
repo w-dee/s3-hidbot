@@ -40,6 +40,7 @@ struct Backend {
  std::atomic_bool hidden_exposure_requested_{false};
  std::atomic_bool hidden_exposure_barrier_passed_{false};
  std::atomic_bool hidden_exposure_termination_claimed_{false};
+ std::atomic<std::uint64_t> hci_establishment_{0};
 };
 '''
 TEST = r'''
@@ -63,6 +64,8 @@ int main(){
  assert(!b.physical_exposure_hidden());run_barrier(b.hidden_exposure_barrier_);
  advertising=true;assert(!b.physical_exposure_hidden());advertising=false;
  enabled=false;assert(!b.physical_exposure_hidden());enabled=true;assert(b.physical_exposure_hidden());
+ b.hci_establishment_=1;assert(!b.physical_exposure_hidden());
+ b.hci_establishment_=0;assert(b.physical_exposure_hidden());
 
  // F1 schedule: Connection Complete is accepted, hide sees no registered
  // peer, then the GAP callback publishes the peer before the host barrier.

@@ -102,6 +102,10 @@ class Backend final : public hid_control_executor::BleBackend {
     static void on_sync();
     static void on_reset(int reason);
     static int on_gap_event(struct ble_gap_event *event, void *context);
+    // Linker-wrapped pinned transport ingress. Successful peripheral
+    // Connection Complete is owned before NimBLE host admission.
+    static bool observe_hci_ingress(const std::uint8_t *event);
+    static void queue_hci_establishment_resolution();
 
   private:
     using LifecycleTimeoutPurpose = detail::LifecycleWatchdogPurpose;
@@ -116,7 +120,10 @@ class Backend final : public hid_control_executor::BleBackend {
     static void stop_task(void *context);
     static void timer_barrier_callback(void *context);
     static void hidden_exposure_barrier_callback(struct ble_npl_event *event);
+    static void hci_establishment_callback(struct ble_npl_event *event);
     void terminate_hidden_connection(std::uint16_t connection_handle);
+    void resolve_hci_establishment(std::uint16_t connection_handle);
+    void process_hci_establishment();
     struct StopOperations;
     bool retire_timers_after_stop();
     ble_lifecycle::StopTransaction stop_transaction_{};
@@ -126,6 +133,10 @@ class Backend final : public hid_control_executor::BleBackend {
     esp_timer_handle_t timer_barrier_ = nullptr;
     struct ble_npl_event hidden_exposure_barrier_{};
     bool hidden_exposure_barrier_initialized_ = false;
+    struct ble_npl_event hci_establishment_event_{};
+    bool hci_establishment_event_initialized_ = false;
+    std::atomic<std::uint64_t> hci_establishment_{0};
+    std::atomic_bool hci_establishment_teardown_claimed_{false};
     std::atomic_bool hidden_exposure_requested_{false};
     std::atomic_bool hidden_exposure_barrier_passed_{false};
     std::atomic_bool hidden_exposure_termination_claimed_{false};

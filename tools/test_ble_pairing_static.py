@@ -12,8 +12,36 @@ def main() -> int:
     transport_header = (ROOT / "firmware/components/ble_transport/include/ble_transport/ble_transport.hpp").read_text()
     watchdog_header = (ROOT / "firmware/components/ble_transport/include/ble_transport/lifecycle_watchdog.hpp").read_text()
     transport = (ROOT / "firmware/components/ble_transport/ble_transport.cpp").read_text()
+    transport_cmake = (ROOT / "firmware/components/ble_transport/CMakeLists.txt").read_text()
+    runtime_header = (ROOT / "firmware/components/hid_runtime/include/hid_runtime/hid_runtime.hpp").read_text()
+    runtime = (ROOT / "firmware/components/hid_runtime/hid_runtime.cpp").read_text()
     pairing_header = (ROOT / "firmware/components/ble_pairing/include/ble_pairing/ble_pairing.hpp").read_text()
     protocol = (ROOT / "firmware/components/control_protocol/control_protocol.cpp").read_text()
+
+    # Hidden-idle authority begins at controller Connection Complete ingress,
+    # before NimBLE can reject admission after advertising retirement.
+    assert "-Wl,--wrap=esp_vhci_host_register_callback" in transport_cmake
+    assert "__wrap_esp_vhci_host_register_callback" in transport
+    assert "Backend::observe_hci_ingress(data + 1)" in transport
+    assert "Backend::queue_hci_establishment_resolution()" in transport
+    assert "ble_hs_hci_cmd_tx(" in transport
+    hidden = re.search(r"bool Backend::physical_exposure_hidden\(\) const \{"
+                       r"(.*?)\n\}", transport, re.S)
+    assert hidden and "hci_establishment_.load(" in hidden.group(1)
+    assert "std::atomic<std::uint64_t> hci_establishment_{0};" in transport_header
+
+    # Sleep owns a runtime admission gate in addition to the serialized
+    # control-operation claim. The exact claim must precede predicate commit.
+    assert "sleep_quiescence_gate_" in runtime_header
+    assert "claim_sleep_quiescence(" in runtime
+    assert "commit_sleep_quiescence(" in runtime
+    sleep = re.search(r"BleCommandOutcome Controller::request_simulated_sleep\(\) \{"
+                      r"(.*?)\n\}", executor, re.S)
+    assert sleep
+    assert sleep.group(1).index("claim_operation(operation)") < \
+        sleep.group(1).index("claim_sleep_quiescence(") < \
+        sleep.group(1).index("commit_sleep_quiescence()") < \
+        sleep.group(1).index("begin_disable()")
 
     assert "constexpr std::uint32_t kInputTimeoutMs = 25000;" in pairing_header
     assert "enum class LiveState" in pairing_header
