@@ -252,12 +252,12 @@ is valid forensic state and is retained under the same no-automatic-purge policy
 
 ## Privileged HCI evidence boundary
 
-Version 4 retains historical v1/v2/v3 capsules and installations. The full contract
+Version 5 retains historical v1/v2/v3/v4 capsules and installations. The full contract
 is in [`evidence-authority.md`](evidence-authority.md). The future root service
 accepts a run ID and strict request, never a caller path. Its fixed state root
-is `/var/lib/s3-hidbot-authority-v4`; protected installation and runtime bundles
-live under `/usr/local/lib/s3-hidbot-authority-v4`. The v3 roots remain immutable
-historical authority for their consumed attempts.
+is `/var/lib/s3-hidbot-authority-v5`; protected installation and runtime bundles
+live under `/usr/local/lib/s3-hidbot-authority-v5`. The v3 and v4 roots remain
+immutable historical authority for their attempts and rehearsals.
 
 `evidence_pipeline.py` invokes `/usr/bin/sudo -n /usr/bin/python3 -I -S -B` with
 the fixed service path and controlled environment. Raw descriptors stay in the
@@ -282,7 +282,7 @@ measured protected source in isolated Python.
 The passive appliance-only check uses the installed runtime ID:
 
 ```sh
-/usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v4/runtime_launcher.py \
+/usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v5/runtime_launcher.py \
   RUNTIME_ID evidence_rehearsal.py - \
   --evidence-pipeline-rehearsal --not-qualification
 ```

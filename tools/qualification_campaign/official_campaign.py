@@ -14,8 +14,8 @@ import evidence_contract as c
 from evidence_pipeline import (create_package, finalize_terminal_package, sha,
                                verify_attempt, phase_command, preflight_command)
 
-EXPECTED_ARCHIVE = 'db7c9afec9ba2a6ec210ebffc030ac61542079d7e4a29db5d026d3c542e3ece9'
-EXPECTED_COMMIT = '8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad'
+EXPECTED_ARCHIVE = '2e6b5a1a20a83e20cfeafa2d10835ddb605f4aff0319225b48e340c856b39a35'
+EXPECTED_COMMIT = '137d489d3d1219b203f84633cf8b570d9fe9f19a'
 PHASES = [('q1_strict', 'q1_strict.py'), ('q2_just_works', 'q2_mouse.py'),
           ('q3_keyboard', 'q3_keyboard.py'), ('q4_id7', 'q4_id7.py'),
           ('q5_led', 'q5_led.py'), ('q6_metadata', 'q6_metadata.py'),

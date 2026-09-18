@@ -1,12 +1,12 @@
-# Qualification evidence authority, version 4
+# Qualification evidence authority, version 5
 
 This boundary changes qualification tooling, with product commit
-`8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad` unchanged. The physical fixture is
+`137d489d3d1219b203f84633cf8b570d9fe9f19a` unchanged. The physical fixture is
 owner-confirmed FNK0099. Previous official FAILs, forensic indexes, interrupted
-manifests, v1/v2/v3 rehearsals, v2/v3 installations and raw captures are historical and
-must not be edited or normalized. A rehearsal is never qualification.
-Version 4 uses a separate fixed namespace so installing it cannot replace the
-engine used by either consumed v3 attempt.
+manifests, v1/v2/v3/v4 rehearsals, v2/v3/v4 installations and raw captures are
+historical and must not be edited or normalized. A rehearsal is never
+qualification. Version 5 uses a separate fixed namespace so installing it
+cannot replace the engine used by any historical attempt or rehearsal.
 
 ## Authority chain
 
@@ -20,7 +20,7 @@ identity here; root ownership and fixed invocation provide provenance, not a
 claim that an untrusted self-described hash is authenticated.
 
 `prepare_bundle.py` copies the retained reviewed phase source, overlays the
-maintained boundary and appends the reviewed v4 amendment to the exact frozen
+maintained boundary and appends the reviewed v5 amendment to the exact frozen
 v3 base qualification plan. BUNDLE.json
 lists **every file**, its digest, the product, coordinator, plan, FROZEN and five
 privileged engine module identities. The runtime ID is the SHA-256 of the exact
@@ -32,9 +32,9 @@ No generated runtime is committed in the source repository.
 An explicit administrator preparation runs `install_authority_runtime.py
 --bundle BUNDLE`. It writes fixed destinations only:
 
-- `/usr/local/lib/s3-hidbot-authority-v4`: protected engine modules and per-digest
+- `/usr/local/lib/s3-hidbot-authority-v5`: protected engine modules and per-digest
   runtimes, files 0444, runtime directories 0555;
-- `/var/lib/s3-hidbot-authority-v4`: root-owned state; `attempts` and `captures`
+- `/var/lib/s3-hidbot-authority-v5`: root-owned state; `attempts` and `captures`
   0700, `staging` 0755 with per-run ordinary-user 0700 directories;
 - protected `roots.json`: the state/capture directory device and inode identities.
 
@@ -49,7 +49,7 @@ The previous v2 installer remains historical tooling, not the future entrypoint.
 The only future entrypoint is:
 
 ```text
-/usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v4/runtime_launcher.py RUNTIME_ID ENTRY CONTEXT [ARGS...]
+/usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v5/runtime_launcher.py RUNTIME_ID ENTRY CONTEXT [ARGS...]
 ```
 
 The launcher verifies complete runtime membership, bytes, ownership and modes.
@@ -80,7 +80,7 @@ an authority source.
 The ordinary boundary invokes the absolute command, with controlled environment:
 
 ```text
-/usr/bin/sudo -n /usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v4/authority_service.py OP RUN_ID
+/usr/bin/sudo -n /usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v5/authority_service.py OP RUN_ID
 ```
 
 Operations are begin, resume, load, activate, capture, verify, record, prepare

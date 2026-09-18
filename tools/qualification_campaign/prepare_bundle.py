@@ -10,7 +10,7 @@ import evidence_contract as c
 import authority_runtime as a
 
 EXPECTED_BASE_PLAN = 'd18126b4a3418bbb0db24b280faebcca0f854cf9e9d92460d155fdd0e0469f44'
-ADDENDUM = HERE / 'qualification-plan-v4-addendum.md'
+ADDENDUM = HERE / 'qualification-plan-v5-addendum.md'
 
 
 def prepare(source, destination, plan):

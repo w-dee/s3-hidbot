@@ -8,7 +8,7 @@ import types
 
 
 def bootstrap(name):
-    path = Path('/usr/local/lib/s3-hidbot-authority-v4') / (name + '.py')
+    path = Path('/usr/local/lib/s3-hidbot-authority-v5') / (name + '.py')
     for parent in (path, *path.parents):
         s = parent.lstat()
         if s.st_uid != 0 or s.st_mode & 0o022 or stat.S_ISLNK(s.st_mode):

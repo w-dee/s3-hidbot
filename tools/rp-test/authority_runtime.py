@@ -1,4 +1,4 @@
-"""Protected source runtime and immutable v4 authority vocabulary (no site startup)."""
+"""Protected source runtime and immutable v5 authority vocabulary (no site startup)."""
 from __future__ import annotations
 import hashlib
 import importlib.abc
@@ -10,17 +10,18 @@ import stat
 import sys
 import evidence_contract as c
 
-INSTALL = Path('/usr/local/lib/s3-hidbot-authority-v4')
-STATE = Path('/var/lib/s3-hidbot-authority-v4')
+INSTALL = Path('/usr/local/lib/s3-hidbot-authority-v5')
+STATE = Path('/var/lib/s3-hidbot-authority-v5')
 ENGINE = ('authority_service.py', 'authority_runtime.py', 'runtime_launcher.py',
           'evidence_contract.py', 'privileged_evidence.py')
-PRODUCT = dict(commit='8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad',
-               tree='02d69f4bbf833c0315c1f557d4e56fa85bb239b9',
-               firmware='851e92881463f23fce51cf7eb150465ad9b59f4e',
-               host='9d756cdefd9a041288a0eb87df905f4f0a166e71',
-               archive='db7c9afec9ba2a6ec210ebffc030ac61542079d7e4a29db5d026d3c542e3ece9',
-               bin='0459b4604d2ede52db0d6690049623a2a8b73bab262f5e45ac3bb0c081400f60',
-               elf='3b913b0ee1873e861d11ecf2dfbe88f285d60b2e58356cf3b7826ab00354c998')
+PRODUCT = dict(version='0.4.0',
+               commit='137d489d3d1219b203f84633cf8b570d9fe9f19a',
+               tree='929f22a9510e2b0e0ca36cb943796ef7532940e7',
+               firmware='26819663473a44fa18538bc754f0f188e92b5a1c',
+               host='9cd778f8cb96fa9a22b8c8be628d3a9f9f0f4953',
+               archive='2e6b5a1a20a83e20cfeafa2d10835ddb605f4aff0319225b48e340c856b39a35',
+               bin='8b0a2e4aed27d12ad3644c1e4d02c121890f3d3066075fb7e23acdfdaffd4315',
+               elf='0a0ac1ded06b1dddce6d014fc1127f9a49f65c23dd289ae89929c4dc41c16c45')
 CLASSIFICATION = 'EVIDENCE_PIPELINE_REHEARSAL / NOT_QUALIFICATION'
 FILES = ('authority.json', 'request.json', 'test.json', 'evidence.json', 'manifest.json', 'index.json')
 
