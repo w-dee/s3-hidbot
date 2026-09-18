@@ -11,7 +11,7 @@ namespace control_session {
 inline constexpr std::size_t kTokenHexLength = 32;
 inline constexpr std::size_t kTokenStorageBytes = kTokenHexLength + 1;
 inline constexpr std::size_t kMaxRequestBytes = 504;
-inline constexpr std::size_t kMaxResponseBytes = 1024;
+inline constexpr std::size_t kMaxResponseBytes = 1280;
 inline constexpr std::uint32_t kLeaseMilliseconds = 5000;
 inline constexpr std::uint64_t kLeaseMicroseconds = 5000000;
 

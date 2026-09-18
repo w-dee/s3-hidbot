@@ -30,6 +30,8 @@ constexpr const ble_fixture_profile::ProfileDefinition *association_profile(Bond
         case BondClass::kStandaloneKeyboard: return &ble_fixture_profile::kStandaloneKeyboard;
         case BondClass::kStandaloneMouseJustWorks:
             return &ble_fixture_profile::kStandaloneMouseJustWorks;
+        case BondClass::kMouseSimulatedSleepV1:
+            return &ble_fixture_profile::kMouseSimulatedSleepV1;
     }
     return nullptr;
 }

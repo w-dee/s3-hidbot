@@ -614,6 +614,21 @@ int main() {
                 hid_control_executor::BleNotifyBackendResult::kStackRejected,
             "mouse", "absent keyboard handle accepted");
     database.reset_after_stop();
+    require(database.configure_profile(ProfileId::kMouseSimulatedSleepV1),
+            "simulated sleep mouse", "selection failed");
+    require(database.register_database() == 0 &&
+                database.validate_registered_database() == 0,
+            "simulated sleep mouse", "registered topology rejected");
+    require(database.hid_handles().keyboard_value == 0 &&
+                database.hid_handles().mouse_value == 0x0019,
+            "simulated sleep mouse", "wrong finite role handles");
+    require_served_value(g_registered_services[0].characteristics,
+                         std::array<std::uint8_t, 1>{7},
+                         "simulated sleep mouse schema epoch");
+    require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid),
+                         kExpectedMouseReportMap,
+                         "simulated sleep mouse report map");
+    database.reset_after_stop();
     require(database.configure_profile(ProfileId::kStandaloneMouseJustWorksId7), "mouse ID7", "selection failed");
     require(database.register_database() == 0 && database.validate_registered_database() == 0,
             "mouse ID7", "registered topology rejected");

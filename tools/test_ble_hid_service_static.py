@@ -555,6 +555,11 @@ def main() -> int:
     assert "num_uuids16 = 1" in transport and "uuids16_is_complete = 1" in transport
     assert "appearance_is_present = 1" in transport and "name_is_complete = 1" in transport
     assert "ble_gap_adv_rsp_set_fields" not in transport
+    assert "start_finite_advertising" in transport
+    assert "parameters.itvl_min = interval_units" in transport
+    assert "parameters.itvl_max = interval_units" in transport
+    assert "duration_ms, &parameters" in transport
+    assert "backend->advertising_incarnation_.load(" in transport
     standard_gap = transport.index("ble_svc_gap_init();")
     standard_gatt = transport.index("ble_svc_gatt_init();")
     project_registration = transport.index("database->register_database()")

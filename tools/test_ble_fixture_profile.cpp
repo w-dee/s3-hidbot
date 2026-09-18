@@ -29,7 +29,21 @@ int main() {
     assert(subscriptions_ready(mouse_definition, report_bit(ReportRole::kMouseInput)));
     assert(!subscriptions_ready(mouse_definition, report_bit(ReportRole::kKeyboardInput)));
 
-    assert(kCatalog.size() == 6);
+    assert(kCatalog.size() == 7);
+    const auto &sleep = kMouseSimulatedSleepV1;
+    assert(find_profile("mouse_simulated_sleep_v1") == &sleep);
+    assert(sleep.report_map_sha256 == mouse_definition.report_map_sha256);
+    assert(sleep.security.id == SecurityPolicyId::kUnauthenticatedBonded);
+    assert(!sleep.security.authenticated && sleep.security.encrypted);
+    assert(sleep.bond_class == BondAssociationClass::kMouseSimulatedSleepV1);
+    assert(sleep.cache.schema_revision == 7 &&
+           sleep.cache.schema_epoch_value[0] == 7);
+    assert(sleep.advertising.behavior ==
+           AdvertisingBehavior::kSimulatedSleepV1);
+    assert(sleep.advertising.fast_interval_units == 64 &&
+           sleep.advertising.slow_interval_units == 800);
+    assert(sleep.advertising.fast_timeout_ms == 3000 &&
+           sleep.advertising.slow_timeout_ms == 7000);
     const auto &metadata = kMouseMetadata;
     assert(metadata.cache.schema_revision == 6 && metadata.cache.schema_epoch_value[0] == 6);
     assert(metadata.bond_class == BondAssociationClass::kMouseMetadata);

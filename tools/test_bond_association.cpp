@@ -9,6 +9,7 @@ using D = AssociationDecision;
 using S = AssociationState;
 constexpr BondClass mouse = BondClass::kStandaloneMouseJustWorks;
 constexpr BondClass strict = BondClass::kStrictComposite;
+constexpr BondClass sleep_profile_class = BondClass::kMouseSimulatedSleepV1;
 constexpr AssociationPeer peer{1, 2, 3, 4, 5, 6, 7};
 constexpr AssociationPeer other{1, 3, 3, 4, 5, 6, 7};
 
@@ -49,10 +50,17 @@ int main() {
         assert(decode_association(word).state == S::kInvalid);
     assert(decode_association(0xa5010101U) == (AssociationRecord{S::kPending, mouse}));
     assert(decode_association(0xa5010102U) == (AssociationRecord{S::kComplete, mouse}));
+    assert(encode_association({S::kComplete, sleep_profile_class}) == 0xa5010602U);
+    assert(decode_association(0xa5010602U) ==
+           (AssociationRecord{S::kComplete, sleep_profile_class}));
+    assert(association_profile(sleep_profile_class) ==
+           &ble_fixture_profile::kMouseSimulatedSleepV1);
     assert(association_compatibility({}, strict) == D::kAllowed);
     assert(association_compatibility({}, mouse) == D::kIncompatible);
     assert(association_compatibility({S::kComplete, mouse}, strict) == D::kIncompatible);
     assert(association_compatibility({S::kComplete, mouse}, mouse) == D::kAllowed);
+    assert(association_compatibility({S::kComplete, mouse}, sleep_profile_class) ==
+           D::kIncompatible);
     assert(association_compatibility({S::kPending, mouse}, mouse) == D::kIncomplete);
     for (const bool our : {false,true}) {
         Store store; AssociationCreation claim;

@@ -33,6 +33,9 @@ class Backend final : public hid_control_executor::BleBackend {
     bool finish_stop(std::uint64_t id) override;
     void set_generation(ble_lifecycle::Generation generation) override;
     std::int32_t start_advertising() override;
+    std::int32_t start_finite_advertising(
+        std::uint16_t interval_units, std::uint32_t timeout_ms,
+        std::uint64_t advertising_incarnation) override;
     std::int32_t stop_advertising() override;
     std::int32_t begin_hidden_exposure() override;
     bool physical_exposure_hidden() const override;
@@ -103,6 +106,9 @@ class Backend final : public hid_control_executor::BleBackend {
   private:
     using LifecycleTimeoutPurpose = detail::LifecycleWatchdogPurpose;
 
+    std::int32_t start_advertising_internal(
+        std::uint16_t interval_units, std::int32_t duration_ms,
+        std::uint64_t advertising_incarnation);
     bool signal_event(hid_control_executor::BleEvent event);
     bool signal(hid_control_executor::BleEventKind kind,
                 std::uint16_t connection_handle, std::int32_t status);
@@ -123,6 +129,7 @@ class Backend final : public hid_control_executor::BleBackend {
     std::atomic_bool hidden_exposure_requested_{false};
     std::atomic_bool hidden_exposure_barrier_passed_{false};
     std::atomic_bool hidden_exposure_termination_claimed_{false};
+    std::atomic<std::uint64_t> advertising_incarnation_{0};
     static void timeout_callback(void *context);
     static void pairing_timeout_callback(void *context);
     static void route_release_grace_callback(void *context);

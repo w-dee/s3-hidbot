@@ -123,6 +123,25 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
         }
         return advertising_result;
     }
+    std::int32_t start_finite_advertising(
+        std::uint16_t interval_units, std::uint32_t timeout_ms,
+        std::uint64_t advertising_incarnation) override {
+        ++finite_advertising_calls;
+        last_advertising_interval = interval_units;
+        last_advertising_timeout_ms = timeout_ms;
+        last_advertising_incarnation = advertising_incarnation;
+        return start_advertising();
+    }
+    bool finite_advertising_complete(std::uint64_t incarnation) {
+        physical_advertising = false;
+        return sink->signal_ble_event({
+            .kind = hid_control_executor::BleEventKind::kAdvertisingComplete,
+            .generation = active_generation,
+            .connection_handle = ble_lifecycle::kNoConnection,
+            .stack_incarnation = stack_incarnation,
+            .advertising_incarnation = incarnation,
+        });
+    }
     std::int32_t stop_advertising() override {
         ++stop_calls;
         return stop_result;
@@ -443,6 +462,10 @@ struct FakeBleBackend final : hid_control_executor::BleBackend {
     int initialize_calls = 0;
     int advertising_attempts = 0;
     int advertising_calls = 0;
+    int finite_advertising_calls = 0;
+    std::uint16_t last_advertising_interval = 0;
+    std::uint32_t last_advertising_timeout_ms = 0;
+    std::uint64_t last_advertising_incarnation = 0;
     int stop_calls = 0;
     int disconnect_calls = 0;
     int arm_route_release_grace_calls = 0;
@@ -526,7 +549,8 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
             handles = {.report_map_value = 5,
                        .keyboard_value = id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks &&
                                          id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7 &&
-                                         id != ble_fixture_profile::ProfileId::kMouseMetadata
+                                         id != ble_fixture_profile::ProfileId::kMouseMetadata &&
+                                         id != ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1
                            ? std::uint16_t{10} : std::uint16_t{0},
                        .mouse_value = (id == ble_fixture_profile::ProfileId::kStandaloneKeyboard ||
                                        id == ble_fixture_profile::ProfileId::kStandaloneKeyboardLeds)
@@ -7762,6 +7786,131 @@ void test_profile_restart_failure_and_deadline_matrix() {
 
 hid_control_executor::Controller *finite_release_controller = nullptr;
 
+void test_simulated_sleep_finite_advertising_and_wake_cycles() {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_profile_select(ProfileId::kMouseSimulatedSleepV1)
+               .result == SelectionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(Event::kSync));
+    assert(controller.process_one_for_test());
+    assert(ble.finite_advertising_calls == 1);
+    assert(ble.last_advertising_interval == 64 &&
+           ble.last_advertising_timeout_ms == 3000);
+    const auto first_fast = ble.last_advertising_incarnation;
+    assert(first_fast != 0);
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kNone);
+
+    // A callback from any other arm cannot advance the current fast stage.
+    assert(ble.finite_advertising_complete(first_fast + 100));
+    assert(controller.process_one_for_test());
+    assert(ble.finite_advertising_calls == 1);
+    assert(ble.finite_advertising_complete(first_fast));
+    assert(controller.process_one_for_test());
+    assert(ble.finite_advertising_calls == 2);
+    assert(ble.last_advertising_interval == 800 &&
+           ble.last_advertising_timeout_ms == 7000);
+    const auto first_slow = ble.last_advertising_incarnation;
+    assert(first_slow != first_fast);
+
+    assert(ble.finite_advertising_complete(first_slow));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kDisabling);
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().desired ==
+           ble_lifecycle::DesiredExposure::kHidden);
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kIdle);
+    assert(!controller.ble_snapshot().advertising &&
+           !controller.ble_snapshot().connected);
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kNone);
+
+    // Existing ble.enable is the narrow fixture wake trigger. It starts a new
+    // fast arm without changing the selected in-RAM profile.
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    const auto second_fast = ble.last_advertising_incarnation;
+    assert(second_fast != first_fast && second_fast != first_slow);
+    assert(ble.last_advertising_interval == 64 &&
+           ble.last_advertising_timeout_ms == 3000);
+    assert(controller.profile_snapshot().selected ==
+           ProfileId::kMouseSimulatedSleepV1);
+
+    // Reconnect after wake follows ordinary readiness. The route remains an
+    // explicit choice, and the first post-wake report uses that fresh route.
+    assert(ble.event(Event::kConnect, 9));
+    assert(controller.process_one_for_test());
+    make_security_ready(ble);
+    ble.security_link.authenticated = false;
+    ble.security_persisted.our.authenticated = false;
+    ble.security_persisted.peer.authenticated = false;
+    assert(ble.event(Event::kEncryptionChange, 9));
+    assert(controller.process_one_for_test());
+    assert(controller.signal_ble_event({
+        .kind = Event::kSubscription,
+        .generation = controller.ble_snapshot().generation,
+        .connection_handle = 9,
+        .attribute_handle = database.handles.mouse_value,
+        .hid_interface = hid_control_executor::BleHidInterface::kMouse,
+        .subscription_reason =
+            hid_control_executor::BleSubscriptionReason::kWrite,
+        .notify_enabled = true,
+        .stack_incarnation = 1,
+    }));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_link_ready());
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kNone);
+    assert(controller.activate_ble_route_internal().action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    assert(controller.queue_ble_mouse_report(1, 1, 0, 0, 0) ==
+           hid_runtime::MouseReportBeginResult::kPublished);
+    assert(controller.process_one_for_test());
+    assert(database.notify_calls == 1);
+
+    // A timeout does not sleep underneath a connected peer.
+    assert(ble.finite_advertising_complete(second_fast));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().connected);
+    assert(controller.ble_snapshot().desired ==
+           ble_lifecycle::DesiredExposure::kExposed);
+    assert(ble.event(Event::kDisconnect, 9));
+    assert(controller.process_one_for_test());
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kNone);
+    assert(!controller.route_snapshot().ready);
+    const auto third_fast = ble.last_advertising_incarnation;
+    assert(third_fast != second_fast);
+
+    // A late callback from the prior cycle has the current lifecycle
+    // generation but still cannot consume the new arm's authority.
+    assert(ble.finite_advertising_complete(first_slow));
+    assert(controller.process_one_for_test());
+    assert(ble.last_advertising_incarnation == third_fast);
+    assert(ble.finite_advertising_complete(third_fast));
+    assert(controller.process_one_for_test());
+    const auto second_slow = ble.last_advertising_incarnation;
+    assert(second_slow != first_slow);
+    assert(ble.finite_advertising_complete(second_slow));
+    assert(controller.process_one_for_test());
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kIdle);
+}
+
 void test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId selected) {
     using namespace ble_fixture_profile;
     using Event = hid_control_executor::BleEventKind;
@@ -8031,6 +8180,8 @@ int main(int argc, char **argv) {
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks);
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseMetadata);
+    test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1);
+    test_simulated_sleep_finite_advertising_and_wake_cycles();
     test_cold_keyboard_profile_capability_consumption(true);
     test_cold_keyboard_profile_capability_consumption(false);
     test_cold_keyboard_profile_capability_consumption(true, true);
@@ -8038,6 +8189,7 @@ int main(int argc, char **argv) {
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kMouseMetadata);
+    test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneKeyboard);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneKeyboardLeds);
     if (argc == 2 &&

@@ -252,6 +252,9 @@ struct BleEvent {
     bool indicate_enabled = false;
     bool suspended = false;
     std::uint32_t stack_incarnation = 0;
+    // Nonzero only for a finite, behavior-owned advertising arm. The
+    // controller supplies this nonreused identity before the host arm.
+    std::uint64_t advertising_incarnation = 0;
 };
 
 class BleEventSink {
@@ -322,6 +325,14 @@ class BleBackend {
     virtual bool finish_stop(std::uint64_t) { return false; }
     virtual void set_generation(ble_lifecycle::Generation generation) = 0;
     virtual std::int32_t start_advertising() = 0;
+    virtual std::int32_t start_finite_advertising(
+        std::uint16_t interval_units, std::uint32_t timeout_ms,
+        std::uint64_t advertising_incarnation) {
+        (void)interval_units;
+        (void)timeout_ms;
+        (void)advertising_incarnation;
+        return start_advertising();
+    }
     virtual std::int32_t stop_advertising() = 0;
     // Stop advertising and initiate teardown of any physical peer, including
     // one whose Connect has not yet reached the executor. Completion requires
@@ -781,6 +792,9 @@ class Controller final : public usb_lifecycle::Executor,
     void process(Action action);
     void drive_profile_selection();
     void drive_ble_disable();
+    std::int32_t start_profile_advertising(
+        ble_lifecycle::Generation generation, bool slow = false);
+    bool simulated_sleep_entry_ready() const;
     const ble_fixture_profile::ProfileDefinition &selected_profile() const;
     void publish_profile(bool active, ble_fixture_profile::SelectionTransition transition);
     bool enqueue(Action action);
@@ -881,6 +895,20 @@ class Controller final : public usb_lifecycle::Executor,
     std::uint64_t profile_deadline_us_ = 0;
     std::uint64_t ble_disable_deadline_us_ = 0;
     ble_lifecycle::Generation ble_disable_generation_ = 0;
+    enum class SimulatedSleepStage : std::uint8_t {
+        kInactive,
+        kFastAdvertising,
+        kSlowAdvertising,
+        kSleepPending,
+        kAsleep,
+    };
+    struct SimulatedSleepState {
+        SimulatedSleepStage stage = SimulatedSleepStage::kInactive;
+        ble_lifecycle::Generation generation = 0;
+        std::uint32_t stack_incarnation = 0;
+        std::uint64_t advertising_incarnation = 0;
+    } simulated_sleep_{};
+    std::uint64_t next_advertising_incarnation_ = 1;
     // Protected by the short DLE admission critical section, never across HCI.
     void observe_dle_event(BleEvent event);
     bool claim_dle(BleEvent event);

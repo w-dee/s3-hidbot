@@ -497,7 +497,7 @@ isolation and late-write retirement. Executor tests keep Output state separate
 from input route readiness/release and invalidate observation across retirement.
 The actual NVS/store adapter rejects plain-keyboard/LED-keyboard bond reuse.
 Host and control-protocol tests cover `ble.led-observation-v1`, exact typed
-status, capability gating, CLI observation, cached retry and the six-profile
+status, capability gating, CLI observation, cached retry and the seven-profile
 catalog at the maximum request ID. None of these tests touches physical LEDs.
 
 The synthetic metadata profile extends the actual GATT registration/access

@@ -16,12 +16,14 @@ enum class ProfileId : std::uint8_t {
     kStandaloneMouseJustWorksId7 = 3,
     kStandaloneKeyboardLeds = 4,
     kMouseMetadata = 5,
+    kMouseSimulatedSleepV1 = 6,
 };
 
 // Profile identity and bond/cache interpretation are separate namespaces.
 enum class BondAssociationClass : std::uint8_t {
     kStrictComposite = 0, kStandaloneMouseJustWorks = 1, kStandaloneKeyboard = 2,
-    kStandaloneMouseJustWorksId7 = 3, kStandaloneKeyboardLeds = 4, kMouseMetadata = 5
+    kStandaloneMouseJustWorksId7 = 3, kStandaloneKeyboardLeds = 4,
+    kMouseMetadata = 5, kMouseSimulatedSleepV1 = 6
 };
 enum class LogicalIdentityClass : std::uint8_t { kSharedFixture = 0 };
 enum class SelectionTransition : std::uint8_t { kStable, kInitializing, kFault };
@@ -60,6 +62,7 @@ enum class GattLayoutId : std::uint8_t {
     kMouseId7Revision4 = 3,
     kKeyboardLedsRevision5 = 4,
     kMouseMetadataRevision6 = 5,
+    kMouseSimulatedSleepRevision7 = 6,
 };
 
 enum class SmpPolicyId : std::uint8_t {
@@ -84,6 +87,20 @@ enum class CachePolicyId : std::uint8_t {
     kMouseId7Revision4 = 3,
     kKeyboardLedsRevision5 = 4,
     kMouseMetadataRevision6 = 5,
+    kMouseSimulatedSleepRevision7 = 6,
+};
+
+enum class AdvertisingBehavior : std::uint8_t {
+    kContinuous,
+    kSimulatedSleepV1,
+};
+
+struct AdvertisingPolicy {
+    AdvertisingBehavior behavior = AdvertisingBehavior::kContinuous;
+    std::uint16_t fast_interval_units = 64;   // 40 ms, 0.625-ms units.
+    std::uint16_t slow_interval_units = 800; // 500 ms, 0.625-ms units.
+    std::uint32_t fast_timeout_ms = 0;
+    std::uint32_t slow_timeout_ms = 0;
 };
 
 using ReportRole = hid_capability::ReportRole;
@@ -266,6 +283,7 @@ struct ProfileDefinition {
     SecurityOutcomePolicy security;
     AttributePolicy attributes;
     CachePolicy cache;
+    AdvertisingPolicy advertising{};
     const SyntheticMetadata *metadata = nullptr;
 };
 
@@ -495,12 +513,34 @@ inline constexpr ProfileDefinition kMouseMetadata = [] {
     return profile;
 }();
 
+// Externally observable sleep/wake simulation only. The MCU remains running.
+// Timing is deliberately finite and fixed; this is not a generic power API.
+inline constexpr ProfileDefinition kMouseSimulatedSleepV1 = [] {
+    auto profile = kStandaloneMouseJustWorks;
+    profile.id = ProfileId::kMouseSimulatedSleepV1;
+    profile.name = "mouse_simulated_sleep_v1";
+    profile.bond_class = BondAssociationClass::kMouseSimulatedSleepV1;
+    profile.layout.id = GattLayoutId::kMouseSimulatedSleepRevision7;
+    profile.cache.id = CachePolicyId::kMouseSimulatedSleepRevision7;
+    profile.cache.schema_revision = 7;
+    profile.cache.schema_epoch_value = {7};
+    profile.advertising = {
+        .behavior = AdvertisingBehavior::kSimulatedSleepV1,
+        .fast_interval_units = 64,
+        .slow_interval_units = 800,
+        .fast_timeout_ms = 3'000,
+        .slow_timeout_ms = 7'000,
+    };
+    return profile;
+}();
+
 struct LedValue { bool valid = false; std::uint8_t leds = 0; };
 struct LedStatus { bool supported = false; bool valid = false; std::uint8_t leds = 0; };
 
-inline constexpr std::array<const ProfileDefinition *, 6> kCatalog{
+inline constexpr std::array<const ProfileDefinition *, 7> kCatalog{
     &kStrictComposite, &kStandaloneMouseJustWorks, &kStandaloneKeyboard,
-    &kStandaloneMouseJustWorksId7, &kStandaloneKeyboardLeds, &kMouseMetadata};
+    &kStandaloneMouseJustWorksId7, &kStandaloneKeyboardLeds, &kMouseMetadata,
+    &kMouseSimulatedSleepV1};
 
 // Internal reviewed definitions can precede public lifecycle enablement.
 constexpr const ProfileDefinition *find_definition(ProfileId id) {
@@ -511,6 +551,7 @@ constexpr const ProfileDefinition *find_definition(ProfileId id) {
         case ProfileId::kStandaloneKeyboardLeds: return &kStandaloneKeyboardLeds;
         case ProfileId::kMouseMetadata: return &kMouseMetadata;
         case ProfileId::kStandaloneMouseJustWorksId7: return &kStandaloneMouseJustWorksId7;
+        case ProfileId::kMouseSimulatedSleepV1: return &kMouseSimulatedSleepV1;
     }
     return nullptr;
 }
@@ -555,7 +596,7 @@ constexpr bool subscriptions_ready(const ProfileDefinition &profile,
 }
 
 static_assert(kStrictComposite.report_map.size() == 116);
-static_assert(kCatalog.size() == 6 &&
+static_assert(kCatalog.size() == 7 &&
               kCatalog[0]->id == ProfileId::kStrictComposite);
 static_assert(kStrictReports[0].report_id == 1 &&
               kStrictReports[0].value_size == 8);

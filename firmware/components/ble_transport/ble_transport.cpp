@@ -1367,9 +1367,16 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
             break;
         }
         case BLE_GAP_EVENT_ADV_COMPLETE:
-            (void)backend->signal(
-                hid_control_executor::BleEventKind::kAdvertisingComplete,
-                ble_lifecycle::kNoConnection, event->adv_complete.reason);
+            (void)backend->signal_event({
+                .kind = hid_control_executor::BleEventKind::kAdvertisingComplete,
+                .generation = backend->generation_.load(
+                    std::memory_order_acquire),
+                .connection_handle = ble_lifecycle::kNoConnection,
+                .status = event->adv_complete.reason,
+                .advertising_incarnation =
+                    backend->advertising_incarnation_.load(
+                        std::memory_order_acquire),
+            });
             break;
         case BLE_GAP_EVENT_SUBSCRIBE:
             if (backend->database_ != nullptr && backend->sink_ != nullptr) {
@@ -1436,6 +1443,24 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
 }
 
 std::int32_t Backend::start_advertising() {
+    return start_advertising_internal(kAdvertisingInterval, BLE_HS_FOREVER, 0);
+}
+
+std::int32_t Backend::start_finite_advertising(
+    std::uint16_t interval_units, std::uint32_t timeout_ms,
+    std::uint64_t advertising_incarnation) {
+    if (advertising_incarnation == 0 || timeout_ms == 0 ||
+        timeout_ms > static_cast<std::uint32_t>(INT32_MAX)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return start_advertising_internal(
+        interval_units, static_cast<std::int32_t>(timeout_ms),
+        advertising_incarnation);
+}
+
+std::int32_t Backend::start_advertising_internal(
+    std::uint16_t interval_units, std::int32_t duration_ms,
+    std::uint64_t advertising_incarnation) {
     if (!initialized_ || database_ == nullptr ||
         !stop_transaction_.initialization_allowed()) {
         return ESP_ERR_INVALID_STATE;
@@ -1448,6 +1473,11 @@ std::int32_t Backend::start_advertising() {
     hidden_exposure_barrier_passed_.store(false, std::memory_order_release);
     hidden_exposure_termination_claimed_.store(false,
                                                std::memory_order_release);
+    // Publish the exact arm identity before the host can synchronously expose
+    // callbacks from the GAP advertising start call. A later lifecycle
+    // generation or stack incarnation independently fences a restarted arm.
+    advertising_incarnation_.store(advertising_incarnation,
+                                   std::memory_order_release);
     ble_hs_adv_fields fields{};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.uuids16 = &s_hid_service_uuid;
@@ -1465,9 +1495,9 @@ std::int32_t Backend::start_advertising() {
     ble_gap_adv_params parameters{};
     parameters.conn_mode = BLE_GAP_CONN_MODE_UND;
     parameters.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    parameters.itvl_min = kAdvertisingInterval;
-    parameters.itvl_max = kAdvertisingInterval;
-    return ble_gap_adv_start(own_address_type_, nullptr, BLE_HS_FOREVER, &parameters,
+    parameters.itvl_min = interval_units;
+    parameters.itvl_max = interval_units;
+    return ble_gap_adv_start(own_address_type_, nullptr, duration_ms, &parameters,
                              on_gap_event, this);
 }
 

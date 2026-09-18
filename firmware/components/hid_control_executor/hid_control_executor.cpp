@@ -467,8 +467,66 @@ void Controller::drive_ble_disable() {
     if (!ble_backend_->physical_exposure_hidden()) return;
     if (!ble_state_.complete_disable(ble_disable_generation_)) return;
     ble_disable_deadline_us_ = 0;
+    if (simulated_sleep_.stage == SimulatedSleepStage::kSleepPending &&
+        simulated_sleep_.generation == ble_disable_generation_ &&
+        simulated_sleep_.stack_incarnation ==
+            ble_stack_incarnation_.load(std::memory_order_acquire)) {
+        simulated_sleep_.stage = SimulatedSleepStage::kAsleep;
+        simulated_sleep_.advertising_incarnation = 0;
+    } else {
+        simulated_sleep_ = {};
+    }
     ble_backend_->record_heap_checkpoint(BleBackend::HeapCheckpoint::kHiddenIdle);
     release_operation(owner);
+}
+
+std::int32_t Controller::start_profile_advertising(
+    ble_lifecycle::Generation generation, bool slow) {
+    const auto &policy = selected_profile().advertising;
+    if (policy.behavior !=
+        ble_fixture_profile::AdvertisingBehavior::kSimulatedSleepV1) {
+        simulated_sleep_ = {};
+        return ble_backend_->start_advertising();
+    }
+    if (next_advertising_incarnation_ == 0 ||
+        next_advertising_incarnation_ == UINT64_MAX) {
+        return -12;
+    }
+    const auto incarnation = next_advertising_incarnation_++;
+    simulated_sleep_ = {
+        .stage = slow ? SimulatedSleepStage::kSlowAdvertising
+                      : SimulatedSleepStage::kFastAdvertising,
+        .generation = generation,
+        .stack_incarnation =
+            ble_stack_incarnation_.load(std::memory_order_acquire),
+        .advertising_incarnation = incarnation,
+    };
+    const auto result = ble_backend_->start_finite_advertising(
+        slow ? policy.slow_interval_units : policy.fast_interval_units,
+        slow ? policy.slow_timeout_ms : policy.fast_timeout_ms,
+        incarnation);
+    if (result != 0) simulated_sleep_ = {};
+    return result;
+}
+
+bool Controller::simulated_sleep_entry_ready() const {
+    if (runtime_ == nullptr) return false;
+    const auto lifecycle = ble_state_.snapshot();
+    const auto route = runtime_->state_machine().route_snapshot();
+    const auto pairing = pairing_state_.snapshot();
+    return lifecycle.stack_ready && !lifecycle.connected &&
+           lifecycle.advertising && !lifecycle.recovery_required &&
+           lifecycle.desired == ble_lifecycle::DesiredExposure::kExposed &&
+           lifecycle.observed == ble_lifecycle::ObservedState::kAdvertising &&
+           route.coherent && !route.invalidation_pending &&
+           route.desired == hid_route::OutputRoute::kNone &&
+           route.active == hid_route::OutputRoute::kNone &&
+           route.transition == hid_route::Transition::kStable &&
+           runtime_->state_machine().profile_switch_quiescent() &&
+           pairing.coherent && !pairing.pairing_active &&
+           pairing.live_state == ble_pairing::LiveState::kIdle &&
+           !ble_hid_peer_.active &&
+           ble_route_release_phase_ == BleRouteReleasePhase::kNone;
 }
 
 void Controller::drive_profile_selection() {
@@ -2420,7 +2478,8 @@ void Controller::process(Action action) {
         if (ble_backend_->persistent_store_failure_observed()) {
             return;
         }
-        const std::int32_t result = ble_backend_->start_advertising();
+        const std::int32_t result =
+            start_profile_advertising(current.generation);
         if (result == 0) {
             ble_state_.complete_advertising(current.generation);
             ble_backend_->record_heap_checkpoint(
@@ -3279,7 +3338,7 @@ bool Controller::reconcile_ble_disconnect(BleEvent event, bool expected) {
     }
     const auto generation = ble_state_.generation();
     ble_backend_->set_generation(generation);
-    const std::int32_t result = ble_backend_->start_advertising();
+    const std::int32_t result = start_profile_advertising(generation);
     if (result == 0) {
         ble_state_.complete_advertising(generation);
         ble_backend_->record_heap_checkpoint(
@@ -3325,7 +3384,8 @@ void Controller::process_ble_event(BleEvent event) {
             if (ble_backend_->persistent_store_failure_observed()) {
                 return;
             }
-            const std::int32_t result = ble_backend_->start_advertising();
+            const std::int32_t result =
+                start_profile_advertising(event.generation);
             if (result == 0) {
                 ble_state_.complete_advertising(event.generation);
                 publish_profile(true, ble_fixture_profile::SelectionTransition::kStable);
@@ -3378,20 +3438,61 @@ void Controller::process_ble_event(BleEvent event) {
             return;
         }
         case BleEventKind::kAdvertisingComplete:
-            // A completion for an obsolete generation is ignored. An active
-            // exposed incarnation is restarted by the serialized owner.
-            if (event.generation == ble_state_.generation() &&
-                ble_state_.snapshot().desired ==
-                    ble_lifecycle::DesiredExposure::kExposed &&
-                !ble_state_.snapshot().connected) {
-                if (ble_backend_->persistent_store_failure_observed()) {
+            // Generation, stack incarnation and the nonreused advertising arm
+            // jointly reject an expiry from an earlier sleep/wake cycle.
+            if (event.generation != ble_state_.generation() ||
+                ble_state_.snapshot().desired !=
+                    ble_lifecycle::DesiredExposure::kExposed ||
+                ble_state_.snapshot().connected ||
+                ble_backend_->persistent_store_failure_observed()) return;
+            if (selected_profile().advertising.behavior ==
+                ble_fixture_profile::AdvertisingBehavior::kSimulatedSleepV1) {
+                if (event.advertising_incarnation == 0 ||
+                    event.advertising_incarnation !=
+                        simulated_sleep_.advertising_incarnation ||
+                    simulated_sleep_.generation != event.generation ||
+                    simulated_sleep_.stack_incarnation !=
+                        event.stack_incarnation) return;
+                if (simulated_sleep_.stage ==
+                    SimulatedSleepStage::kFastAdvertising) {
+                    const auto result =
+                        start_profile_advertising(event.generation, true);
+                    if (result != 0)
+                        fail_ble(event.generation,
+                                 ble_lifecycle::Operation::kRuntime, result,
+                                 ControlOperation::kNone);
                     return;
                 }
-                const std::int32_t result = ble_backend_->start_advertising();
-                if (result != 0) {
-                    fail_ble(event.generation, ble_lifecycle::Operation::kRuntime,
-                             result, ControlOperation::kNone);
+                if (simulated_sleep_.stage !=
+                    SimulatedSleepStage::kSlowAdvertising) return;
+                if (simulated_sleep_entry_ready()) {
+                    const auto outcome = request_ble_disable();
+                    if (outcome.action_result ==
+                        ble_lifecycle::TransitionResult::kAccepted) {
+                        simulated_sleep_.stage =
+                            SimulatedSleepStage::kSleepPending;
+                        simulated_sleep_.generation =
+                            outcome.snapshot.generation;
+                        simulated_sleep_.advertising_incarnation = 0;
+                        return;
+                    }
                 }
+                // A transient route/release owner defers sleep by exactly one
+                // further fixed slow-advertising window.
+                const auto result =
+                    start_profile_advertising(event.generation, true);
+                if (result != 0)
+                    fail_ble(event.generation,
+                             ble_lifecycle::Operation::kRuntime, result,
+                             ControlOperation::kNone);
+                return;
+            }
+            {
+                const auto result = start_profile_advertising(event.generation);
+                if (result != 0)
+                    fail_ble(event.generation,
+                             ble_lifecycle::Operation::kRuntime, result,
+                             ControlOperation::kNone);
             }
             return;
         case BleEventKind::kReset: {

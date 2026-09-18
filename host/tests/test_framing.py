@@ -38,18 +38,18 @@ class FramingTests(unittest.TestCase):
         )
 
     def test_maximum_logical_frame_fits_after_crlf_translation(self) -> None:
-        payload = b"x" * (1023 - len(FRAME_PREFIX) - 1)
+        payload = b"x" * (MAX_MACHINE_FRAME_BYTES - 1 - len(FRAME_PREFIX) - 1)
         logical = FRAME_PREFIX + payload + b"\n"
         wire = logical[:-1] + b"\r\n"
-        self.assertEqual(len(logical), 1023)
+        self.assertEqual(len(logical), MAX_MACHINE_FRAME_BYTES - 1)
         self.assertEqual(len(wire), MAX_MACHINE_FRAME_BYTES)
         self.assertEqual(Framer().feed(wire), (MachineFrame(payload),))
 
     def test_logical_frame_one_byte_over_bound_is_oversize_after_crlf(self) -> None:
-        payload = b"x" * (1024 - len(FRAME_PREFIX) - 1)
+        payload = b"x" * (MAX_MACHINE_FRAME_BYTES - len(FRAME_PREFIX) - 1)
         logical = FRAME_PREFIX + payload + b"\n"
         wire = logical[:-1] + b"\r\n"
-        self.assertEqual(len(logical), 1024)
+        self.assertEqual(len(logical), MAX_MACHINE_FRAME_BYTES)
         self.assertEqual(len(wire), MAX_MACHINE_FRAME_BYTES + 1)
         self.assertEqual(
             Framer().feed(wire),

@@ -75,7 +75,7 @@ void tracked_cjson_free(void *storage) {
 
 constexpr char kNonceA[] = "0123456789abcdef0123456789abcdef";
 constexpr char kNonceB[] = "fedcba9876543210fedcba9876543210";
-constexpr std::size_t kMaxLogicalMachineFrameBytes = 1023;
+constexpr std::size_t kMaxLogicalMachineFrameBytes = 1279;
 
 firmware_identity::Identity make_test_identity() {
     std::array<std::uint8_t, firmware_identity::kAppElfSha256Bytes> digest{};
@@ -2843,7 +2843,9 @@ void test_led_observation_exact_api() {
     require_contains(fixture.sink.last(), "\"code\":\"INVALID_PARAMS\"");
     fixture.payload(request(INT32_MAX, session, "ble.profile.list"));
     require_contains(fixture.sink.last(), "mouse_metadata");
+    require_contains(fixture.sink.last(), "mouse_simulated_sleep_v1");
     require_contains(fixture.sink.last(), "\"bond\":5,\"identity\":0");
+    require_contains(fixture.sink.last(), "\"bond\":6,\"identity\":0");
     assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
 }
 

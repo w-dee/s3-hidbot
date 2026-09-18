@@ -14,8 +14,8 @@ def main() -> int:
     source = SOURCE.read_text(encoding="utf-8")
     header = HEADER.read_text(encoding="utf-8")
     deferred_failure = DEFERRED_FAILURE.read_text(encoding="utf-8")
-    assert "kMaxLogicalMachineFrameBytes = 1023" in header
-    assert "kMaxWireMachineFrameBytes = 1024" in header
+    assert "kMaxLogicalMachineFrameBytes = 1279" in header
+    assert "kMaxWireMachineFrameBytes = 1280" in header
 
     writer_start = source.index("bool write_machine")
     writer_end = source.index("esp_err_t start(", writer_start)

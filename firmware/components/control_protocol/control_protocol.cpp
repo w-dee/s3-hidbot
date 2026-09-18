@@ -601,27 +601,26 @@ bool make_profile_list(control_session::ResponseFrame *frame,
                        ResponseSession session, std::int32_t id) {
     char session_field[kSessionFieldBytes]{};
     if (!format_session_field(session_field, session)) return false;
-    char entries[900]{};
-    std::size_t used = 0;
+    if (!format_frame(frame,
+        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
+        "\"session\":%s,\"ok\":true,\"result\":{\"profiles\":[",
+        static_cast<long>(id), session_field)) return false;
+    bool first = true;
     for (const auto *profile : ble_fixture_profile::kCatalog) {
         char digest[65]{};
         for (std::size_t i = 0; i < profile->report_map_sha256.size(); ++i) {
             std::snprintf(digest + i * 2, 3, "%02x", profile->report_map_sha256[i]);
         }
-        const int written = std::snprintf(entries + used, sizeof(entries) - used,
+        if (!append_frame(frame,
             "%s{\"id\":\"%s\",\"rev\":%u,\"schema\":%u,\"map\":\"%s\","
-            "\"bond\":%u,\"identity\":%u}", used == 0 ? "" : ",", profile->name,
+            "\"bond\":%u,\"identity\":%u}", first ? "" : ",", profile->name,
             static_cast<unsigned>(profile->revision),
             static_cast<unsigned>(profile->cache.schema_revision), digest,
             static_cast<unsigned>(profile->bond_class),
-            static_cast<unsigned>(profile->identity_class));
-        if (written < 0 || static_cast<std::size_t>(written) >= sizeof(entries) - used) return false;
-        used += static_cast<std::size_t>(written);
+            static_cast<unsigned>(profile->identity_class))) return false;
+        first = false;
     }
-    return format_frame(frame,
-        "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
-        "\"session\":%s,\"ok\":true,\"result\":{\"profiles\":[%s]}}\n",
-        static_cast<long>(id), session_field, entries);
+    return append_frame(frame, "]}}\n");
 }
 
 bool make_ble_exposure_status(control_session::ResponseFrame *frame,
