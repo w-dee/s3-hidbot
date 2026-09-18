@@ -338,6 +338,16 @@ publish, and finally reverify one stable Release and its ten exact assets.
 Neither `release-build.yml` nor the historical v0.1.0 draft workflow publishes
 that Release automatically.
 
+For v0.4.0, physical qualification binds the exact product commit and
+firmware archive before the authority-v5 and release-preparation documentation
+commits. The intended annotated tag therefore targets the qualified product
+commit recorded in [`qualification-v0.4.0.md`](qualification-v0.4.0.md), and a
+tag build must reproduce the recorded firmware archive byte-for-byte. The
+later documentation is retained as a separate audit trail and supplies the
+prepared release body and checklist; it does not change the qualified product
+tree. The remaining tag, candidate/tag CI comparison, draft, and publication
+steps keep the bounded read-back and separate-authorization model above.
+
 The local artifact contract remains valid when `build.container_image` is
 `null`; only the dedicated CI workflow supplies immutable container
 provenance.
