@@ -89,8 +89,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         static_step = self.build.split(
             "      - name: Enforce release version authority and static guards\n", 1
         )[1].split("      - name: Build and compare two independent firmware archives\n", 1)[0]
+        activation = 'source "$IDF_PATH/export.sh"'
         install = "python3 -m pip install --disable-pip-version-check --no-input ./host"
+        self.assertIn(activation, static_step)
         self.assertIn(install, static_step)
+        self.assertLess(static_step.index(activation), static_step.index(install))
         self.assertLess(static_step.index(install), static_step.index("./tools/test-static.sh"))
 
     def test_dispatch_inputs_and_checkout_selector_are_fail_closed(self) -> None:

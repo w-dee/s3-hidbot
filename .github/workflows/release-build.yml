@@ -127,6 +127,7 @@ jobs:
           {
             python3 -c 'import json,sys; value=json.load(sys.stdin); print("product-version=" + value["version"]); print("firmware-name=" + value["firmware_archive"]); print("wheel-name=" + value["host_wheel"]); print("sdist-name=" + value["host_sdist"])' <<<"$contract"
           } >> "$GITHUB_OUTPUT"
+          source "$IDF_PATH/export.sh"
           python3 -m pip install --disable-pip-version-check --no-input ./host
           ./tools/test-static.sh
           python3 tools/test_privacy_lint.py

@@ -59,6 +59,7 @@ jobs:
           GIT_CONFIG_VALUE_0: ${{ github.workspace }}
         run: |
           set -euo pipefail
+          source "$IDF_PATH/export.sh"
           python3 -m pip install --disable-pip-version-check --no-input ./host
           ./tools/test-static.sh
           python3 tools/test_privacy_lint.py

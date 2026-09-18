@@ -70,9 +70,14 @@ def main() -> int:
     _required(static_step, r"GIT_CONFIG_COUNT:\s*[\"']?1[\"']?", "nested Git config count")
     _required(static_step, r"GIT_CONFIG_KEY_0:\s*safe\.directory", "nested Git safe-directory key")
     _required(static_step, r"GIT_CONFIG_VALUE_0:\s*\$\{\{\s*github\.workspace\s*\}\}", "trusted workspace value")
+    activation = 'source "$IDF_PATH/export.sh"'
     dependency_install = "python3 -m pip install --disable-pip-version-check --no-input ./host"
+    if activation not in static_step:
+        raise AssertionError("artifact static guards must activate the ESP-IDF Python environment")
     if dependency_install not in static_step:
         raise AssertionError("artifact static guards must install selected-source host dependencies")
+    if static_step.index(activation) > static_step.index(dependency_install):
+        raise AssertionError("artifact Python environment must be active before dependency install")
     if static_step.index(dependency_install) > static_step.index("./tools/test-static.sh"):
         raise AssertionError("artifact host dependencies must be installed before static guards")
     build_step = text.split(
