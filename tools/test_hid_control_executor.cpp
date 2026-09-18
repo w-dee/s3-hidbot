@@ -7801,6 +7801,19 @@ void sleep_claim_usb_route(hid_control_executor::Controller *controller) {
     sleep_claim_ready = controller->simulated_sleep_entry_ready_for_test();
     sleep_claim_route_result =
         controller->request_route(hid_route::OutputRoute::kUsb).action_result;
+    assert(controller->request_route(hid_route::OutputRoute::kBle).action_result ==
+           hid_runtime::RouteTransitionResult::kBusy);
+    assert(controller->request_profile_select(
+               ble_fixture_profile::ProfileId::kStrictComposite).result ==
+           ble_fixture_profile::SelectionResult::kBusy);
+    assert(controller->request_ble_disable().action_result ==
+           ble_lifecycle::TransitionResult::kBusy);
+    assert(controller->request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kBusy);
+    assert(action(controller->request_attach()) ==
+           usb_lifecycle::TransitionResult::kBusy);
+    assert(action(controller->request_detach()) ==
+           usb_lifecycle::TransitionResult::kBusy);
 }
 
 void sleep_claim_runtime_work(hid_control_executor::Controller *controller) {
