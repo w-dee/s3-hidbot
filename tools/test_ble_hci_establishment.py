@@ -62,6 +62,15 @@ int real_registration_result = 0;
 int original_recv = 0;
 int replacement_recv = 0;
 int original_send = 0;
+bool sdk_alive = true;
+std::function<void()> receive_hook;
+std::function<void()> send_hook;
+int host_stop_calls = 0;
+int sdk_deinit_calls = 0;
+constexpr int ESP_OK = 0;
+int nimble_port_stop() { ++host_stop_calls; return 0; }
+void nimble_port_freertos_deinit() {}
+int nimble_port_deinit() { ++sdk_deinit_calls; sdk_alive = false; return 0; }
 int queue_puts = 0;
 int queue_checks = 0;
 bool event_alive = true;
@@ -76,8 +85,8 @@ extern "C" esp_err_t __real_esp_vhci_host_register_callback(
  if (real_registration_result == 0) registered_vhci = callback;
  return real_registration_result;
 }
-void original_send_available() { ++original_send; }
-int original_receive(uint8_t *, uint16_t) { ++original_recv; return 23; }
+void original_send_available() { assert(sdk_alive); ++original_send; if (send_hook) send_hook(); assert(sdk_alive); }
+int original_receive(uint8_t *, uint16_t) { assert(sdk_alive); ++original_recv; if (receive_hook) receive_hook(); assert(sdk_alive); return 23; }
 int replacement_receive(uint8_t *, uint16_t) { ++replacement_recv; return 29; }
 struct ble_hci_lc_disconnect_cp {
  uint16_t conn_handle;
@@ -182,6 +191,11 @@ bool allocate_hci_establishment_id(std::atomic<uint64_t> *, uint64_t *);
 int disconnect_controller_handle(uint16_t);
 class Backend {
 public:
+ struct StopOperations;
+ std::atomic_bool host_exited_{true};
+ ble_npl_event hidden_exposure_barrier_{};
+ bool hidden_exposure_barrier_initialized_ = false;
+ bool retire_timers_after_stop() { return true; }
  static Backend *instance_;
  static bool hci_callback_registration_allowed();
  static bool observe_hci_ingress(const uint8_t *);
@@ -247,6 +261,7 @@ int main() {
  backend.hci_establishment_event_.fn = Backend::hci_establishment_callback;
  backend.hci_establishment_event_.arg = &backend;
 
+ assert(open_vhci_users());
  assert(__wrap_esp_vhci_host_register_callback(nullptr) == ESP_ERR_INVALID_ARG);
  const esp_vhci_host_callback_t original{original_send_available, original_receive};
  assert(__wrap_esp_vhci_host_register_callback(&original) == 0);
@@ -462,6 +477,55 @@ int main() {
  Backend::queue_hci_establishment_resolution();
  assert(queue_checks == checks_before_skip);
 
+ // Replay the production stop adapter while packet forwarding is paused.
+ // Event queue leases are already zero; the separate forwarding user alone
+ // must prevent SDK deinit and keep both send/receive callback resources live.
+ Backend::StopOperations stop{backend};
+ receive_hook = [&]() {
+  assert((s_vhci_users.load() & ~kVhciClosing) == 1);
+  const int before = sdk_deinit_calls;
+  assert(!stop.deinitialize());
+  assert(sdk_deinit_calls == before && sdk_alive);
+  assert(!open_vhci_users());
+ };
+ assert(registered_vhci->notify_host_recv(nullptr, 0) == 23);
+ receive_hook = nullptr;
+ assert(s_vhci_users.load() == kVhciClosing);
+ const int recv_before_closed = original_recv;
+ assert(registered_vhci->notify_host_recv(nullptr, 0) == ESP_ERR_INVALID_STATE);
+ assert(original_recv == recv_before_closed);
+ assert(open_vhci_users());
+ send_hook = [&]() {
+  assert(!stop.deinitialize());
+  assert(sdk_alive);
+ };
+ registered_vhci->notify_host_send_available();
+ send_hook = nullptr;
+ const int send_before_closed = original_send;
+ registered_vhci->notify_host_send_available();
+ assert(original_send == send_before_closed);
+ assert(s_vhci_users.load() == kVhciClosing);
+
+ // Drain the admitted queue-put before host stop can enqueue its exit event.
+ assert(backend.open_hci_event_users());
+ assert(backend.acquire_hci_event_user());
+ backend.close_hci_event_users();
+ const int stops_before = host_stop_calls;
+ assert(!stop.host_stop());
+ assert(host_stop_calls == stops_before);
+ delay_hook = [&]() {
+  assert(host_stop_calls == stops_before);
+  backend.release_hci_event_user();
+  delay_hook = nullptr;
+ };
+ assert(stop.host_stop());
+ assert(host_stop_calls == stops_before + 1);
+ assert(stop.deinitialize());
+ assert(!sdk_alive && sdk_deinit_calls == 1);
+ // New incarnation opens only after full forwarding drain and SDK reclamation.
+ sdk_alive = true;
+ assert(open_vhci_users());
+
  backend.retire_hci_establishment();
  real_registration_result = -77;
  assert(__wrap_esp_vhci_host_register_callback(&replacement) == -77);
@@ -498,7 +562,7 @@ for signature in (
     "void Backend::process_hci_establishment",
 ):
     code += "\n" + body(SOURCE, signature) + "\n"
-code += "\n}\n" + POST
+code += "\n" + STOP_DEINIT + "\n}\n" + POST
 
 with tempfile.TemporaryDirectory(prefix="hidbot-hci-establishment-") as temp:
     cpp = Path(temp) / "test.cpp"

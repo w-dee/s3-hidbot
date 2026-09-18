@@ -523,6 +523,27 @@ class PhysicalRunnerAdapterTests(unittest.TestCase):
         self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
         self.assertEqual(outcome.error_name, "EIO")
 
+    def test_unapproved_error_cannot_hide_behind_other_retirement(self) -> None:
+        for first, second in ((errno.ENODEV, errno.ENXIO),
+                              (errno.ENXIO, errno.ENODEV)):
+            outcome = self.raw_observer_outcome(
+                [OSError(first, "keyboard")], [OSError(second, "mouse")]
+            )
+            self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
+            self.assertEqual(outcome.error_name, "ENXIO")
+            fixture = CleanupFixture()
+            fixture.retirement = outcome
+            with self.assertRaises(QualificationError):
+                fixture.run()
+
+    def test_pending_complete_evidence_survives_partial_tail(self) -> None:
+        observer = rehearsal.Observer(Path("/fake"), "keyboard")
+        observer.pending.extend(self.raw(rehearsal.EV_KEY, 30, 1) + b"x")
+        with self.assertRaises(OSError) as caught:
+            observer.finish_pending()
+        self.assertEqual(caught.exception.errno, errno.EIO)
+        self.assertEqual([(e.code, e.value) for e in getattr(caught.exception, "events", [])], [(30, 1)])
+
     def test_keyboard_retirement_drains_unread_mouse_button(self) -> None:
         outcome = self.raw_observer_outcome(
             [OSError(errno.ENODEV, "keyboard gone")],

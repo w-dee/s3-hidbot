@@ -278,7 +278,9 @@ class Observer:
             # No complete record remains, so any bytes here are an
             # unadjudicated partial record. A collection boundary may not
             # silently turn those bytes into an ALL_UP observation.
-            raise OSError(errno.EIO, "partial evdev record")
+            raise PendingEvidenceError(
+                OSError(errno.EIO, "partial evdev record"), events
+            )
         return events
 
     def read(self, timeout: float) -> list[Event]:
@@ -444,7 +446,7 @@ class ExactObservers:
                 except OSError as exc:
                     if (retirement and
                             phase is BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED and
-                            exc.errno in {errno.ENODEV, errno.ENXIO, errno.ENOENT}):
+                            exc.errno in {errno.ENODEV, errno.ENOENT}):
                         # Retirement is per exact observer. Keep collecting the
                         # other observer until it also retires or the bounded
                         # observation window closes; its fd may still own
@@ -470,7 +472,7 @@ class ExactObservers:
                 except OSError as exc:
                     if (retirement and
                             phase is BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED and
-                            exc.errno in {errno.ENODEV, errno.ENXIO, errno.ENOENT}):
+                            exc.errno in {errno.ENODEV, errno.ENOENT}):
                         retired[index] = True
                         if retirement_error is None:
                             retirement_error = exc
@@ -498,7 +500,7 @@ class ExactObservers:
             except OSError as exc:
                 if (retirement and
                         phase is BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED and
-                        exc.errno in {errno.ENODEV, errno.ENXIO, errno.ENOENT}):
+                        exc.errno in {errno.ENODEV, errno.ENOENT}):
                     retired[index] = True
                     if retirement_error is None:
                         retirement_error = exc

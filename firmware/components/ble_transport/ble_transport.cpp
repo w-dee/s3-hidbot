@@ -62,12 +62,56 @@ std::atomic_flag s_vhci_registration = ATOMIC_FLAG_INIT;
 static_assert(std::atomic<VhciSendAvailable>::is_always_lock_free);
 static_assert(std::atomic<VhciReceive>::is_always_lock_free);
 
+// Packet forwarding outlives the small product-event queue operation. Keep
+// both receive and send callbacks admitted until host stop has obtained its
+// command acknowledgements, then drain them before any SDK object is freed.
+constexpr std::uint32_t kVhciClosing = UINT32_C(1) << 31;
+std::atomic<std::uint32_t> s_vhci_users{kVhciClosing};
+
+bool acquire_vhci_user() {
+    auto value = s_vhci_users.load(std::memory_order_acquire);
+    while ((value & kVhciClosing) == 0U) {
+        if (value == kVhciClosing - 1U) return false;
+        if (s_vhci_users.compare_exchange_weak(
+                value, value + 1U, std::memory_order_acq_rel,
+                std::memory_order_acquire)) return true;
+    }
+    return false;
+}
+
+struct VhciUse {
+    const bool admitted = acquire_vhci_user();
+    ~VhciUse() {
+        if (admitted) s_vhci_users.fetch_sub(1U, std::memory_order_release);
+    }
+};
+
+bool open_vhci_users() {
+    std::uint32_t expected = kVhciClosing;
+    return s_vhci_users.compare_exchange_strong(
+        expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+bool close_and_await_vhci_users() {
+    s_vhci_users.fetch_or(kVhciClosing, std::memory_order_acq_rel);
+    const auto deadline = esp_timer_get_time() + 1'000'000;
+    while (s_vhci_users.load(std::memory_order_acquire) != kVhciClosing) {
+        if (esp_timer_get_time() >= deadline) return false;
+        vTaskDelay(1);
+    }
+    return true;
+}
+
 void vhci_send_available_proxy() {
+    const VhciUse use;
+    if (!use.admitted) return;
     const auto callback = s_vhci_send_available.load(std::memory_order_acquire);
     if (callback != nullptr) callback();
 }
 
 int vhci_receive_proxy(std::uint8_t *data, std::uint16_t length) {
+    const VhciUse use;
+    if (!use.admitted) return ESP_ERR_INVALID_STATE;
     const bool complete_event = data != nullptr && length >= 3U &&
         data[0] == kHciUartH4Event &&
         length == static_cast<std::uint16_t>(data[2]) + 3U;
@@ -893,7 +937,10 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     if (initialized_) {
         return 0;
     }
-    if (sink == nullptr || instance_ != nullptr) {
+    if (sink == nullptr || instance_ != nullptr ||
+        hci_event_users_.load(std::memory_order_acquire) != kHciEventUsersClosing ||
+        hci_establishment_event_initialized_.load(std::memory_order_acquire) ||
+        s_vhci_users.load(std::memory_order_acquire) != kVhciClosing) {
         return ESP_ERR_INVALID_STATE;
     }
     sink_ = sink;
@@ -1064,6 +1111,7 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
                                                    std::memory_order_release);
         return ESP_ERR_INVALID_STATE;
     }
+    if (!open_vhci_users()) return ESP_ERR_INVALID_STATE;
     retire_hci_establishment();
     hci_ingress_enabled_.store(true, std::memory_order_release);
     host_exited_.store(false, std::memory_order_release);
@@ -1126,8 +1174,8 @@ std::uint64_t Backend::begin_stop() {
         return 0;
     }
     // Close callback-side NPL event leases before the host stop event is
-    // enqueued. Any earlier queued resolver therefore drains ahead of stop;
-    // no later callback can queue behind it.
+    // enqueued. The worker drains admitted queue users before host_stop,
+    // so their resolver events are ahead of the final host-stop event.
     close_hci_event_users();
     stop_worker_id_ = id;
     if (xTaskCreate(stop_task, "ble_stop", 4096, this, tskIDLE_PRIORITY + 1,
@@ -1170,7 +1218,11 @@ bool Backend::finish_stop(std::uint64_t id) {
 
 struct Backend::StopOperations {
     Backend &backend;
-    bool host_stop() { return nimble_port_stop() == ESP_OK; }
+    bool host_stop() {
+        // A callback that already owns a queue lease may still enqueue. Keep
+        // the host consuming until all of those puts have completed.
+        return backend.await_hci_event_users() && nimble_port_stop() == ESP_OK;
+    }
     bool await_host_exit() {
         const auto deadline = esp_timer_get_time() + 1'000'000;
         while (!backend.host_exited_.load(std::memory_order_acquire)) {
@@ -1181,6 +1233,7 @@ struct Backend::StopOperations {
     }
     void delete_host_task() { nimble_port_freertos_deinit(); }
     bool deinitialize() {
+        if (!close_and_await_vhci_users()) return false;
         backend.retire_hci_establishment();
         if (!backend.deinitialize_hci_event()) return false;
         if (backend.hidden_exposure_barrier_initialized_) {

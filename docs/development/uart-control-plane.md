@@ -1355,8 +1355,7 @@ paths remain blocked until the global safety barrier is clear.
 
 ## Public safety release
 
-`hid.release_all` is the public safety operation. The separate unsafe
-`hid.keyboard.report` accepts the
+`hid.release_all` is the public safety operation. It accepts a
 normal no-params request (`params` omitted or `{}`) and reports independent
 Keyboard and Mouse outcomes. A successful result is exactly:
 
@@ -1831,10 +1830,14 @@ probe returns host-domain Unknown Connection Identifier. Re-probing is thus
 driven by a completion wake and never treats command acceptance as absence.
 
 The VHCI callback takes a counted lease immediately before inspecting or
-queueing the project NPL resolver event. Stop closes new leases before it
-enqueues the host stop operation and drains every admitted lease before event
-deinitialization; a bounded drain failure leaves the event allocated and fails
-stop closed. A registered connection transfers to the normal GAP/list
+queueing the project NPL resolver event. Stop closes new event leases and
+drains admitted queue operations while the host is still consuming, before
+starting host stop. A separate counted forwarding lease spans the complete
+receive/send callback, including NimBLE forwarding and resolver scheduling.
+Forwarding stays open for host-stop command acknowledgements, then closes and
+drains before any product event or SDK resource is freed. A bounded drain
+failure leaves resources allocated and fails stop closed; a new incarnation
+cannot reopen either gate while old users remain. A registered connection transfers to the normal GAP/list
 authority. Hidden-idle therefore also requires no unresolved HCI
 establishment. The control owner bounds physical-absence observation to five
 seconds; missing progress or changed lifecycle fails hidden with recovery
