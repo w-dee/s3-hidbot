@@ -21,6 +21,11 @@ The implementation is intentionally split into small components:
   `REL_X` checkpoints.
 - `btmon.py` owns a bounded, injectable, unprivileged capture lifecycle and a
   compact path-free summary.
+- `tools/rp-test/privileged_evidence.py` is a separate, narrow appliance helper
+  for root-required btmon captures. It owns the writer through termination and
+  publishes private digest/stat/termination authority. The unprivileged
+  `evidence_pipeline.py` packages that receipt without accessing raw bytes or
+  their filesystem metadata.
 - `tools/qualification_runner.py` is a thin preflight entrypoint. Later U7.6D
   scenario orchestration should compose the modules rather than grow this
   entrypoint into a single campaign script.
@@ -79,10 +84,13 @@ explicit authorization for the current task.
 - F24 value `2` is an autorepeat only between the same key's value `1` DOWN and
   value `0` UP. A repeat or fresh DOWN after release is stale replay and fails.
   The mouse checkpoint requires exact `REL_X=+1` followed by `SYN_REPORT`.
-- `btmon` capture is bounded and never adds privilege escalation. Its raw file
-  is retained at the caller-selected private evidence location; normal JSON
-  contains only byte count, SHA-256, exit/stop state, duration, and focused
-  counters.
+- The reusable `qualification_harness.btmon` capture is bounded and
+  unprivileged. Its raw file is retained at the caller-selected private
+  evidence location; normal JSON contains only byte count, SHA-256, exit/stop
+  state, duration, and focused counters. A campaign requiring root-owned HCI
+  bytes must instead use the rp-test privileged boundary. Its ordering is
+  writer stop, confirmed reap, stable privileged stat/hash, receipt publication,
+  then unprivileged manifest/result/index packaging.
 
 ## Evidence format
 

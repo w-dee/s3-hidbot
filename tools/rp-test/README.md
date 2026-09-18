@@ -28,7 +28,9 @@ hardware serial number or address enters the marker or sanitized output.
 `cache/tooling`, `private/references`, `runs`, `state`, `tmp` have mode 0700.
 The dedicated login user owns the root and private state. The dedicated venv
 is `toolchains/qualification`. Commands run with umask 077. Avoid running normal
-doctor/cache/capsule commands through sudo. Only bootstrap requires sudo.
+doctor/cache/capsule commands through sudo. Bootstrap and the narrowly scoped
+privileged HCI helper described below are the only repository-owned sudo
+entrypoints in this directory.
 
 The audited package set is Python/venv/pip, rsync, openssh-client, git,
 coreutils, usbutils, udev, bluez and util-linux. These support the existing
@@ -247,6 +249,41 @@ Raw evidence presence and payload are separate facts. In particular,
 `RAW_UART_RETAINED=true`, `RAW_UART_BYTES=0` and `RAW_UART_HAS_DATA=false` means
 capture was armed before open but no UART byte was observed. The zero-byte file
 is valid forensic state and is retained under the same no-automatic-purge policy.
+
+## Privileged HCI evidence boundary
+
+`privileged_evidence.py` is the root side of a narrow btmon boundary for
+campaigns whose raw capture must remain root-owned. It accepts only a fresh
+package two levels below `/srv/s3-hidbot-test/private`, requires an exact
+`authority.json` capture token, creates only `privileged/raw-hci` and
+`privileged/finalization.json`, and invokes `/usr/bin/btmon` without a shell.
+It owns the capture child, stops and reaps it, sets mode 0600, and only then
+hashes an open no-follow descriptor. Matching before/after descriptor metadata
+is required. Its receipt records the relative identifier, SHA-256, byte count,
+mode, numeric owner/group, and exact termination state. Missing, empty, live,
+changed, unreadable, or unstatable captures fail closed.
+
+`evidence_pipeline.py` is the unprivileged side. It never opens, stats, chmods,
+chowns, renames, truncates, or copies `privileged/raw-hci`. It validates the
+root helper's receipt and writes the terminal result, retention, manifest and
+index. A product/test failure with valid evidence is `TEST_FAILED`; a helper or
+receipt failure is `EVIDENCE_FINALIZATION_FAILED`. Both produce a terminal
+private metadata package while retaining the original test outcome. Repeating
+the same finalization verifies and returns the sealed package; a conflicting
+repeat is refused.
+
+The explicit appliance-only smoke is:
+
+```sh
+python3 evidence_rehearsal.py \
+  --evidence-pipeline-rehearsal --not-qualification
+```
+
+It is always classified `EVIDENCE_PIPELINE_REHEARSAL / NOT_QUALIFICATION`.
+It captures ambient HCI traffic only; it does not pair, run HID workloads,
+change bonds, touch firmware/NVS, or create qualification authority. The
+ordinary reusable `retain_raw` path remains for captures already readable by
+the capsule owner and must not be used to ingest a root-owned 0600 file.
 
 ```sh
 python3 run_capsule.py mark RUN_ID RESOLVED
