@@ -21,11 +21,16 @@ The implementation is intentionally split into small components:
   `REL_X` checkpoints.
 - `btmon.py` owns a bounded, injectable, unprivileged capture lifecycle and a
   compact path-free summary.
-- `tools/rp-test/privileged_evidence.py` is a separate, narrow appliance helper
-  for root-required btmon captures. It owns the writer through termination and
-  publishes private digest/stat/termination authority. The unprivileged
-  `evidence_pipeline.py` packages that receipt without accessing raw bytes or
-  their filesystem metadata.
+- `tools/rp-test/privileged_evidence.py` implements the separate version 2
+  root-owned capture boundary. The fixed installation and root, pinned directory
+  and capture descriptors, immutable capture journal and strict receipts are
+  documented in [`evidence-authority.md`](../../tools/rp-test/evidence-authority.md).
+  `evidence_pipeline.py` publishes a final commit only after metadata and modes
+  are durable. Ordinary code never reads or changes root raw evidence.
+- `tools/qualification_campaign/official_campaign.py` and `q8_host_security.py`
+  are the maintained future official coordinator and Q8 integration. Their
+  bundle preparation freezes the remaining audited phase snapshot, plan and
+  exact boundary source. Preparing a bundle does not authorize qualification.
 - `tools/qualification_runner.py` is a thin preflight entrypoint. Later U7.6D
   scenario orchestration should compose the modules rather than grow this
   entrypoint into a single campaign script.

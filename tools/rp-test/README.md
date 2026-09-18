@@ -252,38 +252,42 @@ is valid forensic state and is retained under the same no-automatic-purge policy
 
 ## Privileged HCI evidence boundary
 
-`privileged_evidence.py` is the root side of a narrow btmon boundary for
-campaigns whose raw capture must remain root-owned. It accepts only a fresh
-package two levels below `/srv/s3-hidbot-test/private`, requires an exact
-`authority.json` capture token, creates only `privileged/raw-hci` and
-`privileged/finalization.json`, and invokes `/usr/bin/btmon` without a shell.
-It owns the capture child, stops and reaps it, sets mode 0600, and only then
-hashes an open no-follow descriptor. Matching before/after descriptor metadata
-is required. Its receipt records the relative identifier, SHA-256, byte count,
-mode, numeric owner/group, and exact termination state. Missing, empty, live,
-changed, unreadable, or unstatable captures fail closed.
+Version 2 replaces the failed version 1 candidate without modifying historical
+capsules. The full authority and recovery contract is in
+[`evidence-authority.md`](evidence-authority.md). The root CLI accepts one exact
+run basename and a separate capture ID, never a caller path. Its fixed root is
+`/srv/s3-hidbot-test/private/evidence-authority-v2`. A root-owned installation
+pins that directory's device/inode and exact helper/import bytes.
 
-`evidence_pipeline.py` is the unprivileged side. It never opens, stats, chmods,
-chowns, renames, truncates, or copies `privileged/raw-hci`. It validates the
-root helper's receipt and writes the terminal result, retention, manifest and
-index. A product/test failure with valid evidence is `TEST_FAILED`; a helper or
-receipt failure is `EVIDENCE_FINALIZATION_FAILED`. Both produce a terminal
-private metadata package while retaining the original test outcome. Repeating
-the same finalization verifies and returns the sealed package; a conflicting
-repeat is refused.
+`evidence_pipeline.py` invokes `/usr/bin/sudo -n /usr/bin/python3 -I -B` with a
+fixed helper path and controlled environment. Raw descriptors stay inside the
+producer, including during hashing and counter decoding. The ordinary runner
+receives strictly validated metadata only. Test outcome is immutable;
+`manifest.json` and `index.json` describe PREPARED metadata. Only the final
+sibling `commits/RUN_ID.json` establishes COMMITTED authority after permission
+sealing and fsync. `SUCCESS` requires PASS test plus FINALIZED evidence.
 
-The explicit appliance-only smoke is:
+The maintained future coordinator and Q8 live in `tools/qualification_campaign/`.
+Prepare a new bundle from the retained audited phase snapshot with
+`prepare_bundle.py`; it overlays the maintained coordinator/Q8/boundary and
+freezes all source, helper, import, schema and qualification-plan digests before
+any attempt. Installing a helper is a separate explicit owner tooling action.
+No runner installs or upgrades privileged code.
+
+Within a prepared bundle, the explicit passive appliance-only check is:
 
 ```sh
-python3 evidence_rehearsal.py \
+python3 -B evidence_rehearsal.py \
   --evidence-pipeline-rehearsal --not-qualification
 ```
 
-It is always classified `EVIDENCE_PIPELINE_REHEARSAL / NOT_QUALIFICATION`.
-It captures ambient HCI traffic only; it does not pair, run HID workloads,
-change bonds, touch firmware/NVS, or create qualification authority. The
-ordinary reusable `retain_raw` path remains for captures already readable by
-the capsule owner and must not be used to ingest a root-owned 0600 file.
+It is always `EVIDENCE_PIPELINE_REHEARSAL / NOT_QUALIFICATION`, and uses the same
+Q8 capture boundary and coordinator terminal function as a future attempt.
+It does not pair, run HID workloads, change bonds, or touch firmware/NVS.
+The ordinary reusable `retain_raw` path is for already-readable captures; it
+must not ingest root-owned capture bytes. Version 2 evidence has no automatic
+purge. The commands below concern ordinary run capsules, not this separate
+root evidence store.
 
 ```sh
 python3 run_capsule.py mark RUN_ID RESOLVED
