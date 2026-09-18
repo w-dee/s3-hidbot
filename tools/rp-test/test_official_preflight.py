@@ -8,7 +8,9 @@ ROOT = HERE.parent if (HERE.parent / "host" / "src").is_dir() else HERE.parent.p
 sys.path.insert(0, str(ROOT / "host" / "src"))
 sys.path.insert(0, str(HERE.parent / "qualification_campaign"))
 import official_preflight as preflight
+from hidbot.errors import RemoteError
 from hidbot.protocol import UsbExposureStatus
+from types import SimpleNamespace
 
 
 def state(profile="strict_composite", **changes):
@@ -137,6 +139,13 @@ class OfficialPreflightTests(unittest.TestCase):
         self.assertFalse(
             preflight._usb_is_safe(
                 UsbExposureStatus(
+                    **{**hidden.__dict__, "host_release_uncertain": True}
+                )
+            )
+        )
+        self.assertFalse(
+            preflight._usb_is_safe(
+                UsbExposureStatus(
                     desired="exposed",
                     observed="disconnected",
                     generation=1,
@@ -150,6 +159,74 @@ class OfficialPreflightTests(unittest.TestCase):
                     last_error=None,
                 )
             )
+        )
+
+    def test_uninitialized_boot_store_is_probed_and_hidden_again(self):
+        hidden_uninitialized = SimpleNamespace(
+            desired=SimpleNamespace(value="hidden"),
+            observed=SimpleNamespace(value="uninitialized"),
+            advertising=False,
+            connected=False,
+            recovery_required=False,
+            last_error=None,
+        )
+        exposed = SimpleNamespace(
+            desired=SimpleNamespace(value="exposed"),
+            observed=SimpleNamespace(value="advertising"),
+            advertising=True,
+            connected=False,
+            recovery_required=False,
+            last_error=None,
+        )
+        hidden_idle = SimpleNamespace(
+            desired=SimpleNamespace(value="hidden"),
+            observed=SimpleNamespace(value="idle"),
+            advertising=False,
+            connected=False,
+            recovery_required=False,
+            last_error=None,
+        )
+        pairing = SimpleNamespace(
+            state=SimpleNamespace(value="idle"), connected=False,
+            pairing_id=None, action=None,
+        )
+        bonds = SimpleNamespace(healthy=True, bonds=(SimpleNamespace(bond_id="known"),))
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+                self.exposures = iter((hidden_uninitialized, exposed, hidden_idle))
+                self.list_calls = 0
+
+            def ble_bond_list(self):
+                self.calls.append("list")
+                self.list_calls += 1
+                if self.list_calls == 1:
+                    raise RemoteError("BLE_NOT_READY", "not initialized",
+                                      request_id=1, session="0" * 32)
+                return bonds
+
+            def ble_exposure_status(self):
+                self.calls.append("status")
+                return next(self.exposures)
+
+            def ble_pairing_status(self):
+                self.calls.append("pairing")
+                return pairing
+
+            def ble_enable(self):
+                self.calls.append("enable")
+
+            def ble_disable(self):
+                self.calls.append("disable")
+
+        client = Client()
+        result, initialized = preflight._bond_inventory(client)
+        self.assertIs(result, bonds)
+        self.assertTrue(initialized)
+        self.assertEqual(
+            client.calls,
+            ["list", "status", "enable", "status", "pairing", "list", "disable", "status"],
         )
 
 

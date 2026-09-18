@@ -123,7 +123,72 @@ def _usb_is_safe(usb):
         and not usb.mouse_ready
         and not usb.recovery_required
         and not usb.safety_pending
+        and not usb.host_release_uncertain
+        and usb.last_error is None
     )
+
+
+def _ble_is_safe(ble):
+    return (
+        ble.desired.value == "hidden"
+        and ble.observed.value in ("uninitialized", "idle")
+        and not ble.advertising
+        and not ble.connected
+        and not ble.recovery_required
+        and ble.last_error is None
+    )
+
+
+def _pairing_is_idle(pairing):
+    return (
+        pairing.state.value == "idle"
+        and not pairing.connected
+        and pairing.pairing_id is None
+        and pairing.action is None
+    )
+
+
+def _bond_inventory(client, timeout_seconds=12.0):
+    """Read bonds, briefly initializing BLE when the boot-safe store is unavailable."""
+    from hidbot.errors import RemoteError
+
+    try:
+        return client.ble_bond_list(), False
+    except RemoteError as exc:
+        if exc.code != "BLE_NOT_READY":
+            raise
+
+    boot = client.ble_exposure_status()
+    require(_ble_is_safe(boot) and boot.observed.value == "uninitialized",
+            "BOND_STORE_UNAVAILABLE_OUTSIDE_BOOT_STATE")
+    deadline = time.monotonic() + timeout_seconds
+    activated = True
+    try:
+        client.ble_enable()
+        while True:
+            exposure = client.ble_exposure_status()
+            pairing = client.ble_pairing_status()
+            require(not exposure.connected and not exposure.recovery_required
+                    and exposure.last_error is None, "BOND_PROBE_BLE_NOT_SAFE")
+            require(_pairing_is_idle(pairing), "BOND_PROBE_PAIRING_ACTIVE")
+            try:
+                bonds = client.ble_bond_list()
+                return bonds, True
+            except RemoteError as exc:
+                if exc.code != "BLE_NOT_READY":
+                    raise
+            require(time.monotonic() < deadline, "BOND_STORE_INITIALIZATION_TIMEOUT")
+            time.sleep(0.08)
+    finally:
+        if activated:
+            client.ble_disable()
+            hide_deadline = time.monotonic() + timeout_seconds
+            while True:
+                exposure = client.ble_exposure_status()
+                if _ble_is_safe(exposure) and exposure.observed.value == "idle":
+                    break
+                require(time.monotonic() < hide_deadline, "BOND_PROBE_HIDE_TIMEOUT")
+                time.sleep(0.08)
 
 
 def _open_client(deadline_seconds=12.0):
@@ -166,7 +231,9 @@ def _inspect_state(artifact, *, verify_safety):
         pairing = client.ble_pairing_status()
         ble = client.ble_exposure_status()
         usb = client.usb_exposure_status()
-        bonds = client.ble_bond_list()
+        bonds, bond_probe_initialized_ble = _bond_inventory(client)
+        pairing = client.ble_pairing_status()
+        ble = client.ble_exposure_status()
     finally:
         client.close()
     host = _bluez_safe()
@@ -199,19 +266,9 @@ def _inspect_state(artifact, *, verify_safety):
         # A new boot retires every sequence. release_all must additionally prove
         # that no carried logical HID state survived that boot boundary.
         "sequence_active": False,
-        "pairing_idle": (
-            pairing.state.value == "idle"
-            and not pairing.connected
-            and pairing.pairing_id is None
-            and pairing.action is None
-        ),
-        "ble_safe": (
-            ble.desired.value == "hidden"
-            and ble.observed.value in ("uninitialized", "idle")
-            and not ble.advertising
-            and not ble.connected
-            and not ble.recovery_required
-        ),
+        "pairing_idle": _pairing_is_idle(pairing),
+        "ble_safe": _ble_is_safe(ble),
+        "bond_probe_initialized_ble": bond_probe_initialized_ble,
         "usb_safe": _usb_is_safe(usb),
         "host_safe": (
             headless["safe"]
