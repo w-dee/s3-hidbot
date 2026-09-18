@@ -9,7 +9,7 @@ def capture_pair(request, pair, *, _session=CaptureSession, require_pairing=True
         pair()
     finally:
         receipt = session.stop()
-    c.receipt(receipt, request)
+    c.receipt(receipt, request['request'])
     c.need(receipt['status'] == 'FINALIZED', 'Q8_CAPTURE_FAILED')
     if require_pairing:
         counts = receipt['counts']

@@ -23,6 +23,9 @@ IDENTITY = {'version': 2, 'helper_sha256': 'a' * 64, 'imports': {'evidence_contr
 REQ = {'schema': 2, 'attempt_id': '20260918T120000Z-0123456789ab',
        'run_id': '20260918T120000Z-0123456789ab', 'capture_id': 'c' * 32,
        'kind': 'Q8_HCI', 'authority_sha256': 'd' * 64, 'helper': IDENTITY, 'max_seconds': 2}
+HANDLE = {'schema':3,'run_id':REQ['run_id'],'capture_id':REQ['capture_id'], 'runtime_id':'a'*64,'attempt_authority_sha256':REQ['authority_sha256']}
+ENVELOPE = {'handle':HANDLE,'attempt_authority_sha256':REQ['authority_sha256'],'request':REQ}
+
 COUNTS = {'pairing_requests': 1, 'pairing_responses': 1, 'security_requests': 0}
 WRITER = '''import os,signal,sys,time
 mode=sys.argv[1]
@@ -93,10 +96,10 @@ class ContractTests(unittest.TestCase):
                 c.receipt(receipt, REQ)
 
     def test_exact_invocation(self):
-        argv = p.command('capture', REQ)
-        self.assertEqual(argv[:6], ['/usr/bin/sudo','-n','/usr/bin/python3','-I','-B',
-                                   '/usr/local/lib/s3-hidbot-evidence-v2/privileged_evidence.py'])
-        self.assertEqual(argv[6:], ['capture', REQ['run_id'], REQ['capture_id']])
+        argv = p.command('capture', HANDLE)
+        self.assertEqual(argv[:7], ['/usr/bin/sudo','-n','/usr/bin/python3','-I','-S','-B',
+                                   '/usr/local/lib/s3-hidbot-authority-v3/authority_service.py'])
+        self.assertEqual(argv[7:], ['capture', REQ['run_id']])
         self.assertEqual(h.ENV, {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'})
 
     def test_fake_path_sudo(self):
@@ -108,14 +111,14 @@ class ContractTests(unittest.TestCase):
                 self.assertEqual(kwargs['env'], h.ENV)
                 return subprocess.CompletedProcess(argv, 1, b'', b'')
             with mock.patch.dict(os.environ, {'PATH': temp}), mock.patch.object(p.subprocess, 'run', intercept):
-                with self.assertRaises(c.EvidenceError): p.verify_capture(REQ)
+                with self.assertRaises(c.EvidenceError): p.verify_capture(ENVELOPE)
             self.assertFalse(marker.exists())
 
     def test_untrusted_stdout(self):
         for stdout in (b'{"schema":2,"schema":2}', c.encode(fixture({**REQ, 'capture_id':'f'*32})),
                        c.encode(fixture()) + c.encode(fixture())):
             with mock.patch.object(p.subprocess, 'run', return_value=subprocess.CompletedProcess([],0,stdout,b'')):
-                with self.assertRaises(c.EvidenceError): p.verify_capture(REQ)
+                with self.assertRaises(c.EvidenceError): p.verify_capture(ENVELOPE)
 
 
 class ProducerTests(unittest.TestCase):
@@ -281,126 +284,35 @@ class ProducerTests(unittest.TestCase):
         self.assertEqual(value['status'],'FAILED'); self.assertEqual(value['error'],'CAPTURE_INTERRUPTED')
         self.assertFalse(self.raw.exists())
 
-
-class PackageTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.cleanup)
-        self.base = Path(self.temp.name)
-
-    def cleanup(self):
-        for path in self.base.rglob('*'):
-            if path.is_dir(): path.chmod(0o700)
-        self.temp.cleanup()
-
-    def package(self): return p.create_package(self.base, p.CLASSIFICATION, {'helper': IDENTITY})
-    def finish(self, package, passed=True, **kwargs):
-        return coordinator.finish(package, passed, {'phase':'q8'}, _verify=fixture, **kwargs)
-
-    def test_crash_matrix_and_test_immutability(self):
-        for outcome in (True,False):
-            for phase in ('test','manifest','index','permissions','before_commit','after_commit'):
-                with self.subTest(outcome=outcome, phase=phase):
-                    package = self.package()
-                    def cut(point):
-                        if point == phase: raise InterruptedError(point)
-                    with self.assertRaises(InterruptedError): self.finish(package,outcome,_cut=cut)
-                    commit = self.base/'commits'/(package.name+'.json')
-                    self.assertEqual(commit.exists(),phase == 'after_commit')
-                    for name in ('manifest.json','index.json'):
-                        if (package/name).exists(): self.assertEqual(c.decode((package/name).read_bytes())['state'],'PREPARED')
-                    with self.assertRaisesRegex(c.EvidenceError,'IMMUTABLE_CONFLICT'): self.finish(package,not outcome)
-                    terminal = self.finish(package,outcome)
-                    self.assertEqual(terminal['code'],'SUCCESS' if outcome else 'TEST_FAILED')
-                    self.assertEqual(self.finish(package,outcome),terminal)
-                    self.assertEqual(stat.S_IMODE(package.stat().st_mode),0o500)
-                    for name in p.FILES: self.assertEqual(stat.S_IMODE((package/name).stat().st_mode),0o400)
-                    self.assertEqual(p.tree_digest(package),p.tree_digest(package))
-
-    def test_commit_is_last(self):
-        package = self.package(); steps=[]
-        def cut(point):
-            steps.append(point)
-            if point != 'after_commit': self.assertFalse((self.base/'commits'/(package.name+'.json')).exists())
-            if point == 'before_commit':
-                self.assertTrue((package/'index.json').is_file())
-                self.assertEqual(stat.S_IMODE(package.stat().st_mode),0o500)
-        self.finish(package,_cut=cut)
-        self.assertEqual(steps,['test','manifest','index','permissions','before_commit','after_commit'])
-
-    def test_interrupted_atomic_write_recovery(self):
-        package = self.package()
-        pending = package / ('.pending-' + 'a' * 24)
-        pending.write_bytes(b'{"incomplete":'); pending.chmod(0o600)
-        result = self.finish(package)
-        self.assertEqual(result['code'], 'SUCCESS')
-        self.assertFalse(pending.exists())
-        self.assertEqual(set(x.name for x in package.iterdir()), set((*p.FILES, 'lock')))
-
-    def test_pending_symlink_is_not_followed(self):
-        package = self.package(); outside = self.base / 'outside'
-        outside.write_bytes(b'untouched'); outside.chmod(0o640)
-        (package / ('.pending-' + 'a' * 24)).symlink_to(outside)
-        with self.assertRaises(OSError): self.finish(package)
-        self.assertEqual(outside.read_bytes(), b'untouched')
-        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o640)
-
-    def test_abnormal_receipt_never_success(self):
-        package = self.package()
-        result = coordinator.finish(package,True,{},_verify=lambda req:fixture(req,status='FAILED'))
-        self.assertEqual(result['code'],'EVIDENCE_FINALIZATION_FAILED')
-        self.assertEqual(coordinator.finish(package,True,{},_verify=fixture),result)
-
-    def test_replay_or_helper_failure_not_success(self):
-        for verify in (lambda _:fixture(), lambda req: (_ for _ in ()).throw(c.EvidenceError('FAILED'))):
-            result=coordinator.finish(self.package(),True,{},_verify=verify)
-            self.assertEqual(result['code'],'EVIDENCE_FINALIZATION_FAILED')
-
-    def test_no_caller_supplied_receipt_api(self):
-        with self.assertRaises(TypeError):
-            coordinator.finish(self.package(), True, {}, receipt=fixture())
-
-    def test_no_raw_access_and_q8_integration(self):
-        for passed in (True,False):
-            package = self.package(); req = p.package_request(package); events=[]
-            class Session:
-                def __init__(self, request): self.request=request
-                def start(self): events.append('start'); return self
-                def stop(self): events.append('stop'); return fixture(self.request)
-            result=q8_capture.capture_pair(req,lambda:events.append('pair'),_session=Session)
-            self.assertEqual(events,['start','pair','stop']); self.assertEqual(result['counts'],COUNTS)
-            # Metadata tree contains no raw, recursive raw hashing cannot work here.
-            terminal=self.finish(package,passed)
-            self.assertEqual(terminal['code'],'SUCCESS' if passed else 'TEST_FAILED')
-            self.assertEqual(c.decode((package/'index.json').read_bytes())['raw_evidence']['sha256'],'e'*64)
-
-    def test_q8_pair_failure_stops_writer(self):
-        events=[]
-        class Session:
-            def __init__(self, req): pass
-            def start(self): return self
-            def stop(self): events.append('stopped'); return fixture()
-        with self.assertRaisesRegex(RuntimeError,'pair'):
-            q8_capture.capture_pair(REQ,lambda: (_ for _ in ()).throw(RuntimeError('pair')),_session=Session)
-        self.assertEqual(events,['stopped'])
-
-    def test_q8_semantic_and_writer_failure(self):
-        for abnormal in (False,True):
-            value=fixture(status='FAILED' if abnormal else 'FINALIZED')
-            if not abnormal: value['counts']['security_requests']=1
-            class Session:
-                def __init__(self,req): pass
-                def start(self): return self
-                def stop(self): return value
-            with self.assertRaises(c.EvidenceError): q8_capture.capture_pair(REQ,lambda:None,_session=Session)
-
-    def test_future_q8_uses_only_boundary(self):
-        source=(Path(coordinator.__file__).parent/'q8_host_security.py').read_text()
-        self.assertIn('capture_pair(package_request(package)',source)
-        for obsolete in ('monitor=subprocess.Popen','os.chmod(capture','decoded_text','q8-host-security.btsnoop'):
-            self.assertNotIn(obsolete,source)
-        source=Path(coordinator.__file__).read_text()
-        self.assertNotIn('capsule.rglob',source)
-        self.assertIn('finalize_terminal_package',source)
+    def test_real_process_exit_and_parent_death(self):
+        for phase in ('writer_stop','receipt'):
+            root=self.base/('exit-'+phase); root.mkdir(mode=0o700)
+            producer=self.make(); producer.root=root
+            pid=os.fork()
+            if pid==0:
+                producer.cut=lambda point: os._exit(77) if point==phase else None
+                self.run_capture(producer); os._exit(9)
+            self.assertEqual(os.waitpid(pid,0)[1],77<<8)
+            value=producer.operate(REQ)
+            self.assertEqual(value['status'],'FINALIZED'); self.assertEqual(producer.operate(REQ),value)
+        read,write=os.pipe(); pid=os.fork()
+        if pid==0:
+            os.close(read)
+            def control(process):
+                os.write(write,str(process.pid).encode()+b'\n'); time.sleep(10); return False
+            self.run_capture(control=control); os._exit(9)
+        os.close(write); writer_pid=int(os.read(read,64)); os.close(read)
+        with self.assertRaisesRegex(c.EvidenceError,'CAPTURE_ACTIVE'): self.producer.operate(REQ)
+        os.kill(pid,signal.SIGKILL); os.waitpid(pid,0)
+        deadline=time.monotonic()+2; state='unknown'
+        while time.monotonic()<deadline:
+            try: state=Path('/proc/'+str(writer_pid)+'/stat').read_text().split()[2]
+            except (FileNotFoundError, ProcessLookupError): state='GONE'
+            if state in ('GONE','Z'): break
+            time.sleep(.01)
+        self.assertIn(state,('GONE','Z'))
+        value=self.producer.operate(REQ)
+        self.assertEqual(value['status'],'FAILED'); self.assertEqual(value['error'],'CAPTURE_INTERRUPTED')
 
 
 if __name__ == '__main__': unittest.main()

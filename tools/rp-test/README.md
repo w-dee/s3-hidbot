@@ -252,41 +252,44 @@ is valid forensic state and is retained under the same no-automatic-purge policy
 
 ## Privileged HCI evidence boundary
 
-Version 2 replaces the failed version 1 candidate without modifying historical
-capsules. The full authority and recovery contract is in
-[`evidence-authority.md`](evidence-authority.md). The root CLI accepts one exact
-run basename and a separate capture ID, never a caller path. Its fixed root is
-`/srv/s3-hidbot-test/private/evidence-authority-v2`. A root-owned installation
-pins that directory's device/inode and exact helper/import bytes.
+Version 3 retains historical v1/v2 capsules and installations. The full contract
+is in [`evidence-authority.md`](evidence-authority.md). The future root service
+accepts a run ID and strict request, never a caller path. Its fixed state root
+is `/var/lib/s3-hidbot-authority-v3`; protected installation and runtime bundles
+live under `/usr/local/lib/s3-hidbot-authority-v3`.
 
-`evidence_pipeline.py` invokes `/usr/bin/sudo -n /usr/bin/python3 -I -B` with a
-fixed helper path and controlled environment. Raw descriptors stay inside the
-producer, including during hashing and counter decoding. The ordinary runner
-receives strictly validated metadata only. Test outcome is immutable;
-`manifest.json` and `index.json` describe PREPARED metadata. Only the final
-sibling `commits/RUN_ID.json` establishes COMMITTED authority after permission
-sealing and fsync. `SUCCESS` requires PASS test plus FINALIZED evidence.
+`evidence_pipeline.py` invokes `/usr/bin/sudo -n /usr/bin/python3 -I -S -B` with
+the fixed service path and controlled environment. Raw descriptors stay in the
+unchanged Producer. A single immutable Attempt Authority Snapshot binds the
+runtime, coordinator, plan, helper, contract, product and capture. Root persists
+test outcome and evidence before verifying the ordinary metadata stage. It
+copies verified metadata into a private root-owned package, hashes exact final
+file objects, and publishes sibling `commit.json` last. SUCCESS requires PASS
+test plus FINALIZED evidence. The ordinary user cannot mutate final files.
 
-The maintained future coordinator and Q8 live in `tools/qualification_campaign/`.
-Prepare a new bundle from the retained audited phase snapshot with
-`prepare_bundle.py`; it overlays the maintained coordinator/Q8/boundary and
-freezes all source, helper, import, schema and qualification-plan digests before
-any attempt. Installing a helper is a separate explicit owner tooling action.
-No runner installs or upgrades privileged code.
+The maintained coordinator and Q8 live in `tools/qualification_campaign/`.
+`prepare_bundle.py` creates a new measured source-only bundle from the retained
+audited phase snapshot. The explicit `install_authority_runtime.py --bundle
+BUNDLE` step verifies and installs it before any attempt. No runtime installs
+or upgrades privileged code. Code or FROZEN replacement after start is rejected
+against the original journal; bytecode is prohibited, and imports execute
+measured protected source in isolated Python.
 
-Within a prepared bundle, the explicit passive appliance-only check is:
+The passive appliance-only check uses the installed runtime ID:
 
 ```sh
-python3 -B evidence_rehearsal.py \
+/usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v3/runtime_launcher.py \
+  RUNTIME_ID evidence_rehearsal.py - \
   --evidence-pipeline-rehearsal --not-qualification
 ```
 
-It is always `EVIDENCE_PIPELINE_REHEARSAL / NOT_QUALIFICATION`, and uses the same
+It is always `EVIDENCE_PIPELINE_REHEARSAL / NOT_QUALIFICATION`, using the same
 Q8 capture boundary and coordinator terminal function as a future attempt.
 It does not pair, run HID workloads, change bonds, or touch firmware/NVS.
-The ordinary reusable `retain_raw` path is for already-readable captures; it
-must not ingest root-owned capture bytes. Version 2 evidence has no automatic
-purge. The commands below concern ordinary run capsules, not this separate
+`evidence_resume.py RUN_ID`, through the same launcher, finalizes only an
+already recorded test result; it never reruns qualification phases. The ordinary
+`retain_raw` path must not ingest root-owned bytes. There is no automatic purge.
+The commands below concern ordinary run capsules, not this separate
 root evidence store.
 
 ```sh

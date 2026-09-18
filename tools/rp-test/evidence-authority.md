@@ -1,139 +1,157 @@
-# Qualification evidence authority, version 2
+# Qualification evidence authority, version 3
 
-This is tooling authority for the owner-confirmed physical FNK0099 fixture.
-It does not qualify firmware. The product freeze is commit
-`8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad`; no product source or public host API
-changes belong to this boundary. The failed official attempt and version 1
-rehearsal remain immutable historical records.
+This boundary changes qualification tooling, with product commit
+`8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad` unchanged. The physical fixture is
+owner-confirmed FNK0099. The previous official FAIL, forensic index, interrupted
+manifest, v1/v2 rehearsals, v2 installation and raw captures are historical and
+must not be edited or normalized. A rehearsal is never qualification.
 
-## Installation and invocation
+## Authority chain
 
-An owner installs reviewed bytes using `install_evidence_helper.py --frozen-bundle
-BUNDLE`. The installer refuses different bytes in an existing installation;
-updates require an explicit owner installation decision. It writes only the two
-reviewed modules and root-object configuration under
-`/usr/local/lib/s3-hidbot-evidence-v2`, and creates the separate root-owned 0700
-`/srv/s3-hidbot-test/private/evidence-authority-v2` store. All installation
-ancestors are root owned without group/other write permission. Module and
-configuration files are root owned, single-link, regular and read-only.
+Frozen product → protected source runtime → immutable Attempt Authority Snapshot
+→ persisted capture request and test journal → privileged receipt → ordinary
+metadata stage → root-private final bytes → terminal commit.
 
-The runtime command is exactly `/usr/bin/sudo -n /usr/bin/python3 -I -B
-/usr/local/lib/s3-hidbot-evidence-v2/privileged_evidence.py OP RUN_ID CAPTURE_ID`.
-OP is `capture` or `verify`. There is no shell, PATH lookup, caller-selected
-script, caller-selected root, arbitrary raw path, synthetic writer CLI, or
-installation action in the runtime protocol. The small environment fixes PATH,
-LANG and LC_ALL. The shared module is compiled from the exact protected bytes
-whose digest the producer reports; the helper reports its protected source
-identity too. Root administration remains the installation trust boundary.
+Every arrow carries exact equality or a SHA-256 digest. No later step refreshes
+its expectation from FROZEN.json or the current working tree. SHA-256 provides
+identity here; root ownership and fixed invocation provide provenance, not a
+claim that an untrusted self-described hash is authenticated.
 
-A run ID is ASCII `YYYYMMDDTHHMMSSZ-` plus twelve lowercase hex digits. A
-capture ID is thirty-two lowercase hex digits, independent of the run ID.
-Strict JSON stdin binds attempt, run, capture, evidence kind, frozen authority
-digest, helper/import identity, schema and bounded duration. Duplicate keys,
-unknown fields, missing fields, unsupported versions and bool-as-int fail.
+`prepare_bundle.py` copies the retained reviewed phase source, overlays the
+maintained boundary and copies the unchanged qualification plan. BUNDLE.json
+lists **every file**, its digest, the product, coordinator, plan, FROZEN and five
+privileged engine module identities. The runtime ID is the SHA-256 of the exact
+canonical BUNDLE.json bytes. FROZEN.json is an ordinary measured member, never
+a renewable source of truth. Bytecode and cache directories are rejected even
+if listed; symlinks and hardlinks are rejected. Unknown files change membership.
+No generated runtime is committed in the source repository.
 
-## Namespace, object and writer authority
+An explicit administrator preparation runs `install_authority_runtime.py
+--bundle BUNDLE`. It writes fixed destinations only:
 
-The producer opens every directory component with O_DIRECTORY and O_NOFOLLOW,
-retains each FD, and checks that canonical entries still name those objects.
-The configured root device/inode is pinned in the protected installation.
-Run and capture directories are root owned 0700. A capture transaction flock
-prevents simultaneous finalization or verification of a live writer.
+- `/usr/local/lib/s3-hidbot-authority-v3`: protected engine modules and per-digest
+  runtimes, files 0444, runtime directories 0555;
+- `/var/lib/s3-hidbot-authority-v3`: root-owned state; `attempts` and `captures`
+  0700, `staging` 0755 with per-run ordinary-user 0700 directories;
+- protected `roots.json`: the state/capture directory device and inode identities.
 
-A new raw object is created O_EXCL, mode 0600. The producer retains that exact
-FD from creation through writer completion, hashing and decoding. btmon gets
-`/proc/self/fd/N` with that FD explicitly inherited. All other streams are
-/dev/null. Finalization validates regular-file type, owner, link count and
-canonical entry identity before any fchmod. Hashing checks full before/after
-stat signatures, and checks canonical entry and FD identity again after hashing
-and decoding. Replaced parents, replaced raw entries, unexpected links, or
-changed bytes cannot yield a valid receipt and cannot redirect outside chmod.
+It refuses an existing different engine or existing runtime ID; never updates
+an installation during an attempt. New runtime installation remains an explicit
+administrative operation. It is not an RPC and installs no dependency. All
+installation ancestors must be root owned without group/other write permission.
+The previous v2 installer remains historical tooling, not the future entrypoint.
 
-The producer owns the Popen lifetime. Normal accepted stop is requested SIGINT,
-exit code **0**, reaped, no earlier exit, and no forced signal. The bounded
-fallback is SIGTERM then SIGKILL; either makes evidence FAILED while preserving
-forensic bytes/digest when object validation succeeds. Early exit and exit 23
-are failures. EOF/deadline also stop and reap but cannot count as a requested
-normal stop. Linux parent-death SIGKILL prevents the writer outliving a killed
-producer; recovery never signals an arbitrary numeric PID. PID, terminal state,
-and capture ID are recorded together, never used as independent recovery
-permission. Root btmon decoding returns only the three Q8 counters, no HCI text.
+## Source-only execution
 
-## Capture recovery
+The only future entrypoint is:
 
-`request.json` is exclusive/equality-on-retry before launch. `stopped.json` is
-persisted after reaping and contains object, final stat signature and writer
-outcome. `receipt.json` is durable after final FD validation. Capture IDs cannot
-start a second writer.
+```text
+/usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v3/runtime_launcher.py RUNTIME_ID ENTRY CONTEXT [ARGS...]
+```
 
-| Interruption | Retry |
+The launcher verifies complete runtime membership, bytes, ownership and modes.
+`-I -S` excludes current directory, user site, PYTHONPATH, sitecustomize and .pth
+startup. `-B` prevents writes but is not relied upon to prevent reads. A source
+loader reads/hashes/compiles exact protected source and never consults pyc.
+Entry scripts are also compiled from measured source bytes. Local imports are
+restricted to the protected bundle; the existing root-owned `/usr/lib/python3*`
+standard library and installed Debian runtime dependencies are explicitly
+trusted system dependencies. Python version and executable SHA-256 are in the
+snapshot. System administrator changes remain outside the ordinary-user threat
+model; no claim is made to measure every OS shared library or defeat root.
+
+CONTEXT is `-` only for coordinator, rehearsal, metadata resume and read-only
+runtime probe. Each phase instead receives the original handle as JSON argv;
+the launcher loads and validates that original root journal before executing.
+The snapshot contains product commit/tree/archive/BIN/ELF and host tree, exact
+runtime manifest, coordinator/plan/helper/contract identities, schema, storage
+identities, run/capture IDs, classification, duration, owner UID and interpreter.
+Its canonical digest is `attempt_authority_sha256`. An exclusive root attempt
+journal stores snapshot, handle and request before attempt start/capture. The
+handle retained by the coordinator never refreshes. Q8 obtains the launcher
+context and request through this same journal; environment variables are not
+an authority source.
+
+## Narrow root operations
+
+The ordinary boundary invokes the absolute command, with controlled environment:
+
+```text
+/usr/bin/sudo -n /usr/bin/python3 -I -S -B /usr/local/lib/s3-hidbot-authority-v3/authority_service.py OP RUN_ID
+```
+
+Operations are begin, resume, load, capture, verify, record, prepare and seal.
+No arbitrary path, writer executable, ownership target, source code, receipt,
+installation or raw file operation is accepted. The root service derives the
+caller UID from sudo and checks it against the immutable snapshot. Test-only
+constructor seams are absent from the CLI. Requests/receipts use duplicate-free,
+closed JSON schemas, ASCII IDs, strict types and exact handle equality. The
+capture envelope explicitly carries `attempt_authority_sha256`; the preserved
+v2 capture request carries the identical value as `authority_sha256`.
+
+The unchanged v2 Producer retains fixed root, configured root object, ancestor
+FDs, O_NOFOLLOW, O_EXCL raw creation, retained raw FD, inode and stat checks,
+root-only 0600 ownership, flock and writer lifetime policy. btmon receives only
+`/proc/self/fd/N`. Root decoding returns three counters, never raw HCI text.
+Normal acceptance requires requested SIGINT, exit 0, reaped, no early exit and
+no forced signal. EOF/deadline, exit 23, early exit, TERM/KILL are failures.
+Parent-death SIGKILL prevents an orphaned writer; recovery never signals a
+numeric PID. A persisted request without a stopped journal becomes immutable
+CAPTURE_INTERRUPTED. Stopped journal/receipt recovery revalidates exact raw FD
+identity, bytes and writer state. Capture IDs are never recaptured.
+
+## Sealing and crash recovery
+
+The root attempt flock serializes each operation around the **original** handle.
+`record` persists the test result before evidence finalization. PASS/FAIL and
+all details are immutable. `prepare` directly reverifies the root producer and
+persists evidence; an evidence failure cannot upgrade. It constructs exact
+expected authority, request, test, evidence, PREPARED manifest and index bytes.
+The ordinary coordinator writes these metadata mirrors into the fixed stage.
+Raw data never enters that tree or an ordinary recursive hash.
+
+`seal` compares stage membership, regular single-link file identity, UID, 0400
+mode, stable hashes and expected contents. It creates new root-owned copies in
+the attempt's private package; it never chmods/chowns caller files. Stage is
+revalidated after copying. Final root files are 0400 and the package is 0500.
+After fsync, it opens and hashes every actual final file, including index and
+manifest, checks object identity/type/owner/mode and expected semantic bytes,
+and repeats validation immediately before publication. The root-only sibling
+`commit.json` is written last and contains actual per-file hashes/object IDs,
+the actual index hash, original handle and engine identity. The ordinary user
+cannot replace this namespace. Stage changes after that transfer cannot change
+terminal evidence. No PREPARED file alone claims terminal success.
+
+| Crash | Recovery |
 | --- | --- |
-| Before a persisted request | No capture authority; package may record evidence FAILED |
-| Request exists, no stopped journal | Immutable CAPTURE_INTERRUPTED failure; never recapture or certify unknown writer |
-| Writer stopped but stopped journal absent | Same explicit failure; bytes retained |
-| Stopped journal exists, no receipt | Reopen only in pinned directory; require recorded inode/stat and reaped status, then finalize |
-| Receipt exists | Recompute through the same stopped authority and require exact equality |
-| Writer still active | Nonblocking flock rejects verification; no success receipt |
-| Namespace/object changed | Reject; retain forensic objects; never substitute new bytes |
+| Incomplete begin before snapshot/request | Fail closed; no attempt-start authorization |
+| Snapshot and request durable | Resume that original journal, never regenerate authority |
+| Test durable | Same outcome/details only; opposite outcome conflicts |
+| Prepared or partially copied metadata | Same prepared authority and canonical stage only |
+| Inside atomic write | Remove only root-owned regular single-link pending files; retry |
+| Sealed package, no commit | Rehash exact final files and publish commit last |
+| Commit exists | Reverify runtime, snapshot, raw receipt, final objects/modes/hashes and exact commit equality |
+| Runtime or journal conflicts | Reject; never refresh/repair authority |
 
-## Package recovery and terminal authority
+`evidence_resume.py RUN_ID` restores the original root journal through the
+protected launcher and finalizes only an already recorded test result. It
+never resumes or reruns hardware phases. If no test result exists, it fails
+closed for manual investigation. All incomplete/failed records are retained.
+No automatic purge exists.
 
-The ordinary package contains only `authority.json`, immutable `test.json`,
-`evidence.json`, PREPARED `manifest.json`, PREPARED `index.json` and its lock.
-Phase JSON outcomes are embedded in `test.json`; raw digest/size/object come
-from the privileged receipt, never a recursive raw-file hash. There is no
-caller-supplied receipt parameter on production finalization. It always invokes
-the fixed producer to reverify. A persisted evidence failure never upgrades.
+SUCCESS requires test PASS plus FINALIZED evidence. TEST_FAILED retains test
+FAIL with valid evidence. EVIDENCE_FINALIZATION_FAILED retains abnormal or
+unverifiable evidence. Q8 pairing criteria and all official phase criteria
+remain unchanged. A future official attempt requires separate owner instruction;
+this repair campaign uses only passive NOT_QUALIFICATION capture.
 
-Under the package flock, finalization persists the exact test outcome first.
-Retrying FAIL as PASS (or changing test details) conflicts. It then obtains and
-validates root evidence, stages manifest/index with equality-on-retry, seals
-files 0400 and the directory 0500, fsyncs, verifies staged hashes and modes, and
-finally atomically publishes `commits/RUN_ID.json` in the package base.
-The sibling location allows recovery after the package directory is sealed.
-No package-local file independently claims terminal PASS or SEALED.
-While holding the transaction lock, retry removes only regular, single-link,
-owner-matching `.pending-` staging files from interrupted atomic writes. It
-rejects staging symlinks and any unexpected package entry. Thus a crash inside
-a write cannot leave an unindexed 0600 temporary file in a committed package.
+## Validation
 
-| Crash cut | State / retry |
-| --- | --- |
-| After test | Immutable test, incomplete package; same test resumes |
-| After manifest | PREPARED; validate existing records and stage index |
-| After index | PREPARED; validate and seal |
-| After permissions | Sealed but incomplete; read-only equality checks then publish commit |
-| Immediately before commit | Same as above |
-| Immediately after commit | Verify exact records, root receipt and modes; return identical commit |
-
-Overall `SUCCESS` requires test PASS, evidence FINALIZED and COMMITTED.
-Test FAIL with valid evidence is `TEST_FAILED`. Abnormal/missing/unverifiable
-capture yields `EVIDENCE_FINALIZATION_FAILED`. Conflicting or externally changed
-records fail closed; crash recovery does not authorize overwriting them.
-Preserve all incomplete and failed packages for investigation. No automatic
-purge is provided.
-
-## Future coordinator and validation
-
-`tools/qualification_campaign/prepare_bundle.py` copies a retained audited
-phase snapshot into a new directory, overlays the maintained coordinator, Q8
-and evidence modules, and freezes all source and qualification-plan digests in
-FROZEN.json. The future coordinator verifies this before attempt start and each
-phase. The explicit `--official-qualification` operation requires separate owner
-authorization; this repair mission does not run it.
-
-Q8 calls `q8_capture.capture_pair`: arm exact root producer, invoke the existing
-host Pair operation, stop/reap/finalize in finally, validate receipt, then check
-the existing Pairing Request/Response and absent peripheral Security Request
-criteria. The former ordinary raw chmod/decode path is absent. The coordinator
-records each phase and final cleanup outcome, then uses the package transaction.
-The passive rehearsal uses this same capture boundary and coordinator finish
-function with no pairing/HID/firmware/bond operations.
-
-Canonical hardware-free tests include `test_evidence_pipeline.py` and semantic
-mutation tests through `test-rp-test-infra.sh`. The explicit
-`evidence_root_integration.py` test needs root solely to create synthetic raw
-files and drop a child to UID/GID 65534; it installs nothing and uses no devices.
-That child proves read/chmod rejection while Q8 metadata reaches all three
-coordinator terminal outcomes. This is additional validation, never an implicit
-sudo action in CI.
+`test-rp-test-infra.sh` includes real writer/FD races, v3 snapshot/stage/final-byte
+regressions, exception and actual process-exit crash cuts, Q8/coordinator
+integration and 17 assertion-killed semantic mutants. Root/nobody integration
+in `evidence_root_integration.py` uses synthetic writers, no devices and no
+installation; it separately proves raw/runtime/final-package permissions and
+all three terminal codes. Installed-runtime probes test source loader identity
+with hostile PYTHONPATH/current directory/user site and bytecode injections in
+separate synthetic bundles. The accepted passive rehearsal is never mutated.

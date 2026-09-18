@@ -9,7 +9,7 @@ import sys
 import time
 
 import evidence_contract as c
-from evidence_pipeline import code_authority, create_package, finalize_terminal_package, sha
+from evidence_pipeline import create_package, finalize_terminal_package, sha, verify_attempt, phase_command
 
 EXPECTED_ARCHIVE = 'db7c9afec9ba2a6ec210ebffc030ac61542079d7e4a29db5d026d3c542e3ece9'
 EXPECTED_COMMIT = '8ca6a1e0ce9eea88ec15a716fffa89ffeff0bfad'
@@ -21,12 +21,6 @@ PHASES = [('q1_strict', 'q1_strict.py'), ('q2_just_works', 'q2_mouse.py'),
 ROOT = Path(__file__).resolve().parent
 
 
-def frozen_authority(root=ROOT):
-    expected = c.decode((root / 'FROZEN.json').read_bytes())
-    c.need(code_authority(root, root / 'qualification-plan.md') == expected, 'RUNNER_AUTHORITY_CHANGED')
-    return expected
-
-
 def finish(package, passed, details, **test_seams):
     return finalize_terminal_package(package, test_outcome='PASS' if passed else 'FAIL',
                                      details=details, **test_seams)
@@ -34,20 +28,19 @@ def finish(package, passed, details, **test_seams):
 
 def run(artifact, base):
     c.need(sha(artifact) == EXPECTED_ARCHIVE, 'ARTIFACT_AUTHORITY_INVALID')
-    authority = frozen_authority()
-    package = create_package(base, 'OFFICIAL_FNK0099_V0_4_0', authority, kind='Q8_HCI', max_seconds=60)
+    package = create_package('OFFICIAL_FNK0099_V0_4_0', kind='Q8_HCI', max_seconds=60)
     # Phase outputs are ordinary metadata outside the sealed package. The immutable
     # test journal embeds their full JSON content; root raw is never in this tree.
-    outputs = base / (package.name + '-phase-output'); outputs.mkdir(mode=0o700)
+    outputs = base / (package['run_id'] + '-phase-output'); outputs.mkdir(mode=0o700)
     details = {'source_commit': EXPECTED_COMMIT, 'archive_sha256': EXPECTED_ARCHIVE, 'phases': []}
-    print('QUALIFICATION_ATTEMPT_START=' + package.name, flush=True)
-    env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'S3_EVIDENCE_PACKAGE': str(package)}
+    print('QUALIFICATION_ATTEMPT_START=' + package['run_id'], flush=True)
+    env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'S3_ATTEMPT_AUTHORITY_SHA256': package['attempt_authority_sha256']}
     passed = False
     try:
         for name, script in PHASES:
-            frozen_authority()
+            verify_attempt(package)
             out = outputs / (name + '.json')
-            proc = subprocess.run([sys.executable, str(ROOT / script), 'official', str(artifact), str(out)],
+            proc = subprocess.run(phase_command(package, script, 'official', artifact, out),
                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 result = c.decode(out.read_bytes())
@@ -62,7 +55,7 @@ def run(artifact, base):
         details['coordinator_error'] = 'RUNNER_FAILED'
     finally:
         final_path = outputs / 'final-state.json'
-        final = subprocess.run([sys.executable, str(ROOT / 'safe_finalize.py'), str(final_path)],
+        final = subprocess.run(phase_command(package, 'safe_finalize.py', final_path),
                                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             result = c.decode(final_path.read_bytes())
@@ -71,7 +64,7 @@ def run(artifact, base):
         details['final_state'] = result
         passed = passed and final.returncode == 0 and result.get('result') == 'PASS'
         try:
-            frozen_authority()
+            verify_attempt(package)
         except c.EvidenceError:
             passed = False; details['coordinator_error'] = 'RUNNER_AUTHORITY_CHANGED'
         terminal = finish(package, passed, details)

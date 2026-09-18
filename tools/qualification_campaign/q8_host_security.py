@@ -205,10 +205,9 @@ try:
     poll(lambda:target_path in objects(),lambda x:x,seconds=12)
     from evidence_pipeline import package_request
     from q8_capture import capture_pair
-    package=Path(os.environ['S3_EVIDENCE_PACKAGE'])
     note('mutation','Pair exact fixture (host/central initiated, NoInputNoOutput)')
     device=dbus.Interface(bus.get_object('org.bluez',target_path),'org.bluez.Device1')
-    receipt=capture_pair(package_request(package), lambda: async_call(device,'Pair',seconds=30))
+    receipt=capture_pair(package_request(), lambda: async_call(device,'Pair',seconds=30))
     note('hci_security_order',{'capture_preceded_host_pair_invocation':True,
         'pairing_request_count':receipt['counts']['pairing_requests'],
         'pairing_response_count':receipt['counts']['pairing_responses'],
