@@ -32,10 +32,12 @@ preflight must:
 
 When the safe boot state is BLE-uninitialized and the bond store therefore
 returns `BLE_NOT_READY`, the preflight may briefly initialize BLE solely to read
-the non-secret inventory. It must accept no connection or pairing, immediately
-hide BLE again, and re-establish hidden idle with no lifecycle fault before it
-continues. This bounded inventory probe is preflight setup and creates no phase
-or qualification evidence.
+the non-secret inventory. It first powers off the unique BlueZ adapter to
+prevent the retained host from reconnecting, must observe no connection or
+pairing, immediately hides BLE again, restores the original adapter power, and
+re-establishes hidden idle with no lifecycle fault before it continues. This
+bounded inventory probe is preflight setup and creates no phase or qualification
+evidence.
 
 The reset occurs after initial identity verification and before the attempt
 snapshot/package and start boundary. Failure of reset, control recovery,

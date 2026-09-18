@@ -114,6 +114,30 @@ def _bluez_safe():
     }
 
 
+def _set_bluez_powered(powered: bool, timeout_seconds=5.0) -> bool:
+    """Set the unique adapter power state and return its previous value."""
+    import dbus
+
+    bus = dbus.SystemBus()
+    managed = dbus.Interface(
+        bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager"
+    ).GetManagedObjects()
+    adapters = [path for path, value in managed.items()
+                if "org.bluez.Adapter1" in value]
+    require(len(adapters) == 1, "BLUETOOTH_ADAPTER_NOT_UNIQUE")
+    properties = dbus.Interface(
+        bus.get_object("org.bluez", adapters[0]), "org.freedesktop.DBus.Properties"
+    )
+    previous = bool(properties.Get("org.bluez.Adapter1", "Powered"))
+    if previous != powered:
+        properties.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(powered))
+    deadline = time.monotonic() + timeout_seconds
+    while bool(properties.Get("org.bluez.Adapter1", "Powered")) != powered:
+        require(time.monotonic() < deadline, "BLUETOOTH_ADAPTER_POWER_TIMEOUT")
+        time.sleep(0.08)
+    return previous
+
+
 def _usb_is_safe(usb):
     """Evaluate the validated UsbExposureStatus literal-valued contract."""
     return (
@@ -161,9 +185,11 @@ def _bond_inventory(client, timeout_seconds=12.0):
     boot = client.ble_exposure_status()
     require(_ble_is_safe(boot) and boot.observed.value == "uninitialized",
             "BOND_STORE_UNAVAILABLE_OUTSIDE_BOOT_STATE")
+    original_host_power = _set_bluez_powered(False)
     deadline = time.monotonic() + timeout_seconds
-    activated = True
+    activated = False
     try:
+        activated = True
         client.ble_enable()
         while True:
             exposure = client.ble_exposure_status()
@@ -180,15 +206,18 @@ def _bond_inventory(client, timeout_seconds=12.0):
             require(time.monotonic() < deadline, "BOND_STORE_INITIALIZATION_TIMEOUT")
             time.sleep(0.08)
     finally:
-        if activated:
-            client.ble_disable()
-            hide_deadline = time.monotonic() + timeout_seconds
-            while True:
-                exposure = client.ble_exposure_status()
-                if _ble_is_safe(exposure) and exposure.observed.value == "idle":
-                    break
-                require(time.monotonic() < hide_deadline, "BOND_PROBE_HIDE_TIMEOUT")
-                time.sleep(0.08)
+        try:
+            if activated:
+                client.ble_disable()
+                hide_deadline = time.monotonic() + timeout_seconds
+                while True:
+                    exposure = client.ble_exposure_status()
+                    if _ble_is_safe(exposure) and exposure.observed.value == "idle":
+                        break
+                    require(time.monotonic() < hide_deadline, "BOND_PROBE_HIDE_TIMEOUT")
+                    time.sleep(0.08)
+        finally:
+            _set_bluez_powered(original_host_power)
 
 
 def _open_client(deadline_seconds=12.0):

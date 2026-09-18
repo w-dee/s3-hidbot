@@ -2,6 +2,7 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent if (HERE.parent / "host" / "src").is_dir() else HERE.parent.parent
@@ -221,13 +222,26 @@ class OfficialPreflightTests(unittest.TestCase):
                 self.calls.append("disable")
 
         client = Client()
-        result, initialized = preflight._bond_inventory(client)
+        with mock.patch.object(
+            preflight, "_set_bluez_powered", side_effect=(True, False)
+        ) as power:
+            result, initialized = preflight._bond_inventory(client)
         self.assertIs(result, bonds)
         self.assertTrue(initialized)
+        self.assertEqual([call.args for call in power.call_args_list], [(False,), (True,)])
         self.assertEqual(
             client.calls,
             ["list", "status", "enable", "status", "pairing", "list", "disable", "status"],
         )
+
+    def test_ready_bond_store_requires_no_lifecycle_or_host_mutation(self):
+        bonds = SimpleNamespace(healthy=True, bonds=())
+        client = SimpleNamespace(ble_bond_list=lambda: bonds)
+        with mock.patch.object(preflight, "_set_bluez_powered") as power:
+            result, initialized = preflight._bond_inventory(client)
+        self.assertIs(result, bonds)
+        self.assertFalse(initialized)
+        power.assert_not_called()
 
 
 if __name__ == "__main__":
