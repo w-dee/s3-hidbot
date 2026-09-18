@@ -75,7 +75,7 @@ void tracked_cjson_free(void *storage) {
 
 constexpr char kNonceA[] = "0123456789abcdef0123456789abcdef";
 constexpr char kNonceB[] = "fedcba9876543210fedcba9876543210";
-constexpr std::size_t kMaxLogicalMachineFrameBytes = 1535;
+constexpr std::size_t kMaxLogicalMachineFrameBytes = 1023;
 
 firmware_identity::Identity make_test_identity() {
     std::array<std::uint8_t, firmware_identity::kAppElfSha256Bytes> digest{};
@@ -2768,23 +2768,18 @@ void test_finite_profile_api_and_retry() {
     assert(hello.size() <= kMaxLogicalMachineFrameBytes);
     const auto session = extract_string(hello, "session");
     fixture.payload(request(2, session, "ble.profile.list"));
-    require_contains(fixture.sink.last(), "\"id\":\"strict_composite\",\"rev\":1,\"schema\":1");
+    require_contains(fixture.sink.last(), "\"fields\":[\"id\",\"rev\",\"schema\",\"map\",\"bond\",\"identity\"]");
+    require_contains(fixture.sink.last(), "[\"strict_composite\",1,1,0,0,0]");
     require_contains(fixture.sink.last(), "ef1be45d8fe7d0637568c8954b64bab971d5b5f57bf3d44f1cc040e8fe5c3d32");
-    require_contains(fixture.sink.last(), "\"bond\":0,\"identity\":0");
-    require_contains(fixture.sink.last(), "\"id\":\"standalone_mouse_just_works\",\"rev\":1,\"schema\":2");
+    require_contains(fixture.sink.last(), "[\"standalone_mouse_just_works\",1,2,1,1,0]");
     require_contains(fixture.sink.last(), "c2fb165ffe3f84fc4160b013e15914dffbdecbc330c3c315051dc6922262e924");
-    require_contains(fixture.sink.last(), "\"bond\":1,\"identity\":0");
-    require_contains(fixture.sink.last(), "\"id\":\"standalone_keyboard\",\"rev\":1,\"schema\":3");
+    require_contains(fixture.sink.last(), "[\"standalone_keyboard\",1,3,2,2,0]");
     require_contains(fixture.sink.last(), "d56a8aa0efc3f4126a0aea1df4c6f6f1b5bc1d624a710159c34b1cdb02bc45ae");
-    require_contains(fixture.sink.last(), "\"bond\":2,\"identity\":0");
-    require_contains(fixture.sink.last(), "\"id\":\"standalone_mouse_just_works_id7\",\"rev\":1,\"schema\":4");
+    require_contains(fixture.sink.last(), "[\"standalone_mouse_just_works_id7\",1,4,3,3,0]");
     require_contains(fixture.sink.last(), "7e06b773bb36dea83e1f0f76d9b49c46256d1a21d70183154ca4186e610ef628");
-    require_contains(fixture.sink.last(), "\"bond\":3,\"identity\":0");
-    require_contains(fixture.sink.last(), "\"id\":\"standalone_keyboard_leds\",\"rev\":1,\"schema\":5");
+    require_contains(fixture.sink.last(), "[\"standalone_keyboard_leds\",1,5,4,4,0]");
     require_contains(fixture.sink.last(), "bc08d79cc45991446b3f46b37b23e6c82a86a3ad9450f1fe680e4e1134fd504d");
-    require_contains(fixture.sink.last(), "\"bond\":4,\"identity\":0");
-    require_contains(fixture.sink.last(), "\"id\":\"mouse_host_initiated_security\",\"rev\":1,\"schema\":8");
-    require_contains(fixture.sink.last(), "\"bond\":7,\"identity\":0");
+    require_contains(fixture.sink.last(), "[\"mouse_host_initiated_security\",1,8,1,7,0]");
     assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
     fixture.payload(request(3, session, "ble.profile.status"));
     require_contains(fixture.sink.last(), "\"selected\":\"strict_composite\",\"active\":null,\"transition\":\"stable\"");
@@ -2855,9 +2850,11 @@ void test_led_observation_exact_api() {
     require_contains(fixture.sink.last(), "mouse_metadata");
     require_contains(fixture.sink.last(), "mouse_simulated_sleep_v1");
     require_contains(fixture.sink.last(), "mouse_host_initiated_security");
-    require_contains(fixture.sink.last(), "\"bond\":5,\"identity\":0");
-    require_contains(fixture.sink.last(), "\"bond\":6,\"identity\":0");
-    require_contains(fixture.sink.last(), "\"bond\":7,\"identity\":0");
+    require_contains(fixture.sink.last(), "[\"mouse_metadata\",1,6,1,5,0]");
+    require_contains(fixture.sink.last(), "[\"mouse_simulated_sleep_v1\",1,7,1,6,0]");
+    require_contains(fixture.sink.last(), "[\"mouse_host_initiated_security\",1,8,1,7,0]");
+    assert(fixture.sink.last().size() == 832);
+    assert(fixture.sink.last().size() + 1U <= 1024U);  // LF -> CRLF.
     assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
 }
 

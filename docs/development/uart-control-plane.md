@@ -422,9 +422,9 @@ diagnostics; host behavior must rely on `error.code`.
 ## Machine-readable output and logs
 
 Protocol responses and future events must use the common machine writer. The
-logical response-frame maximum is 1535 bytes including prefix, JSON, and LF.
+logical response-frame maximum is 1023 bytes including prefix, JSON, and LF.
 With the current CRLF console configuration, the maximum UART wire form is
-1536 bytes (`...\r\n`) when `CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=y`. The
+1024 bytes (`...\r\n`) when `CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=y`. The
 writer holds the stdout FILE lock, flushes stdout,
 then performs one `write(fileno(stdout), frame, length)` through the configured
 console VFS before unlocking. This makes the complete frame share the UART VFS
@@ -455,10 +455,10 @@ the UART VFS write lock held by normal console output and could split a
 diagnostic line around a machine frame. The current writer replaces that
 bypass.
 
-The protocol response buffer is fixed at 1536 bytes. All formatters use
+The protocol response buffer is fixed at 1024 bytes. All formatters use
 bounded `vsnprintf` serialization and fail closed to a bounded
 `INTERNAL_ERROR` when a formatter cannot serialize; because the NUL terminator
-occupies the last storage byte, generated logical responses are at most 1535
+occupies the last storage byte, generated logical responses are at most 1023
 bytes. The hello format has a compile-time maximum calculation based on
 bounded metadata, four 32-hex values (top-level/result session, boot ID, and
 client nonce), fixed capabilities, maximum ID, prefix, and LF; host-native
@@ -1094,7 +1094,7 @@ serial adapter with a thin CLI in `host/src/hidbot`; protocol logic depends
 only on the generic transport interface. Host tests use fake transports and
 never open a real tty.
 
-The host receive framer is byte-oriented and bounded to the 1536-byte machine-frame
+The host receive framer is byte-oriented and bounded to the 1024-byte machine-frame
 limit. It accepts only an exact `@HIDBOT ` prefix at the beginning of a line,
 supports arbitrary chunks, multiple lines per chunk, LF or CRLF termination,
 and recovers from an overlong prefixed line at the next LF. Prefix-less lines
@@ -1609,12 +1609,16 @@ qualification.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
 
 `ble.profile.list` and `ble.profile.status` accept no params (omitted or `{}`).
-The list result is exactly `{"profiles":[DEFINITION,...]}`. Each definition has
-exactly `id` (finite string), `rev` (positive U16), `schema` (positive U8), `map`
-(64 lowercase hex SHA256 of Report Map bytes), `bond` (finite association class)
-and `identity` (finite logical identity class). Strict uses revision 1, schema 1,
-bond class 0 and shared-fixture identity class 0. These namespaces have separate
-meanings; equal numeric values do not imply interchangeable authority.
+The compact list result has exactly `fields`, `maps`, and `profiles`. `fields`
+is the fixed row schema `["id","rev","schema","map","bond","identity"]`.
+`maps` is an ordered, duplicate-free table of complete 64-lowercase-hex SHA-256
+Report Map digests. Each profile is a six-element row whose `map` field is a
+zero-based index into that table; all other fields retain their prior types and
+meaning. The typed host API expands rows back to named `BleFixtureProfile`
+objects, so no catalog information is discarded. Strict uses revision 1,
+schema 1, bond class 0 and shared-fixture identity class 0. These namespaces
+have separate meanings; equal numeric values do not imply interchangeable
+authority.
 
 Status and selection results are exactly:
 
@@ -1653,7 +1657,7 @@ The Python APIs are `Client.ble_profile_list()`, `ble_profile_status()` and
 are `ble-profile-list`, `ble-profile-status`, and `ble-profile-select PROFILE_ID`.
 They require the advertised capability. The host permits up to 18 capabilities
 only in the hello capability array; other generic arrays retain their 16-item
-bound and the machine response frame remains 1536 bytes. Older host versions
+bound and the machine response frame remains 1024 bytes. Older host versions
 with a 16- or 17-capability limit must be updated for this development firmware.
 
 The internal shared-store association uses bounded `hid_assoc` U32 records,
@@ -1745,8 +1749,11 @@ original response under the usual protocol rules. The typed host method is
 Peers without the capability fail locally before sending the command.
 
 The hello capability-array bound is 18; unrelated JSON arrays retain their
-existing bound of 16. The complete eight-profile catalog remains within the
-1535-byte logical response-frame limit, including a maximum request ID.
+existing bound of 16. The complete eight-profile compact catalog remains within
+the 1023-byte logical response-frame limit, including a maximum request ID and
+all complete Report Map digests. The generated maximum-ID catalog is 832
+logical bytes (833 bytes after configured CRLF translation); the protocol
+suite also applies the same bound to every generated public response.
 
 
 ### Synthetic mouse metadata profile
@@ -1790,18 +1797,34 @@ to a fixed 500 ms interval. After a further 7 seconds without a connection it
 uses the existing bounded disable path to enter hidden idle, but only while the
 route is stable none, both interfaces are known ALL_UP, no Sequence, release,
 pairing, peer, or other safety work remains. A transient safety owner defers
-entry by one more fixed slow-advertising window. `ble.enable` is the fixture-side
-wake trigger and starts a fresh fast-advertising incarnation. Profile selection
-remains RAM-only, the UART remains operational, and reconnect never restores a
-HID route automatically.
+entry by one more fixed slow-advertising window. Sleep first claims the BLE
+disable operation, which fences route, profile, exposure and USB lifecycle
+commands. It then claims a bounded runtime admission gate only when no producer
+is active. The gate excludes new Sequence, report, and release admission while
+quiescence and the exact route generation/runtime authority are validated. A
+release or safety request crossing an uncommitted claim invalidates sleep; a
+successful gate commit is the sleep-entry linearization point and remains held
+until the BLE lifecycle publishes hidden intent. A failed or changed predicate
+releases the claim and rearms the bounded slow window; it never forces an
+existing route to none. `ble.enable` is the fixture-side wake trigger and starts
+a fresh fast-advertising incarnation. Profile selection remains RAM-only, the
+UART remains operational, and reconnect never restores a HID route
+automatically.
 
 BLE hide completion also requires the pinned host to report both advertising
-stopped and no physical connection. A connection established while its callback
-is queued cannot be reported hidden-idle merely because advertising already
-stopped. The control owner initiates teardown once and bounds physical-absence
-observation to five seconds; missing progress or a changed lifecycle fails
-hidden with recovery required. No bond removal or automatic route restore is
-part of this cleanup.
+stopped and no physical connection. A project-owned linker wrapper around the
+pinned public VHCI callback-registration API installs a forwarding ingress
+proxy. The proxy records a successful peripheral Connection Complete handle
+before invoking NimBLE admission, then forwards the event unchanged. If
+stopping advertising makes host admission reject that handle, a
+default-host-queue resolver sends one exact
+standard HCI Disconnect command and retains establishment authority until the
+matching Disconnect Complete arrives. A registered connection transfers to the
+normal GAP/list authority. Hidden-idle therefore also requires no unresolved
+HCI establishment. The control owner bounds physical-absence observation to
+five seconds; missing progress or changed lifecycle fails hidden with recovery
+required. No SDK source modification, bond removal, or automatic route restore
+is part of this cleanup.
 
 ### Host-initiated Just Works security profile
 

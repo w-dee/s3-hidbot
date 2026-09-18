@@ -28,37 +28,48 @@ HOST_SECURITY = {**MOUSE, "id": "mouse_host_initiated_security", "schema": 8, "b
 STATUS = {"selected": "strict_composite", "active": None, "transition": "stable"}
 
 
+def compact_catalog(*profiles):
+    maps = list(dict.fromkeys(profile["map"] for profile in profiles))
+    return {
+        "fields": ["id", "rev", "schema", "map", "bond", "identity"],
+        "maps": maps,
+        "profiles": [[profile["id"], profile["rev"], profile["schema"],
+                      maps.index(profile["map"]), profile["bond"],
+                      profile["identity"]] for profile in profiles],
+    }
+
+
 class ProfileTests(unittest.TestCase):
     def test_exact_catalog_and_status(self):
-        catalog = validate_ble_profile_list({"profiles": [PROFILE]})
+        catalog = validate_ble_profile_list(compact_catalog(PROFILE))
         self.assertEqual(catalog[0].profile_id, BleProfileId.STRICT_COMPOSITE)
         self.assertEqual(catalog[0].report_map_sha256, PROFILE["map"])
         self.assertIsNone(validate_ble_profile_status(STATUS).active)
-        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE]})
+        catalog = validate_ble_profile_list(compact_catalog(PROFILE, MOUSE))
         self.assertEqual(catalog[1].profile_id, BleProfileId.STANDALONE_MOUSE_JUST_WORKS)
         self.assertEqual(catalog[1].bond_class, 1)
         mouse_status = {"selected": MOUSE["id"], "active": MOUSE["id"], "transition": "stable"}
         self.assertEqual(validate_ble_profile_status(mouse_status).active, BleProfileId.STANDALONE_MOUSE_JUST_WORKS)
-        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE, KEYBOARD]})
+        catalog = validate_ble_profile_list(compact_catalog(PROFILE, MOUSE, KEYBOARD))
         self.assertEqual(catalog[2].profile_id, BleProfileId.STANDALONE_KEYBOARD)
         self.assertEqual(catalog[2].bond_class, 2)
         self.assertIn(b'standalone_keyboard', build_ble_profile_select_frame(9, TOKEN, KEYBOARD["id"]))
-        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE, KEYBOARD, ID7]})
+        catalog = validate_ble_profile_list(compact_catalog(PROFILE, MOUSE, KEYBOARD, ID7))
         self.assertEqual(catalog[3].profile_id, BleProfileId.STANDALONE_MOUSE_JUST_WORKS_ID7)
         self.assertEqual(catalog[3].bond_class, 3)
         self.assertEqual(request_object(build_ble_profile_select_frame(10, TOKEN, ID7["id"]))["params"], {"profile": ID7["id"]})
         self.assertEqual(validate_ble_profile_status({"selected": ID7["id"], "active": ID7["id"], "transition": "stable"}).active, BleProfileId.STANDALONE_MOUSE_JUST_WORKS_ID7)
-        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE, KEYBOARD, ID7, LEDS]})
+        catalog = validate_ble_profile_list(compact_catalog(PROFILE, MOUSE, KEYBOARD, ID7, LEDS))
         self.assertEqual(catalog[4].profile_id, BleProfileId.STANDALONE_KEYBOARD_LEDS)
         self.assertEqual(catalog[4].bond_class, 4)
-        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE, KEYBOARD, ID7, LEDS, METADATA]})
+        catalog = validate_ble_profile_list(compact_catalog(PROFILE, MOUSE, KEYBOARD, ID7, LEDS, METADATA))
         self.assertEqual(catalog[5].profile_id, BleProfileId.MOUSE_METADATA)
         self.assertEqual(catalog[5].bond_class, 5)
         self.assertEqual(request_object(build_ble_profile_select_frame(11, TOKEN, METADATA["id"]))["params"], {"profile": "mouse_metadata"})
-        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE, KEYBOARD, ID7, LEDS, METADATA, SLEEP]})
+        catalog = validate_ble_profile_list(compact_catalog(PROFILE, MOUSE, KEYBOARD, ID7, LEDS, METADATA, SLEEP))
         self.assertEqual(catalog[6].profile_id, BleProfileId.MOUSE_SIMULATED_SLEEP_V1)
         self.assertEqual(catalog[6].bond_class, 6)
-        catalog = validate_ble_profile_list({"profiles": [PROFILE, MOUSE, KEYBOARD, ID7, LEDS, METADATA, SLEEP, HOST_SECURITY]})
+        catalog = validate_ble_profile_list(compact_catalog(PROFILE, MOUSE, KEYBOARD, ID7, LEDS, METADATA, SLEEP, HOST_SECURITY))
         self.assertEqual(catalog[7].profile_id, BleProfileId.MOUSE_HOST_INITIATED_SECURITY)
         self.assertEqual(catalog[7].bond_class, 7)
         self.assertEqual(request_object(build_ble_profile_select_frame(12, TOKEN, HOST_SECURITY["id"]))["params"], {"profile": HOST_SECURITY["id"]})
@@ -68,13 +79,27 @@ class ProfileTests(unittest.TestCase):
             validate_ble_profile_status(item)
 
     def test_exact_finite_validation_rejects_unreviewed_values(self):
-        for key, value in [("id", "custom"), ("rev", True), ("schema", 0),
-                           ("map", "a" * 63), ("bond", 8), ("identity", True),
-                           ("upload", "bytes")]:
-            with self.subTest(key=key), self.assertRaises(ProtocolError):
-                validate_ble_profile_list({"profiles": [{**PROFILE, key: value}]})
-        for item in ({"profiles": []}, {"profiles": [PROFILE, PROFILE]},
-                     {"profiles": [PROFILE], "extra": 1}):
+        valid = compact_catalog(PROFILE)
+        bad_rows = [
+            ["custom", 1, 1, 0, 0, 0],
+            [PROFILE["id"], True, 1, 0, 0, 0],
+            [PROFILE["id"], 1, 0, 0, 0, 0],
+            [PROFILE["id"], 1, 1, 1, 0, 0],
+            [PROFILE["id"], 1, 1, 0, 8, 0],
+            [PROFILE["id"], 1, 1, 0, 0, True],
+            [PROFILE["id"], 1, 1, 0, 0, 0, "upload"],
+        ]
+        for row in bad_rows:
+            with self.subTest(row=row), self.assertRaises(ProtocolError):
+                validate_ble_profile_list({**valid, "profiles": [row]})
+        for item in (
+            {**valid, "profiles": []},
+            {**valid, "profiles": valid["profiles"] * 2},
+            {**valid, "maps": ["a" * 63]},
+            {**valid, "maps": valid["maps"] * 2},
+            {**valid, "fields": ["id"]},
+            {**valid, "extra": 1},
+        ):
             with self.assertRaises(ProtocolError):
                 validate_ble_profile_list(item)
         for item in ({**STATUS, "selected": "custom"}, {**STATUS, "active": 1},
@@ -108,7 +133,7 @@ class ProfileTests(unittest.TestCase):
             if command == "ble.profile.select":
                 selected_frames.append(data)
                 if len(selected_frames) == 1: return
-            result = {"profiles": [PROFILE]} if command == "ble.profile.list" else STATUS
+            result = compact_catalog(PROFILE) if command == "ble.profile.list" else STATUS
             transport.chunks.append(response(req["id"], TOKEN, result=result))
         transport = FakeTransport(on_write)
         clock = FakeClock()
@@ -160,7 +185,7 @@ class ProfileTests(unittest.TestCase):
                     transport.chunks.append(hello_response(req["id"], req["params"]["client_nonce"],
                         capabilities=sorted(BASELINE_REQUIRED_CAPABILITIES | OPTIONAL_CAPABILITIES)))
                 else:
-                    value = {"profiles": [PROFILE]} if req["cmd"] == "ble.profile.list" else STATUS
+                    value = compact_catalog(PROFILE) if req["cmd"] == "ble.profile.list" else STATUS
                     transport.chunks.append(response(req["id"], TOKEN, result=value))
             transport = FakeTransport(on_write)
             transport.open = lambda: None

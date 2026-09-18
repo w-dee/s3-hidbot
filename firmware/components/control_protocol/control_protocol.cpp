@@ -1,6 +1,7 @@
 #include "control_protocol/control_protocol.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -603,19 +604,51 @@ bool make_profile_list(control_session::ResponseFrame *frame,
     if (!format_session_field(session_field, session)) return false;
     if (!format_frame(frame,
         "@HIDBOT {\"type\":\"response\",\"v\":1,\"id\":%ld,"
-        "\"session\":%s,\"ok\":true,\"result\":{\"profiles\":[",
+        "\"session\":%s,\"ok\":true,\"result\":{"
+        "\"fields\":[\"id\",\"rev\",\"schema\",\"map\",\"bond\",\"identity\"],"
+        "\"maps\":[",
         static_cast<long>(id), session_field)) return false;
-    bool first = true;
+    std::array<const ble_fixture_profile::ProfileDefinition *,
+               ble_fixture_profile::kCatalog.size()> unique_maps{};
+    std::size_t unique_map_count = 0;
     for (const auto *profile : ble_fixture_profile::kCatalog) {
+        bool found = false;
+        for (std::size_t index = 0; index < unique_map_count; ++index) {
+            if (unique_maps[index]->report_map_sha256 ==
+                profile->report_map_sha256) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        unique_maps[unique_map_count++] = profile;
         char digest[65]{};
         for (std::size_t i = 0; i < profile->report_map_sha256.size(); ++i) {
-            std::snprintf(digest + i * 2, 3, "%02x", profile->report_map_sha256[i]);
+            std::snprintf(digest + i * 2, 3, "%02x",
+                          profile->report_map_sha256[i]);
         }
+        if (!append_frame(frame, "%s\"%s\"",
+                          unique_map_count == 1 ? "" : ",", digest)) {
+            return false;
+        }
+    }
+    if (!append_frame(frame, "],\"profiles\":[")) return false;
+    bool first = true;
+    for (const auto *profile : ble_fixture_profile::kCatalog) {
+        std::size_t map_index = unique_map_count;
+        for (std::size_t index = 0; index < unique_map_count; ++index) {
+            if (unique_maps[index]->report_map_sha256 ==
+                profile->report_map_sha256) {
+                map_index = index;
+                break;
+            }
+        }
+        if (map_index == unique_map_count) return false;
         if (!append_frame(frame,
-            "%s{\"id\":\"%s\",\"rev\":%u,\"schema\":%u,\"map\":\"%s\","
-            "\"bond\":%u,\"identity\":%u}", first ? "" : ",", profile->name,
+            "%s[\"%s\",%u,%u,%u,%u,%u]", first ? "" : ",", profile->name,
             static_cast<unsigned>(profile->revision),
-            static_cast<unsigned>(profile->cache.schema_revision), digest,
+            static_cast<unsigned>(profile->cache.schema_revision),
+            static_cast<unsigned>(map_index),
             static_cast<unsigned>(profile->bond_class),
             static_cast<unsigned>(profile->identity_class))) return false;
         first = false;

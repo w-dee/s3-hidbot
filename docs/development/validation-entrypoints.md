@@ -506,7 +506,10 @@ flags, wrong-handle/write rejection, missing-attribute failure and strict
 restoration. Store-adapter tests reject plain-mouse/metadata-mouse bond reuse
 in both directions despite identical maps and security. Runtime/cache tests
 exercise its mouse-only readiness and explicit release; the maximum-ID catalog
-response must still fit the bounded 1536-byte wire frame.
+response measures 832 logical bytes and 833 CRLF wire bytes, within the bounded
+1024-byte wire frame. The catalog uses its
+fixed field schema plus a duplicate-free full-digest table and indexed rows;
+host tests validate exact typed expansion and malformed references.
 
 The host-initiated Just Works mouse reuses the actual encrypted mouse GATT
 oracle while carrying distinct schema and bond authority. Executor coverage

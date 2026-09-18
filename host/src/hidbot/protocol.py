@@ -1514,30 +1514,39 @@ def _profile_id(value: Any) -> BleProfileId:
 
 
 def validate_ble_profile_list(value: Any) -> tuple[BleFixtureProfile, ...]:
-    if not isinstance(value, dict) or set(value) != {"profiles"}:
+    if not isinstance(value, dict) or set(value) != {"fields", "maps", "profiles"}:
         raise ProtocolError("BLE profile list fields are invalid")
+    if value["fields"] != ["id", "rev", "schema", "map", "bond", "identity"]:
+        raise ProtocolError("BLE profile row fields are invalid")
+    maps = value["maps"]
+    if (not isinstance(maps, list) or not 1 <= len(maps) <= len(BleProfileId)
+            or any(not isinstance(item, str)
+                   or APP_ELF_SHA256_PATTERN.fullmatch(item) is None
+                   for item in maps)
+            or len(set(maps)) != len(maps)):
+        raise ProtocolError("BLE Report Map table is invalid")
     profiles = value["profiles"]
     if not isinstance(profiles, list) or not 1 <= len(profiles) <= len(BleProfileId):
         raise ProtocolError("BLE profile catalog size is invalid")
     result = []
     for item in profiles:
-        if not isinstance(item, dict) or set(item) != {"id", "rev", "schema", "map", "bond", "identity"}:
+        if not isinstance(item, list) or len(item) != 6:
             raise ProtocolError("BLE profile definition fields are invalid")
-        profile_id = _profile_id(item["id"])
-        if type(item["rev"]) is not int or not 1 <= item["rev"] <= 65535:
+        profile_id = _profile_id(item[0])
+        if type(item[1]) is not int or not 1 <= item[1] <= 65535:
             raise ProtocolError("BLE profile revision is invalid")
-        if type(item["schema"]) is not int or not 1 <= item["schema"] <= 255:
+        if type(item[2]) is not int or not 1 <= item[2] <= 255:
             raise ProtocolError("BLE profile schema is invalid")
-        if not isinstance(item["map"], str) or APP_ELF_SHA256_PATTERN.fullmatch(item["map"]) is None:
-            raise ProtocolError("BLE Report Map digest is invalid")
-        if type(item["bond"]) is not int or item["bond"] not in {0, 1, 2, 3, 4, 5, 6, 7}:
+        if type(item[3]) is not int or not 0 <= item[3] < len(maps):
+            raise ProtocolError("BLE Report Map reference is invalid")
+        if type(item[4]) is not int or item[4] not in {0, 1, 2, 3, 4, 5, 6, 7}:
             raise ProtocolError("BLE bond association class is invalid")
-        if type(item["identity"]) is not int or item["identity"] != 0:
+        if type(item[5]) is not int or item[5] != 0:
             raise ProtocolError("BLE logical identity class is invalid")
         if any(profile.profile_id == profile_id for profile in result):
             raise ProtocolError("duplicate BLE profile ID")
-        result.append(BleFixtureProfile(profile_id, item["rev"], item["schema"],
-                                        item["map"], item["bond"], item["identity"]))
+        result.append(BleFixtureProfile(profile_id, item[1], item[2],
+                                        maps[item[3]], item[4], item[5]))
     return tuple(result)
 
 
