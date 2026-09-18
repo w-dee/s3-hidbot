@@ -529,6 +529,69 @@ bool Controller::simulated_sleep_entry_ready() const {
            ble_route_release_phase_ == BleRouteReleasePhase::kNone;
 }
 
+BleCommandOutcome Controller::request_simulated_sleep() {
+    constexpr ControlOperation operation = ControlOperation::kBleDisable;
+    if (!initialized_ || ble_backend_ == nullptr || runtime_ == nullptr ||
+        !claim_operation(operation)) {
+        return {};
+    }
+    // The operation claim fences route, profile, exposure, attach and detach
+    // requests. The runtime claim then drains concurrent producer admissions
+    // and fences Sequence, report and release work through the exact BLE
+    // lifecycle commit.
+    const auto route = runtime_->state_machine().route_snapshot();
+    const auto authority = runtime_->state_machine().authority_epoch();
+    if (!runtime_->state_machine().claim_sleep_quiescence(
+            authority, route.generation)) {
+        release_operation(operation);
+        return {};
+    }
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    if (simulated_sleep_claim_hook_ != nullptr) {
+        simulated_sleep_claim_hook_(this);
+    }
+#endif
+    const auto current_route = runtime_->state_machine().route_snapshot();
+    if (!current_route.coherent ||
+        current_route.generation != route.generation ||
+        current_route.desired != route.desired ||
+        current_route.active != route.active ||
+        current_route.transition != route.transition ||
+        runtime_->state_machine().authority_epoch() != authority ||
+        !simulated_sleep_entry_ready() ||
+        !runtime_->state_machine().commit_sleep_quiescence()) {
+        runtime_->state_machine().release_sleep_quiescence();
+        release_operation(operation);
+        return {};
+    }
+    const ble_lifecycle::TransitionOutcome outcome = [this] {
+        DleLock lock;
+        const auto transition = ble_state_.begin_disable();
+        if (transition.action_result ==
+            ble_lifecycle::TransitionResult::kAccepted) {
+            dle_available_ = false;
+        }
+        return transition;
+    }();
+    runtime_->state_machine().release_sleep_quiescence();
+    if (outcome.action_result == ble_lifecycle::TransitionResult::kAccepted) {
+        const Action item =
+            Action::with_operation(ActionKind::kBleDisable, operation);
+        if (!enqueue(item)) {
+            ble_state_.complete_fault(outcome.snapshot.generation,
+                                      ble_lifecycle::Operation::kDisable, -1);
+            clear_ble_hid_peer();
+            release_operation(operation);
+            return {};
+        }
+    } else {
+        release_operation(operation);
+    }
+    return {.action_result = outcome.action_result,
+            .snapshot_valid = outcome.snapshot_valid,
+            .snapshot = outcome.snapshot};
+}
+
 void Controller::drive_profile_selection() {
     constexpr auto operation = ControlOperation::kProfileSelection;
     if (active_operation_.load(std::memory_order_acquire) != operation ||
@@ -3470,8 +3533,8 @@ void Controller::process_ble_event(BleEvent event) {
                 }
                 if (simulated_sleep_.stage !=
                     SimulatedSleepStage::kSlowAdvertising) return;
-                if (simulated_sleep_entry_ready()) {
-                    const auto outcome = request_ble_disable();
+                {
+                    const auto outcome = request_simulated_sleep();
                     if (outcome.action_result ==
                         ble_lifecycle::TransitionResult::kAccepted) {
                         simulated_sleep_.stage =

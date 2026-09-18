@@ -21,6 +21,45 @@ constexpr std::uint8_t kSuspendedBit = 1U << 1;
 constexpr std::uint8_t kKeyboardReadyBit = 1U << 2;
 constexpr std::uint8_t kMouseReadyBit = 1U << 3;
 
+constexpr std::uint32_t kSleepQuiescenceClaimed = 0x80000000U;
+constexpr std::uint32_t kSleepQuiescenceConflict = 0xc0000000U;
+constexpr std::uint32_t kSleepQuiescenceCommitted = 0x40000000U;
+constexpr std::uint32_t kSleepQuiescenceControlMask = 0xc0000000U;
+
+class ScopedConflictingAdmission {
+  public:
+    explicit ScopedConflictingAdmission(std::atomic<std::uint32_t> *gate)
+        : gate_(gate) {
+        std::uint32_t observed = gate_->load(std::memory_order_acquire);
+        while ((observed & kSleepQuiescenceControlMask) == 0U) {
+            if (gate_->compare_exchange_weak(observed, observed + 1U,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+                acquired_ = true;
+                return;
+            }
+        }
+        if (observed == kSleepQuiescenceClaimed) {
+            (void)gate_->compare_exchange_strong(
+                observed, kSleepQuiescenceConflict, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+    }
+
+    ~ScopedConflictingAdmission() {
+        if (acquired_) gate_->fetch_sub(1U, std::memory_order_release);
+    }
+
+    bool acquired() const { return acquired_; }
+
+    ScopedConflictingAdmission(const ScopedConflictingAdmission &) = delete;
+    ScopedConflictingAdmission &operator=(const ScopedConflictingAdmission &) = delete;
+
+  private:
+    std::atomic<std::uint32_t> *gate_;
+    bool acquired_ = false;
+};
+
 std::size_t index(Interface interface) {
     return static_cast<std::size_t>(interface);
 }
@@ -345,6 +384,41 @@ bool StateMachine::profile_switch_quiescent() const {
            lifecycle_detach_safety_clean();
 }
 
+bool StateMachine::claim_sleep_quiescence(
+    AuthorityEpoch expected_authority_epoch,
+    RouteGeneration expected_route_generation) {
+    std::uint32_t expected = 0;
+    if (!sleep_quiescence_gate_.compare_exchange_strong(
+            expected, kSleepQuiescenceClaimed, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return false;
+    }
+    const auto route = route_snapshot();
+    if (authority_epoch_.load(std::memory_order_acquire) !=
+            expected_authority_epoch ||
+        route.generation != expected_route_generation || !route.coherent ||
+        route.invalidation_pending ||
+        route.desired != hid_route::OutputRoute::kNone ||
+        route.active != hid_route::OutputRoute::kNone ||
+        route.transition != hid_route::Transition::kStable ||
+        !profile_switch_quiescent()) {
+        release_sleep_quiescence();
+        return false;
+    }
+    return true;
+}
+
+bool StateMachine::commit_sleep_quiescence() {
+    std::uint32_t expected = kSleepQuiescenceClaimed;
+    return sleep_quiescence_gate_.compare_exchange_strong(
+        expected, kSleepQuiescenceCommitted, std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
+void StateMachine::release_sleep_quiescence() {
+    sleep_quiescence_gate_.store(0, std::memory_order_release);
+}
+
 bool StateMachine::release_producers_blocked() const {
     return release_transaction_active(
         release_ticket_.state.load(std::memory_order_acquire));
@@ -420,6 +494,10 @@ void StateMachine::preserve_suspend_safety(InterfaceState &interface_state) {
 }
 
 void StateMachine::on_mount() {
+    // USB callbacks are safety authority, so they must never wait behind the
+    // simulated-sleep claim. Entering before the claim makes it wait for this
+    // callback to finish; entering after the claim invalidates that claim.
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     if (!usb_lifecycle_.observe_mount()) {
         return;
     }
@@ -496,6 +574,7 @@ void StateMachine::on_mount() {
 }
 
 void StateMachine::on_unmount() {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     const UsbGeneration retired_generation = attach_generation();
     if (!usb_lifecycle_.observe_unmount()) {
         // Explicit uninstall calls tud_umount_cb() during caller-side
@@ -554,6 +633,7 @@ void StateMachine::on_unmount() {
 }
 
 void StateMachine::on_suspend() {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     if (!usb_lifecycle_.observe_suspend()) {
         return;
     }
@@ -588,6 +668,7 @@ void StateMachine::on_suspend() {
 }
 
 void StateMachine::on_resume() {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     if (!usb_lifecycle_.observe_resume()) {
         return;
     }
@@ -641,6 +722,7 @@ UsbLinkStallResult StateMachine::on_usb_link_stall(
     if (conditional_token == nullptr) {
         return UsbLinkStallResult::kStale;
     }
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     const auto withdraw_conditional = [&]() {
         if (*conditional_token !=
             hid_route::kNoConditionalInvalidationToken) {
@@ -1693,6 +1775,8 @@ void StateMachine::reconcile_unavailable_zero_work_release() {
 
 bool StateMachine::queue_report(Interface interface, ReportKind kind,
                                 const std::uint8_t *report, std::uint8_t length) {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    if (!admission.acquired()) return false;
     const bool safety_kind = kind == ReportKind::kSafetyKeyboard ||
                              kind == ReportKind::kSafetyMouse;
     if (report == nullptr || length == 0 || length > 8 ||
@@ -1760,6 +1844,8 @@ KeyboardReportBeginResult StateMachine::begin_keyboard_report(
     std::uint8_t modifiers, const std::array<std::uint8_t, 6> &keycodes,
     SequenceAuthority sequence, HidTicketId *ticket_id,
     ReportOriginOwnerId originating_local_owner_id) {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    if (!admission.acquired()) return KeyboardReportBeginResult::kBusy;
     if (ticket_id != nullptr) *ticket_id = 0;
     if (sequence.generation == 0 && sequence_active()) {
         return KeyboardReportBeginResult::kBusy;
@@ -2067,6 +2153,8 @@ MouseReportBeginResult StateMachine::begin_mouse_report(
     std::int8_t horizontal, SequenceAuthority sequence,
     HidTicketId *ticket_id,
     ReportOriginOwnerId originating_local_owner_id) {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    if (!admission.acquired()) return MouseReportBeginResult::kBusy;
     if (ticket_id != nullptr) *ticket_id = 0;
     if (sequence.generation == 0 && sequence_active()) {
         return MouseReportBeginResult::kBusy;
@@ -2765,6 +2853,9 @@ void StateMachine::publish_release_request() {
 }
 
 void StateMachine::request_release_all() {
+    // Safety release is never discarded. Crossing an uncommitted sleep claim
+    // first invalidates that claim, then publishes the normal safety debt.
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     publish_release_request();
     reconcile_unavailable_zero_work_release();
 }
@@ -2837,6 +2928,7 @@ bool StateMachine::lifecycle_detach_safety_clean() const {
 }
 
 void StateMachine::mark_lifecycle_detach_uncertain(UsbGeneration old_generation) {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     for (InterfaceState &interface_state : interfaces_) {
         interface_state.safety_required.store(true, std::memory_order_release);
         interface_state.host_state_uncertain.store(true, std::memory_order_release);
@@ -2847,6 +2939,7 @@ void StateMachine::mark_lifecycle_detach_uncertain(UsbGeneration old_generation)
 }
 
 void StateMachine::on_driver_uninstalled() {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -2894,6 +2987,7 @@ void StateMachine::complete_usb_uninstall_failure(std::int32_t error_code) {
 }
 
 bool StateMachine::begin_usb_runtime_fault(std::int32_t error_code) {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     if (!usb_lifecycle_.begin_runtime_fault(error_code)) {
         return false;
     }
@@ -2958,6 +3052,8 @@ void StateMachine::complete_usb_detach_route_invalidation(hid_route::Snapshot ol
 }
 
 ReleaseAllId StateMachine::begin_release_all() {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    if (!admission.acquired()) return 0;
     // A single UART owner admits requests; terminal callbacks and executor
     // work share the short metadata lock, never transport calls or waits.
     bool exhausted = false;
@@ -3348,6 +3444,9 @@ bool StateMachine::fail_release_locked(ReleaseAllId expected_id, bool continuity
 
 void StateMachine::note_ble_route_continuity_loss(
     BleRouteAuthoritySnapshot expected) {
+    // BLE loss notification is callback-side safety authority. Preserve it
+    // while making an in-progress sleep claim observe an exact conflict.
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     const ScopedTicketMetadataLock lock(release_ticket_lock_);
     const ReleaseAllSnapshot transaction = release_all_snapshot_locked();
     if (!release_ticket_matches_locked(transaction) || !expected.coherent ||
@@ -4177,6 +4276,8 @@ bool StateMachine::report_in_flight(Interface interface) const {
 
 SequenceAdmissionResult StateMachine::begin_sequence(
     ConfirmedHidState *snapshot, SequenceAuthority *sequence) {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    if (!admission.acquired()) return SequenceAdmissionResult::kBusy;
     if (snapshot == nullptr || sequence == nullptr) {
         return SequenceAdmissionResult::kNotReady;
     }
@@ -4330,6 +4431,7 @@ void StateMachine::end_sequence(SequenceAuthority sequence) {
 }
 
 void StateMachine::revoke_sequence() {
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
     sequence_generation_.exchange(0, std::memory_order_acq_rel);
 }
 

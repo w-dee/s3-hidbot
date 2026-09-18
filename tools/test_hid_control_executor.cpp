@@ -7786,6 +7786,144 @@ void test_profile_restart_failure_and_deadline_matrix() {
 }
 
 hid_control_executor::Controller *finite_release_controller = nullptr;
+hid_runtime::Runtime *sleep_claim_runtime = nullptr;
+bool sleep_claim_hook_called = false;
+bool sleep_claim_ready = false;
+hid_runtime::RouteTransitionResult sleep_claim_route_result =
+    hid_runtime::RouteTransitionResult::kAccepted;
+hid_runtime::SequenceAdmissionResult sleep_claim_sequence_result =
+    hid_runtime::SequenceAdmissionResult::kAccepted;
+hid_runtime::AuthorityEpoch sleep_claim_authority_before = 0;
+hid_runtime::AuthorityEpoch sleep_claim_authority_after = 0;
+
+void sleep_claim_usb_route(hid_control_executor::Controller *controller) {
+    sleep_claim_hook_called = true;
+    sleep_claim_ready = controller->simulated_sleep_entry_ready_for_test();
+    sleep_claim_route_result =
+        controller->request_route(hid_route::OutputRoute::kUsb).action_result;
+}
+
+void sleep_claim_runtime_work(hid_control_executor::Controller *controller) {
+    sleep_claim_hook_called = true;
+    sleep_claim_ready = controller->simulated_sleep_entry_ready_for_test();
+    hid_runtime::ConfirmedHidState state{};
+    hid_runtime::SequenceAuthority authority{};
+    sleep_claim_sequence_result =
+        sleep_claim_runtime->state_machine().begin_sequence(&state, &authority);
+    sleep_claim_runtime->state_machine().request_release_all();
+}
+
+void sleep_claim_usb_suspend(hid_control_executor::Controller *controller) {
+    sleep_claim_hook_called = true;
+    sleep_claim_ready = controller->simulated_sleep_entry_ready_for_test();
+    sleep_claim_authority_before =
+        sleep_claim_runtime->state_machine().authority_epoch();
+    sleep_claim_runtime->state_machine().on_suspend();
+    sleep_claim_authority_after =
+        sleep_claim_runtime->state_machine().authority_epoch();
+}
+
+void test_simulated_sleep_claim_fences_usb_route_and_preserves_busy_route() {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_profile_select(ProfileId::kMouseSimulatedSleepV1)
+               .result == SelectionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(Event::kSync));
+    assert(controller.process_one_for_test());
+    assert(ble.finite_advertising_complete(ble.last_advertising_incarnation));
+    assert(controller.process_one_for_test());
+    sleep_claim_runtime = &runtime;
+    sleep_claim_hook_called = false;
+    sleep_claim_ready = false;
+    sleep_claim_sequence_result =
+        hid_runtime::SequenceAdmissionResult::kAccepted;
+    controller.set_simulated_sleep_claim_hook_for_test(sleep_claim_runtime_work);
+    const auto producer_race_slow = ble.last_advertising_incarnation;
+    assert(ble.finite_advertising_complete(producer_race_slow));
+    assert(controller.process_one_for_test());
+    controller.set_simulated_sleep_claim_hook_for_test(nullptr);
+    assert(sleep_claim_hook_called);
+    assert(sleep_claim_ready);
+    assert(sleep_claim_sequence_result ==
+           hid_runtime::SequenceAdmissionResult::kBusy);
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kAdvertising);
+    assert(ble.last_advertising_incarnation != producer_race_slow);
+
+    // A real asynchronous USB lifecycle callback is safety authority too. It
+    // may proceed, but crossing the sleep claim must invalidate that claim.
+    assert(action(controller.request_attach()) ==
+           usb_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    mount_ready(runtime);
+    sleep_claim_hook_called = false;
+    sleep_claim_ready = false;
+    sleep_claim_authority_before = 0;
+    sleep_claim_authority_after = 0;
+    controller.set_simulated_sleep_claim_hook_for_test(sleep_claim_usb_suspend);
+    const auto lifecycle_race_slow = ble.last_advertising_incarnation;
+    assert(ble.finite_advertising_complete(lifecycle_race_slow));
+    assert(controller.process_one_for_test());
+    controller.set_simulated_sleep_claim_hook_for_test(nullptr);
+    assert(sleep_claim_hook_called);
+    assert(sleep_claim_ready);
+    assert(sleep_claim_authority_after == sleep_claim_authority_before + 1);
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kAdvertising);
+    assert(ble.last_advertising_incarnation != lifecycle_race_slow);
+    runtime.state_machine().on_resume();
+    runtime.state_machine().set_ready(hid_runtime::Interface::kKeyboard, true);
+    runtime.state_machine().set_ready(hid_runtime::Interface::kMouse, true);
+
+    sleep_claim_hook_called = false;
+    sleep_claim_ready = false;
+    sleep_claim_route_result = hid_runtime::RouteTransitionResult::kAccepted;
+    controller.set_simulated_sleep_claim_hook_for_test(sleep_claim_usb_route);
+    assert(ble.finite_advertising_complete(ble.last_advertising_incarnation));
+    assert(controller.process_one_for_test());
+    controller.set_simulated_sleep_claim_hook_for_test(nullptr);
+    assert(sleep_claim_hook_called);
+    assert(sleep_claim_ready);
+    assert(sleep_claim_route_result !=
+           hid_runtime::RouteTransitionResult::kAccepted);
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kNone);
+    if (controller.ble_snapshot().observed ==
+        ble_lifecycle::ObservedState::kDisabling) {
+        assert(controller.process_one_for_test());
+    }
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kIdle);
+
+    // An explicit route that exists before expiry is preserved. Sleep is
+    // deferred by the documented fixed slow window rather than forcing none.
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.request_route(hid_route::OutputRoute::kUsb).action_result ==
+           hid_runtime::RouteTransitionResult::kAccepted);
+    assert(ble.finite_advertising_complete(ble.last_advertising_incarnation));
+    assert(controller.process_one_for_test());
+    const auto first_slow = ble.last_advertising_incarnation;
+    assert(ble.finite_advertising_complete(first_slow));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().desired ==
+           ble_lifecycle::DesiredExposure::kExposed);
+    assert(controller.route_snapshot().route.active ==
+           hid_route::OutputRoute::kUsb);
+    assert(ble.last_advertising_incarnation != first_slow);
+    assert(ble.last_advertising_interval == 800);
+}
 
 void test_simulated_sleep_finite_advertising_and_wake_cycles() {
     using namespace ble_fixture_profile;
@@ -8192,6 +8330,7 @@ int main(int argc, char **argv) {
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseMetadata);
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1);
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseHostInitiatedSecurity);
+    test_simulated_sleep_claim_fences_usb_route_and_preserves_busy_route();
     test_simulated_sleep_finite_advertising_and_wake_cycles();
     test_cold_keyboard_profile_capability_consumption(true);
     test_cold_keyboard_profile_capability_consumption(false);

@@ -622,6 +622,14 @@ class StateMachine {
     void revoke_sequence();
     bool profile_switch_quiescent() const;
     bool sequence_active() const;
+    // Claims the exact all-up/no-work runtime boundary used by simulated
+    // sleep. While claimed, conflicting producer admission either invalidates
+    // the claim or fails closed. Commit is the linearization point; release
+    // follows immediately after the BLE lifecycle state is made hidden.
+    bool claim_sleep_quiescence(AuthorityEpoch expected_authority_epoch,
+                                RouteGeneration expected_route_generation);
+    bool commit_sleep_quiescence();
+    void release_sleep_quiescence();
 
 #ifdef HID_RUNTIME_NATIVE_TEST
     using TestHook = void (*)(StateMachine *);
@@ -847,6 +855,10 @@ class StateMachine {
     std::atomic<std::uint32_t> next_sequence_generation_{1};
     std::atomic<ProfileActivationEpoch> next_profile_activation_epoch_{1};
     std::atomic_bool unavailable_release_reconciler_active_{false};
+    // Low bits count producer admissions. The high states are deliberately
+    // finite: CLAIMED may become CONFLICT, while COMMITTED excludes all new
+    // work until the BLE hide publication has completed.
+    std::atomic<std::uint32_t> sleep_quiescence_gate_{0};
     std::atomic<std::uint32_t> ble_route_sequence_{0};
     std::atomic<AuthorityEpoch> ble_route_authority_epoch_{0};
     std::atomic<RouteGeneration> ble_route_generation_{0};

@@ -682,6 +682,14 @@ class Controller final : public usb_lifecycle::Executor,
     ControlOperation active_operation_for_test() const;
     bool reserve_operation_for_test(ControlOperation operation);
     void release_operation_for_test(ControlOperation operation);
+    using SimulatedSleepClaimHook = void (*)(Controller *controller);
+    void set_simulated_sleep_claim_hook_for_test(
+        SimulatedSleepClaimHook hook) {
+        simulated_sleep_claim_hook_ = hook;
+    }
+    bool simulated_sleep_entry_ready_for_test() const {
+        return simulated_sleep_entry_ready();
+    }
     void fail_next_enqueue_for_test();
     void set_next_pairing_id_for_test(std::uint32_t value);
     bool pairing_mailbox_zero_for_test() const;
@@ -795,6 +803,7 @@ class Controller final : public usb_lifecycle::Executor,
     std::int32_t start_profile_advertising(
         ble_lifecycle::Generation generation, bool slow = false);
     bool simulated_sleep_entry_ready() const;
+    BleCommandOutcome request_simulated_sleep();
     const ble_fixture_profile::ProfileDefinition &selected_profile() const;
     void publish_profile(bool active, ble_fixture_profile::SelectionTransition transition);
     bool enqueue(Action action);
@@ -919,6 +928,9 @@ class Controller final : public usb_lifecycle::Executor,
     ble_pairing::StateMachine pairing_state_{};
     bool initialized_ = false;
     std::atomic<ControlOperation> active_operation_{ControlOperation::kNone};
+#ifdef HID_CONTROL_EXECUTOR_NATIVE_TEST
+    SimulatedSleepClaimHook simulated_sleep_claim_hook_ = nullptr;
+#endif
     // A nonzero value is the exact BLE lifecycle authority whose event stream
     // became uncertain. Generation zero has a separate bit so zero can remain
     // the inactive sentinel for the primary atomic. Producers replace only a
