@@ -240,9 +240,28 @@ class Observer:
             self.path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
         )
 
+    def _decode_pending(self) -> list[Event]:
+        events: list[Event] = []
+        while len(self.pending) >= Event.record.size:
+            raw = Event.record.unpack(self.pending[: Event.record.size])
+            event = Event(raw)
+            if event.event_type == EV_SYN and event.code == SYN_DROPPED:
+                # Return any earlier records first.  The next call consumes
+                # this terminal evidence before waiting for more fd input.
+                if events:
+                    return events
+                del self.pending[: Event.record.size]
+                raise OSError(errno.EIO, "evdev synchronization dropped")
+            del self.pending[: Event.record.size]
+            events.append(event)
+        return events
+
     def read(self, timeout: float) -> list[Event]:
         if self.fd is None:
             raise OSError(errno.ENODEV, "observer is closed")
+        events = self._decode_pending()
+        if events:
+            return events
         with selectors.DefaultSelector() as selector:
             selector.register(self.fd, selectors.EVENT_READ)
             if not selector.select(max(0.0, timeout)):
@@ -254,21 +273,22 @@ class Observer:
                 break
             except OSError as exc:
                 if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    if self.pending:
+                        raise OSError(errno.EIO, "partial evdev record")
                     break
+                if self.pending:
+                    raise OSError(errno.EIO, "partial evdev record") from exc
                 raise
             if not data:
+                if self.pending:
+                    raise OSError(errno.EIO, "partial evdev record")
                 raise OSError(errno.ENODEV, "exact evdev observer retired")
             self.pending.extend(data)
-        events: list[Event] = []
-        while len(self.pending) >= Event.record.size:
-            raw = Event.record.unpack(self.pending[: Event.record.size])
-            del self.pending[: Event.record.size]
-            event = Event(raw)
-            if event.event_type == EV_SYN and event.code == SYN_DROPPED:
-                raise OSError(errno.EIO, "evdev synchronization dropped")
-            events.append(event)
-        if self.pending:
-            raise OSError(errno.EIO, "partial evdev record")
+            events = self._decode_pending()
+            if events:
+                # Complete records become caller-owned evidence before another
+                # read can report terminal device lifetime.
+                return events
         return events
 
     def held_count(self) -> int:

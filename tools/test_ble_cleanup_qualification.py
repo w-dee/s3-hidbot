@@ -354,6 +354,116 @@ class PhysicalRunnerAdapterTests(unittest.TestCase):
             1, phase=phase, retirement=retirement
         )
 
+    def raw_observer_outcome(
+        self,
+        keyboard_reads,
+        mouse_reads,
+        *,
+        phase=BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED,
+        retirement=True,
+    ):
+        keyboard = rehearsal.Observer(Path("/keyboard"), "keyboard")
+        mouse = rehearsal.Observer(Path("/mouse"), "mouse")
+        keyboard.fd = 101
+        mouse.fd = 102
+        queues = {101: list(keyboard_reads), 102: list(mouse_reads)}
+
+        def read(fd, _length):
+            item = queues[fd].pop(0) if queues[fd] else BlockingIOError(
+                errno.EAGAIN, "drained"
+            )
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        selector = mock.MagicMock()
+        selector.__enter__.return_value.select.return_value = [(object(), 1)]
+        with mock.patch.object(rehearsal.selectors, "DefaultSelector",
+                               return_value=selector), \
+             mock.patch.object(rehearsal.os, "read", side_effect=read):
+            return rehearsal.ExactObservers(keyboard, mouse).collect(
+                1, phase=phase, retirement=retirement
+            )
+
+    @staticmethod
+    def raw(event_type: int, code: int, value: int) -> bytes:
+        return rehearsal.Event.record.pack(0, 0, event_type, code, value)
+
+    def test_raw_unexpected_keyboard_survives_enodev(self) -> None:
+        outcome = self.raw_observer_outcome(
+            [self.raw(rehearsal.EV_KEY, 30, 1), OSError(errno.ENODEV, "gone")],
+            [],
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.EXPECTED_DEVICE_RETIRED)
+        self.assertEqual(outcome.unexpected_events, 1)
+
+    def test_raw_unexpected_mouse_survives_enodev(self) -> None:
+        outcome = self.raw_observer_outcome(
+            [BlockingIOError(errno.EAGAIN, "drained"),
+             BlockingIOError(errno.EAGAIN, "drained")],
+            [self.raw(rehearsal.EV_REL, rehearsal.REL_X, 1),
+             OSError(errno.ENODEV, "gone")],
+        )
+        self.assertEqual(outcome.unexpected_events, 1)
+
+    def test_raw_held_key_survives_enodev(self) -> None:
+        outcome = self.raw_observer_outcome(
+            [self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 1),
+             OSError(errno.ENODEV, "gone")],
+            [],
+        )
+        self.assertEqual((outcome.relevant_events, outcome.held_keys), (1, 1))
+
+    def test_multiple_raw_events_are_owned_before_enodev(self) -> None:
+        records = (
+            self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 1)
+            + self.raw(rehearsal.EV_KEY, 30, 1)
+        )
+        outcome = self.raw_observer_outcome(
+            [records, OSError(errno.ENODEV, "gone")], []
+        )
+        self.assertEqual(
+            (outcome.relevant_events, outcome.unexpected_events,
+             outcome.held_keys),
+            (1, 1, 1),
+        )
+
+    def test_clean_complete_raw_events_allow_expected_retirement(self) -> None:
+        records = (
+            self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 1)
+            + self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 0)
+        )
+        outcome = self.raw_observer_outcome(
+            [records, OSError(errno.ENODEV, "gone")], []
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.EXPECTED_DEVICE_RETIRED)
+        self.assertEqual((outcome.relevant_events, outcome.held_keys), (2, 0))
+
+    def test_complete_raw_event_plus_partial_record_is_io_error(self) -> None:
+        record = self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 1)
+        outcome = self.raw_observer_outcome(
+            [record + record[:5], OSError(errno.ENODEV, "gone")], []
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
+        self.assertEqual((outcome.relevant_events, outcome.held_keys), (1, 1))
+
+    def test_raw_event_survives_eio(self) -> None:
+        outcome = self.raw_observer_outcome(
+            [self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 1),
+             OSError(errno.EIO, "io")], []
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
+        self.assertEqual((outcome.relevant_events, outcome.held_keys), (1, 1))
+
+    def test_raw_event_survives_pre_retirement_enodev(self) -> None:
+        outcome = self.raw_observer_outcome(
+            [self.raw(rehearsal.EV_KEY, 30, 1), OSError(errno.ENODEV, "gone")],
+            [], phase=BleCleanupPhase.PRE_RETIREMENT_CLEANUP,
+            retirement=False,
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.UNEXPECTED_DEVICE_LOSS)
+        self.assertEqual(outcome.unexpected_events, 1)
+
     def test_retirement_preserves_unexpected_keyboard_evidence(self) -> None:
         unexpected = self.event(rehearsal.EV_KEY, 30, 1)
         outcome = self.observer_outcome(
@@ -416,6 +526,46 @@ class PhysicalRunnerAdapterTests(unittest.TestCase):
         self.assertEqual(outcome.status, ObserverTerminalStatus.EXPECTED_DEVICE_RETIRED)
         self.assertEqual(outcome.unexpected_events, 1)
         self.assertEqual(outcome.held_keys, 1)
+
+    def test_raw_evidence_survives_final_eviocgkey_failure(self) -> None:
+        keyboard = rehearsal.Observer(Path("/keyboard"), "keyboard")
+        mouse = rehearsal.Observer(Path("/mouse"), "mouse")
+        keyboard.fd = 101
+        mouse.fd = 102
+        queues = {
+            101: [self.raw(rehearsal.EV_KEY, 30, 1),
+                  BlockingIOError(errno.EAGAIN, "drained")],
+            102: [BlockingIOError(errno.EAGAIN, "drained")],
+        }
+
+        def read(fd, _length):
+            item = queues[fd].pop(0) if queues[fd] else BlockingIOError(
+                errno.EAGAIN, "drained"
+            )
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        def held(fd, _request, _data, _mutate):
+            if fd == 102:
+                raise OSError(errno.ENODEV, "gone")
+
+        selector = mock.MagicMock()
+        selector.__enter__.return_value.select.return_value = [(object(), 1)]
+        with mock.patch.object(rehearsal.selectors, "DefaultSelector",
+                               return_value=selector), \
+             mock.patch.object(rehearsal.os, "read", side_effect=read), \
+             mock.patch.object(rehearsal.fcntl, "ioctl", side_effect=held), \
+             mock.patch.object(rehearsal.time, "monotonic",
+                               side_effect=[0, 0, 0, 0, 2]):
+            outcome = rehearsal.ExactObservers(keyboard, mouse).collect(
+                1,
+                phase=BleCleanupPhase.OBSERVER_RETIREMENT_ALLOWED,
+                retirement=True,
+            )
+        self.assertEqual(outcome.status,
+                         ObserverTerminalStatus.EXPECTED_DEVICE_RETIRED)
+        self.assertEqual(outcome.unexpected_events, 1)
 
     def test_observer_io_error_preserves_prior_evidence(self) -> None:
         down = self.event(rehearsal.EV_KEY, rehearsal.KEY_F24, 1)
