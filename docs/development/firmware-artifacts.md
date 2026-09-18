@@ -341,11 +341,15 @@ that Release automatically.
 For v0.4.0, physical qualification binds the exact product commit and
 firmware archive before the authority-v5 and release-preparation documentation
 commits. The intended annotated tag therefore targets the qualified product
-commit recorded in [`qualification-v0.4.0.md`](qualification-v0.4.0.md), and a
-tag build must reproduce the recorded firmware archive byte-for-byte. The
-later documentation is retained as a separate audit trail and supplies the
-prepared release body and checklist; it does not change the qualified product
-tree. The remaining tag, candidate/tag CI comparison, draft, and publication
+commit recorded in [`qualification-v0.4.0.md`](qualification-v0.4.0.md). The
+prepared public asset set contains that recorded archive byte-for-byte. A
+container Release build truthfully records its different container/tool
+environment in `manifest.json`, so its outer archive is diagnostic evidence
+and must not replace the physically qualified archive. The build must still
+match every firmware payload byte, source/dependency authority, and source
+epoch. The later documentation is retained as a separate audit trail and
+supplies the prepared release body and checklist; it does not change the
+qualified product tree. The remaining tag, recovery CI, draft, and publication
 steps keep the bounded read-back and separate-authorization model above.
 
 The local artifact contract remains valid when `build.container_image` is

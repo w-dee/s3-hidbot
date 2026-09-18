@@ -20,8 +20,19 @@ authorization.
 The intended tag target is the qualified product commit. The later
 authority-v5 and release-preparation commits contain evidence tooling and
 documentation only; they are deliberately separate from the qualified product
-tree. A tag build must use commit epoch `1789735191` and produce the exact
-firmware archive hash above before any release mutation.
+tree. The fixed public set is staged under
+`~/Downloads/s3-hidbot-v0.4.0-release-candidate/assets/`. Its firmware archive
+must retain the exact hash above through every upload and read-back.
+
+Candidate Release build run `35349474513` passed both independent builds and
+the Python 3.11/3.12 checkout-free consumers at the qualified source and epoch.
+Its application, ELF, bootloader, partition table, flash plan, SDK lock/config,
+and source/dependency authority are byte-identical to the qualified bundle.
+Its outer archive SHA-256 is
+`7715ef38d1c32a584e7facb63747d74049a74fdcf4237db77398eb57dc9c1ff1`
+because its manifest truthfully records the pinned container and different
+tool versions. That CI archive is not a release asset and must not replace the
+qualified archive.
 
 ## Prepared local asset inventory
 
@@ -54,6 +65,7 @@ host distributions.
 - [x] independent read-only evidence review and safe final fixture state;
 - [x] release notes, qualification summary, exact asset list, and hashes;
 - [x] local canonical release-asset verification and qualified-archive byte comparison;
+- [x] candidate Release build run `35349474513` and both checkout-free consumers;
 - [ ] owner authorization for the irreversible/public release sequence.
 
 ## Owner-authorized release sequence
@@ -65,9 +77,12 @@ bounded sequence:
    Release exists;
 2. create an annotated unsigned `v0.4.0` tag at the exact target above and push
    that tag normally;
-3. require the exact tag Release build to pass and compare its firmware bytes
-   with the qualified archive;
-4. verify the tag-build ten-asset set and the rendered release body;
+3. dispatch the fixed recovery workflow from `release/v0.4.0` for the existing
+   tag and exact target, require it to pass, and compare every firmware payload
+   byte and authority field with the qualified archive;
+4. retain the fixed local ten-asset set, verify all adjacent sidecars and the
+   rendered release body, and reject the container-built outer firmware archive
+   as a substitute;
 5. create one stable GitHub Release draft without overwriting any existing
    object, then read it back and freshly download and compare all assets; and
 6. only after a separate publication authorization, publish that same verified
