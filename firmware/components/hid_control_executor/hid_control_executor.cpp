@@ -3417,8 +3417,13 @@ void Controller::process_ble_event(BleEvent event) {
                 (void)ble_backend_->configure_connection(event.connection_handle);
                 ble_backend_->record_heap_checkpoint(
                     BleBackend::HeapCheckpoint::kConnected);
-                const std::int32_t result =
-                    ble_backend_->initiate_security(event.connection_handle);
+                std::int32_t result = 0;
+                if (selected_profile().security_initiation ==
+                    ble_fixture_profile::SecurityInitiation::
+                        kPeripheralImmediate) {
+                    result =
+                        ble_backend_->initiate_security(event.connection_handle);
+                }
                 if (claim_dle(event)) {
                     // Admission is consumed even on error. No product retry or
                     // teardown solely for DLE; SDK HCI fault handling remains.

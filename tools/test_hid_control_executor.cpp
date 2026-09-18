@@ -550,7 +550,8 @@ struct FakeBleDatabase final : hid_control_executor::BleDatabase {
                        .keyboard_value = id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorks &&
                                          id != ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7 &&
                                          id != ble_fixture_profile::ProfileId::kMouseMetadata &&
-                                         id != ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1
+                                         id != ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1 &&
+                                         id != ble_fixture_profile::ProfileId::kMouseHostInitiatedSecurity
                            ? std::uint16_t{10} : std::uint16_t{0},
                        .mouse_value = (id == ble_fixture_profile::ProfileId::kStandaloneKeyboard ||
                                        id == ble_fixture_profile::ProfileId::kStandaloneKeyboardLeds)
@@ -7919,6 +7920,8 @@ void test_cold_mouse_profile_capability_consumption(ble_fixture_profile::Profile
     FakeBleBackend ble;
     FakeBleDatabase database;
     hid_control_executor::Controller controller;
+    const bool host_initiated =
+        selected == ProfileId::kMouseHostInitiatedSecurity;
     assert(controller.initialize(&runtime, &usb, &ble, &database));
     assert(controller.request_profile_select(selected).result == SelectionResult::kAccepted);
     assert(controller.process_one_for_test());
@@ -7928,7 +7931,14 @@ void test_cold_mouse_profile_capability_consumption(ble_fixture_profile::Profile
     assert(controller.request_ble_enable().action_result == ble_lifecycle::TransitionResult::kAccepted);
     assert(controller.process_one_for_test());
     assert(ble.event(Event::kSync)); assert(controller.process_one_for_test());
+    if (host_initiated) ble.initiate_security_result = -94;
     assert(ble.event(Event::kConnect, 4)); assert(controller.process_one_for_test());
+    assert(ble.initiate_security_calls == (host_initiated ? 0 : 1));
+    assert(ble.dle_calls == 1);
+    assert(ble.dle_order == (host_initiated ? 13U : 123U));
+    assert(controller.ble_snapshot().connected &&
+           !controller.ble_snapshot().recovery_required);
+    assert(!controller.ble_link_ready());
     make_security_ready(ble);
     ble.security_link.authenticated = false;
     ble.security_persisted.our.authenticated = ble.security_persisted.peer.authenticated = false;
@@ -8181,6 +8191,7 @@ int main(int argc, char **argv) {
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseMetadata);
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1);
+    test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseHostInitiatedSecurity);
     test_simulated_sleep_finite_advertising_and_wake_cycles();
     test_cold_keyboard_profile_capability_consumption(true);
     test_cold_keyboard_profile_capability_consumption(false);
@@ -8190,6 +8201,7 @@ int main(int argc, char **argv) {
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kMouseMetadata);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1);
+    test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kMouseHostInitiatedSecurity);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneKeyboard);
     test_single_role_cache_requires_map_and_fresh_write_without_migration(ble_fixture_profile::ProfileId::kStandaloneKeyboardLeds);
     if (argc == 2 &&

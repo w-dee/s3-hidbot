@@ -497,7 +497,7 @@ isolation and late-write retirement. Executor tests keep Output state separate
 from input route readiness/release and invalidate observation across retirement.
 The actual NVS/store adapter rejects plain-keyboard/LED-keyboard bond reuse.
 Host and control-protocol tests cover `ble.led-observation-v1`, exact typed
-status, capability gating, CLI observation, cached retry and the seven-profile
+status, capability gating, CLI observation, cached retry and the eight-profile
 catalog at the maximum request ID. None of these tests touches physical LEDs.
 
 The synthetic metadata profile extends the actual GATT registration/access
@@ -506,7 +506,15 @@ flags, wrong-handle/write rejection, missing-attribute failure and strict
 restoration. Store-adapter tests reject plain-mouse/metadata-mouse bond reuse
 in both directions despite identical maps and security. Runtime/cache tests
 exercise its mouse-only readiness and explicit release; the maximum-ID catalog
-response must still fit the unchanged wire frame limit.
+response must still fit the bounded 1536-byte wire frame.
+
+The host-initiated Just Works mouse reuses the actual encrypted mouse GATT
+oracle while carrying distinct schema and bond authority. Executor coverage
+sets the backend security-initiation result to failure and proves the call is
+omitted only for that profile, the one admitted Data Length update still runs,
+the connected link remains not ready before host security, and the unchanged
+unauthenticated bonded 16-byte outcome can later satisfy normal cache,
+subscription, explicit-route, report, and release behavior.
 
 Retained reconnect coverage distinguishes the initial non-strict schema fence
 from an already current matching association: an exact restored subscription

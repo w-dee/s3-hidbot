@@ -29,7 +29,7 @@ int main() {
     assert(subscriptions_ready(mouse_definition, report_bit(ReportRole::kMouseInput)));
     assert(!subscriptions_ready(mouse_definition, report_bit(ReportRole::kKeyboardInput)));
 
-    assert(kCatalog.size() == 7);
+    assert(kCatalog.size() == 8);
     const auto &sleep = kMouseSimulatedSleepV1;
     assert(find_profile("mouse_simulated_sleep_v1") == &sleep);
     assert(sleep.report_map_sha256 == mouse_definition.report_map_sha256);
@@ -44,6 +44,24 @@ int main() {
            sleep.advertising.slow_interval_units == 800);
     assert(sleep.advertising.fast_timeout_ms == 3000 &&
            sleep.advertising.slow_timeout_ms == 7000);
+    assert(sleep.security_initiation ==
+           SecurityInitiation::kPeripheralImmediate);
+    const auto &host_security = kMouseHostInitiatedSecurity;
+    assert(find_profile("mouse_host_initiated_security") == &host_security);
+    assert(host_security.report_map_sha256 ==
+           mouse_definition.report_map_sha256);
+    assert(host_security.smp.id == mouse_definition.smp.id);
+    assert(host_security.security.id == mouse_definition.security.id);
+    assert(host_security.attributes.id == mouse_definition.attributes.id);
+    assert(host_security.security.encrypted && host_security.security.bonded &&
+           !host_security.security.authenticated &&
+           host_security.security.key_size == 16);
+    assert(host_security.security_initiation == SecurityInitiation::kHostOnly);
+    assert(host_security.bond_class ==
+           BondAssociationClass::kMouseHostInitiatedSecurity);
+    assert(host_security.cache.schema_revision == 8 &&
+           host_security.cache.schema_epoch_value[0] == 8);
+    assert(host_security.identity_class == mouse_definition.identity_class);
     const auto &metadata = kMouseMetadata;
     assert(metadata.cache.schema_revision == 6 && metadata.cache.schema_epoch_value[0] == 6);
     assert(metadata.bond_class == BondAssociationClass::kMouseMetadata);

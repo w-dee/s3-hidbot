@@ -17,13 +17,15 @@ enum class ProfileId : std::uint8_t {
     kStandaloneKeyboardLeds = 4,
     kMouseMetadata = 5,
     kMouseSimulatedSleepV1 = 6,
+    kMouseHostInitiatedSecurity = 7,
 };
 
 // Profile identity and bond/cache interpretation are separate namespaces.
 enum class BondAssociationClass : std::uint8_t {
     kStrictComposite = 0, kStandaloneMouseJustWorks = 1, kStandaloneKeyboard = 2,
     kStandaloneMouseJustWorksId7 = 3, kStandaloneKeyboardLeds = 4,
-    kMouseMetadata = 5, kMouseSimulatedSleepV1 = 6
+    kMouseMetadata = 5, kMouseSimulatedSleepV1 = 6,
+    kMouseHostInitiatedSecurity = 7
 };
 enum class LogicalIdentityClass : std::uint8_t { kSharedFixture = 0 };
 enum class SelectionTransition : std::uint8_t { kStable, kInitializing, kFault };
@@ -63,6 +65,7 @@ enum class GattLayoutId : std::uint8_t {
     kKeyboardLedsRevision5 = 4,
     kMouseMetadataRevision6 = 5,
     kMouseSimulatedSleepRevision7 = 6,
+    kMouseHostSecurityRevision8 = 7,
 };
 
 enum class SmpPolicyId : std::uint8_t {
@@ -88,6 +91,12 @@ enum class CachePolicyId : std::uint8_t {
     kKeyboardLedsRevision5 = 4,
     kMouseMetadataRevision6 = 5,
     kMouseSimulatedSleepRevision7 = 6,
+    kMouseHostSecurityRevision8 = 7,
+};
+
+enum class SecurityInitiation : std::uint8_t {
+    kPeripheralImmediate,
+    kHostOnly,
 };
 
 enum class AdvertisingBehavior : std::uint8_t {
@@ -284,6 +293,8 @@ struct ProfileDefinition {
     AttributePolicy attributes;
     CachePolicy cache;
     AdvertisingPolicy advertising{};
+    SecurityInitiation security_initiation =
+        SecurityInitiation::kPeripheralImmediate;
     const SyntheticMetadata *metadata = nullptr;
 };
 
@@ -534,13 +545,29 @@ inline constexpr ProfileDefinition kMouseSimulatedSleepV1 = [] {
     return profile;
 }();
 
+// Same final Just Works policy as the ordinary mouse; only the SMP initiator
+// changes. The host must initiate security before encrypted GATT access and
+// the BLE HID route remain eligible.
+inline constexpr ProfileDefinition kMouseHostInitiatedSecurity = [] {
+    auto profile = kStandaloneMouseJustWorks;
+    profile.id = ProfileId::kMouseHostInitiatedSecurity;
+    profile.name = "mouse_host_initiated_security";
+    profile.bond_class = BondAssociationClass::kMouseHostInitiatedSecurity;
+    profile.layout.id = GattLayoutId::kMouseHostSecurityRevision8;
+    profile.cache.id = CachePolicyId::kMouseHostSecurityRevision8;
+    profile.cache.schema_revision = 8;
+    profile.cache.schema_epoch_value = {8};
+    profile.security_initiation = SecurityInitiation::kHostOnly;
+    return profile;
+}();
+
 struct LedValue { bool valid = false; std::uint8_t leds = 0; };
 struct LedStatus { bool supported = false; bool valid = false; std::uint8_t leds = 0; };
 
-inline constexpr std::array<const ProfileDefinition *, 7> kCatalog{
+inline constexpr std::array<const ProfileDefinition *, 8> kCatalog{
     &kStrictComposite, &kStandaloneMouseJustWorks, &kStandaloneKeyboard,
     &kStandaloneMouseJustWorksId7, &kStandaloneKeyboardLeds, &kMouseMetadata,
-    &kMouseSimulatedSleepV1};
+    &kMouseSimulatedSleepV1, &kMouseHostInitiatedSecurity};
 
 // Internal reviewed definitions can precede public lifecycle enablement.
 constexpr const ProfileDefinition *find_definition(ProfileId id) {
@@ -552,6 +579,8 @@ constexpr const ProfileDefinition *find_definition(ProfileId id) {
         case ProfileId::kMouseMetadata: return &kMouseMetadata;
         case ProfileId::kStandaloneMouseJustWorksId7: return &kStandaloneMouseJustWorksId7;
         case ProfileId::kMouseSimulatedSleepV1: return &kMouseSimulatedSleepV1;
+        case ProfileId::kMouseHostInitiatedSecurity:
+            return &kMouseHostInitiatedSecurity;
     }
     return nullptr;
 }
@@ -596,7 +625,7 @@ constexpr bool subscriptions_ready(const ProfileDefinition &profile,
 }
 
 static_assert(kStrictComposite.report_map.size() == 116);
-static_assert(kCatalog.size() == 7 &&
+static_assert(kCatalog.size() == 8 &&
               kCatalog[0]->id == ProfileId::kStrictComposite);
 static_assert(kStrictReports[0].report_id == 1 &&
               kStrictReports[0].value_size == 8);

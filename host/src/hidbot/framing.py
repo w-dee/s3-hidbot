@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 FRAME_PREFIX = b"@HIDBOT "
 TRANSPORT_SYNC = b"\x00\x00\x00\x00"
-MAX_MACHINE_FRAME_BYTES = 1280
+MAX_MACHINE_FRAME_BYTES = 1536
 
 
 @dataclass(frozen=True)

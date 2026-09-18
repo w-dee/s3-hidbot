@@ -11,8 +11,8 @@ namespace uart_control_transport {
 // The formatter includes the prefix, JSON, and LF in this logical bound. The
 // configured console VFS converts LF to CRLF on the UART wire, so the wire
 // representation is one byte longer.
-inline constexpr std::size_t kMaxLogicalMachineFrameBytes = 1279;
-inline constexpr std::size_t kMaxWireMachineFrameBytes = 1280;
+inline constexpr std::size_t kMaxLogicalMachineFrameBytes = 1535;
+inline constexpr std::size_t kMaxWireMachineFrameBytes = 1536;
 
 // Starts the sole UART RX consumer for the configured ESP-IDF console UART.
 // It owns byte transport and the sole machine-response writer; the protocol

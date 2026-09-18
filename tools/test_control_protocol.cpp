@@ -75,7 +75,7 @@ void tracked_cjson_free(void *storage) {
 
 constexpr char kNonceA[] = "0123456789abcdef0123456789abcdef";
 constexpr char kNonceB[] = "fedcba9876543210fedcba9876543210";
-constexpr std::size_t kMaxLogicalMachineFrameBytes = 1279;
+constexpr std::size_t kMaxLogicalMachineFrameBytes = 1535;
 
 firmware_identity::Identity make_test_identity() {
     std::array<std::uint8_t, firmware_identity::kAppElfSha256Bytes> digest{};
@@ -2783,6 +2783,8 @@ void test_finite_profile_api_and_retry() {
     require_contains(fixture.sink.last(), "\"id\":\"standalone_keyboard_leds\",\"rev\":1,\"schema\":5");
     require_contains(fixture.sink.last(), "bc08d79cc45991446b3f46b37b23e6c82a86a3ad9450f1fe680e4e1134fd504d");
     require_contains(fixture.sink.last(), "\"bond\":4,\"identity\":0");
+    require_contains(fixture.sink.last(), "\"id\":\"mouse_host_initiated_security\",\"rev\":1,\"schema\":8");
+    require_contains(fixture.sink.last(), "\"bond\":7,\"identity\":0");
     assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
     fixture.payload(request(3, session, "ble.profile.status"));
     require_contains(fixture.sink.last(), "\"selected\":\"strict_composite\",\"active\":null,\"transition\":\"stable\"");
@@ -2809,8 +2811,16 @@ void test_finite_profile_api_and_retry() {
     fixture.payload(request(8, session, "ble.profile.select", "{\"profile\":\"standalone_mouse_just_works_id7\"}"));
     assert(fixture.profile.requested == ble_fixture_profile::ProfileId::kStandaloneMouseJustWorksId7);
     require_contains(fixture.sink.last(), "\"selected\":\"standalone_mouse_just_works_id7\"");
+    fixture.profile.snapshot.selected =
+        ble_fixture_profile::ProfileId::kMouseHostInitiatedSecurity;
+    fixture.payload(request(9, session, "ble.profile.select",
+                            "{\"profile\":\"mouse_host_initiated_security\"}"));
+    assert(fixture.profile.requested ==
+           ble_fixture_profile::ProfileId::kMouseHostInitiatedSecurity);
+    require_contains(fixture.sink.last(),
+                     "\"selected\":\"mouse_host_initiated_security\"");
     const int calls = fixture.profile.selections;
-    int id = 9;
+    int id = 10;
     for (const auto *params : {"{}", "{\"profile\":3}", "{\"profile\":\"unknown\"}",
                               "{\"profile\":\"strict_composite\",\"upload\":true}",
                               "{\"profile\":\"strict_composite\\u0000x\"}"}) {
@@ -2844,8 +2854,10 @@ void test_led_observation_exact_api() {
     fixture.payload(request(INT32_MAX, session, "ble.profile.list"));
     require_contains(fixture.sink.last(), "mouse_metadata");
     require_contains(fixture.sink.last(), "mouse_simulated_sleep_v1");
+    require_contains(fixture.sink.last(), "mouse_host_initiated_security");
     require_contains(fixture.sink.last(), "\"bond\":5,\"identity\":0");
     require_contains(fixture.sink.last(), "\"bond\":6,\"identity\":0");
+    require_contains(fixture.sink.last(), "\"bond\":7,\"identity\":0");
     assert(fixture.sink.last().size() <= kMaxLogicalMachineFrameBytes);
 }
 

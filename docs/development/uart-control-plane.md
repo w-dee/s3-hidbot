@@ -422,9 +422,9 @@ diagnostics; host behavior must rely on `error.code`.
 ## Machine-readable output and logs
 
 Protocol responses and future events must use the common machine writer. The
-logical response-frame maximum is 1279 bytes including prefix, JSON, and LF.
+logical response-frame maximum is 1535 bytes including prefix, JSON, and LF.
 With the current CRLF console configuration, the maximum UART wire form is
-1280 bytes (`...\r\n`) when `CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=y`. The
+1536 bytes (`...\r\n`) when `CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=y`. The
 writer holds the stdout FILE lock, flushes stdout,
 then performs one `write(fileno(stdout), frame, length)` through the configured
 console VFS before unlocking. This makes the complete frame share the UART VFS
@@ -455,10 +455,10 @@ the UART VFS write lock held by normal console output and could split a
 diagnostic line around a machine frame. The current writer replaces that
 bypass.
 
-The protocol response buffer is fixed at 1280 bytes. All formatters use
+The protocol response buffer is fixed at 1536 bytes. All formatters use
 bounded `vsnprintf` serialization and fail closed to a bounded
 `INTERNAL_ERROR` when a formatter cannot serialize; because the NUL terminator
-occupies the last storage byte, generated logical responses are at most 1279
+occupies the last storage byte, generated logical responses are at most 1535
 bytes. The hello format has a compile-time maximum calculation based on
 bounded metadata, four 32-hex values (top-level/result session, boot ID, and
 client nonce), fixed capabilities, maximum ID, prefix, and LF; host-native
@@ -1094,7 +1094,7 @@ serial adapter with a thin CLI in `host/src/hidbot`; protocol logic depends
 only on the generic transport interface. Host tests use fake transports and
 never open a real tty.
 
-The host receive framer is byte-oriented and bounded to the 1280-byte machine-frame
+The host receive framer is byte-oriented and bounded to the 1536-byte machine-frame
 limit. It accepts only an exact `@HIDBOT ` prefix at the beginning of a line,
 supports arbitrary chunks, multiple lines per chunk, LF or CRLF termination,
 and recovers from an overlong prefixed line at the next LF. Prefix-less lines
@@ -1602,7 +1602,8 @@ not a schematic, direct-rail, backfeed, or general electrical-safety claim.
 GATT or arbitrary configuration upload. The public development catalog contains
 `strict_composite`, `standalone_mouse_just_works`, `standalone_keyboard` and
 `standalone_mouse_just_works_id7`, `standalone_keyboard_leds`,
-`mouse_metadata`, and `mouse_simulated_sleep_v1`. Public
+`mouse_metadata`, `mouse_simulated_sleep_v1`, and
+`mouse_host_initiated_security`. Public
 availability does not imply physical
 qualification.
 Cold boot selects strict composite in RAM. No profile setting is persisted.
@@ -1652,7 +1653,7 @@ The Python APIs are `Client.ble_profile_list()`, `ble_profile_status()` and
 are `ble-profile-list`, `ble-profile-status`, and `ble-profile-select PROFILE_ID`.
 They require the advertised capability. The host permits up to 18 capabilities
 only in the hello capability array; other generic arrays retain their 16-item
-bound and the machine response frame remains 1280 bytes. Older host versions
+bound and the machine response frame remains 1536 bytes. Older host versions
 with a 16- or 17-capability limit must be updated for this development firmware.
 
 The internal shared-store association uses bounded `hid_assoc` U32 records,
@@ -1744,8 +1745,8 @@ original response under the usual protocol rules. The typed host method is
 Peers without the capability fail locally before sending the command.
 
 The hello capability-array bound is 18; unrelated JSON arrays retain their
-existing bound of 16. The complete seven-profile catalog remains within the
-1279-byte logical response-frame limit, including a maximum request ID.
+existing bound of 16. The complete eight-profile catalog remains within the
+1535-byte logical response-frame limit, including a maximum request ID.
 
 
 ### Synthetic mouse metadata profile
@@ -1801,3 +1802,20 @@ stopped. The control owner initiates teardown once and bounds physical-absence
 observation to five seconds; missing progress or a changed lifecycle fails
 hidden with recovery required. No bond removal or automatic route restore is
 part of this cleanup.
+
+### Host-initiated Just Works security profile
+
+`mouse_host_initiated_security` is revision 1, schema 8, bond class 7 and
+shared identity 0. It retains the ordinary mouse's Report ID 2, exact 69-byte
+Report Map, encrypted attributes, 16-byte key requirement, bonding, and final
+`authenticated=false` outcome. Its separate cache and bond authority make its
+bonds incompatible with every other profile.
+
+On a new connection this profile configures connection parameters and performs
+the one admitted Data Length update, but does not call the peripheral security
+initiation API. The peer must initiate SMP or restore encryption from its bond.
+Until the existing final security, persistent bond, schema, subscription, and
+lifecycle predicates all hold, BLE HID remains not ready and route selection
+cannot succeed. There is no delayed fallback timer, arbitrary delay, weaker
+attribute permission, automatic route selection, or changed final security
+policy. Existing profiles continue to initiate security immediately.

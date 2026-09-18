@@ -36,8 +36,8 @@ and exact verified production-SDK identity. Existing version 1 artifacts remain
 readable and immutable.
 
 The production patch suppresses only ESP-NimBLE's automatic post-Connect DLE
-tail. The firmware control owner retains this successful-connect host API
-sequence:
+tail. For profiles with peripheral-immediate security, the firmware control
+owner retains this successful-connect host API sequence:
 
 ```text
 connection update
@@ -51,6 +51,11 @@ and controller execution have a stronger order. The associated public issue is
 `#19057 / IDFGH-18248`: ESP32-S3 BLE bonded reconnect encryption timeout
 depends on LE Set Data Length host-call ordering. No claim is made here about
 the issue's current status.
+
+The finite `mouse_host_initiated_security` profile deliberately omits the
+security-initiation call and keeps the connection-update then Data Length call
+ordering. It preserves the same final Just Works security predicates and does
+not change the pinned dependency patch.
 
 ## Memory envelope and fixture profile
 

@@ -629,6 +629,32 @@ int main() {
                          kExpectedMouseReportMap,
                          "simulated sleep mouse report map");
     database.reset_after_stop();
+    require(database.configure_profile(ProfileId::kMouseHostInitiatedSecurity),
+            "host-initiated mouse", "selection failed");
+    require(database.register_database() == 0 &&
+                database.validate_registered_database() == 0,
+            "host-initiated mouse", "registered topology rejected");
+    require(database.hid_handles().keyboard_value == 0 &&
+                database.hid_handles().mouse_value == 0x0019,
+            "host-initiated mouse", "wrong finite role handles");
+    require_served_value(g_registered_services[0].characteristics,
+                         std::array<std::uint8_t, 1>{8},
+                         "host-initiated mouse schema epoch");
+    require_served_value(find_characteristic(kHidServiceUuid, kReportMapUuid),
+                         kExpectedMouseReportMap,
+                         "host-initiated mouse report map");
+    const auto *host_security_input =
+        find_characteristic(kHidServiceUuid, kReportUuid);
+    require(host_security_input != nullptr &&
+                host_security_input->flags ==
+                    (BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC |
+                     BLE_GATT_CHR_F_NOTIFY |
+                     BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC |
+                     BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHOR) &&
+                host_security_input->min_key_size == 16,
+            "host-initiated mouse",
+            "final encrypted/key-size policy changed");
+    database.reset_after_stop();
     require(database.configure_profile(ProfileId::kStandaloneMouseJustWorksId7), "mouse ID7", "selection failed");
     require(database.register_database() == 0 && database.validate_registered_database() == 0,
             "mouse ID7", "registered topology rejected");

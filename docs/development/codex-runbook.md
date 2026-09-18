@@ -29,9 +29,11 @@ valid. The dirty suffix is not dependency provenance: the separately verified
 revision, patch, source and archive hashes supply that identity. No UART field
 or protocol version is added for this purpose.
 
-Only the automatic successful-CONNECT DLE tail is suppressed. The existing
-control owner calls update, connected heap checkpoint, security initiation,
-then one admitted direct Set Data Length (251 octets, 17040 us). DLE errors do
+Only the automatic successful-CONNECT DLE tail is suppressed. The control owner
+calls update and the connected heap checkpoint, then calls security initiation
+for peripheral-immediate profiles and finally performs one admitted direct Set
+Data Length (251 octets, 17040 us). The finite host-initiated profile omits only
+the security-initiation call. DLE errors do
 not add retries or teardown. Admission is retired by disconnect, reset or hide;
 a command already admitted before retirement may still be in flight. This is
 host API sequencing, not an RF/controller ordering or physical qualification

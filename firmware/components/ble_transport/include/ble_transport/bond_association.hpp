@@ -32,6 +32,8 @@ constexpr const ble_fixture_profile::ProfileDefinition *association_profile(Bond
             return &ble_fixture_profile::kStandaloneMouseJustWorks;
         case BondClass::kMouseSimulatedSleepV1:
             return &ble_fixture_profile::kMouseSimulatedSleepV1;
+        case BondClass::kMouseHostInitiatedSecurity:
+            return &ble_fixture_profile::kMouseHostInitiatedSecurity;
     }
     return nullptr;
 }
