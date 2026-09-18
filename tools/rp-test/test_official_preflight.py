@@ -3,8 +3,12 @@ from pathlib import Path
 import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "qualification_campaign"))
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent if (HERE.parent / "host" / "src").is_dir() else HERE.parent.parent
+sys.path.insert(0, str(ROOT / "host" / "src"))
+sys.path.insert(0, str(HERE.parent / "qualification_campaign"))
 import official_preflight as preflight
+from hidbot.protocol import UsbExposureStatus
 
 
 def state(profile="strict_composite", **changes):
@@ -114,6 +118,39 @@ class OfficialPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightFailure, "INITIAL_IDENTITY_MISMATCH"):
             preflight.normalize_fixture(lambda: initial, lambda: events.append("reset"), state)
         self.assertEqual(events, [])
+
+    def test_usb_safety_uses_the_validated_literal_contract(self):
+        hidden = UsbExposureStatus(
+            desired="hidden",
+            observed="driver_not_installed",
+            generation=0,
+            mounted=False,
+            suspended=False,
+            keyboard_ready=False,
+            mouse_ready=False,
+            safety_pending=False,
+            host_release_uncertain=False,
+            recovery_required=False,
+            last_error=None,
+        )
+        self.assertTrue(preflight._usb_is_safe(hidden))
+        self.assertFalse(
+            preflight._usb_is_safe(
+                UsbExposureStatus(
+                    desired="exposed",
+                    observed="disconnected",
+                    generation=1,
+                    mounted=False,
+                    suspended=False,
+                    keyboard_ready=False,
+                    mouse_ready=False,
+                    safety_pending=False,
+                    host_release_uncertain=False,
+                    recovery_required=False,
+                    last_error=None,
+                )
+            )
+        )
 
 
 if __name__ == "__main__":

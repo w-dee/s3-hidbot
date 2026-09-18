@@ -114,6 +114,18 @@ def _bluez_safe():
     }
 
 
+def _usb_is_safe(usb):
+    """Evaluate the validated UsbExposureStatus literal-valued contract."""
+    return (
+        usb.desired == "hidden"
+        and not usb.mounted
+        and not usb.keyboard_ready
+        and not usb.mouse_ready
+        and not usb.recovery_required
+        and not usb.safety_pending
+    )
+
+
 def _open_client(deadline_seconds=12.0):
     from ble_cleanup_rehearsal import _serial_port
     from hidbot.client import Client
@@ -200,14 +212,7 @@ def _inspect_state(artifact, *, verify_safety):
             and not ble.connected
             and not ble.recovery_required
         ),
-        "usb_safe": (
-            usb.desired.value == "hidden"
-            and not usb.mounted
-            and not usb.keyboard_ready
-            and not usb.mouse_ready
-            and not usb.recovery_required
-            and not usb.safety_pending
-        ),
+        "usb_safe": _usb_is_safe(usb),
         "host_safe": (
             headless["safe"]
             and host["powered"]
