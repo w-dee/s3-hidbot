@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -6,6 +7,7 @@
 #include <string_view>
 #include <utility>
 #include <functional>
+#include <thread>
 
 // Reuse the same persistent fault model and actual transaction engine at the
 // real executor boundary; no physical interfaces or target SDK are involved.
@@ -7795,6 +7797,45 @@ hid_runtime::SequenceAdmissionResult sleep_claim_sequence_result =
     hid_runtime::SequenceAdmissionResult::kAccepted;
 hid_runtime::AuthorityEpoch sleep_claim_authority_before = 0;
 hid_runtime::AuthorityEpoch sleep_claim_authority_after = 0;
+std::atomic_bool sleep_safety_entered{false};
+std::atomic_bool sleep_safety_resume{false};
+std::atomic_uint sleep_safety_entries{0};
+std::thread sleep_safety_thread;
+std::thread second_sleep_safety_thread;
+
+void pause_sleep_safety_after_admission(hid_runtime::StateMachine *) {
+    sleep_safety_entries.fetch_add(1, std::memory_order_acq_rel);
+    sleep_safety_entered.store(true, std::memory_order_release);
+    while (!sleep_safety_resume.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+void sleep_claim_start_paused_safety(
+    hid_control_executor::Controller *controller) {
+    sleep_claim_runtime->state_machine()
+        .set_sleep_safety_admission_hook_for_test(
+            pause_sleep_safety_after_admission);
+    sleep_safety_thread = std::thread([] {
+        sleep_claim_runtime->state_machine().request_release_all();
+    });
+    second_sleep_safety_thread = std::thread([] {
+        sleep_claim_runtime->state_machine().request_release_all();
+    });
+    while (sleep_safety_entries.load(std::memory_order_acquire) != 2U) {
+        std::this_thread::yield();
+    }
+    // A USB lifecycle safety callback overlaps both admitted releases. Normal
+    // route and Sequence work remain excluded by the same sleep claim.
+    sleep_claim_runtime->state_machine().on_suspend();
+    hid_runtime::ConfirmedHidState state{};
+    hid_runtime::SequenceAuthority authority{};
+    assert(sleep_claim_runtime->state_machine().begin_sequence(
+               &state, &authority) ==
+           hid_runtime::SequenceAdmissionResult::kBusy);
+    assert(controller->request_route(hid_route::OutputRoute::kUsb)
+               .action_result == hid_runtime::RouteTransitionResult::kBusy);
+}
 
 void sleep_claim_usb_route(hid_control_executor::Controller *controller) {
     sleep_claim_hook_called = true;
@@ -7936,6 +7977,66 @@ void test_simulated_sleep_claim_fences_usb_route_and_preserves_busy_route() {
            hid_route::OutputRoute::kUsb);
     assert(ble.last_advertising_incarnation != first_slow);
     assert(ble.last_advertising_interval == 800);
+}
+
+void test_simulated_sleep_abort_preserves_outstanding_safety_admission() {
+    using namespace ble_fixture_profile;
+    using Event = hid_control_executor::BleEventKind;
+    hid_runtime::Runtime runtime;
+    FakeBackend usb;
+    FakeBleBackend ble;
+    FakeBleDatabase database;
+    hid_control_executor::Controller controller;
+    assert(controller.initialize(&runtime, &usb, &ble, &database));
+    assert(controller.request_profile_select(ProfileId::kMouseSimulatedSleepV1)
+               .result == SelectionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(controller.request_ble_enable().action_result ==
+           ble_lifecycle::TransitionResult::kAccepted);
+    assert(controller.process_one_for_test());
+    assert(ble.event(Event::kSync));
+    assert(controller.process_one_for_test());
+    assert(ble.finite_advertising_complete(ble.last_advertising_incarnation));
+    assert(controller.process_one_for_test());
+
+    sleep_claim_runtime = &runtime;
+    sleep_safety_entered.store(false, std::memory_order_release);
+    sleep_safety_resume.store(false, std::memory_order_release);
+    sleep_safety_entries.store(0, std::memory_order_release);
+    controller.set_simulated_sleep_claim_hook_for_test(
+        sleep_claim_start_paused_safety);
+    const auto claim_a = ble.last_advertising_incarnation;
+    assert(ble.finite_advertising_complete(claim_a));
+    assert(controller.process_one_for_test());
+    controller.set_simulated_sleep_claim_hook_for_test(nullptr);
+    assert(sleep_safety_entered.load(std::memory_order_acquire));
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kAdvertising);
+
+    // Claim A has aborted, but the safety caller remains admitted. Claim B
+    // must observe that count and defer for another finite slow window.
+    const auto claim_b = ble.last_advertising_incarnation;
+    assert(claim_b != claim_a);
+    assert(ble.finite_advertising_complete(claim_b));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().desired ==
+           ble_lifecycle::DesiredExposure::kExposed);
+    assert(controller.ble_snapshot().observed ==
+           ble_lifecycle::ObservedState::kAdvertising);
+    assert(ble.last_advertising_incarnation != claim_b);
+
+    sleep_safety_resume.store(true, std::memory_order_release);
+    sleep_safety_thread.join();
+    second_sleep_safety_thread.join();
+    runtime.state_machine().set_sleep_safety_admission_hook_for_test(nullptr);
+    assert(runtime.state_machine().profile_switch_quiescent());
+
+    // Once the exact admission and its debt are gone, the next clean expiry
+    // can own and publish logical sleep normally.
+    assert(ble.finite_advertising_complete(ble.last_advertising_incarnation));
+    assert(controller.process_one_for_test());
+    assert(controller.ble_snapshot().desired ==
+           ble_lifecycle::DesiredExposure::kHidden);
 }
 
 void test_simulated_sleep_finite_advertising_and_wake_cycles() {
@@ -8344,6 +8445,7 @@ int main(int argc, char **argv) {
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseSimulatedSleepV1);
     test_cold_mouse_profile_capability_consumption(ble_fixture_profile::ProfileId::kMouseHostInitiatedSecurity);
     test_simulated_sleep_claim_fences_usb_route_and_preserves_busy_route();
+    test_simulated_sleep_abort_preserves_outstanding_safety_admission();
     test_simulated_sleep_finite_advertising_and_wake_cycles();
     test_cold_keyboard_profile_capability_consumption(true);
     test_cold_keyboard_profile_capability_consumption(false);

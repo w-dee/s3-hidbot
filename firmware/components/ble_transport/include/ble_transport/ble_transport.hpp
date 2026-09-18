@@ -104,6 +104,7 @@ class Backend final : public hid_control_executor::BleBackend {
     static int on_gap_event(struct ble_gap_event *event, void *context);
     // Linker-wrapped pinned transport ingress. Successful peripheral
     // Connection Complete is owned before NimBLE host admission.
+    static bool hci_callback_registration_allowed();
     static bool observe_hci_ingress(const std::uint8_t *event);
     static void queue_hci_establishment_resolution();
 
@@ -122,7 +123,8 @@ class Backend final : public hid_control_executor::BleBackend {
     static void hidden_exposure_barrier_callback(struct ble_npl_event *event);
     static void hci_establishment_callback(struct ble_npl_event *event);
     void terminate_hidden_connection(std::uint16_t connection_handle);
-    void resolve_hci_establishment(std::uint16_t connection_handle);
+    void resolve_hci_establishment(std::uint64_t establishment_id);
+    void retire_hci_establishment();
     void process_hci_establishment();
     struct StopOperations;
     bool retire_timers_after_stop();
@@ -135,8 +137,15 @@ class Backend final : public hid_control_executor::BleBackend {
     bool hidden_exposure_barrier_initialized_ = false;
     struct ble_npl_event hci_establishment_event_{};
     bool hci_establishment_event_initialized_ = false;
-    std::atomic<std::uint64_t> hci_establishment_{0};
-    std::atomic_bool hci_establishment_teardown_claimed_{false};
+    std::atomic<std::uint64_t> hci_establishment_id_{0};
+    std::atomic<std::uint64_t> next_hci_establishment_id_{1};
+    std::atomic<std::uint64_t> hci_establishment_disconnect_owner_{0};
+    std::atomic<std::uint32_t> hci_establishment_stack_{0};
+    std::atomic<ble_lifecycle::Generation> hci_establishment_generation_{0};
+    std::atomic<std::uint16_t> hci_establishment_handle_{
+        ble_lifecycle::kNoConnection};
+    std::atomic_bool hci_ingress_enabled_{false};
+    std::atomic<std::uint64_t> hci_ingress_epoch_{1};
     std::atomic_bool hidden_exposure_requested_{false};
     std::atomic_bool hidden_exposure_barrier_passed_{false};
     std::atomic_bool hidden_exposure_termination_claimed_{false};

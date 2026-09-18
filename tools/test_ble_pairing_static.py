@@ -27,8 +27,8 @@ def main() -> int:
     assert "ble_hs_hci_cmd_tx(" in transport
     hidden = re.search(r"bool Backend::physical_exposure_hidden\(\) const \{"
                        r"(.*?)\n\}", transport, re.S)
-    assert hidden and "hci_establishment_.load(" in hidden.group(1)
-    assert "std::atomic<std::uint64_t> hci_establishment_{0};" in transport_header
+    assert hidden and "hci_establishment_id_.load(" in hidden.group(1)
+    assert "std::atomic<std::uint64_t> hci_establishment_id_{0};" in transport_header
 
     # Sleep owns a runtime admission gate in addition to the serialized
     # control-operation claim. The exact claim must precede predicate commit.

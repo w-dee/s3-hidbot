@@ -1,6 +1,7 @@
 #include "hid_runtime/hid_runtime.hpp"
 
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 
 #ifndef HID_RUNTIME_NATIVE_TEST
@@ -21,28 +22,57 @@ constexpr std::uint8_t kSuspendedBit = 1U << 1;
 constexpr std::uint8_t kKeyboardReadyBit = 1U << 2;
 constexpr std::uint8_t kMouseReadyBit = 1U << 3;
 
-constexpr std::uint32_t kSleepQuiescenceClaimed = 0x80000000U;
-constexpr std::uint32_t kSleepQuiescenceConflict = 0xc0000000U;
-constexpr std::uint32_t kSleepQuiescenceCommitted = 0x40000000U;
-constexpr std::uint32_t kSleepQuiescenceControlMask = 0xc0000000U;
+constexpr std::uint32_t kSleepQuiescenceAdmissionMask = 0x1fffffffU;
+constexpr std::uint32_t kSleepQuiescenceClaimed = 0x20000000U;
+constexpr std::uint32_t kSleepQuiescenceConflict = 0x40000000U;
+constexpr std::uint32_t kSleepQuiescenceCommitted = 0x80000000U;
+constexpr std::uint32_t kSleepQuiescenceControlMask = 0xe0000000U;
 
 class ScopedConflictingAdmission {
   public:
-    explicit ScopedConflictingAdmission(std::atomic<std::uint32_t> *gate)
+    explicit ScopedConflictingAdmission(std::atomic<std::uint32_t> *gate,
+                                        bool safety = false)
         : gate_(gate) {
         std::uint32_t observed = gate_->load(std::memory_order_acquire);
-        while ((observed & kSleepQuiescenceControlMask) == 0U) {
-            if (gate_->compare_exchange_weak(observed, observed + 1U,
+        while (true) {
+            const auto admissions = observed & kSleepQuiescenceAdmissionMask;
+            if (admissions == kSleepQuiescenceAdmissionMask) {
+                // Exhaustion is unreachable under the product's fixed task
+                // cardinality. Reset is safer than allowing unowned safety
+                // work or wrapping the admission count.
+                if (safety) std::abort();
+                return;
+            }
+            const auto control = observed & kSleepQuiescenceControlMask;
+            if (control == 0U) {
+                if (gate_->compare_exchange_weak(
+                        observed, observed + 1U, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    acquired_ = true;
+                    return;
+                }
+                continue;
+            }
+            if (!safety) {
+                if (control == kSleepQuiescenceClaimed) {
+                    (void)gate_->compare_exchange_strong(
+                        observed, observed | kSleepQuiescenceConflict,
+                        std::memory_order_acq_rel, std::memory_order_acquire);
+                }
+                return;
+            }
+            std::uint32_t desired = observed + 1U;
+            if (control == kSleepQuiescenceClaimed ||
+                control == (kSleepQuiescenceClaimed |
+                            kSleepQuiescenceConflict)) {
+                desired |= kSleepQuiescenceConflict;
+            }
+            if (gate_->compare_exchange_weak(observed, desired,
                                              std::memory_order_acq_rel,
                                              std::memory_order_acquire)) {
                 acquired_ = true;
                 return;
             }
-        }
-        if (observed == kSleepQuiescenceClaimed) {
-            (void)gate_->compare_exchange_strong(
-                observed, kSleepQuiescenceConflict, std::memory_order_acq_rel,
-                std::memory_order_acquire);
         }
     }
 
@@ -416,7 +446,12 @@ bool StateMachine::commit_sleep_quiescence() {
 }
 
 void StateMachine::release_sleep_quiescence() {
-    sleep_quiescence_gate_.store(0, std::memory_order_release);
+    std::uint32_t observed = sleep_quiescence_gate_.load(
+        std::memory_order_acquire);
+    while (!sleep_quiescence_gate_.compare_exchange_weak(
+        observed, observed & kSleepQuiescenceAdmissionMask,
+        std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
 }
 
 bool StateMachine::release_producers_blocked() const {
@@ -497,7 +532,7 @@ void StateMachine::on_mount() {
     // USB callbacks are safety authority, so they must never wait behind the
     // simulated-sleep claim. Entering before the claim makes it wait for this
     // callback to finish; entering after the claim invalidates that claim.
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     if (!usb_lifecycle_.observe_mount()) {
         return;
     }
@@ -574,7 +609,7 @@ void StateMachine::on_mount() {
 }
 
 void StateMachine::on_unmount() {
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     const UsbGeneration retired_generation = attach_generation();
     if (!usb_lifecycle_.observe_unmount()) {
         // Explicit uninstall calls tud_umount_cb() during caller-side
@@ -633,7 +668,7 @@ void StateMachine::on_unmount() {
 }
 
 void StateMachine::on_suspend() {
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     if (!usb_lifecycle_.observe_suspend()) {
         return;
     }
@@ -668,7 +703,7 @@ void StateMachine::on_suspend() {
 }
 
 void StateMachine::on_resume() {
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     if (!usb_lifecycle_.observe_resume()) {
         return;
     }
@@ -722,7 +757,7 @@ UsbLinkStallResult StateMachine::on_usb_link_stall(
     if (conditional_token == nullptr) {
         return UsbLinkStallResult::kStale;
     }
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     const auto withdraw_conditional = [&]() {
         if (*conditional_token !=
             hid_route::kNoConditionalInvalidationToken) {
@@ -1469,6 +1504,10 @@ void StateMachine::set_before_release_success_claim_hook_for_test(TestHook hook)
 
 void StateMachine::set_before_release_admission_hook_for_test(TestHook hook) {
     before_release_admission_hook_ = hook;
+}
+
+void StateMachine::set_sleep_safety_admission_hook_for_test(TestHook hook) {
+    sleep_safety_admission_hook_ = hook;
 }
 
 void StateMachine::set_before_release_finalize_hook_for_test(TestHook hook) {
@@ -2855,7 +2894,12 @@ void StateMachine::publish_release_request() {
 void StateMachine::request_release_all() {
     // Safety release is never discarded. Crossing an uncommitted sleep claim
     // first invalidates that claim, then publishes the normal safety debt.
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
+#ifdef HID_RUNTIME_NATIVE_TEST
+    if (sleep_safety_admission_hook_ != nullptr) {
+        sleep_safety_admission_hook_(this);
+    }
+#endif
     publish_release_request();
     reconcile_unavailable_zero_work_release();
 }
@@ -2928,7 +2972,7 @@ bool StateMachine::lifecycle_detach_safety_clean() const {
 }
 
 void StateMachine::mark_lifecycle_detach_uncertain(UsbGeneration old_generation) {
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     for (InterfaceState &interface_state : interfaces_) {
         interface_state.safety_required.store(true, std::memory_order_release);
         interface_state.host_state_uncertain.store(true, std::memory_order_release);
@@ -2939,7 +2983,7 @@ void StateMachine::mark_lifecycle_detach_uncertain(UsbGeneration old_generation)
 }
 
 void StateMachine::on_driver_uninstalled() {
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     cancel_release_ticket();
     cancel_keyboard_ticket(KeyboardReportTicketOutcome::kAuthorityLost);
     cancel_mouse_ticket(MouseReportTicketOutcome::kAuthorityLost);
@@ -2987,7 +3031,7 @@ void StateMachine::complete_usb_uninstall_failure(std::int32_t error_code) {
 }
 
 bool StateMachine::begin_usb_runtime_fault(std::int32_t error_code) {
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     if (!usb_lifecycle_.begin_runtime_fault(error_code)) {
         return false;
     }
@@ -3052,7 +3096,7 @@ void StateMachine::complete_usb_detach_route_invalidation(hid_route::Snapshot ol
 }
 
 ReleaseAllId StateMachine::begin_release_all() {
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     if (!admission.acquired()) return 0;
     // A single UART owner admits requests; terminal callbacks and executor
     // work share the short metadata lock, never transport calls or waits.
@@ -3446,7 +3490,7 @@ void StateMachine::note_ble_route_continuity_loss(
     BleRouteAuthoritySnapshot expected) {
     // BLE loss notification is callback-side safety authority. Preserve it
     // while making an in-progress sleep claim observe an exact conflict.
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     const ScopedTicketMetadataLock lock(release_ticket_lock_);
     const ReleaseAllSnapshot transaction = release_all_snapshot_locked();
     if (!release_ticket_matches_locked(transaction) || !expected.coherent ||
@@ -4431,7 +4475,7 @@ void StateMachine::end_sequence(SequenceAuthority sequence) {
 }
 
 void StateMachine::revoke_sequence() {
-    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_);
+    const ScopedConflictingAdmission admission(&sleep_quiescence_gate_, true);
     sequence_generation_.exchange(0, std::memory_order_acq_rel);
 }
 

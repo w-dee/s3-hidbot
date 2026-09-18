@@ -346,9 +346,17 @@ class PhysicalRunnerAdapterTests(unittest.TestCase):
         keyboard_held=0,
         mouse_held=0,
     ):
-        keyboard = mock.Mock(role="keyboard", held_count=mock.Mock(return_value=keyboard_held))
+        keyboard = mock.Mock(
+            role="keyboard",
+            held_count=mock.Mock(return_value=keyboard_held),
+            finish_pending=mock.Mock(return_value=[]),
+        )
         keyboard.read.side_effect = keyboard_reads
-        mouse = mock.Mock(role="mouse", held_count=mock.Mock(return_value=mouse_held))
+        mouse = mock.Mock(
+            role="mouse",
+            held_count=mock.Mock(return_value=mouse_held),
+            finish_pending=mock.Mock(return_value=[]),
+        )
         mouse.read.side_effect = mouse_reads
         return rehearsal.ExactObservers(keyboard, mouse).collect(
             1, phase=phase, retirement=retirement
@@ -447,6 +455,46 @@ class PhysicalRunnerAdapterTests(unittest.TestCase):
         self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
         self.assertEqual((outcome.relevant_events, outcome.held_keys), (1, 1))
 
+    def test_pending_syn_dropped_survives_other_observer_retirement(self) -> None:
+        keyboard = (
+            self.raw(rehearsal.EV_SYN, 0, 0)
+            + self.raw(rehearsal.EV_SYN, rehearsal.SYN_DROPPED, 0)
+        )
+        outcome = self.raw_observer_outcome(
+            [keyboard], [OSError(errno.ENODEV, "mouse gone")]
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
+        self.assertEqual(outcome.error_name, "EIO")
+
+    def test_pending_partial_survives_other_observer_retirement(self) -> None:
+        record = self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 1)
+        outcome = self.raw_observer_outcome(
+            [record + record[:5]], [OSError(errno.ENODEV, "mouse gone")]
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
+        self.assertEqual((outcome.relevant_events, outcome.held_keys), (1, 1))
+
+    def test_partial_only_eagain_fails_before_deadline(self) -> None:
+        record = self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 1)
+        outcome = self.raw_observer_outcome(
+            [record[:5], BlockingIOError(errno.EAGAIN, "drained")], []
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
+        self.assertEqual(outcome.error_name, "EIO")
+
+    def test_mouse_pending_anomaly_survives_keyboard_retirement(self) -> None:
+        mouse = (
+            self.raw(rehearsal.EV_SYN, 0, 0)
+            + self.raw(rehearsal.EV_SYN, rehearsal.SYN_DROPPED, 0)
+        )
+        outcome = self.raw_observer_outcome(
+            [BlockingIOError(errno.EAGAIN, "drained"),
+             OSError(errno.ENODEV, "keyboard gone")],
+            [mouse],
+        )
+        self.assertEqual(outcome.status, ObserverTerminalStatus.OBSERVER_IO_ERROR)
+        self.assertEqual(outcome.error_name, "EIO")
+
     def test_raw_event_survives_eio(self) -> None:
         outcome = self.raw_observer_outcome(
             [self.raw(rehearsal.EV_KEY, rehearsal.KEY_F24, 1),
@@ -511,9 +559,11 @@ class PhysicalRunnerAdapterTests(unittest.TestCase):
         keyboard = mock.Mock(role="keyboard")
         keyboard.read.return_value = [unexpected]
         keyboard.held_count.return_value = 1
+        keyboard.finish_pending.return_value = []
         mouse = mock.Mock(role="mouse")
         mouse.read.return_value = []
         mouse.held_count.side_effect = OSError(errno.ENODEV, "gone")
+        mouse.finish_pending.return_value = []
         observer = rehearsal.ExactObservers(keyboard, mouse)
         with mock.patch.object(
             rehearsal.time, "monotonic", side_effect=[0, 0, 0, 0, 2]
@@ -596,8 +646,8 @@ class PhysicalRunnerAdapterTests(unittest.TestCase):
             self.assertEqual(observer.held_count(), 1)
 
     def test_empty_history_cannot_hide_preexisting_held_state(self) -> None:
-        keyboard = mock.Mock(held_count=lambda: 1)
-        mouse = mock.Mock(held_count=lambda: 0)
+        keyboard = mock.Mock(held_count=lambda: 1, finish_pending=lambda: [])
+        mouse = mock.Mock(held_count=lambda: 0, finish_pending=lambda: [])
         observer = rehearsal.ExactObservers(keyboard, mouse)
         outcome = observer.collect(0, phase=BleCleanupPhase.PRE_RETIREMENT_CLEANUP,
                                    retirement=False)

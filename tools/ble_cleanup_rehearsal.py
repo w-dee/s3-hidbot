@@ -256,6 +256,20 @@ class Observer:
             events.append(event)
         return events
 
+    def finish_pending(self) -> list[Event]:
+        """Return every complete pending record or fail on terminal evidence."""
+        events: list[Event] = []
+        while self.pending:
+            decoded = self._decode_pending()
+            events.extend(decoded)
+            if decoded:
+                continue
+            # No complete record remains, so any bytes here are an
+            # unadjudicated partial record. A collection boundary may not
+            # silently turn those bytes into an ALL_UP observation.
+            raise OSError(errno.EIO, "partial evdev record")
+        return events
+
     def read(self, timeout: float) -> list[Event]:
         if self.fd is None:
             raise OSError(errno.ENODEV, "observer is closed")
@@ -270,6 +284,8 @@ class Observer:
             try:
                 data = os.read(self.fd, 4096)
             except BlockingIOError:
+                if self.pending:
+                    raise OSError(errno.EIO, "partial evdev record")
                 break
             except OSError as exc:
                 if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
@@ -344,66 +360,84 @@ class ExactObservers:
         deadline = time.monotonic() + duration
         relevant = 0
         unexpected = 0
+
+        def aggregate(observer: Observer, events: list[Event]) -> None:
+            nonlocal relevant, unexpected
+            for event in events:
+                if event.event_type == EV_SYN:
+                    continue
+                if event.event_type == EV_MSC and event.code == MSC_SCAN:
+                    continue
+                if (
+                    observer.role == "keyboard"
+                    and event.event_type == EV_KEY
+                    and event.code == KEY_F24
+                    and event.value in {0, 1, 2}
+                ):
+                    relevant += 1
+                    if event.value == 1:
+                        self.held_keys.add(event.code)
+                    elif event.value == 0:
+                        self.held_keys.discard(event.code)
+                elif (
+                    observer.role == "mouse"
+                    and event.event_type == EV_KEY
+                    and event.code == BTN_LEFT
+                    and event.value in {0, 1}
+                ):
+                    relevant += 1
+                    if event.value == 1:
+                        self.held_buttons.add(event.code)
+                    else:
+                        self.held_buttons.discard(event.code)
+                else:
+                    unexpected += 1
+
+        def finish_pending() -> OSError | None:
+            pending_error: OSError | None = None
+            for observer in self.observers:
+                try:
+                    aggregate(observer, observer.finish_pending())
+                except OSError as exc:
+                    # Continue adjudicating the other observer so already
+                    # complete evidence is never blanked by the first error.
+                    if pending_error is None:
+                        pending_error = exc
+            return pending_error
+
+        def terminal(
+            exc: OSError, *, held_keys: int | None = None,
+            held_buttons: int | None = None,
+        ) -> ObserverOutcome:
+            pending_error = finish_pending()
+            return classify_observer_error(
+                pending_error or exc,
+                phase=phase,
+                exact_device=True,
+                retirement_requested=retirement,
+                relevant_events=relevant,
+                unexpected_events=unexpected,
+                held_keys=max(len(self.held_keys), held_keys or 0),
+                held_buttons=max(len(self.held_buttons), held_buttons or 0),
+            )
+
         while time.monotonic() < deadline:
             for observer in self.observers:
                 try:
                     events = observer.read(min(0.02, max(0.0, deadline - time.monotonic())))
                 except OSError as exc:
-                    return classify_observer_error(
-                        exc,
-                        phase=phase,
-                        exact_device=True,
-                        retirement_requested=retirement,
-                        relevant_events=relevant,
-                        unexpected_events=unexpected,
-                        held_keys=len(self.held_keys),
-                        held_buttons=len(self.held_buttons),
-                    )
-                for event in events:
-                    if event.event_type == EV_SYN:
-                        continue
-                    if event.event_type == EV_MSC and event.code == MSC_SCAN:
-                        continue
-                    if (
-                        observer.role == "keyboard"
-                        and event.event_type == EV_KEY
-                        and event.code == KEY_F24
-                        and event.value in {0, 1, 2}
-                    ):
-                        relevant += 1
-                        if event.value == 1:
-                            self.held_keys.add(event.code)
-                        elif event.value == 0:
-                            self.held_keys.discard(event.code)
-                    elif (
-                        observer.role == "mouse"
-                        and event.event_type == EV_KEY
-                        and event.code == BTN_LEFT
-                        and event.value in {0, 1}
-                    ):
-                        relevant += 1
-                        if event.value == 1:
-                            self.held_buttons.add(event.code)
-                        else:
-                            self.held_buttons.discard(event.code)
-                    else:
-                        unexpected += 1
+                    return terminal(exc)
+                aggregate(observer, events)
+        pending_error = finish_pending()
+        if pending_error is not None:
+            return terminal(pending_error)
         keys = len(self.held_keys)
         buttons = len(self.held_buttons)
         for index, observer in enumerate(self.observers):
             try:
                 held = observer.held_count()
             except OSError as exc:
-                return classify_observer_error(
-                    exc,
-                    phase=phase,
-                    exact_device=True,
-                    retirement_requested=retirement,
-                    relevant_events=relevant,
-                    unexpected_events=unexpected,
-                    held_keys=keys,
-                    held_buttons=buttons,
-                )
+                return terminal(exc, held_keys=keys, held_buttons=buttons)
             if index == 0:
                 keys = max(keys, held)
             else:

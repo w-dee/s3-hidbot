@@ -56,6 +56,23 @@ class FramingTests(unittest.TestCase):
             (MachineFrameIssue("oversize"),),
         )
 
+    def test_literal_public_1024_byte_wire_contract(self) -> None:
+        self.assertEqual(MAX_MACHINE_FRAME_BYTES, 1024)
+        payload = b"x" * 1014
+        logical = b"@HIDBOT " + payload + b"\n"
+        wire = b"@HIDBOT " + payload + b"\r\n"
+        self.assertEqual(len(logical), 1023)
+        self.assertEqual(len(wire), 1024)
+        self.assertEqual(Framer().feed(wire), (MachineFrame(payload),))
+
+        oversized_payload = b"x" * 1015
+        oversized_wire = b"@HIDBOT " + oversized_payload + b"\r\n"
+        self.assertEqual(len(oversized_wire), 1025)
+        self.assertEqual(
+            Framer().feed(oversized_wire),
+            (MachineFrameIssue("oversize"),),
+        )
+
     def test_prefix_must_be_at_beginning_of_line(self) -> None:
         logs: list[bytes] = []
         framer = Framer(log_sink=logs.append)

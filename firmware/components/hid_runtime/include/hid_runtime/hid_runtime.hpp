@@ -643,6 +643,7 @@ class StateMachine {
     void set_before_release_success_claim_hook_for_test(TestHook hook);
     void set_before_release_finalize_hook_for_test(TestHook hook);
     void set_before_release_admission_hook_for_test(TestHook hook);
+    void set_sleep_safety_admission_hook_for_test(TestHook hook);
     void set_next_release_id_for_test(ReleaseAllId id);
     void publish_release_request_only_for_test();
     bool release_requested_for_test() const;
@@ -855,9 +856,10 @@ class StateMachine {
     std::atomic<std::uint32_t> next_sequence_generation_{1};
     std::atomic<ProfileActivationEpoch> next_profile_activation_epoch_{1};
     std::atomic_bool unavailable_release_reconciler_active_{false};
-    // Low bits count producer admissions. The high states are deliberately
-    // finite: CLAIMED may become CONFLICT, while COMMITTED excludes all new
-    // work until the BLE hide publication has completed.
+    // Low bits exactly count outstanding admissions. The high states are
+    // finite: safety work admitted during CLAIMED both remains counted and
+    // marks CONFLICT; ordinary work is rejected. COMMITTED rejects ordinary
+    // work while still allowing safety callbacks to publish fail-closed debt.
     std::atomic<std::uint32_t> sleep_quiescence_gate_{0};
     std::atomic<std::uint32_t> ble_route_sequence_{0};
     std::atomic<AuthorityEpoch> ble_route_authority_epoch_{0};
@@ -892,6 +894,7 @@ class StateMachine {
     TestHook before_release_success_claim_hook_ = nullptr;
     TestHook before_release_finalize_hook_ = nullptr;
     TestHook before_release_admission_hook_ = nullptr;
+    TestHook sleep_safety_admission_hook_ = nullptr;
     TestHook inside_ticket_cancel_hook_ = nullptr;
     TestHook inside_ticket_finalize_hook_ = nullptr;
     TestHook before_terminal_ticket_publish_hook_ = nullptr;

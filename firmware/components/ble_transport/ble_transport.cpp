@@ -58,6 +58,7 @@ using VhciReceive = int (*)(std::uint8_t *, std::uint16_t);
 constexpr std::uint8_t kHciUartH4Event = 0x04;
 std::atomic<VhciSendAvailable> s_vhci_send_available{nullptr};
 std::atomic<VhciReceive> s_vhci_receive{nullptr};
+std::atomic_flag s_vhci_registration = ATOMIC_FLAG_INIT;
 static_assert(std::atomic<VhciSendAvailable>::is_always_lock_free);
 static_assert(std::atomic<VhciReceive>::is_always_lock_free);
 
@@ -69,7 +70,7 @@ void vhci_send_available_proxy() {
 int vhci_receive_proxy(std::uint8_t *data, std::uint16_t length) {
     const bool complete_event = data != nullptr && length >= 3U &&
         data[0] == kHciUartH4Event &&
-        length >= static_cast<std::uint16_t>(data[2]) + 3U;
+        length == static_cast<std::uint16_t>(data[2]) + 3U;
     const bool establishment = complete_event &&
         ble_transport::Backend::observe_hci_ingress(data + 1);
     const auto callback = s_vhci_receive.load(std::memory_order_acquire);
@@ -93,11 +94,28 @@ extern "C" esp_err_t __wrap_esp_vhci_host_register_callback(
         callback->notify_host_recv == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_vhci_registration.test_and_set(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!ble_transport::Backend::hci_callback_registration_allowed()) {
+        s_vhci_registration.clear(std::memory_order_release);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const auto previous_send =
+        s_vhci_send_available.load(std::memory_order_acquire);
+    const auto previous_receive = s_vhci_receive.load(std::memory_order_acquire);
     s_vhci_send_available.store(callback->notify_host_send_available,
                                 std::memory_order_release);
     s_vhci_receive.store(callback->notify_host_recv,
                          std::memory_order_release);
-    return __real_esp_vhci_host_register_callback(&s_vhci_proxy);
+    const esp_err_t result =
+        __real_esp_vhci_host_register_callback(&s_vhci_proxy);
+    if (result != 0) {
+        s_vhci_send_available.store(previous_send, std::memory_order_release);
+        s_vhci_receive.store(previous_receive, std::memory_order_release);
+    }
+    s_vhci_registration.clear(std::memory_order_release);
+    return result;
 }
 
 namespace ble_transport {
@@ -111,18 +129,21 @@ constexpr std::int32_t kLifecycleTimeoutError = -3;
 constexpr std::uint16_t kConnectionIntervalMin = 12;  // 15 ms.
 constexpr std::uint16_t kConnectionIntervalMax = 24;  // 30 ms.
 constexpr std::uint16_t kSupervisionTimeout = 400;    // 4 s.
-constexpr std::uint64_t kHciEstablishmentPresent = UINT64_C(1) << 48;
 constexpr char kLogTag[] = "ble_transport";
 
-std::uint64_t hci_establishment_token(std::uint32_t stack_incarnation,
-                                      std::uint16_t connection_handle) {
-    return kHciEstablishmentPresent |
-           (static_cast<std::uint64_t>(stack_incarnation) << 16) |
-           connection_handle;
-}
-
-std::uint16_t hci_establishment_handle(std::uint64_t token) {
-    return static_cast<std::uint16_t>(token & UINT16_MAX);
+bool allocate_hci_establishment_id(std::atomic<std::uint64_t> *next,
+                                   std::uint64_t *result) {
+    if (next == nullptr || result == nullptr) return false;
+    std::uint64_t candidate = next->load(std::memory_order_acquire);
+    while (candidate != 0 && candidate != UINT64_MAX) {
+        if (next->compare_exchange_weak(candidate, candidate + 1U,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+            *result = candidate;
+            return true;
+        }
+    }
+    return false;
 }
 
 int disconnect_controller_handle(std::uint16_t connection_handle) {
@@ -1034,9 +1055,8 @@ std::int32_t Backend::initialize(hid_control_executor::BleEventSink *sink,
     ble_npl_event_init(&hci_establishment_event_,
                        hci_establishment_callback, this);
     hci_establishment_event_initialized_ = true;
-    hci_establishment_.store(0, std::memory_order_release);
-    hci_establishment_teardown_claimed_.store(false,
-                                              std::memory_order_release);
+    retire_hci_establishment();
+    hci_ingress_enabled_.store(true, std::memory_order_release);
     host_exited_.store(false, std::memory_order_release);
     initialized_ = true;
     nimble_port_freertos_init(host_task);
@@ -1077,6 +1097,7 @@ std::uint64_t Backend::begin_stop() {
     if (!stop_transaction_.initialization_allowed() ||
         !initialized_ || instance_ != this || persistent_store_failure_observed() ||
         current_connection_.load(std::memory_order_acquire) != ble_lifecycle::kNoConnection ||
+        hci_establishment_id_.load(std::memory_order_acquire) != 0 ||
         ble_gap_adv_active() || ble_gap_conn_active()) return 0;
     const auto id = stop_transaction_.begin();
     if (id == 0) return 0;
@@ -1115,9 +1136,7 @@ bool Backend::finish_stop(std::uint64_t id) {
     hidden_exposure_barrier_passed_.store(false, std::memory_order_release);
     hidden_exposure_termination_claimed_.store(false,
                                                std::memory_order_release);
-    hci_establishment_.store(0, std::memory_order_release);
-    hci_establishment_teardown_claimed_.store(false,
-                                              std::memory_order_release);
+    retire_hci_establishment();
     return true;
 }
 
@@ -1134,6 +1153,7 @@ struct Backend::StopOperations {
     }
     void delete_host_task() { nimble_port_freertos_deinit(); }
     bool deinitialize() {
+        backend.retire_hci_establishment();
         if (backend.hidden_exposure_barrier_initialized_) {
             ble_npl_event_deinit(&backend.hidden_exposure_barrier_);
             backend.hidden_exposure_barrier_initialized_ = false;
@@ -1327,6 +1347,8 @@ void Backend::on_sync() {
 
 void Backend::on_reset(int reason) {
     if (instance_ != nullptr) {
+        instance_->retire_hci_establishment();
+        instance_->hci_ingress_enabled_.store(true, std::memory_order_release);
         instance_->association_creation_.retire();
         instance_->active_host_connection_ = 0;
         instance_->host_connection_handle_ = ble_lifecycle::kNoConnection;
@@ -1374,8 +1396,6 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
-                backend->resolve_hci_establishment(
-                    event->connect.conn_handle);
                 backend->association_creation_.retire();
                 backend->active_host_connection_ = backend->host_connection_incarnation_ == UINT64_MAX
                     ? 0 : ++backend->host_connection_incarnation_;
@@ -1399,8 +1419,6 @@ int Backend::on_gap_event(struct ble_gap_event *event, void *context) {
                 event->connect.conn_handle, event->connect.status);
             break;
         case BLE_GAP_EVENT_DISCONNECT:
-            backend->resolve_hci_establishment(
-                event->disconnect.conn.conn_handle);
             backend->association_creation_.retire();
             backend->active_host_connection_ = 0;
             backend->host_connection_handle_ = ble_lifecycle::kNoConnection;
@@ -1663,7 +1681,7 @@ bool Backend::physical_exposure_hidden() const {
     const bool advertising = ble_gap_adv_active() != 0;
     ble_hs_unlock();
     return !connected && !advertising &&
-           hci_establishment_.load(std::memory_order_acquire) == 0;
+           hci_establishment_id_.load(std::memory_order_acquire) == 0;
 }
 
 void Backend::hidden_exposure_barrier_callback(struct ble_npl_event *event) {
@@ -1675,46 +1693,130 @@ void Backend::hidden_exposure_barrier_callback(struct ble_npl_event *event) {
     }
 }
 
+bool Backend::hci_callback_registration_allowed() {
+    Backend *backend = instance_;
+    return backend == nullptr ||
+           !backend->hci_ingress_enabled_.load(std::memory_order_acquire);
+}
+
 bool Backend::observe_hci_ingress(const std::uint8_t *event) {
     Backend *backend = instance_;
-    if (backend == nullptr || event == nullptr) return false;
-    if (event[0] == BLE_HCI_EVCODE_DISCONN_CMP && event[1] >= 4 &&
+    if (backend == nullptr || event == nullptr) {
+        return false;
+    }
+    const auto ingress_epoch = backend->hci_ingress_epoch_.load(
+        std::memory_order_acquire);
+    if (!backend->hci_ingress_enabled_.load(std::memory_order_acquire) ||
+        backend->hci_ingress_epoch_.load(std::memory_order_acquire) !=
+            ingress_epoch) return false;
+    if (event[0] == BLE_HCI_EVCODE_DISCONN_CMP && event[1] == 4 &&
         event[2] == BLE_ERR_SUCCESS) {
         std::uint16_t connection_handle = 0;
         std::memcpy(&connection_handle, event + 3, sizeof(connection_handle));
-        backend->resolve_hci_establishment(le16toh(connection_handle));
+        connection_handle = le16toh(connection_handle);
+        const auto establishment_id = backend->hci_establishment_id_.load(
+            std::memory_order_acquire);
+        if (establishment_id != 0 && establishment_id != UINT64_MAX &&
+            backend->hci_establishment_disconnect_owner_.load(
+                std::memory_order_acquire) == establishment_id &&
+            backend->hci_establishment_stack_.load(
+                std::memory_order_acquire) == backend->stack_incarnation_ &&
+            backend->hci_establishment_handle_.load(
+                std::memory_order_acquire) == connection_handle) {
+            backend->resolve_hci_establishment(establishment_id);
+        }
         return false;
     }
-    if (event[0] != BLE_HCI_EVCODE_LE_META || event[1] < 5 ||
-        (event[2] != BLE_HCI_LE_SUBEV_CONN_COMPLETE &&
-         event[2] != BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE &&
-         event[2] != BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE_V2) ||
-        event[3] != BLE_ERR_SUCCESS ||
-        event[6] != BLE_HCI_LE_CONN_COMPLETE_ROLE_SLAVE) {
+    if (event[0] != BLE_HCI_EVCODE_LE_META || event[1] < 1) {
         return false;
     }
+    std::uint8_t expected_length = 0;
+    switch (event[2]) {
+        case BLE_HCI_LE_SUBEV_CONN_COMPLETE:
+            expected_length = sizeof(ble_hci_ev_le_subev_conn_complete);
+            break;
+        case BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE:
+#if MYNEWT_VAL(BLE_PERIODIC_ADV_WITH_RESPONSES)
+            expected_length = sizeof(ble_hci_ev_le_subev_enh_conn_complete) - 3U;
+            break;
+        case BLE_HCI_LE_SUBEV_ENH_CONN_COMPLETE_V2:
+#endif
+            expected_length = sizeof(ble_hci_ev_le_subev_enh_conn_complete);
+            break;
+        default:
+            return false;
+    }
+    if (event[1] != expected_length || event[3] != BLE_ERR_SUCCESS ||
+        event[6] != BLE_HCI_LE_CONN_COMPLETE_ROLE_SLAVE) return false;
     std::uint16_t connection_handle = 0;
     std::memcpy(&connection_handle, event + 4, sizeof(connection_handle));
     connection_handle = le16toh(connection_handle);
-    const auto token = hci_establishment_token(
-        backend->stack_incarnation_, connection_handle);
-    std::uint64_t expected = 0;
-    if (backend->hci_establishment_.compare_exchange_strong(
-            expected, token, std::memory_order_acq_rel,
+    const auto current_id = backend->hci_establishment_id_.load(
+        std::memory_order_acquire);
+    if (current_id != 0) {
+        const bool duplicate = current_id != UINT64_MAX &&
+            backend->hci_establishment_stack_.load(
+                std::memory_order_acquire) == backend->stack_incarnation_ &&
+            backend->hci_establishment_generation_.load(
+                std::memory_order_acquire) ==
+                backend->generation_.load(std::memory_order_acquire) &&
+            backend->hci_establishment_handle_.load(
+                std::memory_order_acquire) == connection_handle;
+        if (!duplicate && backend->sink_ != nullptr) {
+            backend->sink_->signal_ble_lifecycle_handoff_failure();
+        }
+        return duplicate;
+    }
+    std::uint64_t establishment_id = 0;
+    if (!allocate_hci_establishment_id(
+            &backend->next_hci_establishment_id_, &establishment_id)) {
+        if (backend->sink_ != nullptr) {
+            backend->sink_->signal_ble_lifecycle_handoff_failure();
+        }
+        return false;
+    }
+    std::uint64_t empty = 0;
+    if (!backend->hci_establishment_id_.compare_exchange_strong(
+            empty, UINT64_MAX, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
-        backend->hci_establishment_teardown_claimed_.store(
-            false, std::memory_order_release);
-        return true;
+        if (backend->sink_ != nullptr) {
+            backend->sink_->signal_ble_lifecycle_handoff_failure();
+        }
+        return false;
     }
-    if (expected != token && backend->sink_ != nullptr) {
-        backend->sink_->signal_ble_lifecycle_handoff_failure();
+    if (!backend->hci_ingress_enabled_.load(std::memory_order_acquire) ||
+        backend->hci_ingress_epoch_.load(std::memory_order_acquire) !=
+            ingress_epoch) {
+        std::uint64_t reserved = UINT64_MAX;
+        (void)backend->hci_establishment_id_.compare_exchange_strong(
+            reserved, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        return false;
     }
-    return expected == token;
+    backend->hci_establishment_stack_.store(
+        backend->stack_incarnation_, std::memory_order_relaxed);
+    backend->hci_establishment_generation_.store(
+        backend->generation_.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
+    backend->hci_establishment_handle_.store(connection_handle,
+                                             std::memory_order_relaxed);
+    backend->hci_establishment_disconnect_owner_.store(
+        0, std::memory_order_relaxed);
+    backend->hci_establishment_id_.store(establishment_id,
+                                         std::memory_order_release);
+    if (!backend->hci_ingress_enabled_.load(std::memory_order_acquire) ||
+        backend->hci_ingress_epoch_.load(std::memory_order_acquire) !=
+            ingress_epoch) {
+        backend->resolve_hci_establishment(establishment_id);
+        return false;
+    }
+    return true;
 }
 
 void Backend::queue_hci_establishment_resolution() {
     Backend *backend = instance_;
     if (backend == nullptr ||
+        !backend->hci_ingress_enabled_.load(std::memory_order_acquire) ||
         !backend->hci_establishment_event_initialized_ ||
         ble_npl_event_is_queued(&backend->hci_establishment_event_)) {
         return;
@@ -1728,24 +1830,41 @@ void Backend::hci_establishment_callback(struct ble_npl_event *event) {
     if (backend != nullptr) backend->process_hci_establishment();
 }
 
-void Backend::resolve_hci_establishment(
-    std::uint16_t connection_handle) {
-    std::uint64_t token = hci_establishment_.load(std::memory_order_acquire);
-    while (token != 0 && hci_establishment_handle(token) == connection_handle &&
-           !hci_establishment_.compare_exchange_weak(
-               token, 0, std::memory_order_acq_rel,
-               std::memory_order_acquire)) {
-    }
-    if (token != 0 && hci_establishment_handle(token) == connection_handle) {
-        hci_establishment_teardown_claimed_.store(false,
-                                                  std::memory_order_release);
-    }
+void Backend::resolve_hci_establishment(std::uint64_t establishment_id) {
+    if (establishment_id == 0 || establishment_id == UINT64_MAX) return;
+    std::uint64_t expected = establishment_id;
+    if (!hci_establishment_id_.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire)) return;
+    expected = establishment_id;
+    (void)hci_establishment_disconnect_owner_.compare_exchange_strong(
+        expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+void Backend::retire_hci_establishment() {
+    hci_ingress_enabled_.store(false, std::memory_order_release);
+    hci_ingress_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    hci_establishment_id_.store(0, std::memory_order_release);
+    hci_establishment_disconnect_owner_.store(0, std::memory_order_release);
+    hci_establishment_stack_.store(0, std::memory_order_release);
+    hci_establishment_generation_.store(0, std::memory_order_release);
+    hci_establishment_handle_.store(ble_lifecycle::kNoConnection,
+                                    std::memory_order_release);
 }
 
 void Backend::process_hci_establishment() {
-    const auto token = hci_establishment_.load(std::memory_order_acquire);
-    if (token == 0) return;
-    const auto handle = hci_establishment_handle(token);
+    const auto establishment_id = hci_establishment_id_.load(
+        std::memory_order_acquire);
+    if (establishment_id == 0 || establishment_id == UINT64_MAX) return;
+    if (hci_establishment_stack_.load(std::memory_order_acquire) !=
+            stack_incarnation_ ||
+        hci_establishment_generation_.load(std::memory_order_acquire) !=
+            generation_.load(std::memory_order_acquire)) {
+        if (sink_ != nullptr) sink_->signal_ble_lifecycle_handoff_failure();
+        return;
+    }
+    const auto handle = hci_establishment_handle_.load(
+        std::memory_order_acquire);
     std::pair<std::uint16_t, bool> registered{handle, false};
     ble_hs_lock();
     ble_gap_conn_foreach_handle([](std::uint16_t value, void *context) {
@@ -1755,21 +1874,24 @@ void Backend::process_hci_establishment() {
     }, &registered);
     ble_hs_unlock();
     if (registered.second) {
-        resolve_hci_establishment(handle);
+        resolve_hci_establishment(establishment_id);
         if (hidden_exposure_requested_.load(std::memory_order_acquire)) {
             terminate_hidden_connection(handle);
         }
         return;
     }
-    bool unclaimed = false;
-    if (!hci_establishment_teardown_claimed_.compare_exchange_strong(
-            unclaimed, true, std::memory_order_acq_rel,
+    std::uint64_t unclaimed = 0;
+    if (!hci_establishment_disconnect_owner_.compare_exchange_strong(
+            unclaimed, establishment_id, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
+        if (unclaimed != establishment_id && sink_ != nullptr) {
+            sink_->signal_ble_lifecycle_handoff_failure();
+        }
         return;
     }
     const int result = disconnect_controller_handle(handle);
-    if (result == BLE_ERR_UNK_CONN_ID) {
-        resolve_hci_establishment(handle);
+    if (result == BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID)) {
+        resolve_hci_establishment(establishment_id);
         return;
     }
     if (result != 0 ||
